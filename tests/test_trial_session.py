@@ -6,6 +6,7 @@ import asyncio
 import copy
 import ssl
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from ocpp_hub_core.prototype.store import fingerprint
+from ocpp_hub_core.prototype.trial_allocation import observe_history
 from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection
 from ocpp_hub_core.prototype.trial_resources import Baseline
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_private
@@ -45,8 +47,14 @@ class Bench:
         self.reader: asyncio.Task[None] | None = None
         self.received_profiles: list[int] = []
         self.received_limits: list[float] = []
+        self.device_calls: list[list[Any]] = []
         self.composite_reply_delay = 0.0
         self.observation_failure = False
+        self.history: list[dict[str, Any]] = []
+        self.next_vendor = 9000
+        self.boot_on_probe = False
+        self.auto_boots = 0
+        self.before_reply: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
 
     # Use the actual fake firmware's profile list as independent native inventory evidence.
     async def observe(self) -> Evidence:
@@ -73,12 +81,14 @@ class Bench:
             time.time(),
             self.cp,
             self.connection,
-            0,
-            0,
+            self.firmware.current,
+            self.firmware.current * 240,
             self.firmware.active is not None,
             fingerprint(self.configuration),
             tuple(resources),
             self.online,
+            self.firmware.active,
+            observe_history(self.history, "OFFLINE001", "HARDWARE001", time.time()),
         )
 
     # The fake cloud answers real correlated frames without sharing transaction mappings with the local gateway.
@@ -93,7 +103,8 @@ class Bench:
             elif frame[2] == "Authorize":
                 answer = {"idTagInfo": info()}
             elif frame[2] == "StartTransaction":
-                answer = {"transactionId": 9001, "idTagInfo": info()}
+                self.next_vendor += 1
+                answer = {"transactionId": self.next_vendor, "idTagInfo": info()}
             elif frame[2] == "Heartbeat":
                 answer = {"currentTime": "2030-01-01T00:00:00Z"}
             else:
@@ -108,6 +119,7 @@ class Bench:
                 self.replies[frame[1]].set_result(frame)
                 continue
             action, payload = frame[2:]
+            self.device_calls.append(copy.deepcopy(frame))
             answer = self.firmware.answer(action, payload)
             if action == "GetCompositeSchedule":
                 await asyncio.sleep(self.composite_reply_delay)
@@ -118,7 +130,18 @@ class Bench:
                 )
             elif action == "RemoteStopTransaction":
                 self.remote_stop.set()
+            if self.before_reply is not None:
+                await self.before_reply(action, payload)
             await charger.send(build_call_result(frame[1], answer))
+            if (
+                action == "TriggerMessage"
+                and payload.get("requestedMessage") == "BootNotification"
+                and self.boot_on_probe
+            ):
+                self.auto_boots += 1
+                token = "device-boot-" + str(self.auto_boots)
+                self.replies[token] = asyncio.get_running_loop().create_future()
+                await charger.send(build_call(token, "BootNotification", BOOT))
 
     # Submit an actual device CALL while the separate reader continues answering proxy RPCs.
     async def call(self, charger: Any, token: str, action: str, payload: dict[str, Any]) -> list[Any]:
@@ -128,8 +151,16 @@ class Bench:
         answer = await asyncio.wait_for(future, 2)
         if answer[0] == 3 and action == "StartTransaction":
             self.firmware.active = answer[2]["transactionId"]
+            if not any(row["transactionId"] == self.firmware.active for row in self.history):
+                self.history.append({"transactionId": self.firmware.active, "start": copy.deepcopy(payload)})
         elif answer[0] == 3 and action == "StopTransaction":
             self.firmware.active = None
+            self.firmware.requested_current = 0
+            if self.cp == "C":
+                self.cp, self.connection = "B", "Plug"
+            for row in self.history:
+                if row["transactionId"] == payload["transactionId"]:
+                    row["stop"] = copy.deepcopy(payload)
         return answer
 
     # A new authenticated charger socket represents the same independent physical device after proxy restart.
@@ -351,8 +382,13 @@ async def test_trial_session_full_lifecycle_and_verified_rollback(
 # Intent: an unplugged but open session after process loss can reconnect under a zero hold and complete its real Stop.
 # Why: requiring the session already closed before binding creates a recovery deadlock on this iCS firmware.
 @pytest.mark.parametrize("profile_kind", ["Relative", "Absolute"])
+@pytest.mark.parametrize("vehicle", ["unplugged", "plugged", "charging"])
 async def test_trial_restart_opens_restricted_recovery_listener(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, profile_kind: str
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    profile_kind: str,
+    vehicle: str,
 ) -> None:
     import json
 
@@ -375,6 +411,11 @@ async def test_trial_restart_opens_restricted_recovery_listener(
                 await until(lambda: first.gateway.controls.ready and first.gateway.vendor_registration == "Accepted")
                 await bench.call(charger, "start", "StartTransaction", START)
                 await until(lambda: first.journal.vendor_id(1001) == 9001)
+                if vehicle != "unplugged":
+                    bench.cp, bench.connection = ("B", "Plug") if vehicle == "plugged" else ("C", "Charging")
+                if vehicle == "charging":
+                    bench.firmware.requested_current = 6
+                    assert (await bench.observe()).current_a == 6
                 # Simulate process loss rather than graceful shutdown; firmware and its open transaction survive.
                 await first.runtime.close()
                 first.journal.close()
@@ -408,6 +449,11 @@ async def test_trial_restart_opens_restricted_recovery_listener(
                     await until(lambda: second.journal.next_delivery() is None)
                     assert second.journal.active() is None
                     assert len([f for f in bench.calls if f[0] == 2 and f[2] == "StartTransaction"]) == 1
+                    await second.command({"command": "resume"})
+                    assert second.journal.get("trial_phase") == "active"
+                    assert second.gateway.controls.desired() == 0 and second.gateway.controls.ready
+                    assert bench.firmware.current == 0
+                    bench.cp, bench.connection = "A", "Unplug"
                     await second.command({"command": "rollback"})
                 finally:
                     reader.cancel()

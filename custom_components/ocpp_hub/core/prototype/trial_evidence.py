@@ -13,6 +13,7 @@ from .policy import DeniedError, integer, number
 from .security import SecurityError
 from .station import anchor_epoch
 from .store import fingerprint
+from .trial_allocation import HistoryObservation, observe_history
 from .trial_config import TrialConfig, basic_secret
 
 
@@ -154,6 +155,8 @@ class Evidence:
     configuration_digest: str
     resources: tuple[Resource, ...]
     upstream_connected: bool = False
+    native_transaction_id: int | None = None
+    history: HistoryObservation | None = None
 
     # Validate identity, freshness and inventory uniqueness independently of whether a supervised session is active.
     def require_fresh(self, identity: str, max_age: float = 30) -> None:
@@ -188,15 +191,26 @@ class NativeObserver:
         self.configuration_snapshot: Any = None
 
     # Reject every action outside the exact observed getter set before contacting the literal charger address.
-    async def _read(self, action: str, data: str | None = None) -> Any:
-        if action not in ("getConfig", "statistics") or (
-            action == "statistics" and data not in ("CONNECTOR", "METER", "SESSION", "SMART", "SETPLAN", "OCPP")
+    async def _read(self, action: str, data: str | dict[str, Any] | None = None) -> Any:
+        if (
+            action not in ("getConfig", "statistics", "getTransaction")
+            or (action == "statistics" and data not in ("CONNECTOR", "METER", "SESSION", "SMART", "SETPLAN", "OCPP"))
+            or (action == "getConfig" and data is not None)
+            or (action == "getTransaction" and data != {})
         ):
             raise SecurityError("native action is outside the read-only trial observer")
         return await read_native(self.config.charger_ip, self.port, self.authorization, action, data)
 
     # The entire observation has one deadline in addition to each bounded request; no worker survives cancellation.
     async def observe(self) -> Evidence:
+        return await self._observe(False)
+
+    # Only fresh admission reads rolling history; recovery never depends on reseeding from it.
+    async def observe_with_history(self) -> Evidence:
+        return await self._observe(True)
+
+    # Recheck native identity and configuration around one complete bounded physical snapshot.
+    async def _observe(self, include_history: bool) -> Evidence:
         async with asyncio.timeout(15):
             started = time.time()
             config = await self._read("getConfig")
@@ -210,6 +224,10 @@ class NativeObserver:
             values = {}
             for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP"):
                 values[name] = await self._read("statistics", name)
+            if include_history:
+                values["TRANSACTIONS"] = await self._read("getTransaction", {})
+            if await self._read("getConfig") != config:
+                raise SecurityError("native configuration changed during the history audit")
             return native_evidence(config, values, started)
 
     # The explicit command-line baseline capture owns its loop; websocket runtime always uses observe directly.
@@ -252,8 +270,11 @@ def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> 
         session = values["SESSION"]["saveData"]["sessionList"]
         if len(session) != 1:
             raise ValueError
-        current = number(meter[0]["meterData"]["cur"][0], 10000) / 10
-        power = number(meter[0]["meterData"]["power"][3], 1000000)
+        currents, powers = meter[0]["meterData"]["cur"], meter[0]["meterData"]["power"]
+        if not isinstance(currents, list) or len(currents) != 3 or not isinstance(powers, list) or len(powers) != 4:
+            raise ValueError
+        current = max(number(value, 10000) / 10 for value in currents)
+        power = max(number(value, 1000000) for value in powers)
         transaction = integer(session[0]["_transactionId"], -1)
         online = values["OCPP"]["online"]
         if type(online) is not bool:
@@ -269,6 +290,10 @@ def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> 
             fingerprint(config),
             tuple(resources),
             online,
+            transaction if transaction > 0 else None,
+            observe_history(values["TRANSACTIONS"], identity, config["bPSN"], observed_at)
+            if "TRANSACTIONS" in values
+            else None,
         )
     except ValueError, KeyError, TypeError, IndexError:
         raise SecurityError("complete native trial inventory could not be validated") from None

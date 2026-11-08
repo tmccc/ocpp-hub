@@ -287,7 +287,8 @@ class ResourceBook:
         if answer[0] == 3 and answer[2].get("status") == "Accepted":
             if action == "SetChargingProfile":
                 self.journal.db.execute(
-                    "UPDATE trial_resources SET confirmed=desired,state='confirmed' WHERE key=?", (key,)
+                    "UPDATE trial_resources SET confirmed=desired,state='confirmed',observed_digest=NULL WHERE key=?",
+                    (key,),
                 )
             else:
                 self.journal.db.execute("UPDATE trial_resources SET state='clear_acknowledged' WHERE key=?", (key,))

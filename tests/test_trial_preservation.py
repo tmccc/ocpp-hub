@@ -303,3 +303,34 @@ def test_synthetic_clear_hypotheses_remain_distinct(mode: str) -> None:
     firmware.clear_mode = mode
     firmware.answer("ClearChargingProfile", {"id": 7001})
     assert set(firmware.profiles) == {"scoped": {42, 43}, "all_profiles": set(), "prune_inactive": {42}}[mode]
+
+
+# Intent: an old-confirmed native digest observed during a pending update cannot poison the accepted new profile.
+# Why: legitimate6→0 transition bytes differ, while later unrelated byte drift must remain a durable blocker.
+async def test_pending_set_old_digest_is_retired_on_real_acceptance(tmp_path: Path) -> None:
+    rig = TrialRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.gateway.set_limit(6)
+        old = rig.evidence()
+        zero = commands.set_charging_profile(0, commands.PURPOSE_CHARGE_POINT_MAX, 0, 7001)
+        rig.book.before_send("SetChargingProfile", zero)
+        rig.book.owned_present(old)
+        row = rig.store.db.execute("SELECT observed_digest FROM trial_resources").fetchone()
+        assert row["observed_digest"] is not None
+        actual_ack = rig.firmware.answer("SetChargingProfile", zero)
+        rig.book.after_result("SetChargingProfile", zero, [3, "real-peer-ack", actual_ack])
+        current = rig.evidence()
+        rig.book.owned_present(current)
+        assert not rig.store.get("trial_inventory_fault")
+        resource = next(row for row in current.resources if row.key == "profile:7001")
+        changed = replace(resource, body={**resource.body, "unexpected_native_field": True})
+        drift = replace(
+            current, resources=tuple(changed if row.key == resource.key else row for row in current.resources)
+        )
+        with pytest.raises(SecurityError):
+            rig.book.owned_present(drift)
+        assert rig.store.get("trial_inventory_fault")["reason"] == "owned_profile_bytes_changed"
+    finally:
+        await rig.gateway.close()
+        rig.store.close()

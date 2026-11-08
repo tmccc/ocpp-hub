@@ -94,8 +94,17 @@ class Gateway:
         self._inbound = InboundCache()
         self.failures: list[str] = []
 
+    # Restrict new transports or changed introductions before they can authorize any charging-capable request.
+    def _restrict_trial_introduction(self) -> None:
+        if self.journal.get("trial_phase") == "active" and self.journal.get("trial_binding") is not None:
+            with self.journal.atomic():
+                control = self.journal.get("control", {})
+                self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+                self.journal.put("trial_phase", "recovering")
+
     # Attach only an already admitted transport; the gateway never opens sockets itself.
     def attach_charger(self, sender: Sender) -> int:
+        self._restrict_trial_introduction()
         epoch = self.journal.connection_epoch()
         self.charger.detach()
         self._charger_epoch = epoch
@@ -286,6 +295,7 @@ class Gateway:
         if action == "BootNotification":
             previous_boot = self.journal.get("boot")
             if previous_boot is not None and previous_boot != payload:
+                self._restrict_trial_introduction()
                 self.controls.invalidate()
             self.journal.put("boot", payload)
             self._boot_charger_epoch = self._charger_epoch
@@ -362,6 +372,7 @@ class Gateway:
     def _tag_allowed(self, tag: Any) -> bool:
         if (
             not isinstance(tag, str)
+            or self.journal.get("trial_starting")
             or self.journal.get("control", {}).get("inhibit")
             or self.journal.get("trial_phase") not in (None, "active")
         ):
@@ -383,7 +394,11 @@ class Gateway:
 
     # An explicit owner Start may release a completed hold, but cannot bypass revocation or recovery mode.
     def _local_start_allowed(self, tag: str) -> bool:
-        if not self._local_tag(tag) or self.journal.get("trial_phase") not in (None, "active"):
+        if (
+            not self._local_tag(tag)
+            or self.journal.get("trial_phase") not in (None, "active")
+            or self.journal.get("trial_starting")
+        ):
             return False
         info = self.auth_info.get(tag)
         return info is None or info["status"] == "Accepted"
@@ -516,7 +531,7 @@ class Gateway:
         if (
             kind == "write"
             and action != "RemoteStopTransaction"
-            and self.journal.get("trial_phase") not in (None, "active")
+            and (self.journal.get("trial_phase") not in (None, "active") or self.journal.get("trial_starting"))
         ):
             raise DeniedError("trial vendor controls are frozen")
         control = self.journal.get("control", {})

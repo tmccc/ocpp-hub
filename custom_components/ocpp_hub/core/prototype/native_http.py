@@ -71,7 +71,7 @@ async def response_body(reader: asyncio.StreamReader) -> bytes:
 
 
 # The whole request has one deadline; closing the stream on cancellation does not leave a background reader running.
-async def read_native(host: str, port: int, authorization: str, action: str, data: str | None) -> Any:
+async def read_native(host: str, port: int, authorization: str, action: str, data: str | dict[str, Any] | None) -> Any:
     writer: asyncio.StreamWriter | None = None
     payload: dict[str, Any] = {"action": action}
     if data is not None:

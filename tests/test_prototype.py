@@ -27,7 +27,7 @@ class Rig:
     """Synthetic peers observe the real engine and supply configurable results."""
 
     # Attach in-memory transports without mocking any gateway or journal behavior.
-    def __init__(self, path: Path, policy: Policy | None = None) -> None:
+    def __init__(self, path: Path, policy: Policy | None = None, attach: bool = True) -> None:
         self.store = Journal(path, "OFFLINE001")
         self.gateway = Gateway(self.store, policy, timeout=0.08)
         self.charger_frames: list[list[Any]] = []
@@ -39,7 +39,8 @@ class Rig:
         self.crash_reply = False
         self.next_vendor = 9000
         self.firmware = Firmware()
-        self.gateway.attach_charger(self.charger_send)
+        if attach:
+            self.gateway.attach_charger(self.charger_send)
 
     # Record charger-bound requests and return synthetic peer results under their actual correlation id.
     async def charger_send(self, raw: str) -> None:

@@ -352,14 +352,16 @@ def native_values() -> dict[str, Any]:
         "METER": [{"meterData": {"cur": [0, 0, 0], "power": [0, 0, 0, 0]}}],
         "CONNECTOR": [{"info": {"CP": "A"}, "connStatus": "Unplug"}],
         "OCPP": {"online": True},
+        "TRANSACTIONS": [],
     }
 
 
-# Intent: the native observer uses only the seven known read requests and independently proves unplugged idle state.
+# Intent: the native observer uses only bounded read requests and independently proves unplugged history and state.
 # Why: OCPP SuspendedEV is not trustworthy vehicle-connection evidence on this charger.
 @pytest.mark.parametrize("mismatch", [None, "ocpp", "hardware"])
+@pytest.mark.parametrize("include_history", [False, True])
 async def test_native_observer_real_http_is_read_only(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], mismatch: str | None
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], mismatch: str | None, include_history: bool
 ) -> None:
     values = native_values()
     identity = "SYNTHETIC_OCPP_ID_" + "C" * 14
@@ -380,7 +382,13 @@ async def test_native_observer_real_http_is_read_only(
         )
         request = json.loads(await reader.readexactly(length))
         requests.append(request)
-        key = "config" if request["action"] == "getConfig" else request["data"]
+        key = (
+            "config"
+            if request["action"] == "getConfig"
+            else "TRANSACTIONS"
+            if request["action"] == "getTransaction"
+            else request["data"]
+        )
         body = json.dumps({"code": 200, "data": json.dumps(values[key])}).encode()
         writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         await writer.drain()
@@ -402,12 +410,13 @@ async def test_native_observer_real_http_is_read_only(
                 await observer.observe()
             assert len(requests) == 1
             return
-        evidence = await observer.observe()
+        evidence = await (observer.observe_with_history() if include_history else observer.observe())
         evidence.require_unplugged(config.identity)
-        assert len(requests) == 7 and evidence.upstream_connected
+        assert len(requests) == (9 if include_history else 8) and evidence.upstream_connected
+        assert (evidence.history is not None) == include_history
         with pytest.raises(SecurityError):
             await observer._read("setConfig")
-        assert len(requests) == 7
+        assert len(requests) == (9 if include_history else 8)
     finally:
         server.close()
         await server.wait_closed()

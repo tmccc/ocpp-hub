@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
@@ -132,6 +134,39 @@ class Journal:
     def put(self, key: str, value: Any) -> None:
         self.db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, encoded(value)))
 
+    # New trial sessions need a durable identity-bound allocation boundary; old receipts and Stop remain readable.
+    def require_allocation(self) -> None:
+        if self.get("trial_phase") is None:
+            return
+        proof = self.get("trial_allocation")
+        counter = self.get("next_transaction")
+        maximum = self.db.execute("SELECT MAX(local) FROM transactions").fetchone()[0]
+        if (
+            not isinstance(proof, dict)
+            or type(proof.get("version")) is not int
+            or proof.get("version") != 1
+            or set(proof)
+            != {"version", "identity_digest", "hardware_digest", "observed_at", "digest", "count", "floor"}
+            or proof.get("identity_digest") != fingerprint(self.identity)
+            or any(
+                not isinstance(proof.get(key), str)
+                or len(proof[key]) != 64
+                or any(character not in "0123456789abcdef" for character in proof[key])
+                for key in ("hardware_digest", "digest")
+            )
+            or type(proof.get("count")) is not int
+            or not 0 <= proof["count"] <= 10000
+            or type(proof.get("observed_at")) not in (int, float)
+            or not math.isfinite(proof["observed_at"])
+            or not 0 < proof["observed_at"] <= time.time() + 2
+            or type(proof.get("floor")) is not int
+            or type(counter) is not int
+            or not 1000 <= proof["floor"] <= counter < 2**31 - 1
+            or maximum is not None
+            and counter < maximum
+        ):
+            raise RecoveryRequiredError("new sessions require a verified durable allocation boundary")
+
     # Queue a lifecycle event before acknowledging it; retain its stable upstream request id.
     def enqueue(self, action: str, payload: dict[str, Any], local: int | None = None) -> str:
         if self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] >= self.capacity:
@@ -230,7 +265,11 @@ class Journal:
             else:
                 if self.active(int(payload["connectorId"])) is not None:
                     raise ConflictError("connector already has an unresolved transaction")
-                local = int(self.get("next_transaction", 1000)) + 1
+                self.require_allocation()
+                counter = self.get("next_transaction", 1000)
+                if type(counter) is not int or not 1000 <= counter < 2**31 - 1:
+                    raise RecoveryRequiredError("transaction counter is invalid or exhausted")
+                local = counter + 1
                 if local >= 2**31:
                     raise RecoveryRequiredError("transaction counter exhausted")
                 self.put("next_transaction", local)

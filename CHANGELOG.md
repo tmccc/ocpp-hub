@@ -2,11 +2,21 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Automatically reserve fresh local transaction numbers above complete retained native history, pin both identities,
+  preserve durable counters and receipts across restart, and reject history advancing during initial handoff.
+- Add offline-verified connected restart under a confirmed zero-current hold, exact native-session matching, saved
+  configuration/Boot/station binding, read-only silent-Boot probing and explicit owner recovery acknowledgement.
+- Block app/owner positive writes until initial native admission completes. Refresh snapshots overtaken by legitimate
+  control/session/receipt changes within a bounded budget; preserve frozen cleanup phases after late audit failures.
+- Wait for pending Set/Clear replies before native ownership classification; retire the old digest on an actual accepted
+  Set transition while retaining sticky faults and detection of subsequent unrelated native-byte changes.
+- Keep connected cleanup behind its existing unplugged guard until an independent interlock is proven. No live charger,
+  Home Assistant or permanent service change accompanies this offline hardening.
 - Verify physical local Start, nominal 6 A charging and local Stop with the vendor link retired, then real cloud
   acknowledgement of all seven queued events after local authorization expiry, preserving immutable session data.
 - Preserve all nine previous history bodies plus the new 38 Wh session; complete guarded cleanup and normal-backend
-  restoration. Verify a private fresh-journal allocation bootstrap above native history; automatic CLI bootstrap
-  remains future work.
+  restoration. Record the private allocation bootstrap used in that trial; its automatic CLI replacement is now
+  implemented and validated offline above.
 - Verify an unplugged local zero-current hold while the vendor connection is deliberately retired, followed by
   successful cloud reconnection, 6 A release and complete restoration with all nine history records unchanged.
 - Verify the corresponding Start/Stop/backfill path with guarded synthetic TLS peers before the physical test.
@@ -37,7 +47,8 @@
   Pin choice/capabilities to the device introduction, discard mixed-Boot discovery, and keep Stop authoritative.
 - Carry Absolute anchors through ownership and native rollback checks; verify schedules at response completion.
   Extend the independent firmware model and real TLS tests for timing, rejection, recovery and unchanged replay.
-- Keep subsequent corrections offline. Physical current enforcement and full app control remain unproven.
+- Keep the latest restart corrections offline. Earlier trials verified nominal physical current limiting and core app
+  controls; the new restart path, wider app compatibility and unattended deployment still need live validation.
 - Separate the original OCPP identity from the native hardware serial and validate both before native admission.
 - Correct credential preparation: iCS authentication keys are write-only, so blank native backups cannot restore them.
 - Add explicitly configured absent-header admission while retaining exact source/path/TLS; never infer a fallback.

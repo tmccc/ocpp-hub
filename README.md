@@ -1,6 +1,10 @@
 ## Standalone iCS prototype — real app and local control verified in a supervised trial
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
+The latest automatic allocation and restricted restart changes are validated offline only. They have not been run on
+the household charger, installed as a service or loaded into Home Assistant. The seven physical trials below describe
+the preceding supervised implementation.
+
 Seven authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
 the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
 control, metadata reads and the existing Fast-mode write. The station setting was 6 A; the meter reported about
@@ -41,14 +45,51 @@ configuration and schedule. All nine previous history bodies remain alongside th
 Before that seventh trial, a separately reviewed private bootstrap reserved the fresh journal's transaction counter
 strictly above every ID in complete native history, avoiding reuse of earlier proxy session numbers. Guarded tests
 verified persistence across restart, a real TLS Start/Stop/backfill sequence using that range, and rejection of invalid
-or exhausted IDs. The standard commissioning CLI does not automatically bootstrap that counter from native history;
-charging with a fresh journal remains an explicitly prepared, supervised procedure.
+or exhausted IDs. The new offline implementation now performs that reservation automatically during fresh admission
+and rechecks history at first charger introduction. Its first physical validation remains pending.
 
 The earlier loss of an inactive profile during the second trial remains unexplained. Later successes start from a
 profile-free baseline; they neither recreate that old resource nor prove selective clearing beside unrelated profiles.
-Eco/EcoPlus, saved-schedule editing, indefinite operation, automatic recovery while a vehicle remains connected and
+Eco/EcoPlus, saved-schedule editing, indefinite operation, live automatic recovery while a vehicle remains connected and
 full-battery auto-stop through the proxy remain unproven. This is a verified supervised control path, not a claim of
 complete app compatibility or unattended production readiness.
+
+### Automatic allocation and restricted restart — offline validation
+
+A fresh `run` reads complete retained native history with the observed `getTransaction` request and exact empty data
+object. Both OCPP and physical identities are checked, and native configuration is reread around the snapshot.
+Before listening, an empty prepared journal atomically reserves its next local number above every retained transaction ID,
+with bounded signed-integer headroom and private provenance. First introduction rechecks that history has not advanced
+beyond the reservation during handoff. Errors, missing/duplicate/invalid IDs, changed hardware and exhausted ranges
+fail closed before charging-capable writes. Restart retains the existing durable counter rather than reseeding it
+from rolling history. This cannot reconstruct records already absent from native history; keep the durable journal.
+
+Connected recovery requires an existing verified journal, matching native session ID, present owned station profile,
+and unchanged configuration, station selection and Boot binding. Replacement transports immediately claim local zero
+ownership. Recovery attempts and verifies the zero profile first, then requests Stop for the exact known session. If
+the hold is refused, that known-session safety Stop remains available while readiness stays false. Recovery waits for
+the real Stop message and cloud acknowledgements. Unknown sessions, changed bindings, missing profiles and incomplete
+first commissioning remain explicit refusals. Ambiguous cloud Starts remain quarantined; no duplicate Start or
+synthetic Stop is created. A silent charger is asked for an actual BootNotification after ten seconds; a saved Boot
+never introduces a new connection.
+
+Legitimate Stop/lifecycle/receipt changes can overtake the native HTTP snapshot. Both native observers compare the
+current transport, Boot revision, phase and control/session/resource authority around each read, then discard stale
+snapshots before ownership classification. Refresh is bounded to three attempts within fifteen seconds. Late audits
+cannot overwrite frozen cleanup or recreate a removed profile. Tests reproduce these races over real TLS peers.
+An in-flight Set/Clear reply must resolve before ownership classification. A genuine accepted Set retires the previous
+raw-profile digest; a fresh read pins the newly confirmed bytes, and subsequent unexpected changes still block controls.
+
+The explicit `resume` command acknowledges completed recovery but retains the zero-current hold. It requires the
+current Boot/audit, actual native and journal closure, reconciled history and writes, intact resources and valid
+allocation provenance. A later explicit `start` or `release` is still needed to permit charging. Legacy journals remain
+usable for immutable receipt replay, Stop/history and guarded cleanup, while missing new provenance blocks new starts.
+Recovery tests cover plugged idle, actual synthetic current flow, lost Stop messages, rejected zero profiles, lost cloud
+Start replies, early app/owner writes, pre-Boot safety Stop and successive fresh journals with preserved old history.
+
+Connected restart is separate from connected cleanup. Removing the safety profile and restoring the original backend
+with the lead attached still needs an independently verified vehicle-side inhibit or equivalent interlock. The existing
+unplugged cleanup guard is retained. No further live cable test is part of this offline change.
 
 The third trial verified ordinary Stop at 0 A and Release back to 6 A with accepted 60-second composites and the same
 accepted cloud session. Exact-id removal of the owned profile succeeded from a profile-free baseline; fresh native
@@ -214,8 +255,10 @@ are pinned in `requirements-trial.txt`; test/development dependencies remain in 
 
 The explicit `capture-baseline` action performs only the existing read-only LAN getters. It saves a private native
 profile/plan inventory and original configuration backup. It does not change the charger. The native reader uses the
-charger's existing LAN HTTP API at its exact IP, supports only seven observed read requests, rejects duplicate JSON
+charger's existing LAN HTTP API at its exact IP, supports only the observed read-only requests, rejects duplicate JSON
 keys and bounds each response and the entire observation without leaving background worker threads.
+Ordinary audits inspect every current and power channel and the exact native session ID. Complete history is read only
+for fresh admission and first introduction; existing recovery does not depend on fetching or reseeding rolling history.
 After restart this firmware can report the exact missing `/tmp/Ioc/OCPP.json` envelope instead of an offline flag.
 Only that observed OCPP-specific reply becomes `online: false`; other failed getters remain errors, and absence can
 never establish successful original-backend restoration.
@@ -299,11 +342,12 @@ fresh native readings show the original configuration, original resources, no ow
 Configuration restoration alone cannot prove that reconnection has happened. History and any unsent observations remain
 in the journal; they are not erased to make rollback look successful.
 
-After process loss, an existing trial may open a restricted recovery listener once the vehicle is physically unplugged,
-even if iCS still considers its session open. It persists zero-current local ownership before binding, blocks new starts,
-and can receive lifecycle retries, stop the known session and deliver/reconcile retained history. Unknown cloud Starts
-and pending-start uncertainty still require independent reconciliation; they are never automatically retried or discarded.
-A failed native audit does not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
+After process loss, a verified existing trial may now open restricted recovery while the vehicle remains connected,
+subject to the exact native session and saved binding checks above. New socket admission and changed introductions
+persist zero-current local ownership before charging-capable messages can proceed. Recovery receives actual lifecycle
+retries, stops only the known session and delivers retained history. Unknown cloud Starts and pending-start uncertainty
+still require independent reconciliation; they are never automatically retried or discarded. A failed native audit does
+not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
 
 The fifth trial verifies automatic readiness, nominal physical current limiting and core app/local controls from a
 profile-free baseline. Selective clearing beside unrelated profiles and the wider unattended-operation cases remain blocked.

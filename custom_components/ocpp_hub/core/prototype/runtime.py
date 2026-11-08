@@ -176,8 +176,10 @@ class ConnectionRuntime:
             else:
                 await self.gateway.wait_for_boot(epoch)
             self.status.boot_observed = self.gateway.current_boot_seen(epoch)
+            self.gateway._require_epoch("charger", epoch)
             if self.before_ceiling is not None:
                 await self.before_ceiling()
+            self.gateway._require_epoch("charger", epoch)
             await self.gateway.controls.ensure_ceiling()
         except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError) as error:
             self.status.last_failure = "BootOrCeilingUnavailable"

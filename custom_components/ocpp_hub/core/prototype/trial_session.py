@@ -19,8 +19,11 @@ from .runtime import ConnectionRuntime, RuntimeSettings
 from .security import SecurityError
 from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, fingerprint
+from .trial_allocation import initialize_allocation, verify_initial_history
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
 from .trial_evidence import Evidence, NativeObserver
+from .trial_observation import StableObserver
+from .trial_recovery import Recovery
 from .trial_resources import Baseline, ResourceBook
 from .trial_rollback import Rollback
 from .trial_transport import TrialTransport
@@ -115,6 +118,7 @@ class TrialSession:
     ) -> None:
         self.prepared = prepared
         self.observe = observe or prepared.observer.observe
+        self.observe_initial = observe or prepared.observer.observe_with_history
         config = prepared.config
         self.journal = Journal(config.journal, config.identity)
         try:
@@ -135,6 +139,20 @@ class TrialSession:
                 },
             )
             self.gateway = Gateway(self.journal, policy, timeout=5)
+            self.observe = StableObserver(
+                self.journal,
+                self.observe,
+                lambda: self.gateway._charger_epoch,
+                lambda: self.gateway.controls._revision,
+                self._resource_mutation_inflight,
+            )
+            self.observe_initial = StableObserver(
+                self.journal,
+                self.observe_initial,
+                lambda: self.gateway._charger_epoch,
+                lambda: self.gateway.controls._revision,
+                self._resource_mutation_inflight,
+            )
             self._station_inventory = (sum(r.kind == "profile" for r in prepared.baseline.resources), False)
             self.station = StationDiscovery(
                 self.journal,
@@ -144,13 +162,20 @@ class TrialSession:
             self.gateway.controls.prepare_station = self.station.prepare
             self.gateway.charger.before_send = self.book.before_send
             self.gateway.charger.after_result = self.book.after_result
-            transport = TrialTransport(config, prepared.tls, settings)
-            self.runtime = ConnectionRuntime(self.gateway, transport, settings, self._before_ceiling)
+            actual_settings = settings or RuntimeSettings(boot_probe_after=10)
+            transport = TrialTransport(config, prepared.tls, actual_settings)
+            self.runtime = ConnectionRuntime(self.gateway, transport, actual_settings, self._before_ceiling)
             self.runtime.vendor_enabled = lambda: (
                 self.journal.get("trial_phase") == "active"
                 or (self.journal.get("trial_phase") in ("recovering", "blocked") and self.gateway.controls.ready)
             )
             self.rollback = Rollback(self.gateway, self.book, self.observe)
+            self.recovery = Recovery(
+                self.gateway,
+                self.book,
+                self.observe,
+                StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
+            )
         except BaseException:
             self.journal.close()
             raise
@@ -158,42 +183,60 @@ class TrialSession:
         self.closed = False
         self.final_status: dict[str, Any] | None = None
 
+    # Never classify native profile bytes while their actual outgoing Set/Clear response is still unresolved.
+    def _resource_mutation_inflight(self) -> bool:
+        return bool(self.gateway.charger._pending) and self.gateway.charger.diagnostics.action in (
+            "SetChargingProfile",
+            "ClearChargingProfile",
+        )
+
     # Initial admission is unplugged only; an already active supervised trial can reapply its hold after reconnect.
     async def _before_ceiling(self) -> None:
         phase = self.journal.get("trial_phase")
         if phase not in ("prepared", "active", "recovering", "blocked"):
             raise UnavailableError("trial ceiling reapplication remains frozen during rollback")
         try:
-            evidence = await self.observe()
+            epoch = self.gateway._charger_epoch
+            initial = self.journal.get("trial_starting") and self.journal.get("trial_binding") is None
+            evidence = await (self.observe_initial() if initial else self.observe())
+            self.gateway._require_epoch("charger", epoch)
+            if initial:
+                if evidence.history is None:
+                    raise SecurityError("first introduction requires a fresh complete native history check")
+                verify_initial_history(
+                    self.journal,
+                    evidence.history,
+                    self.prepared.config.identity,
+                    self.prepared.config.hardware_identity,
+                )
             self._station_inventory = (
                 sum(resource.kind == "profile" for resource in evidence.resources),
                 any(resource.key == "profile:7001" for resource in evidence.resources),
             )
-            if phase == "prepared":
-                self.book.activate(evidence)
-            else:
-                evidence.require_fresh(self.journal.identity)
-                self.book.owned_present(evidence)
-                if phase in ("recovering", "blocked"):
-                    await self.gateway.stop()
+            evidence.require_fresh(self.journal.identity)
+            await self.recovery.introduce(evidence, epoch)
         except SecurityError, RecoveryRequiredError:
-            self.journal.put("trial_phase", "blocked")
+            if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
+                self.journal.put("trial_phase", "blocked")
             raise UnavailableError("native trial audit failed; controls remain blocked") from None
 
     # Take a final native idle check immediately before binding; the charger then introduces itself through real Boot.
     async def start(self) -> None:
-        evidence = await self.observe()
         phase = self.journal.get("trial_phase")
+        evidence = await (self.observe_initial() if phase == "prepared" else self.observe())
         if phase == "prepared":
             self.book.require_profile_free_baseline()
+            evidence.require_unplugged(self.journal.identity)
+            if evidence.history is None:
+                raise SecurityError("fresh trial admission requires complete native transaction history")
+            initialize_allocation(
+                self.journal, evidence.history, self.prepared.config.identity, self.prepared.config.hardware_identity
+            )
             self.book.activate(evidence)
-        elif phase == "active":
-            evidence.require_disconnected(self.journal.identity)
-            self.book.owned_present(evidence)
-            control = self.journal.get("control", {})
-            self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
-            self.journal.put("trial_phase", "recovering")
-        elif phase in ("recovering", "blocked"):
+            self.journal.put("trial_starting", True)
+        elif phase in ("active", "recovering"):
+            self.recovery.admit(evidence)
+        elif phase == "blocked":
             evidence.require_disconnected(self.journal.identity)
             control = self.journal.get("control", {})
             self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
@@ -241,13 +284,20 @@ class TrialSession:
         if command == "stop":
             await self.gateway.stop()
             return {"stop_requested": True, "transaction_still_open": self.journal.active() is not None}
+        if command == "resume":
+            return await self.recovery.resume()
         if command == "start":
+            self.journal.require_allocation()
+            if self.journal.get("trial_starting") or not self.gateway.controls.ready:
+                raise RecoveryRequiredError("local Start requires the current verified trial ceiling")
             tags = self.prepared.config.local_tags
             if len(tags) != 1:
                 raise SecurityError("local trial start requires exactly one explicitly approved owner tag")
             await self.gateway.start(next(iter(tags)))
             return {"start_requested": True, "ceiling_a": 6}
         if command == "release":
+            if self.journal.get("trial_starting") or not self.gateway.controls.ready:
+                raise RecoveryRequiredError("release requires the current verified trial ceiling")
             await self.gateway.release()
             return {"local_owner_released": True, "ceiling_a": 6}
         if command == "rollback-plan":

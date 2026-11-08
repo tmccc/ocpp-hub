@@ -134,6 +134,8 @@ class LocalControl:
 
     # Install the reserved station profile; Accepted confirms receipt, not yet real-device execution or persistence.
     async def _cap(self, call: Call, limit: float, epoch: int) -> Frame:
+        if limit > 0 and self.journal.get("trial_starting"):
+            raise DeniedError("initial native admission has not completed")
         self._confirmed_epoch = -1
         revision = self._revision
         ticket = self.journal.get("control", {}).get("ticket")
@@ -229,6 +231,8 @@ class LocalControl:
     async def _set_limit(self, value: Any) -> Frame:
         limit = number(value, self.policy.max_current_a)
         limit = 0.0 if limit < 6 else limit
+        if limit > 0 and self.journal.get("trial_starting"):
+            raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("inhibit") and limit > 0:
             raise DeniedError("resume or release explicitly before raising a stopped limit")
@@ -278,6 +282,8 @@ class LocalControl:
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
     async def _start(self, tag: str) -> Frame:
+        if self.journal.get("trial_starting"):
+            raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("uncertain") or previous.get("start_pending"):
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
@@ -311,6 +317,8 @@ class LocalControl:
 
     # A failed physical release reinstalls zero instead of retaining only a misleading software hold.
     async def _release(self, acknowledge_uncertainty: bool) -> None:
+        if self.journal.get("trial_starting"):
+            raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("uncertain") and not acknowledge_uncertainty:
             raise RecoveryRequiredError("previous local outcome requires reconciliation")

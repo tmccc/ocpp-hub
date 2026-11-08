@@ -13,6 +13,7 @@ from ocpp_hub_core.frames import build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import Policy
 from ocpp_hub_core.prototype.store import encoded, fingerprint
+from ocpp_hub_core.prototype.trial_allocation import initialize_allocation, observe_history
 from ocpp_hub_core.prototype.trial_config import TrialConfig
 from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection, profile_projection
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
@@ -56,7 +57,7 @@ class TrialRig(Rig):
 
     # Seed genuine original resources before taking a baseline; the new journal owns none of them.
     def __init__(self, path: Path, original_profile: bool = False, original_purpose: str = "TxProfile") -> None:
-        super().__init__(path, Policy(max_current_a=6))
+        super().__init__(path, Policy(max_current_a=6), attach=False)
         original = commands.set_charging_profile(
             1, original_purpose, 32, 42, stack_level=1, transaction_id=77 if original_purpose == "TxProfile" else None
         )
@@ -74,10 +75,17 @@ class TrialRig(Rig):
         self.clear_order: list[int] = []
         self.baseline = Baseline.capture(self.store.identity, self.evidence())
         self.book = ResourceBook(self.store, self.baseline)
+        initialize_allocation(
+            self.store,
+            observe_history([], self.store.identity, "HARDWARE001", time.time()),
+            self.store.identity,
+            "HARDWARE001",
+        )
         self.book.activate(self.evidence())
         self.gateway.charger.before_send = self.book.before_send
         self.gateway.charger.after_result = self.book.after_result
         self.rollback = Rollback(self.gateway, self.book, self.observe)
+        self.gateway.attach_charger(self.charger_send)
 
     # Load a profile and its historical receipt as an older journal, without bypassing the new write gate at runtime.
     def seed_legacy_profile(self, payload: dict[str, Any]) -> None:
