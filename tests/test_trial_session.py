@@ -124,7 +124,9 @@ class Bench:
         return connect(
             f"wss://127.0.0.1:{config.listener_port}" + config.charger_path,
             ssl=session.prepared.tls.client,
-            additional_headers=[("Authorization", session.prepared.tls.incoming)],
+            additional_headers=[]
+            if session.prepared.tls.incoming is None
+            else [("Authorization", session.prepared.tls.incoming)],
             subprotocols=["ocpp1.6"],
             logger=TRANSPORT_LOG,
             proxy=None,
@@ -133,12 +135,21 @@ class Bench:
 
 # Intent: exercise start, authorization, mirroring, stop and rollback through the real transport with fake TLS peers.
 # Why: constructor/file tests cannot prove a usable standalone trial package or clean retirement of its owned cap.
+@pytest.mark.parametrize("incoming_mode", ["basic", "none"])
 async def test_trial_session_full_lifecycle_and_verified_rollback(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, incoming_mode: str
 ) -> None:
+    import json
+
+    from ocpp_hub_core.prototype.trial_session import save_private
+
     bench = Bench()
     async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
         config, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        if incoming_mode == "none":
+            value = json.loads(path.read_text())
+            value.update(incoming_auth="none", incoming_secret=None)
+            save_private(path, value)
         session = TrialSession(preflight(path), FAST, bench.observe)
         try:
             await session.start()

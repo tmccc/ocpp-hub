@@ -9,18 +9,23 @@ import ssl
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from ocpp_hub_core.frames import basic_auth_header
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
+from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_config import PreparedTLS, prepare_tls, read_file
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver
+from ocpp_hub_core.prototype.trial_resources import Baseline
 from ocpp_hub_core.prototype.trial_session import preflight, save_private
 from ocpp_hub_core.prototype.trial_transport import TrialTransport
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.datastructures import Headers
 from websockets.exceptions import InvalidStatus
+from websockets.http11 import Request
 
 from tests.test_prototype_tls import tls as tls
 from tests.trial_helpers import config_files
@@ -47,6 +52,35 @@ def test_default_cli_preflight_is_dormant(
     assert not output["hardware_admission_verified"] and not output["hardware_ceiling_verified"]
     assert not config.journal.exists()
     assert "SECRET" not in repr(preflight(path))
+
+
+# Intent: a real-length OCPP URL identity stays separate from the physical serial, without an idTag's 20-byte cap.
+# Why: all earlier synthetic peers reused a short hardware serial and hid this commissioning admission failure.
+@pytest.mark.parametrize("length", [32, 64])
+def test_preflight_preserves_long_ocpp_identity(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], length: int
+) -> None:
+    config, path = config_files(tmp_path, 19876, 19877)
+    identity = "C" * length
+    value = json.loads(path.read_text())
+    value.update(
+        identity=identity, charger_path="/charger/" + identity, vendor_url="wss://127.0.0.1:19877/ocpp/" + identity
+    )
+    save_private(path, value)
+    baseline = json.loads(config.baseline.read_text())
+    baseline["identity_digest"] = fingerprint(identity)
+    save_private(config.baseline, baseline)
+    for secret in (config.incoming_secret, config.upstream_secret):
+        assert secret is not None
+        credential = json.loads(secret.read_text())
+        credential["username"] = identity
+        save_private(secret, credential)
+    prepared = preflight(path)
+    assert prepared.config.identity == identity
+    assert prepared.config.hardware_identity == "HARDWARE001"
+    assert prepared.baseline == Baseline.parse(baseline)
+    with pytest.raises(SecurityError):
+        replace(prepared.config, identity="C" * 65)
 
 
 # Intent: final failure status replaces the running status even when cleanup itself raises after retiring connections.
@@ -179,6 +213,10 @@ def test_listener_tls_preflight(
         {"vendor_url": "wss://127.0.0.1:1234/ocpp/OFFLINE001?token=x"},
         {"charger_path": "/other/OFFLINE001"},
         {"max_current_a": 7},
+        {"incoming_auth": "none"},
+        {"incoming_secret": None},
+        {"upstream_auth": "none"},
+        {"upstream_secret": None},
     ],
 )
 def test_trial_endpoint_validation(
@@ -189,11 +227,51 @@ def test_trial_endpoint_validation(
         replace(config, **changes)
 
 
+# Intent: a manually constructed TLS package cannot silently weaken either explicitly selected authentication mode.
+# Why: validating the configuration alone is insufficient if another caller passes inconsistent prepared credentials.
+@pytest.mark.parametrize("leg", ["incoming", "upstream"])
+@pytest.mark.parametrize("mode", ["basic", "none"])
+def test_trial_transport_refuses_inconsistent_prepared_authentication(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], leg: str, mode: str
+) -> None:
+    config, _ = config_files(tmp_path, 19876, 19877)
+    if mode == "none":
+        config = replace(config, **{leg + "_auth": "none", leg + "_secret": None})
+    prepared = prepare_tls(config)
+    inconsistent = replace(prepared, **{leg: None if mode == "basic" else "Basic SYNTHETIC"})
+    with pytest.raises(SecurityError):
+        TrialTransport(config, inconsistent)
+
+
+# Intent: absent, malformed or wrong-source connection metadata is refused before it can replace an admitted charger.
+# Why: closing or incomplete transports must not bypass address checks or crash the admission boundary.
+@pytest.mark.parametrize("remote", [None, (), "unexpected", ("invalid", 1), ("127.0.0.2", 1)])
+def test_trial_admission_refuses_malformed_or_wrong_peer(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], remote: Any
+) -> None:
+    config, _ = config_files(tmp_path, 19876, 19877)
+    prepared = prepare_tls(config)
+    transport = TrialTransport(config, prepared)
+
+    # Preserve the rejection classification without requiring an impossible malformed operating-system peer tuple.
+    def respond(status: Any, text: str) -> Any:
+        return SimpleNamespace(status_code=int(status))
+
+    connection = SimpleNamespace(remote_address=remote, respond=respond)
+    request = Request(config.charger_path, Headers([("Authorization", prepared.incoming)]))
+    assert transport.admit(connection, request).status_code == 401
+
+
 # Intent: exact full-path admission and independent credentials protect both real synthetic TLS legs.
 # Why: accepting merely a trailing identity or forwarding the local secret would violate the trial boundary.
 @pytest.mark.parametrize("upstream_mode", ["basic", "none"])
+@pytest.mark.parametrize("incoming_mode", ["basic", "none"])
 async def test_trial_transport_exact_admission_and_independent_upstream_secret(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, upstream_mode: str
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    upstream_mode: str,
+    incoming_mode: str,
 ) -> None:
     server_tls, client_tls, _ = tls
     seen: list[tuple[str, list[str]]] = []
@@ -205,10 +283,12 @@ async def test_trial_transport_exact_admission_and_independent_upstream_secret(
 
     async with serve(vendor, "127.0.0.1", 0, ssl=server_tls, subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
         config, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        value = json.loads(path.read_text())
         if upstream_mode == "none":
-            value = json.loads(path.read_text())
             value.update(upstream_auth="none", upstream_secret=None)
-            save_private(path, value)
+        if incoming_mode == "none":
+            value.update(incoming_auth="none", incoming_secret=None)
+        save_private(path, value)
         prepared = preflight(path)
         config = prepared.config
         transport = TrialTransport(config, prepared.tls)
@@ -222,11 +302,13 @@ async def test_trial_transport_exact_admission_and_independent_upstream_secret(
         listener = await transport.listen(charger_handler)
         try:
             base = f"wss://127.0.0.1:{config.listener_port}"
+            valid_headers = [] if prepared.tls.incoming is None else [("Authorization", prepared.tls.incoming)]
+            invalid_header = basic_auth_header("OFFLINE001", "wrong")[1]
             for suffix, headers in (
-                ("/other/OFFLINE001", [("Authorization", prepared.tls.incoming)]),
-                (config.charger_path + "?x=1", [("Authorization", prepared.tls.incoming)]),
-                (config.charger_path, [("Authorization", basic_auth_header("OFFLINE001", "wrong")[1])]),
-                (config.charger_path, [("Authorization", prepared.tls.incoming)] * 2),
+                ("/other/OFFLINE001", valid_headers),
+                (config.charger_path + "?x=1", valid_headers),
+                (config.charger_path, [("Authorization", invalid_header)]),
+                (config.charger_path, [("Authorization", invalid_header)] * 2),
             ):
                 with pytest.raises(InvalidStatus):
                     async with connect(
@@ -242,7 +324,7 @@ async def test_trial_transport_exact_admission_and_independent_upstream_secret(
             async with connect(
                 base + config.charger_path,
                 ssl=client_tls,
-                additional_headers=[("Authorization", prepared.tls.incoming)],
+                additional_headers=valid_headers,
                 subprotocols=["ocpp1.6"],
                 logger=TRANSPORT_LOG,
                 proxy=None,
@@ -252,7 +334,8 @@ async def test_trial_transport_exact_admission_and_independent_upstream_secret(
                     await asyncio.sleep(0.02)
             expected = [] if prepared.tls.upstream is None else [prepared.tls.upstream]
             assert seen == [("/ocpp/OFFLINE001", expected)]
-            assert prepared.tls.incoming != prepared.tls.upstream
+            if prepared.tls.incoming is not None:
+                assert prepared.tls.incoming != prepared.tls.upstream
         finally:
             listener.close()
             await listener.wait_closed()
@@ -262,7 +345,7 @@ async def test_trial_transport_exact_admission_and_independent_upstream_secret(
 def native_values() -> dict[str, Any]:
     purposes = {"ChargePointMaxProfile": [], "TxDefaultProfile": [], "TxProfile": []}
     return {
-        "config": {"bPSN": "OFFLINE001", "installerCurrent": 32},
+        "config": {"Id": "OFFLINE001", "bPSN": "HARDWARE001", "installerCurrent": 32},
         "SMART": {"conn0": purposes, "conn1": purposes},
         "SETPLAN": {"planList": [], "defaultEco": "Fast"},
         "SESSION": {"saveData": {"sessionList": [{"_transactionId": -1}]}},
@@ -274,10 +357,17 @@ def native_values() -> dict[str, Any]:
 
 # Intent: the native observer uses only the seven known read requests and independently proves unplugged idle state.
 # Why: OCPP SuspendedEV is not trustworthy vehicle-connection evidence on this charger.
+@pytest.mark.parametrize("mismatch", [None, "ocpp", "hardware"])
 async def test_native_observer_real_http_is_read_only(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path]
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], mismatch: str | None
 ) -> None:
     values = native_values()
+    identity = "SYNTHETIC_OCPP_ID_" + "C" * 14
+    values["config"]["Id"] = identity
+    if mismatch == "ocpp":
+        values["config"]["Id"] = "OTHER_OCPP_ID"
+    elif mismatch == "hardware":
+        values["config"]["bPSN"] = "OTHER_HARDWARE"
     requests: list[dict[str, Any]] = []
 
     # This separate HTTP peer rejects anything outside the actual read-only native action envelope.
@@ -300,7 +390,18 @@ async def test_native_observer_real_http_is_read_only(
     server = await asyncio.start_server(peer, "127.0.0.1", 0)
     try:
         config, _ = config_files(tmp_path, 19876, 19877)
+        config = replace(
+            config,
+            identity=identity,
+            charger_path="/charger/" + identity,
+            vendor_url="wss://127.0.0.1:19877/ocpp/" + identity,
+        )
         observer = NativeObserver(config, server.sockets[0].getsockname()[1])
+        if mismatch is not None:
+            with pytest.raises(SecurityError):
+                await observer.observe()
+            assert len(requests) == 1
+            return
         evidence = await observer.observe()
         evidence.require_unplugged(config.identity)
         assert len(requests) == 7 and evidence.upstream_connected
@@ -409,3 +510,44 @@ async def test_native_http_framing(raw: bytes, valid: bool) -> None:
     else:
         with pytest.raises((ValueError, SecurityError)):
             await response_body(reader)
+
+
+# Intent: only the observed missing OCPP status file means disconnected; all other native failures remain errors.
+# Why: the file is absent after restart until a backend connects, so requiring it before listening creates a deadlock.
+@pytest.mark.parametrize(
+    ("module", "message", "code", "valid"),
+    [
+        ("OCPP", "NO FOUND /tmp/Ioc/OCPP.json", 1004, True),
+        ("CONNECTOR", "NO FOUND /tmp/Ioc/OCPP.json", 1004, False),
+        ("OCPP", "unexpected native failure", 1004, False),
+        ("OCPP", "NO FOUND /tmp/Ioc/OCPP.json", 1004.0, False),
+    ],
+)
+async def test_native_missing_backend_file_is_explicitly_disconnected(
+    module: str, message: str, code: int | float, valid: bool
+) -> None:
+    from ocpp_hub_core.prototype.native_http import read_native
+
+    raw = json.dumps({"code": code, "message": message, "data": None}).encode()
+
+    # An independent native HTTP peer returns the exact observed startup envelope or its negative controls.
+    async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(peer, "127.0.0.1", 0)
+    try:
+        operation = read_native(
+            "127.0.0.1", server.sockets[0].getsockname()[1], "Basic SYNTHETIC", "statistics", module
+        )
+        if valid:
+            assert await operation == {"online": False}
+        else:
+            with pytest.raises(SecurityError):
+                await operation
+    finally:
+        server.close()
+        await server.wait_closed()

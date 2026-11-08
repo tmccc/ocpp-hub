@@ -147,12 +147,14 @@ def config_files(directory: Path, listener_port: int, vendor_port: int) -> tuple
     save_private(directory / "baseline.json", Baseline.capture("OFFLINE001", evidence).value())
     value = {
         "identity": "OFFLINE001",
+        "hardware_identity": "HARDWARE001",
         "listener_host": "127.0.0.1",
         "listener_port": listener_port,
         "listener_name": "127.0.0.1",
         "charger_ip": "127.0.0.1",
         "charger_path": "/charger/OFFLINE001",
         "vendor_url": f"wss://127.0.0.1:{vendor_port}/ocpp/OFFLINE001",
+        "incoming_auth": "basic",
         "upstream_auth": "basic",
         "incoming_secret": str(directory / "incoming.json"),
         "upstream_secret": str(directory / "upstream.json"),

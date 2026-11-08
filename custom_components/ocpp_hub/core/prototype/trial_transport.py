@@ -26,6 +26,10 @@ class TrialTransport:
         require_verified_tls(tls.client)
         if tls.server.protocol != ssl.PROTOCOL_TLS_SERVER:
             raise SecurityError("trial requires a listener server TLS context")
+        if (config.incoming_auth == "basic") != (tls.incoming is not None) or (config.upstream_auth == "basic") != (
+            tls.upstream is not None
+        ):
+            raise SecurityError("prepared transport credentials must match both explicit authentication modes")
         self.config, self.tls, self.settings = config, tls, settings or RuntimeSettings()
 
     # Admit one exact source/path/credential before a candidate can displace the current device connection.
@@ -37,12 +41,12 @@ class TrialTransport:
             source_matches = ipaddress.ip_address(peer) == ipaddress.ip_address(self.config.charger_ip)
         except ValueError:
             source_matches = False
-        if (
-            not source_matches
-            or request.path != self.config.charger_path
-            or len(headers) != 1
-            or not hmac.compare_digest(headers[0].encode(), self.tls.incoming.encode())
-        ):
+        credential_matches = (
+            not headers
+            if self.tls.incoming is None
+            else len(headers) == 1 and hmac.compare_digest(headers[0].encode(), self.tls.incoming.encode())
+        )
+        if not source_matches or request.path != self.config.charger_path or not credential_matches:
             return connection.respond(HTTPStatus.UNAUTHORIZED, "trial admission refused\n")
         return None
 

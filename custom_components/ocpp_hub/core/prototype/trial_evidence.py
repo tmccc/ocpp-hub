@@ -131,6 +131,12 @@ class NativeObserver:
         async with asyncio.timeout(15):
             started = time.time()
             config = await self._read("getConfig")
+            if (
+                not isinstance(config, dict)
+                or config.get("Id") != self.config.identity
+                or config.get("bPSN") != self.config.hardware_identity
+            ):
+                raise SecurityError("native OCPP and physical identities must both match the configured charger")
             self.configuration_snapshot = config
             values = {}
             for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP"):
@@ -145,7 +151,7 @@ class NativeObserver:
 # Preserve full native bodies, projecting only profile fields whose scaling was observed in actual iCS captures.
 def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> Evidence:
     try:
-        identity = config["bPSN"]
+        identity = config["Id"]
         if not isinstance(identity, str) or not identity:
             raise ValueError
         resources = []

@@ -1,9 +1,25 @@
-## Standalone commissioning package — prepared, not deployed
+## Standalone commissioning package — unplugged trial completed, original setup restored
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-The charger and live Home Assistant have not been changed or connected to it. The normal integration does not load it.
-Actual charger admission, certificate trust, physical limit enforcement and cloud history acceptance still need a
-later supervised trial. Simulated success is not a claim of live readiness.
+An authorised unplugged trial connected the charger temporarily on 8 November 2026. Its original connection and
+settings have been restored and independently verified. Live Home Assistant was not changed; its integration does not
+load this package. The trial found unresolved limit and cloud-session compatibility gaps, so this is not ready for
+unattended use or a charging test.
+
+The actual trial established:
+
+- The charger accepted an encrypted TLS 1.2 local connection and introduced itself with BootNotification. It sent no
+  Authorization header, including after a Basic challenge. Its original identity and write-only keys were preserved.
+- A temporary self-signed allowance was needed for the local certificate; hostname and expiry checks remained enabled.
+  The original strict trust setting was restored afterwards. This does not prove acceptance of a production certificate.
+- The proposed 6 A `ChargePointMaxProfile`, relative kind and stack 16, received an actual correlated `Rejected` reply.
+  Native inventory confirmed profile 7001 was never installed. Effective physical current limiting remains unproven.
+- Two isolated upstream connections accepted the exact original BootNotification without Basic authentication. The
+  proxy's continuing cloud session nevertheless disconnected and retained two status observations. The cause remains
+  unresolved; iCS2.0Lite control through the complete proxy was not established.
+- Rollback independently confirmed the exact original configuration, original schedule/profile inventory, unchanged
+  session history, zero current/power, original backend online, no proxy profiles and retirement of the proxy socket.
+  The trial process and independent restoration fallback have stopped. The car remained unplugged throughout.
 
 `tools/trial_proxy.py` is the standalone entry point. Its default action is `check`, which reads private configuration,
 credentials, baseline and certificates without creating a journal, doing DNS, binding a listener or contacting a device.
@@ -23,17 +39,21 @@ are pinned in `requirements-trial.txt`; test/development dependencies remain in 
 - Configure one literal private listener address/port, one exact charger IP and full `/charger/<identity>` path,
   and one exact upstream WSS URL including the original identity. Wildcard/public listeners, URL credentials,
   redirects, query strings and ambient HTTP proxies are refused.
-- Incoming proxy Basic credentials and manufacturer-cloud credentials are independent. Each Basic secret is a private
-  JSON object with `username` and `password`; the configured identity must match. The LAN observer has its own separate
+- Keep the original OCPP `Id` separate from native `bPSN`: `identity` pins the connection identity (up to 64 characters),
+  and `hardware_identity` independently pins the physical serial. Native observations must match both. Neither is an idTag.
+- Incoming proxy authentication and manufacturer-cloud authentication are independently explicit. Each Basic secret
+  is a private JSON object with `username` and `password`; the configured identity must match. The LAN observer has its own separate
   credential. Passwords are never command-line arguments or status/log fields. Android app Bearer tokens are not used.
-- Upstream authentication is explicitly `basic` with a private secret file, or explicitly `none` with
-  `upstream_secret: null`. There is no automatic fallback. Retained iCS configuration has empty OCPP authorisation-key
-  fields; that does not prove what its actual websocket upgrade sends. The selected cloud mode still needs live proof.
-- The incoming leg always requires its separately chosen Basic password. Applying that prospective password to the
-  charger's connection profile is part of a later authorised trial, not this preparation. Returning to the original
-  profile must restore its original empty/nonempty authentication fields exactly.
+- Either leg is explicitly `basic` with its private secret file, or explicitly `none` with that secret set to `null`.
+  There is no automatic fallback. Incoming `none` refuses an Authorization header and still pins the source IP,
+  full path and TLS listener; it is appropriate only after actual bounded observation proves that device behaviour.
+  iCS OCPP authorisation-key fields are write-only and always read back blank; that cannot establish what its websocket
+  upgrade sends. The selected mode needs independent evidence.
+- A Basic leg requires a known charger password. Never overwrite an unknown existing cloud password for a
+  trial: the native backup cannot recover a write-only secret. Omit those key fields from connection updates and rollback;
+  do not submit their blank readbacks. A separate bounded private handshake observation can establish the existing header.
 - Both legs retain TLS. Upstream CA and hostname checks are mandatory; listener key pairing, SAN/IP name and certificate
-  dates are checked offline. Actual charger trust of the listener certificate remains unproven.
+  dates are checked offline. Production certificate trust remains separate from the temporary trial allowance.
 - Files must be owned regular files, not symlinks. Secrets/configuration and state are private to the runtime user;
   public certificates/CA files may be readable but cannot be writable by other users. Keys are loaded from verified
   bytes through anonymous descriptors, avoiding a second pathname-open race. State directory permissions are checked
@@ -45,6 +65,9 @@ The explicit `capture-baseline` action performs only the existing read-only LAN 
 profile/plan inventory and original configuration backup. It does not change the charger. The native reader uses the
 charger's existing LAN HTTP API at its exact IP, supports only seven observed read requests, rejects duplicate JSON
 keys and bounds each response and the entire observation without leaving background worker threads.
+After restart this firmware can report the exact missing `/tmp/Ioc/OCPP.json` envelope instead of an offline flag.
+Only that observed OCPP-specific reply becomes `online: false`; other failed getters remain errors, and absence can
+never establish successful original-backend restoration.
 
 ```bash
 python3.14 tools/trial_proxy.py capture-baseline --config /private/trial.json
@@ -127,8 +150,8 @@ and can receive lifecycle retries, stop the known session and deliver/reconcile 
 and pending-start uncertainty still require independent reconciliation; they are never automatically retried or discarded.
 A failed native audit does not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
 
-The next live step remains a separately authorised unplugged admission/Boot test. The commissioning package has been
-exercised only with synthetic peers on literal loopback under `tools/offline_validate.py`.
+Resolve the recorded limit rejection and continuing cloud-session failure offline before another authorised trial.
+The synthetic commissioning tests remain restricted to literal loopback under `tools/offline_validate.py`.
 
 ---
 
@@ -136,8 +159,8 @@ exercised only with synthetic peers on literal loopback under `tools/offline_val
 
 This branch builds on OCPP Hub 0.2.1 (`1229028b4b56cb474b04686e5fdf71f079a0888f`) with an isolated durable gateway
 and an offline connection supervisor in `custom_components/ocpp_hub/core/prototype/`.
-**The proxy has never been connected to the actual charger or iCS backend. The normal Home Assistant entry point
-is unchanged and does not load it.** Actual app observations below used the charger's original backend connection.
+**The normal Home Assistant entry point is unchanged and does not load this prototype.** The app observations in this
+section used the original backend; the later standalone unplugged trial is described above.
 
 Local control and vendor-app traffic share a local transaction authority. Charger observations are committed before
 local replies and delivered to the simulated cloud in order. Explicitly allowed vendor commands receive the actual
@@ -213,7 +236,7 @@ trial transport.
 On 8 November 2026, the owner authorised inspection of the installed iCS2.0Lite 1.7.3 Android app and reversible
 charging-control trials through that app. Process-scoped HTTP debug logs and the charger's existing read-only LAN
 getters supplied message evidence without TLS interception, certificate installation or app modification.
-The proxy and live Home Assistant setup stayed disconnected from this work.
+Those earlier app observations left the proxy disconnected and live Home Assistant unchanged.
 
 These complete, sanitised fixtures overlap; their frame counts must not be added as unique traffic:
 
@@ -275,13 +298,16 @@ StopTransaction with reason Remote and received its acknowledgement. Native read
 transaction, unplugged and 0 A / 0 W. Configuration, schedule and SMART profile data exactly matched the baseline
 for this uninterrupted trial. Its real session added one history record (5 to 6) and 769 Wh; history was not erased.
 
-### Remaining boundaries before a live proxy trial
+### Remaining boundaries after the first unplugged proxy trial
 
-This is an offline prototype, not a deployment package or a claim of full iCS2.0Lite compatibility.
+The commissioning package is separate from Home Assistant and does not establish full iCS2.0Lite compatibility.
 
-- Actual charger websocket admission, Basic credentials and BootNotification have not been observed through the
-  proxy. A certificate-verified TLS-only probe proved backend reachability, not authenticated websocket admission.
-- Actual `ChargePointMaxProfile` acceptance, stack precedence, composite-schedule support, 0 A enforcement and profile
+- Local TLS admission and Boot were observed, without Basic credentials. Isolated upstream Boot registration worked,
+  but the continuing proxy/cloud connection failed. Its actual failure sequence still needs private wire diagnostics.
+  One retained difference is timestamp format: local Boot replies and subsequent device status used fractional UTC
+  offsets, while original-backend status used whole-second `Z`. Device Auto date formatting may follow its backend;
+  whether iCS rejects the proxy-induced format is an inference to test, not an established server defect.
+- The proposed `ChargePointMaxProfile` was rejected. Supported purpose/kind/stack combinations, composite schedules, 0 A enforcement and profile
   persistence across device reboot remain unproven. The fake firmware checks OCPP stacking, but cannot prove hardware
   behaviour. A current composite read does not rule out a pre-existing higher-stack profile becoming active later.
   A clean, independently verified profile/session boundary is required before any future cutover.
@@ -290,14 +316,14 @@ This is an offline prototype, not a deployment package or a claim of full iCS2.0
 - Full cloud history replay, billing/session reconciliation and app presentation after a real offline interval remain
   untested. An uncertain cloud Start cannot be safely repeated automatically. Existing pre-cutover sessions/plans need
   a clean boundary or independently verified adoption; the proxy never invents historical Stops.
-- Local Authorize replies do not reproduce all cloud expiry/parent-tag/cache semantics. Dynamic start grants cover
-  only an explicitly trusted single start and its active session. Unknown tags and other proprietary variants fail closed.
+- Strict expiry/parent-tag/cache handling is tested offline. Full real-app authorisation and historical reconciliation
+  through the proxy remain unproven. Dynamic grants cover only one trusted start; unknown variants fail closed.
 - Firmware updates, reset and diagnostic uploads stay refused. Unobserved plan stop models, fractional-current device
   behaviour, arbitrary vendor extension bodies and every app screen are outside the validated subset.
 - Resource tables and per-connection reply caches are bounded. Exhaustion and unresolved outcomes need operator
   reconciliation; no silent id recycling or automatic live recovery UI has been added.
 - The existing Home Assistant integration, dashboard and deliberately disabled EV/reserve automations are unchanged.
-  No release, deployment, charger backend change or public push has been made.
+  The temporary charger backend change was fully restored. No release, HA deployment or public push has been made.
 
 Original upstream documentation follows.
 

@@ -2,6 +2,12 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Separate the original OCPP identity from the native hardware serial and validate both before native admission.
+- Correct credential preparation: iCS authentication keys are write-only, so blank native backups cannot restore them.
+- Add explicitly configured absent-header admission while retaining exact source/path/TLS; never infer a fallback.
+- Interpret only the observed missing OCPP status file as disconnected so a restarted device can enter the listener.
+- Record the authorised unplugged trial and verified original-state restoration. Local TLS/Boot and isolated cloud
+  registration worked; the 6 A station profile was rejected and the continuing cloud session remains unresolved.
 - Add a separate standalone commissioning package with dormant private-file preflight, exact endpoint admission,
   independently configured credentials, certificate name/date checks and a bounded 6 A run. Keep offline adapters intact.
 - Add a complete read-only native observer with bounded asynchronous HTTP and strict JSON/framing validation.
@@ -9,7 +15,7 @@
   clear only verified owned profiles with the station cap last, and verify original-backend reconnection separately.
 - Add a restricted unplugged recovery listener and retain safety Stop during recovery; preserve ambiguous history.
 - Add strict expiry/parent/revocation handling, nested authorisation preflight and immutable lifecycle reply metadata.
-- Supply configuration/service examples and pinned runtime requirements. Nothing is deployed or connected to a live charger.
+- Supply configuration/service examples and pinned runtime requirements. Keep Home Assistant undeployed and unchanged.
 
 - Add an isolated HA-free durable gateway and an offline TLS runtime. Keep the normal Home Assistant setup unchanged.
 - Keep local controls independent of cloud reconnects, registration retries, negotiated OCPP heartbeats, Ping/Pong and

@@ -91,6 +91,15 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
             raw = await response_body(reader)
             value = json.loads(raw, object_pairs_hook=unique_object)
             encoded(value)
+            if (
+                action == "statistics"
+                and data == "OCPP"
+                and isinstance(value, dict)
+                and type(value.get("code")) is int
+                and value == {"code": 1004, "message": "NO FOUND /tmp/Ioc/OCPP.json", "data": None}
+            ):
+                # This exact firmware reply means it has not yet created its backend-status file after restart.
+                return {"online": False}
             if not isinstance(value, dict) or type(value.get("code")) is not int or value["code"] != 200:
                 raise ValueError("native envelope is invalid")
             result = value["data"]

@@ -1,11 +1,13 @@
 {
   "identity": "OFFLINE001",
+  "hardware_identity": "HARDWARE001",
   "listener_host": "127.0.0.1",
   "listener_port": 9001,
   "listener_name": "127.0.0.1",
   "charger_ip": "127.0.0.1",
   "charger_path": "/charger/OFFLINE001",
   "vendor_url": "wss://vendor.example.invalid:9113/ocpp/OFFLINE001",
+  "incoming_auth": "basic",
   "upstream_auth": "basic",
   "incoming_secret": "/etc/ocpp-trial/incoming.json",
   "upstream_secret": "/etc/ocpp-trial/upstream.json",

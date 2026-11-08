@@ -107,14 +107,16 @@ class TrialConfig:
     """Private endpoints and identities are excluded from representations and public status."""
 
     identity: str
+    hardware_identity: str
     listener_host: str
     listener_port: int
     listener_name: str
     charger_ip: str
     charger_path: str
     vendor_url: str
+    incoming_auth: str
     upstream_auth: str
-    incoming_secret: Path
+    incoming_secret: Path | None
     upstream_secret: Path | None
     native_secret: Path
     certificate: Path
@@ -128,8 +130,12 @@ class TrialConfig:
 
     # Output files must never alias a credential, certificate, configuration input or another state file.
     def check_paths(self, configuration: Path | None = None) -> None:
-        inputs = [self.incoming_secret, self.native_secret, self.certificate, self.private_key]
-        inputs += [path for path in (self.upstream_secret, self.ca_file, configuration) if path is not None]
+        inputs = [self.native_secret, self.certificate, self.private_key]
+        inputs += [
+            path
+            for path in (self.incoming_secret, self.upstream_secret, self.ca_file, configuration)
+            if path is not None
+        ]
         outputs = [
             self.journal,
             Path(str(self.journal) + ".lock"),
@@ -144,16 +150,17 @@ class TrialConfig:
         input_paths = {path.resolve(strict=False) for path in inputs}
         if len(resolved) != len(set(resolved)) or input_paths.intersection(resolved):
             raise SecurityError("trial output paths must not alias inputs or other state files")
-        credentials = [self.incoming_secret, self.native_secret]
-        if self.upstream_secret is not None:
-            credentials.append(self.upstream_secret)
+        credentials = [self.native_secret]
+        credentials += [path for path in (self.incoming_secret, self.upstream_secret) if path is not None]
         if len({path.resolve(strict=False) for path in credentials}) != len(credentials):
             raise SecurityError("trial credential files must remain independent")
 
     # Enforce a single station, single source address, 6 A commissioning ceiling and explicit file locations.
     def __post_init__(self) -> None:
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,20}", self.identity) is None:
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.identity) is None:
             raise SecurityError("trial charger identity is malformed")
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.hardware_identity) is None:
+            raise SecurityError("trial hardware identity is malformed")
         try:
             host, peer = ipaddress.ip_address(self.listener_host), ipaddress.ip_address(self.charger_ip)
             if (
@@ -178,6 +185,10 @@ class TrialConfig:
         exact_wss(self.vendor_url)
         if not self.vendor_url.endswith("/" + self.identity):
             raise SecurityError("trial upstream path must include its exact charger identity")
+        if self.incoming_auth not in ("basic", "none") or (self.incoming_auth == "basic") != (
+            self.incoming_secret is not None
+        ):
+            raise SecurityError("incoming authentication must be explicitly Basic or explicitly absent")
         if self.upstream_auth not in ("basic", "none") or (self.upstream_auth == "basic") != (
             self.upstream_secret is not None
         ):
@@ -185,7 +196,6 @@ class TrialConfig:
         if type(self.max_current_a) not in (int, float) or self.max_current_a != 6:
             raise SecurityError("commissioning package is restricted to six amperes")
         for path in (
-            self.incoming_secret,
             self.native_secret,
             self.certificate,
             self.private_key,
@@ -197,8 +207,9 @@ class TrialConfig:
                 raise SecurityError("trial requires absolute file paths")
         if self.ca_file is not None and not self.ca_file.is_absolute():
             raise SecurityError("trial requires an absolute CA file path")
-        if self.upstream_secret is not None and not self.upstream_secret.is_absolute():
-            raise SecurityError("trial requires an absolute upstream secret path")
+        for credential_path in (self.incoming_secret, self.upstream_secret):
+            if credential_path is not None and not credential_path.is_absolute():
+                raise SecurityError("trial requires absolute credential paths")
         if len(self.local_tags) > 32 or any(
             re.fullmatch(r"[A-Za-z0-9_-]{1,20}", tag) is None for tag in self.local_tags
         ):
@@ -213,7 +224,6 @@ class TrialConfig:
         if set(value) != keys:
             raise SecurityError("trial configuration fields are incomplete or unknown")
         paths = {
-            "incoming_secret",
             "native_secret",
             "certificate",
             "private_key",
@@ -224,6 +234,7 @@ class TrialConfig:
         try:
             for key in paths:
                 value[key] = Path(value[key])
+            value["incoming_secret"] = None if value["incoming_secret"] is None else Path(value["incoming_secret"])
             value["upstream_secret"] = None if value["upstream_secret"] is None else Path(value["upstream_secret"])
             value["ca_file"] = None if value["ca_file"] is None else Path(value["ca_file"])
             if not isinstance(value["local_tags"], list) or not all(
@@ -244,7 +255,7 @@ class PreparedTLS:
 
     server: ssl.SSLContext
     client: ssl.SSLContext
-    incoming: str
+    incoming: str | None
     upstream: str | None
 
 
@@ -282,7 +293,7 @@ def verify_listener_certificate(descriptor: int, name: str) -> None:
 
 # Load TLS keys from verified bytes through anonymous descriptors, avoiding a second pathname open race.
 def prepare_tls(config: TrialConfig) -> PreparedTLS:
-    incoming = basic_secret(config.incoming_secret, config.identity)
+    incoming = basic_secret(config.incoming_secret, config.identity) if config.incoming_secret is not None else None
     upstream = basic_secret(config.upstream_secret, config.identity) if config.upstream_secret is not None else None
     certificate = read_file(config.certificate, secret=False)
     private_key = read_file(config.private_key)
