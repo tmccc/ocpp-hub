@@ -11,6 +11,7 @@ from typing import Any
 from .native_http import read_native
 from .policy import DeniedError, integer, number
 from .security import SecurityError
+from .station import anchor_epoch
 from .store import fingerprint
 from .trial_config import TrialConfig, basic_secret
 
@@ -40,10 +41,22 @@ def profile_projection(payload: dict[str, Any]) -> dict[str, Any]:
     profile = payload["csChargingProfiles"]
     schedule = profile["chargingSchedule"]
     periods = schedule["chargingSchedulePeriod"]
+    kind = profile.get("chargingProfileKind")
+    absolute = kind == "Absolute"
+    start = anchor_epoch(schedule.get("startSchedule")) if absolute else None
     if (
-        profile.get("chargingProfileKind") != "Relative"
+        kind not in ("Relative", "Absolute")
+        or absolute
+        and (
+            profile.get("chargingProfileId") != 7001
+            or profile.get("chargingProfilePurpose") != "ChargePointMaxProfile"
+            or payload.get("connectorId") != 0
+            or start is None
+            or start >= time.time()
+        )
         or schedule.get("chargingRateUnit") != "A"
         or len(periods) != 1
+        or type(periods[0].get("startPeriod")) is not int
         or periods[0].get("startPeriod") != 0
         or set(profile)
         - {
@@ -54,21 +67,77 @@ def profile_projection(payload: dict[str, Any]) -> dict[str, Any]:
             "chargingSchedule",
             "transactionId",
         }
-        or set(schedule) != {"chargingRateUnit", "chargingSchedulePeriod"}
+        or set(schedule) != {"chargingRateUnit", "chargingSchedulePeriod"} | ({"startSchedule"} if absolute else set())
         or set(periods[0]) - {"startPeriod", "limit", "numberPhases"}
     ):
-        raise DeniedError("trial supports constant relative ampere profiles only")
-    return {
+        raise DeniedError("trial supports only its explicitly selected constant ampere profiles")
+    result = {
         "id": integer(profile["chargingProfileId"], 1),
         "connector": integer(payload["connectorId"], 0, 1),
         "purpose": profile["chargingProfilePurpose"],
         "stack": integer(profile["stackLevel"], 0, 255),
-        "kind": "Relative",
+        "kind": kind,
         "unit": "A",
         "limit": number(periods[0]["limit"], 32),
         "phases": integer(periods[0].get("numberPhases", 1), 1, 1),
         "transaction": profile.get("transactionId"),
     }
+    if absolute:
+        result["start"] = start
+    return result
+
+
+# Only a fully matching native constant schedule can establish ownership of a newly written trial profile.
+def native_profile_projection(profile: dict[str, Any], connector: int, purpose: str, now: float) -> dict[str, Any]:
+    try:
+        periods = profile["periods"]
+        kind = profile["periodKind"]
+        if (
+            kind not in ("Relative", "Absolute")
+            or profile["unit"] != "A"
+            or not isinstance(periods, list)
+            or len(periods) != 1
+            or integer(periods[0]["startPeriod"], 0) != 0
+            or integer(profile["validFrom"], 0) != 0
+            or integer(profile["validTo"], 0) < now + 3600
+            or integer(profile["duration"], 0) < 3600
+            or integer(periods[0]["endPeriod"], 0) < 3600
+        ):
+            return {"unsupported": True}
+        start: int | None = None
+        if kind == "Relative":
+            if type(profile["startSchedule"]) is not int or profile["startSchedule"] != 0:
+                return {"unsupported": True}
+        else:
+            raw = profile["startSchedule"]
+            start = anchor_epoch(raw) if isinstance(raw, str) else integer(raw, 1)
+            if (
+                profile["chargingProfileId"] != 7001
+                or purpose != "ChargePointMaxProfile"
+                or connector != 0
+                or start >= now
+                or start + profile["duration"] < now + 3600
+                or start + periods[0]["endPeriod"] < now + 3600
+                or periods[0]["endPeriod"] < now + 3600
+            ):
+                # Until the native Absolute format is observed, require coverage under both possible end conventions.
+                return {"unsupported": True}
+        result = {
+            "id": integer(profile["chargingProfileId"], 1),
+            "connector": connector,
+            "purpose": purpose,
+            "stack": integer(profile["stackLevel"], 0, 255),
+            "kind": kind,
+            "unit": "A",
+            "limit": number(periods[0]["limit"], 320) / 10,
+            "phases": integer(periods[0]["numberPhases"], 1, 1),
+            "transaction": profile["transactionId"] if purpose == "TxProfile" else None,
+        }
+        if start is not None:
+            result["start"] = start
+        return result
+    except KeyError, TypeError, ValueError, OverflowError:
+        return {"unsupported": True}
 
 
 @dataclass(frozen=True, repr=False)
@@ -169,31 +238,7 @@ def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> 
                     identifier = integer(profile["chargingProfileId"], 1)
                     if profile["purpose"] != purpose or profile["connnectroId"] != connector:
                         raise ValueError
-                    periods = profile["periods"]
-                    canonical: dict[str, Any] = {"unsupported": True}
-                    if (
-                        profile["purpose"] == purpose
-                        and profile["connnectroId"] == connector
-                        and profile["periodKind"] == "Relative"
-                        and profile["unit"] == "A"
-                        and len(periods) == 1
-                        and periods[0]["startPeriod"] == 0
-                        and profile["validFrom"] == 0
-                        and profile["validTo"] >= time.time() + 3600
-                        and profile["duration"] >= 3600
-                        and profile["startSchedule"] == 0
-                    ):
-                        canonical = {
-                            "id": identifier,
-                            "connector": connector,
-                            "purpose": purpose,
-                            "stack": profile["stackLevel"],
-                            "kind": "Relative",
-                            "unit": "A",
-                            "limit": number(periods[0]["limit"], 320) / 10,
-                            "phases": periods[0]["numberPhases"],
-                            "transaction": profile["transactionId"] if purpose == "TxProfile" else None,
-                        }
+                    canonical = native_profile_projection(profile, connector, purpose, time.time())
                     resources.append(Resource("profile", identifier, profile, canonical))
         plans = values["SETPLAN"]["planList"]
         if not isinstance(plans, list):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import Policy
 from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_config import TrialConfig
-from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, profile_projection
+from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
 from ocpp_hub_core.prototype.trial_rollback import Rollback
 from ocpp_hub_core.prototype.trial_session import save_private
@@ -41,7 +42,11 @@ def native_profile(profile: dict[str, Any], connector: int) -> dict[str, Any]:
         "validFrom": 0,
         "validTo": 2147483646,
         "duration": 2147483646,
-        "startSchedule": 0,
+        "startSchedule": (
+            int(datetime.fromisoformat(profile["chargingSchedule"]["startSchedule"].replace("Z", "+00:00")).timestamp())
+            if profile["chargingProfileKind"] == "Absolute"
+            else 0
+        ),
     }
 
 
@@ -78,9 +83,14 @@ class TrialRig(Rig):
             connector = self.connectors.get(
                 identifier, 0 if profile["chargingProfilePurpose"] == "ChargePointMaxProfile" else 1
             )
-            payload = {"connectorId": connector, "csChargingProfiles": profile}
+            body = native_profile(profile, connector)
             resources.append(
-                Resource("profile", identifier, native_profile(profile, connector), profile_projection(payload))
+                Resource(
+                    "profile",
+                    identifier,
+                    body,
+                    native_profile_projection(body, connector, body["purpose"], time.time()),
+                )
             )
         resources += [Resource("plan", key, body, {"unsupported": True}) for key, body in self.firmware.plans.items()]
         return Evidence(
@@ -156,6 +166,9 @@ def config_files(directory: Path, listener_port: int, vendor_port: int) -> tuple
         "vendor_url": f"wss://127.0.0.1:{vendor_port}/ocpp/OFFLINE001",
         "incoming_auth": "basic",
         "upstream_auth": "basic",
+        "station_profile_kind": "Relative",
+        "station_stack_level": 1,
+        "station_profile_start": None,
         "incoming_secret": str(directory / "incoming.json"),
         "upstream_secret": str(directory / "upstream.json"),
         "native_secret": str(directory / "native.json"),

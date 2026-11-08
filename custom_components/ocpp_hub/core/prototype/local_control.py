@@ -9,10 +9,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .. import commands
-from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .policy import DeniedError, Policy, number
 from .rpc import Peer, UnavailableError
+from .station import StationChoice
 from .store import Journal, RecoveryRequiredError
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
@@ -26,10 +26,12 @@ class LocalControl:
         self.journal, self.peer, self.policy, self.epoch = journal, peer, policy, epoch
         self._confirmed_epoch = -1
         self._confirmed_limit: float | None = None
+        self._revision = 0
         self._operations: set[asyncio.Task[Any]] = set()
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
         self.authorize: Callable[[str], bool] | None = None
+        self.prepare_station: Callable[[Call, int], Awaitable[StationChoice]] | None = None
 
     # Client cancellation cannot abandon a safety sequence halfway through its physical effects.
     async def _owned[T](self, operation: Coroutine[Any, Any, T]) -> T:
@@ -75,6 +77,11 @@ class LocalControl:
     def ready(self) -> bool:
         return self._confirmed_epoch == self.epoch() and self._confirmed_limit == self.desired()
 
+    # A changed device introduction cannot inherit a confirmation or complete an older in-flight verification.
+    def invalidate(self) -> None:
+        self._revision += 1
+        self._confirmed_epoch, self._confirmed_limit = -1, None
+
     # Validate both transport generation and a newer stop/operation before every RPC in a sequence.
     def _check(self, epoch: int, ticket: str | None = None) -> None:
         if epoch != self.epoch():
@@ -112,23 +119,31 @@ class LocalControl:
     # Install the reserved station profile; Accepted confirms receipt, not yet real-device execution or persistence.
     async def _cap(self, call: Call, limit: float, epoch: int) -> Frame:
         self._confirmed_epoch = -1
+        revision = self._revision
+
+        # Boot may change on the same socket while a capability or composite RPC awaits its reply.
+        def check() -> None:
+            self._check(epoch)
+            if revision != self._revision:
+                raise UnavailableError("device introduction changed during station verification")
+
+        choice = (
+            await self.prepare_station(call, epoch)
+            if self.prepare_station is not None
+            else StationChoice("Relative", self.policy.local_stack_level)
+        )
+        check()
         answer = await call(
             "SetChargingProfile",
-            commands.set_charging_profile(
-                0,
-                commands.PURPOSE_CHARGE_POINT_MAX,
-                limit,
-                HUB_PROFILE_ID,
-                stack_level=self.policy.local_stack_level,
-            ),
+            choice.payload(limit),
         )
-        self._check(epoch)
+        check()
         if answer[0] != 3 or answer[2].get("status") != "Accepted":
             self._confirmed_epoch = -1
             raise UnavailableError("charger did not confirm the station ceiling")
-        requested_at = datetime.now(UTC)
         verification = await call("GetCompositeSchedule", commands.get_composite_schedule(1, 1))
-        self._check(epoch)
+        completed_at = datetime.now(UTC)
+        check()
         result = verification[2]
         schedule = result.get("chargingSchedule", {}) if verification[0] == 3 else {}
         periods = schedule.get("chargingSchedulePeriod") if isinstance(schedule, dict) else None
@@ -159,8 +174,8 @@ class LocalControl:
             start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
             if start.tzinfo is None:
                 raise DeniedError("schedule start requires a timezone")
-            age = (requested_at - start).total_seconds()
-            if not -2 <= age <= schedule["duration"] + 2:
+            age = (completed_at - start).total_seconds()
+            if not 0 <= age < schedule["duration"]:
                 raise DeniedError("schedule does not cover the requested instant")
         except DeniedError, ValueError:
             raise UnavailableError("composite schedule does not cover the requested instant") from None
@@ -189,9 +204,17 @@ class LocalControl:
         if self.ready:
             return
         epoch = self.epoch()
-        async with self.peer.sequence(0, lambda: self._check(epoch)) as call:
+        limit = self.desired()
+
+        # Capability reads may await a peer; a newer Stop or lower desired limit must win before the eventual write.
+        def check() -> None:
+            self._check(epoch)
+            if self.desired() != limit:
+                raise DeniedError("desired ceiling changed during preparation")
+
+        async with self.peer.sequence(0, check) as call:
             if not self.ready:
-                await self._cap(call, self.desired(), epoch)
+                await self._cap(call, limit, epoch)
 
     # A positive slider update cannot silently release an explicit zero-current hold.
     async def set_limit(self, value: Any) -> Frame:
@@ -227,10 +250,12 @@ class LocalControl:
         async with self.peer.sequence(0, lambda: self._check(epoch, ticket)) as call:
             try:
                 answer = await self._cap(call, 0, epoch)
-            except (UnavailableError, DeniedError) as error:
+            except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
                 self._check(epoch, ticket)
                 cap_error = (
-                    UnavailableError("station hold could not be confirmed") if isinstance(error, DeniedError) else error
+                    error
+                    if isinstance(error, UnavailableError)
+                    else UnavailableError("station hold could not be confirmed")
                 )
             local = self.journal.active()
             if local is not None:
@@ -267,7 +292,7 @@ class LocalControl:
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":
                     raise UnavailableError("transaction start was not confirmed")
-            except UnavailableError, DeniedError:
+            except UnavailableError, DeniedError, RecoveryRequiredError:
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)
                 await self._cap(call, 0, epoch)
@@ -292,7 +317,7 @@ class LocalControl:
                     number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a),
                     epoch,
                 )
-            except UnavailableError, DeniedError:
+            except UnavailableError, DeniedError, RecoveryRequiredError:
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)
                 await self._cap(call, 0, epoch)

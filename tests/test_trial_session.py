@@ -14,7 +14,7 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from ocpp_hub_core.prototype.store import fingerprint
-from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, profile_projection
+from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
@@ -41,18 +41,20 @@ class Bench:
         self.replies: dict[str, asyncio.Future[list[Any]]] = {}
         self.reader: asyncio.Task[None] | None = None
         self.received_profiles: list[int] = []
+        self.received_limits: list[float] = []
 
     # Use the actual fake firmware's profile list as independent native inventory evidence.
     async def observe(self) -> Evidence:
         resources = []
         for identifier, profile in self.firmware.profiles.items():
             connector = 0 if profile["chargingProfilePurpose"] == "ChargePointMaxProfile" else 1
+            body = native_profile(profile, connector)
             resources.append(
                 Resource(
                     "profile",
                     identifier,
-                    native_profile(profile, connector),
-                    profile_projection({"connectorId": connector, "csChargingProfiles": profile}),
+                    body,
+                    native_profile_projection(body, connector, body["purpose"], time.time()),
                 )
             )
         return Evidence(
@@ -102,6 +104,9 @@ class Bench:
                 answer = self.firmware.answer(action, payload)
             if action == "SetChargingProfile":
                 self.received_profiles.append(payload["csChargingProfiles"]["chargingProfileId"])
+                self.received_limits.append(
+                    payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+                )
             elif action == "RemoteStopTransaction":
                 self.remote_stop.set()
             await charger.send(build_call_result(frame[1], answer))
@@ -136,8 +141,13 @@ class Bench:
 # Intent: exercise start, authorization, mirroring, stop and rollback through the real transport with fake TLS peers.
 # Why: constructor/file tests cannot prove a usable standalone trial package or clean retirement of its owned cap.
 @pytest.mark.parametrize("incoming_mode", ["basic", "none"])
+@pytest.mark.parametrize("profile_kind", ["Relative", "Absolute"])
 async def test_trial_session_full_lifecycle_and_verified_rollback(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, incoming_mode: str
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    incoming_mode: str,
+    profile_kind: str,
 ) -> None:
     import json
 
@@ -146,10 +156,12 @@ async def test_trial_session_full_lifecycle_and_verified_rollback(
     bench = Bench()
     async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
         config, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        value = json.loads(path.read_text())
+        if profile_kind == "Absolute":
+            value.update(station_profile_kind="Absolute", station_profile_start="2020-01-01T00:00:00Z")
         if incoming_mode == "none":
-            value = json.loads(path.read_text())
             value.update(incoming_auth="none", incoming_secret=None)
-            save_private(path, value)
+        save_private(path, value)
         session = TrialSession(preflight(path), FAST, bench.observe)
         try:
             await session.start()
@@ -201,12 +213,21 @@ async def test_trial_session_full_lifecycle_and_verified_rollback(
 
 # Intent: an unplugged but open session after process loss can reconnect under a zero hold and complete its real Stop.
 # Why: requiring the session already closed before binding creates a recovery deadlock on this iCS firmware.
+@pytest.mark.parametrize("profile_kind", ["Relative", "Absolute"])
 async def test_trial_restart_opens_restricted_recovery_listener(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, profile_kind: str
 ) -> None:
+    import json
+
+    from ocpp_hub_core.prototype.trial_session import save_private
+
     bench = Bench()
     async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
         _, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        if profile_kind == "Absolute":
+            value = json.loads(path.read_text())
+            value.update(station_profile_kind="Absolute", station_profile_start="2020-01-01T00:00:00Z")
+            save_private(path, value)
         prepared = preflight(path)
         first = TrialSession(prepared, FAST, bench.observe)
         await first.start()
@@ -225,6 +246,7 @@ async def test_trial_restart_opens_restricted_recovery_listener(
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
         second = TrialSession(prepared, FAST, bench.observe)
+        checkpoint = len(bench.received_limits)
         try:
             await second.start()
             assert second.journal.get("trial_phase") == "recovering"
@@ -235,6 +257,9 @@ async def test_trial_restart_opens_restricted_recovery_listener(
                     await bench.call(charger, "boot2", "BootNotification", BOOT)
                     await asyncio.wait_for(bench.remote_stop.wait(), 2)
                     assert bench.firmware.effective_limit() == 0
+                    assert bench.received_limits[checkpoint:] and all(
+                        value == 0 for value in bench.received_limits[checkpoint:]
+                    )
                     with pytest.raises(Exception):
                         await second.command({"command": "start"})
                     await bench.call(

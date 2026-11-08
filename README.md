@@ -21,6 +21,47 @@ The actual trial established:
   session history, zero current/power, original backend online, no proxy profiles and retirement of the proxy socket.
   The trial process and independent restoration fallback have stopped. The car remained unplugged throughout.
 
+### Offline corrections after the unplugged trial
+
+New local Boot and Heartbeat replies now use whole-second UTC `Z`, matching the observed manufacturer's clock replies.
+An independent fake charger copies that clock representation, and a deliberately format-sensitive fake cloud accepts
+its new status updates. Separate tests reproduce Accepted Boot followed by status rejection and disconnect, including
+normal close codes 1000/1001. This demonstrates the failure mechanism; it does not prove the real iCS server's cause.
+Already recorded timestamps and event bodies are never rewritten. Retained fractional/offset statuses survive cloud
+reconnect and process restart and can be delivered unchanged when the synthetic backend accepts them.
+
+The standalone configuration now explicitly selects `station_profile_kind`, `station_stack_level` and
+`station_profile_start`. Relative mode requires a null start; Absolute mode requires a whole-second UTC anchor in
+the past, within the supported native epoch range. The example selects Absolute, stack 1 and a fixed 2020 anchor.
+That is a candidate for a later trial, not a finding that iCS accepts it. The same choice is used for the 6 A ceiling,
+zero hold, reconnect, ownership receipts and rollback. Rejection never switches kind or falls back to a transaction limit.
+
+Before any station profile write, the trial reads six capabilities, one key per RPC: `NumberOfConnectors`,
+`SupportedFeatureProfiles`, `ChargingScheduleAllowedChargingRateUnit`, `ChargeProfileMaxStackLevel`,
+`ChargingScheduleMaxPeriods` and `MaxChargingProfilesInstalled`. They must establish one connector, SmartCharging,
+ampere support, room for the profile and a maximum covering the explicitly reserved stack. Documented `Current`/`A`
+values permit amperes; power-only, missing, unknown, duplicate or malformed replies fail closed. Stack 0 is valid if
+explicitly selected and reported. The selected stack also reserves the gateway's cloud-policy boundary.
+Discovery is repeated for a new connection and pinned to the device's Boot introduction. A Boot change during the
+reads discards the entire snapshot. A changed introduction also invalidates readiness and any in-flight verification.
+A concurrent Stop wins over a positive ceiling prepared before its capability replies arrived. Discovery failure
+retains local inhibit and still permits the known-session Stop; it cannot falsely confirm a physical zero hold.
+
+Absolute ownership includes the exact requested start instant. The candidate native decoder accepts only narrowly
+matching records and checks current/future coverage conservatively; its Absolute representation still needs actual
+device evidence. A different or unsupported representation blocks automatic cleanup. The independent firmware model
+now enforces kind, stack, start time, duration and capacity, and does not apply a future profile early. Composite
+verification requires a schedule covering response completion, rather than a nearby future or already-ended interval.
+
+Private status now separates charger and vendor faults, preserves accepted registration counts after disconnect,
+and reports request stage, whitelisted action, reply-id matching/length and numeric close codes. Endpoints, identities,
+payloads, close reasons and exception messages are excluded. Raw private evidence from the previous trial remains
+outside the repository. This work performs no new charger, vendor or Home Assistant connection or deployment.
+
+The station discovery and explicit Absolute option follow the
+[pinned reference integration](https://github.com/lbbrhzn/ocpp/blob/c6a2fa0f994f5b25160c6cf77eb1fcdbf3f60d5b/custom_components/ocpp/ocppv16.py),
+with stricter refusal of unknown capabilities. They remain hardware-unverified on this charger.
+
 `tools/trial_proxy.py` is the standalone entry point. Its default action is `check`, which reads private configuration,
 credentials, baseline and certificates without creating a journal, doing DNS, binding a listener or contacting a device.
 The original `OfflineRuntime` and its loopback-only adapters remain enforced independently. Both runtime paths share
@@ -104,7 +145,7 @@ composite confirmation, local hold and blocked history delivery. The service als
 A timer expiry or shutdown attempts a zero-current hold and known-session Stop, retains uncertainty if either cannot
 be confirmed, and leaves its journal intact. It does not automatically restore the manufacturer's connection.
 
-The first trial intentionally permits only constant relative ampere profiles and the observed metadata/Fast/delayed-stop
+The trial permits only constant ampere profiles, an explicit Relative/Absolute station choice, and the metadata/Fast/delayed-stop
 commands. Plan editing and Eco/EcoPlus changes remain disabled in this narrower trial path. New profiles cannot replace
 any original connector/purpose scope, including a different transaction at that scope: actual iCS captures showed that
 setting a new TxProfile can replace an older one. The existing offline codecs and tests still cover those wider app
@@ -150,7 +191,8 @@ and can receive lifecycle retries, stop the known session and deliver/reconcile 
 and pending-start uncertainty still require independent reconciliation; they are never automatically retried or discarded.
 A failed native audit does not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
 
-Resolve the recorded limit rejection and continuing cloud-session failure offline before another authorised trial.
+The offline corrections above are prepared for another authorised unplugged trial; actual profile acceptance and
+continuing iCS cloud behaviour still need live confirmation before any charging test.
 The synthetic commissioning tests remain restricted to literal loopback under `tools/offline_validate.py`.
 
 ---
@@ -304,9 +346,9 @@ The commissioning package is separate from Home Assistant and does not establish
 
 - Local TLS admission and Boot were observed, without Basic credentials. Isolated upstream Boot registration worked,
   but the continuing proxy/cloud connection failed. Its actual failure sequence still needs private wire diagnostics.
-  One retained difference is timestamp format: local Boot replies and subsequent device status used fractional UTC
-  offsets, while original-backend status used whole-second `Z`. Device Auto date formatting may follow its backend;
-  whether iCS rejects the proxy-induced format is an inference to test, not an established server defect.
+  New local clocks now use whole-second `Z`, and a synthetic format-policy reproduction passes. Device Auto date
+  formatting may follow its backend; whether the real iCS server rejected the earlier fractional/offset form remains
+  an inference, not an established server defect. Historical payloads remain unchanged.
 - The proposed `ChargePointMaxProfile` was rejected. Supported purpose/kind/stack combinations, composite schedules, 0 A enforcement and profile
   persistence across device reboot remain unproven. The fake firmware checks OCPP stacking, but cannot prove hardware
   behaviour. A current composite read does not rule out a pre-existing higher-stack profile becoming active later.

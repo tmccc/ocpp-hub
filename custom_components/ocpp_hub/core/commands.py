@@ -40,6 +40,7 @@ def set_charging_profile(
     stack_level: int = 0,
     transaction_id: int | None = None,
     kind: str = "Relative",
+    start_schedule: str | None = None,
 ) -> dict[str, Any]:
     profile: dict[str, Any] = {
         "chargingProfileId": profile_id,
@@ -53,6 +54,8 @@ def set_charging_profile(
     }
     if purpose == PURPOSE_TX and transaction_id is not None:
         profile["transactionId"] = transaction_id
+    if start_schedule is not None:
+        profile["chargingSchedule"]["startSchedule"] = start_schedule
     return {"connectorId": connector_id, "csChargingProfiles": profile}
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -11,12 +12,44 @@ class Firmware:
     """The device stores plans separately from profiles, so a timer can run without any new network CALL."""
 
     # Begin with an ordinary 32 A single-phase charger and no session or profiles.
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
         self.profiles: dict[int, dict[str, Any]] = {}
         self.plans: dict[int, dict[str, Any]] = {}
         self.active: int | None = None
         self.requested_current = 0.0
         self.timer_fires = 0
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.profile_kinds = frozenset({"Relative", "Absolute", "Recurring"})
+        self.configuration = {
+            "NumberOfConnectors": "1",
+            "SupportedFeatureProfiles": "Core,SmartCharging,RemoteTrigger",
+            "ChargingScheduleAllowedChargingRateUnit": "Current,Power",
+            "ChargeProfileMaxStackLevel": "16",
+            "ChargingScheduleMaxPeriods": "96",
+            "MaxChargingProfilesInstalled": "64",
+        }
+
+    # Derive time applicability from the fake device's own clock, without asking the proxy whether its cap is ready.
+    def scheduled_limit(self, profile: dict[str, Any]) -> float | None:
+        now = self.clock()
+        for key, future in (("validFrom", True), ("validTo", False)):
+            if key in profile:
+                instant = datetime.fromisoformat(profile[key].replace("Z", "+00:00"))
+                if (future and now < instant) or (not future and now >= instant):
+                    return None
+        schedule = profile["chargingSchedule"]
+        elapsed = 0.0
+        if profile["chargingProfileKind"] != "Relative":
+            start = datetime.fromisoformat(schedule["startSchedule"].replace("Z", "+00:00"))
+            elapsed = (now - start).total_seconds()
+            if elapsed < 0:
+                return None
+            if profile["chargingProfileKind"] == "Recurring":
+                elapsed %= 604800 if profile.get("recurrencyKind") == "Weekly" else 86400
+        if "duration" in schedule and elapsed >= schedule["duration"]:
+            return None
+        applicable = [period for period in schedule["chargingSchedulePeriod"] if period["startPeriod"] <= elapsed]
+        return float(applicable[-1]["limit"]) if applicable else None
 
     # The highest stack wins within each purpose, then the lowest applicable purpose wins overall.
     def effective_limit(self) -> float:
@@ -26,9 +59,13 @@ class Firmware:
             if purpose == "TxProfile" and profile.get("transactionId") != self.active:
                 continue
             level = profile["stackLevel"]
-            limit = profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+            limit = self.scheduled_limit(profile)
+            if limit is None:
+                continue
             if purpose not in purposes or level >= purposes[purpose][0]:
                 purposes[purpose] = level, float(limit)
+        if "TxProfile" in purposes:
+            purposes.pop("TxDefaultProfile", None)
         return min([32.0, *(row[1] for row in purposes.values())])
 
     # A planned start is autonomous: it does not ask the proxy for permission or a new profile.
@@ -45,12 +82,39 @@ class Firmware:
     def answer(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "SetChargingProfile":
             profile = json.loads(json.dumps(payload["csChargingProfiles"]))
+            try:
+                if (
+                    profile["chargingProfileKind"] not in self.profile_kinds
+                    or type(profile["stackLevel"]) is not int
+                    or not 0 <= profile["stackLevel"] <= int(self.configuration["ChargeProfileMaxStackLevel"])
+                ):
+                    return {"status": "Rejected"}
+                if profile["chargingProfileKind"] != "Relative":
+                    start = datetime.fromisoformat(profile["chargingSchedule"]["startSchedule"].replace("Z", "+00:00"))
+                    if start.tzinfo is None:
+                        return {"status": "Rejected"}
+                if profile["chargingProfileId"] not in self.profiles and len(self.profiles) >= int(
+                    self.configuration["MaxChargingProfilesInstalled"]
+                ):
+                    return {"status": "Rejected"}
+            except KeyError, ValueError, TypeError:
+                return {"status": "Rejected"}
             self.profiles[profile["chargingProfileId"]] = profile
+        elif action == "GetConfiguration":
+            keys = payload.get("key", list(self.configuration))
+            return {
+                "configurationKey": [
+                    {"key": key, "readonly": True, "value": self.configuration[key]}
+                    for key in keys
+                    if key in self.configuration
+                ],
+                "unknownKey": [key for key in keys if key not in self.configuration],
+            }
         elif action == "GetCompositeSchedule":
             return {
                 "status": "Accepted",
                 "connectorId": 1,
-                "scheduleStart": datetime.now(UTC).isoformat(),
+                "scheduleStart": self.clock().isoformat(),
                 "chargingSchedule": {
                     "duration": 1,
                     "chargingRateUnit": "A",

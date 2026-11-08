@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from ..frames import basic_auth_header
 from .ics import unique_object
 from .security import SecurityError
+from .station import StationChoice
 
 
 # Read through one verified descriptor so symlinks, permissive secrets and oversized files fail before parsing.
@@ -116,6 +117,9 @@ class TrialConfig:
     vendor_url: str
     incoming_auth: str
     upstream_auth: str
+    station_profile_kind: str
+    station_stack_level: int
+    station_profile_start: str | None
     incoming_secret: Path | None
     upstream_secret: Path | None
     native_secret: Path
@@ -161,6 +165,10 @@ class TrialConfig:
             raise SecurityError("trial charger identity is malformed")
         if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.hardware_identity) is None:
             raise SecurityError("trial hardware identity is malformed")
+        try:
+            StationChoice(self.station_profile_kind, self.station_stack_level, self.station_profile_start)
+        except ValueError:
+            raise SecurityError("trial station profile selection is invalid") from None
         try:
             host, peer = ipaddress.ip_address(self.listener_host), ipaddress.ip_address(self.charger_ip)
             if (

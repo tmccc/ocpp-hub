@@ -63,7 +63,7 @@ class Policy:
     def __post_init__(self) -> None:
         if number(self.max_current_a, 32) < 6 or self.phases != 1:
             raise DeniedError("prototype requires a 6–32 A single-phase ceiling")
-        integer(self.local_stack_level, 1, 255)
+        integer(self.local_stack_level, 0, 255)
         integer(self.vendor_tag_ttl_s, 1, 300)
         if type(self.trust_vendor_start_tags) is not bool or type(self.strict_cloud_authorization) is not bool:
             raise DeniedError("vendor tag trust must be explicit")

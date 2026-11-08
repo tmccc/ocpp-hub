@@ -73,6 +73,7 @@ async def test_lower_local_ceiling_survives_resume_and_release(tmp_path: Path) -
 # Why: Accepted on SetChargingProfile proves receipt, while an independent composite response exposes precedence.
 async def test_composite_verification_detects_higher_station_stack(tmp_path: Path) -> None:
     rig = Rig(tmp_path / "journal.db")
+    rig.firmware.configuration["ChargeProfileMaxStackLevel"] = "32"
     rig.firmware.answer(
         "SetChargingProfile",
         commands.set_charging_profile(

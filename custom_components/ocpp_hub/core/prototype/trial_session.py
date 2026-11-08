@@ -17,6 +17,7 @@ from .policy import Policy
 from .rpc import UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
 from .security import SecurityError
+from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
 from .trial_evidence import Evidence, NativeObserver
@@ -80,6 +81,10 @@ class PreparedTrial:
             "hardware_ceiling_verified": False,
             "original_resources": len(self.baseline.resources),
             "ceiling_a": 6,
+            "station_profile": StationChoice(
+                self.config.station_profile_kind, self.config.station_stack_level, self.config.station_profile_start
+            ).value(),
+            "station_capability_discovery_required": True,
             "fresh_native_check_required_at_start": True,
         }
 
@@ -117,6 +122,7 @@ class TrialSession:
                 allowed_tags=config.local_tags,
                 trust_vendor_start_tags=True,
                 strict_cloud_authorization=True,
+                local_stack_level=config.station_stack_level,
                 extensions={
                     ("IoCharger", name): mode
                     for name, mode in (
@@ -127,6 +133,13 @@ class TrialSession:
                 },
             )
             self.gateway = Gateway(self.journal, policy, timeout=5)
+            self._station_inventory = (sum(r.kind == "profile" for r in prepared.baseline.resources), False)
+            self.station = StationDiscovery(
+                self.journal,
+                StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
+                lambda: self._station_inventory,
+            )
+            self.gateway.controls.prepare_station = self.station.prepare
             self.gateway.charger.before_send = self.book.before_send
             self.gateway.charger.after_result = self.book.after_result
             transport = TrialTransport(config, prepared.tls, settings)
@@ -150,6 +163,10 @@ class TrialSession:
             raise UnavailableError("trial ceiling reapplication remains frozen during rollback")
         try:
             evidence = await self.observe()
+            self._station_inventory = (
+                sum(resource.kind == "profile" for resource in evidence.resources),
+                any(resource.key == "profile:7001" for resource in evidence.resources),
+            )
             if phase == "prepared":
                 self.book.activate(evidence)
             else:
@@ -196,10 +213,19 @@ class TrialSession:
                 "charger_connected": self.runtime.status.charger_connected,
                 "vendor_connected": self.runtime.status.vendor_connected,
                 "effective_ceiling_confirmed": self.gateway.controls.ready,
+                "station_capabilities": self.station.snapshot(),
                 "boot_observed": self.runtime.status.boot_observed,
                 "vendor_registered": self.gateway.vendor_registration == "Accepted",
                 "delivery_blocked": self.runtime.status.delivery_blocked,
                 "failure_classification": self.runtime.status.last_failure,
+                "protocol_diagnostics": {
+                    "vendor_attempts": self.runtime.status.vendor_attempts,
+                    "vendor_sessions_opened": self.runtime.status.reconnects,
+                    "vendor_rpc": self.gateway.vendor.diagnostics.snapshot(),
+                    "charger_rpc": self.gateway.charger.diagnostics.snapshot(),
+                    "vendor_fault": self.runtime.status.vendor_fault.snapshot(),
+                    "charger_fault": self.runtime.status.charger_fault.snapshot(),
+                },
                 "local_hold": bool(self.journal.get("control", {}).get("inhibit")),
                 "local_outcome_uncertain": bool(self.journal.get("control", {}).get("uncertain")),
                 "pending_lifecycle_events": self.journal.db.execute(

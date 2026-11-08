@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
+from .diagnostics import RpcDiagnostics
 from .store import RecoveryRequiredError, fingerprint
 
 Sender = Callable[[str], Awaitable[None]]
@@ -124,10 +125,12 @@ class Peer:
         self._pending: dict[str, asyncio.Future[Frame]] = {}
         self.before_send: Callable[[str, dict[str, Any]], None] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
+        self.diagnostics = RpcDiagnostics()
 
     # Correlate replies by fresh, namespaced ids; unknown replies are ignored.
     def receive(self, frame: Frame) -> None:
         future = self._pending.get(frame[1])
+        self.diagnostics.reply(len(frame[1]), future is not None and not future.done())
         if future is not None and not future.done():
             future.set_result(frame)
 
@@ -182,14 +185,18 @@ class Peer:
                     before_send()
                 if self.before_send is not None:
                     self.before_send(action, actual)
+                self.diagnostics.sending(action, len(unique_id))
                 await sender(build_call(unique_id, action, actual))
+                self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 if self.after_result is not None:
                     self.after_result(action, actual, answer)
+                self.diagnostics.phase = "complete"
                 return answer
         except (TimeoutError, OSError) as error:
             raise UnavailableError("peer outcome is unconfirmed") from error
         finally:
+            self.diagnostics.interrupted()
             self._pending.pop(unique_id, None)
             if future.done() and not future.cancelled():
                 future.exception()
@@ -198,6 +205,7 @@ class Peer:
 
     # Fail pending work immediately on a disconnect without affecting the other peer.
     def detach(self) -> None:
+        self.diagnostics.interrupted()
         self.sender = None
         for future in self._pending.values():
             if not future.done():

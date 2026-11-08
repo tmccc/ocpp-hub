@@ -2,6 +2,14 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Standardise new local Boot/Heartbeat clocks to UTC seconds without rewriting retained event timestamps.
+- Preserve registration acceptance, per-leg failures, request stages, reply-match lengths and numeric close codes,
+  including normal remote closes; exclude protocol bodies, identities and arbitrary remote reasons from diagnostics.
+- Add strict single-key station capability discovery and explicit Relative/Absolute profile choices, including stack 0.
+  Pin choice/capabilities to the device introduction, discard mixed-Boot discovery, and keep Stop authoritative.
+- Carry Absolute anchors through ownership and native rollback checks; verify schedules at response completion.
+  Extend the independent firmware model and real TLS tests for timing, rejection, recovery and unchanged replay.
+- Keep these corrections offline. Actual iCS profile acceptance and continuing cloud compatibility remain unproven.
 - Separate the original OCPP identity from the native hardware serial and validate both before native admission.
 - Correct credential preparation: iCS authentication keys are write-only, so blank native backups cannot restore them.
 - Add explicitly configured absent-header admission while retaining exact source/path/TLS; never infer a fallback.

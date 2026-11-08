@@ -8,13 +8,14 @@ import sqlite3
 import ssl
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, Self
 
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
+from .diagnostics import FaultDiagnostics
 from .gateway import Gateway
 from .policy import DeniedError
 from .rpc import RegistrationDeferredError, Sender, UnavailableError
@@ -66,6 +67,9 @@ class RuntimeStatus:
     delivery_blocked: bool = False
     boot_observed: bool = False
     last_failure: str | None = None
+    vendor_attempts: int = 0
+    charger_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
+    vendor_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
 
 
 class Transport(Protocol):
@@ -144,6 +148,7 @@ class ConnectionRuntime:
                 await self.gateway.receive("charger", raw, epoch)
         except (ConnectionClosed, UnavailableError, DeniedError) as error:
             self.status.last_failure = type(error).__name__
+            self.status.charger_fault.record(error, "charger_receive", self.gateway.charger.diagnostics.action)
         finally:
             if probe is not None:
                 probe.cancel()
@@ -174,8 +179,33 @@ class ConnectionRuntime:
             if self.before_ceiling is not None:
                 await self.before_ceiling()
             await self.gateway.controls.ensure_ceiling()
-        except UnavailableError, TimeoutError:
+        except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError) as error:
             self.status.last_failure = "BootOrCeilingUnavailable"
+            self.status.charger_fault.record(error, "boot_or_ceiling", self.gateway.charger.diagnostics.action)
+
+    # Classify the live vendor exchange before detach changes registration and pending RPC state.
+    def _vendor_stage(self) -> str:
+        if self.gateway.vendor_registration != "Accepted":
+            return "registration"
+        action = self.gateway.vendor.diagnostics.action
+        if action in ("Heartbeat", "Authorize"):
+            return "heartbeat" if action == "Heartbeat" else "authorization"
+        return (
+            "history"
+            if action in ("StatusNotification", "MeterValues", "StartTransaction", "StopTransaction")
+            else "session"
+        )
+
+    # Inspect the already received close frame before our own cancellation or context-manager cleanup sends a close.
+    def _vendor_close(self, connection: ClientConnection, fault_count: int) -> None:
+        received, sent = connection.protocol.close_rcvd, connection.protocol.close_sent
+        if received is not None and self.status.vendor_fault.count == fault_count:
+            self.status.vendor_fault.record_close(
+                self._vendor_stage(),
+                self.gateway.vendor.diagnostics.action,
+                int(received.code),
+                int(sent.code) if sent is not None else None,
+            )
 
     # Recover transport loss with bounded backoff while the local listener stays alive.
     async def _vendor_runner(self) -> None:
@@ -188,6 +218,9 @@ class ConnectionRuntime:
             ):
                 await asyncio.sleep(self.settings.pump_interval)
                 continue
+            fault_count = self.status.vendor_fault.count
+            stage = "opening"
+            self.status.vendor_attempts += 1
             try:
                 async with self.transport.connect() as connection:
                     self.status.vendor_connected = True
@@ -196,12 +229,15 @@ class ConnectionRuntime:
                     try:
                         await self._vendor_session(connection, epoch)
                     finally:
+                        stage = self._vendor_stage()
                         if self.gateway.vendor_registration == "Accepted":
                             delay = self.settings.retry_min
                         self.gateway.detach_vendor(epoch)
                         self.status.vendor_connected = False
             except (OSError, ConnectionClosed, InvalidHandshake, UnavailableError, DeniedError) as error:
                 self.status.last_failure = type(error).__name__
+                if self.status.vendor_fault.count == fault_count:
+                    self.status.vendor_fault.record(error, stage, self.gateway.vendor.diagnostics.action)
             if not self._closing:
                 await asyncio.sleep(delay)
                 delay = min(self.settings.retry_max, delay * 2)
@@ -209,11 +245,18 @@ class ConnectionRuntime:
     # Stop all session children when any transport/heartbeat child ends; quarantine leaves the pump alive.
     async def _vendor_session(self, connection: ClientConnection, epoch: int) -> None:
         charger_epoch = self.gateway._charger_epoch
+        fault_count = self.status.vendor_fault.count
 
         # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
         async def receive() -> None:
-            async for raw in connection:
-                await self.gateway.receive("vendor", raw, epoch)
+            try:
+                async for raw in connection:
+                    await self.gateway.receive("vendor", raw, epoch)
+            except ConnectionClosed as error:
+                self.status.vendor_fault.record(error, self._vendor_stage(), self.gateway.vendor.diagnostics.action)
+                raise
+            else:
+                self._vendor_close(connection, fault_count)
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
@@ -234,6 +277,7 @@ class ConnectionRuntime:
             for task in done:
                 await task
         finally:
+            self._vendor_close(connection, fault_count)
             await self._retire(tasks)
 
     # Keep strong references to any uncooperative task and surface failure instead of abandoning it.

@@ -278,12 +278,19 @@ class Gateway:
     # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
     def _local_answer(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "BootNotification":
+            previous_boot = self.journal.get("boot")
+            if previous_boot is not None and previous_boot != payload:
+                self.controls.invalidate()
             self.journal.put("boot", payload)
             self._boot_charger_epoch = self._charger_epoch
             self._boot_seen.set()
-            return {"status": "Accepted", "interval": 60, "currentTime": datetime.now(UTC).isoformat()}
+            return {
+                "status": "Accepted",
+                "interval": 60,
+                "currentTime": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
         if action == "Heartbeat":
-            return {"currentTime": datetime.now(UTC).isoformat()}
+            return {"currentTime": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
         if action == "Authorize":
             tag = payload.get("idTag")
             allowed = self._tag_allowed(tag)
@@ -611,6 +618,7 @@ class Gateway:
             except DeniedError:
                 raise UnavailableError("vendor registration time is invalid") from None
             self.vendor_registration = status
+            self.vendor.diagnostics.registration(status)
             self.vendor_interval = interval
             if status != "Accepted":
                 self._boot_retry_at = asyncio.get_running_loop().time() + interval
