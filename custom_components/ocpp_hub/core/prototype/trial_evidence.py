@@ -6,7 +6,7 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .native_http import read_native
 from .policy import DeniedError, integer, number
@@ -15,6 +15,9 @@ from .station import anchor_epoch
 from .store import fingerprint
 from .trial_allocation import HistoryObservation, observe_history
 from .trial_config import TrialConfig, basic_secret
+
+if TYPE_CHECKING:
+    from .trial_handover_evidence import HandoverEvidence
 
 
 @dataclass(frozen=True, repr=False)
@@ -194,7 +197,10 @@ class NativeObserver:
     async def _read(self, action: str, data: str | dict[str, Any] | None = None) -> Any:
         if (
             action not in ("getConfig", "statistics", "getTransaction")
-            or (action == "statistics" and data not in ("CONNECTOR", "METER", "SESSION", "SMART", "SETPLAN", "OCPP"))
+            or (
+                action == "statistics"
+                and data not in ("CONNECTOR", "METER", "SESSION", "SMART", "SETPLAN", "OCPP", "STATE")
+            )
             or (action == "getConfig" and data is not None)
             or (action == "getTransaction" and data != {})
         ):
@@ -208,6 +214,27 @@ class NativeObserver:
     # Only fresh admission reads rolling history; recovery never depends on reseeding from it.
     async def observe_with_history(self) -> Evidence:
         return await self._observe(True)
+
+    # The separate connected path needs the actual native USER/HW limits and full history, not desired OCPP state.
+    async def observe_handover(self) -> HandoverEvidence:
+        from .trial_handover_evidence import handover_evidence
+
+        async with asyncio.timeout(15):
+            started = time.time()
+            config = await self._read("getConfig")
+            if (
+                not isinstance(config, dict)
+                or config.get("Id") != self.config.identity
+                or config.get("bPSN") != self.config.hardware_identity
+            ):
+                raise SecurityError("connected native identities do not match the configured charger")
+            values = {}
+            for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP", "STATE"):
+                values[name] = await self._read("statistics", name)
+            values["TRANSACTIONS"] = await self._read("getTransaction", {})
+            if await self._read("getConfig") != config:
+                raise SecurityError("native configuration changed during the connected audit")
+            return handover_evidence(config, values, started)
 
     # Recheck native identity and configuration around one complete bounded physical snapshot.
     async def _observe(self, include_history: bool) -> Evidence:

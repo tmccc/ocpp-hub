@@ -56,6 +56,7 @@ class StableObserver:
             "station": journal.get("station_selection"),
             "binding": journal.get("trial_binding"),
             "resources": rows,
+            "connected_handover": journal.get("connected_handover"),
         }
         return Authority(self.epoch(), self.revision(), journal.get("trial_phase"), fingerprint(value))
 

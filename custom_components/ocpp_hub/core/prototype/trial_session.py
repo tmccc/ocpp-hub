@@ -22,6 +22,8 @@ from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
 from .trial_evidence import Evidence, NativeObserver
+from .trial_handover import ConnectedHandover, ObserveHandover
+from .trial_handover_evidence import PauseProvider
 from .trial_observation import StableObserver
 from .trial_recovery import Recovery
 from .trial_resources import Baseline, ResourceBook
@@ -91,6 +93,8 @@ class PreparedTrial:
             ).value(),
             "station_capability_discovery_required": True,
             "fresh_native_check_required_at_start": True,
+            "connected_handover_requires_live_vehicle_provider": True,
+            "connected_handover_enabled_by_default": False,
         }
 
 
@@ -115,6 +119,10 @@ class TrialSession:
         prepared: PreparedTrial,
         settings: RuntimeSettings | None = None,
         observe: Callable[[], Awaitable[Evidence]] | None = None,
+        handover_provider: PauseProvider | None = None,
+        handover_vehicle_digest: str | None = None,
+        handover_observe: ObserveHandover | None = None,
+        handover_original_configuration: dict[str, Any] | None = None,
     ) -> None:
         self.prepared = prepared
         self.observe = observe or prepared.observer.observe
@@ -176,6 +184,20 @@ class TrialSession:
                 self.observe,
                 StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
             )
+            original = handover_original_configuration
+            if handover_provider is not None and original is None:
+                original = private_json(config.baseline.with_suffix(".original-config.json"))
+            self.handover = ConnectedHandover(
+                self.gateway,
+                self.book,
+                handover_observe or prepared.observer.observe_handover,
+                config.hardware_identity,
+                handover_provider,
+                handover_vehicle_digest,
+                original,
+            )
+            self.connected_cleanup_only = False
+            self.runtime.ceiling_enabled = lambda: not self.connected_cleanup_only
         except BaseException:
             self.journal.close()
             raise
@@ -192,6 +214,18 @@ class TrialSession:
 
     # Initial admission is unplugged only; an already active supervised trial can reapply its hold after reconnect.
     async def _before_ceiling(self) -> None:
+        if self.connected_cleanup_only:
+            try:
+                native = await self.handover.protected("cleanup_introduction")
+                present = self.book.owned_present(native.physical)
+                if not present or not self.gateway.current_boot_seen(self.gateway._charger_epoch):
+                    raise SecurityError(
+                        "connected cleanup introduction requires existing owned resources and real Boot"
+                    )
+                self.handover.require_zero_station(present)
+            except SecurityError:
+                raise UnavailableError("connected cleanup protection was not verified") from None
+            return
         phase = self.journal.get("trial_phase")
         if phase not in ("prepared", "active", "recovering", "blocked"):
             raise UnavailableError("trial ceiling reapplication remains frozen during rollback")
@@ -248,6 +282,35 @@ class TrialSession:
         await self.runtime.start()
         self.started = True
 
+    # Restart only an existing connected handover; verified absence never opens a listener or recreates a profile.
+    async def resume_connected_handover(self) -> None:
+        self.handover.require_provider()
+        state = self.journal.get("connected_handover")
+        if not state or self.journal.get("trial_phase") not in (
+            "blocked",
+            "recovering",
+            "rollback",
+            "backend_restore_pending",
+        ):
+            raise RecoveryRequiredError("there is no incomplete connected handover to resume")
+        if state["stage"] in (
+            "awaiting_backend",
+            "backend_verified",
+            "settings_verified",
+            "vehicle_restore_intent",
+            "unplugged_vehicle_permission_pending",
+        ):
+            return  # Native restoration checks need no proxy socket, vendor runner or ceiling reapplication.
+        native = await self.handover.protected("resume_cleanup")
+        present = self.book.owned_present(native.physical)
+        self.handover.require_zero_station(present)
+        self.journal.put("trial_phase", "rollback")
+        if not present:
+            return
+        self.connected_cleanup_only = True
+        await self.runtime.start()
+        self.started = True
+
     # A small explicit operator interface keeps all controls inside the original gateway ownership rules.
     async def command(self, value: dict[str, Any]) -> dict[str, Any]:
         if set(value) != {"command"} or not isinstance(value["command"], str):
@@ -259,6 +322,7 @@ class TrialSession:
                 "charger_connected": self.runtime.status.charger_connected,
                 "vendor_connected": self.runtime.status.vendor_connected,
                 "effective_ceiling_confirmed": self.gateway.controls.ready,
+                "connected_handover": self.handover.status(),
                 "station_capabilities": self.station.snapshot(),
                 "boot_observed": self.runtime.status.boot_observed,
                 "vendor_registered": self.gateway.vendor_registration == "Accepted",
@@ -305,7 +369,21 @@ class TrialSession:
         if command == "rollback":
             return await self.rollback.run(self.runtime.stop_vendor)
         if command == "confirm-original-backend":
+            if self.journal.get("connected_handover"):
+                return await self.handover.confirm_unplugged_backend(self.rollback)
             return await self.rollback.confirm_original_backend()
+        if command == "connected-handover-plan":
+            return await self.handover.plan()
+        if command == "connected-handover":
+            return await self.handover.run(self.runtime.stop_vendor)
+        if command == "confirm-connected-original-backend":
+            return await self.handover.confirm_backend()
+        if command == "confirm-connected-original-settings":
+            return await self.handover.confirm_settings()
+        if command == "restore-connected-vehicle-permission":
+            return await self.handover.restore_vehicle()
+        if command == "confirm-unplugged-vehicle-permission":
+            return await self.handover.confirm_unplugged_vehicle()
         raise SecurityError("trial command is not supported")
 
     # Shutdown never removes an unverified hold; even a journal failure must retire both transport paths.

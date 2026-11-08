@@ -88,8 +88,17 @@ Recovery tests cover plugged idle, actual synthetic current flow, lost Stop mess
 Start replies, early app/owner writes, pre-Boot safety Stop and successive fresh journals with preserved old history.
 
 Connected restart is separate from connected cleanup. Removing the safety profile and restoring the original backend
-with the lead attached still needs an independently verified vehicle-side inhibit or equivalent interlock. The existing
-unplugged cleanup guard is retained. No further live cable test is part of this offline change.
+with the lead attached needs an independently verified vehicle-side inhibit. A subsequent normal-backend physical
+test confirmed a separate native USER6 limit, car-side Stop/Start, and car pause surviving a closed-session charger
+restart and a fresh iCS Start: a 6 A offer continued for 60 seconds with every current/power phase at zero. Original
+settings and vehicle permission were restored with the lead still attached. All ten original history bodies remained,
+alongside two genuine completed sessions totalling 129 Wh. This is capability evidence, not present permission.
+
+The standalone proxy now has a separate, offline-tested connected-handover controller. Ordinary unplugged admission
+and rollback remain unchanged. **No live vehicle-pause provider is supplied or enabled by default.** The command path
+refuses connected cleanup before any freeze or write when that provider is absent; a historical pilot JSON, a zero
+power reading, a command acceptance or an operator `allow_connected` flag cannot substitute for fresh vehicle state.
+No charger or live Home Assistant change accompanies this implementation.
 
 The third trial verified ordinary Stop at 0 A and Release back to 6 A with accepted 60-second composites and the same
 accepted cloud session. Exact-id removal of the owned profile succeeded from a profile-free baseline; fresh native
@@ -341,6 +350,46 @@ backup as a separate operation. `confirm-original-backend` succeeds only once th
 fresh native readings show the original configuration, original resources, no owned profiles and a connected backend.
 Configuration restoration alone cannot prove that reconnection has happened. History and any unsent observations remain
 in the journal; they are not erased to make rollback look successful.
+
+The separate connected path is exposed through `connected-handover-plan`, `connected-handover`,
+`confirm-connected-original-backend`, `confirm-connected-original-settings` and
+`restore-connected-vehicle-permission`. A commissioning adapter must explicitly supply a `PauseProvider`, the vehicle
+identity digest and the immutable original full configuration to `TrialSession`; the default CLI supplies none.
+There is deliberately no production SEAT endpoint/auth implementation or file-based permission import in this change.
+Home Assistant's deliberately read-only SEAT integration is not used for vehicle writes.
+
+Each protected step requires a new provider response bound to the car, charger, hardware, baseline, operation nonce,
+current Boot/connection and complete native snapshot. The response must prove current pause, unchanged owner revision,
+matching restart/positive-offer capability, observation age at most five seconds and known validity. The pause must
+require explicit release, survive process loss and remain reserved for at least fifteen minutes; expiration of a
+readback must never resume the car. The original physical test alone does not establish that provider contract.
+
+Native checks require saved USER6 **and** runtime USER60/HWCFG320, all three currents and four power readings at zero,
+CP B/Plug, a closed native/local session, reconciled lifecycle/vendor writes and zero effective `outLimit`.
+Two distinct native timestamps must be at least two seconds apart. `offerCur` can retain 60 after Finished and is
+not an active-output test. Every other readable configuration field, original resource and retained history body stays
+pinned. Unknown/changed resources or revoked vehicle permission block further restoration.
+
+Cleanup freezes positive writes, retires the vendor runner, clears only exactly owned profiles and verifies actual
+absence, with station profile 7001 last. Its durable handover state is separate from ordinary recovery. The explicit
+`TrialSession.resume_connected_handover()` continuation cannot reinstall a cleared profile: verified absence needs no
+listener; remaining owned resources use a fresh proof-gated cleanup-only transport without ceiling reapplication.
+An unconfirmed Clear is reconciled through complete native inventory rather than sent again after verified absence.
+
+Connection and USER restoration remain explicit operator steps. First restore only the original connection fields
+while retaining USER6 and the car pause, then confirm the original backend. Only then restore USER32 and confirm the
+complete original configuration. Vehicle permission is restored last through a provider compare-and-set operation.
+A lost response uses a distinct outcome read and never repeats an uncertain vehicle Start. Normal manufacturer-side
+charging after that restoration is observed as actual native activity, without inventing a proxy transaction or
+claiming ownership of new manufacturer resources. Only ordinary transaction profiles tied to the genuine native
+session or a newly completed native history record are accepted as new resources; unrelated plans/station profiles
+block completion. Original history/resources must still be intact. The final handover stage and trial phase commit
+atomically, while the independently verified vehicle outcome is retained before any remaining completion check.
+
+A connected plan never disables the stronger unplugged fallback. If the lead is removed, ordinary `rollback` can
+still clear its owned resources. `confirm-original-backend` verifies the normal unplugged original configuration but
+retains any recorded vehicle-permission obligation instead of claiming completion. After the owner has restored that
+permission, `confirm-unplugged-vehicle-permission` verifies it read-only through the provider; it never sends Start.
 
 After process loss, a verified existing trial may now open restricted recovery while the vehicle remains connected,
 subject to the exact native session and saved binding checks above. New socket admission and changed introductions

@@ -103,6 +103,7 @@ class ConnectionRuntime:
         self._charger_lock = asyncio.Lock()
         self._closing = False
         self.vendor_enabled: Callable[[], bool] = lambda: True
+        self.ceiling_enabled: Callable[[], bool] = lambda: True
 
     # Expose only the ephemeral test port after startup.
     @property
@@ -180,7 +181,8 @@ class ConnectionRuntime:
             if self.before_ceiling is not None:
                 await self.before_ceiling()
             self.gateway._require_epoch("charger", epoch)
-            await self.gateway.controls.ensure_ceiling()
+            if self.ceiling_enabled():
+                await self.gateway.controls.ensure_ceiling()
         except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError) as error:
             self.status.last_failure = "BootOrCeilingUnavailable"
             self.status.charger_fault.record(error, "boot_or_ceiling", self.gateway.charger.diagnostics.action)

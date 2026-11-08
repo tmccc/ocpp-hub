@@ -34,8 +34,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   All prior history remains plus the new 38 Wh session, and full restoration is verified. A private tested bootstrap
   reserves fresh session numbers above native history. Automatic CLI allocation, first-handoff history revalidation,
   connected restricted restart, explicit zero-hold acknowledgement and bounded stale-snapshot rejection are now
-  implemented and tested offline. These changes await physical validation; connected cleanup still requires a proven
-  independent interlock, and no live Home Assistant or permanent service deployment has been made.
+  implemented and tested offline. A subsequent normal-backend car-pause trial proves zero draw through a charger restart
+  and fresh 6 A Start offer, with restoration while the lead stays attached. Connected-handover checks now have their
+  own fresh provider/vehicle evidence, native USER6/closed-zero gates, journalled cleanup continuation and staged
+  restoration. This separate path is tested offline and remains disabled without a real current-state provider;
+  the earlier pilot cannot authorise it. No live Home Assistant or permanent service deployment has been made.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

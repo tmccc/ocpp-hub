@@ -2,6 +2,14 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add a separate connected-handover controller with fresh vehicle/provider/nonce/Boot bindings, independent native
+  USER6 verification, distinct closed-zero samples, explicit-release pause lifetime and staged original restoration.
+  Keep production disabled without an explicitly integrated live provider; historical pilot files cannot enable it.
+- Reconcile lost Clear and vehicle-restore replies without repeating verified deletions or uncertain Starts. Resume
+  cleanup without reapplying a removed ceiling, preserve original resources/history, and observe genuine normal
+  manufacturer-side charging only after original permission has been independently restored.
+- Verify car-side pause through a normal-backend charger restart and fresh 6 A Start offer for 60 seconds; restore
+  original settings and car permission with the lead connected, retaining all ten old records plus two real sessions.
 - Automatically reserve fresh local transaction numbers above complete retained native history, pin both identities,
   preserve durable counters and receipts across restart, and reject history advancing during initial handoff.
 - Add offline-verified connected restart under a confirmed zero-current hold, exact native-session matching, saved
@@ -10,8 +18,8 @@
   control/session/receipt changes within a bounded budget; preserve frozen cleanup phases after late audit failures.
 - Wait for pending Set/Clear replies before native ownership classification; retire the old digest on an actual accepted
   Set transition while retaining sticky faults and detection of subsequent unrelated native-byte changes.
-- Keep connected cleanup behind its existing unplugged guard until an independent interlock is proven. No live charger,
-  Home Assistant or permanent service change accompanies this offline hardening.
+- Keep ordinary unplugged cleanup unchanged and connected cleanup unavailable without fresh independent interlock
+  evidence. No live charger, Home Assistant or permanent service change accompanies the offline implementation.
 - Verify physical local Start, nominal 6 A charging and local Stop with the vendor link retired, then real cloud
   acknowledgement of all seven queued events after local authorization expiry, preserving immutable session data.
 - Preserve all nine previous history bodies plus the new 38 Wh session; complete guarded cleanup and normal-backend
