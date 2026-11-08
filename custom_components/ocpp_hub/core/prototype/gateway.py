@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
+from .auth_info import InfoBook, validate_info
 from .authorisation import VendorAuthorisation
 from .events import validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
@@ -76,6 +77,9 @@ class Gateway:
         self.vendor = Peer("vendor", timeout)
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
+        self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
+        if self.policy.strict_cloud_authorization:
+            self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
         self._flush_lock = asyncio.Lock()
         self._boot_lock = asyncio.Lock()
@@ -232,6 +236,28 @@ class Gateway:
                     self.journal.mutation_finished(mutation, True)
                 text = reply_as(answer, token)
             else:
+                if action == "Authorize" and self.policy.strict_cloud_authorization:
+                    info = await self._authorize_tag(payload.get("idTag"))
+                    self._require_epoch("charger", epoch)
+                    if info["status"] == "Accepted" and not self._tag_allowed(payload.get("idTag")):
+                        info = {"status": "Invalid"}
+                    if info["status"] == "Accepted":
+                        if (
+                            self.authorisation.allows(payload.get("idTag", ""))
+                            and self.charger.gate.busy
+                            and not self.controls.ready
+                        ):
+                            raise UnavailableError("nested authorization cannot bypass an unconfirmed ceiling")
+                        await self.controls.ensure_ceiling()
+                    self._require_epoch("charger", epoch)
+                    if info["status"] == "Accepted":
+                        latest = self._tag_info(payload["idTag"])
+                        info = (
+                            latest
+                            if self._tag_allowed(payload["idTag"]) or latest["status"] != "Accepted"
+                            else {"status": "Invalid"}
+                        )
+                    return build_call_result(token, {"idTagInfo": info})
                 if action in ("Authorize", "StartTransaction") and self._tag_allowed(payload.get("idTag")):
                     await self.controls.ensure_ceiling()
                 receipt = f"{epoch}:{token}"
@@ -276,12 +302,26 @@ class Gateway:
                 control = self.journal.get("control", {})
                 self.journal.put("control", {**control, "start_pending": False})
 
-            return self.journal.start(token, payload, accepted)
+            info = self._tag_info(payload["idTag"]) if self.policy.strict_cloud_authorization and not known else None
+            if info is not None:
+                if info["status"] != "Accepted":
+                    raise DeniedError("authorization changed before accepting the new session")
+                if not self._local_tag(payload["idTag"]):
+                    self.auth_info.require_dynamic(info)
+            return self.journal.start(token, payload, accepted, info)
         if action == "StopTransaction":
             integer(payload.get("transactionId"))
             number(payload.get("meterStop"), 1e12)
             timestamp(payload.get("timestamp"))
-            return self.journal.stop(token, payload, self.authorisation.retire)
+            tag = payload.get("idTag")
+            info = self.auth_info.get(tag) if self.policy.strict_cloud_authorization and isinstance(tag, str) else None
+            if info is not None and info["status"] == "Accepted" and isinstance(tag, str) and not self._local_tag(tag):
+                try:
+                    self.auth_info.require_dynamic(info)
+                except RecoveryRequiredError:
+                    info = None
+            response = {"idTagInfo": info} if info is not None else None
+            return self.journal.stop(token, payload, self.authorisation.retire, response)
         if action in (
             "StatusNotification",
             "MeterValues",
@@ -307,11 +347,75 @@ class Gateway:
 
     # Local stop overrides both the static allowlist and an app-generated trusted vendor start grant.
     def _tag_allowed(self, tag: Any) -> bool:
-        if not isinstance(tag, str) or self.journal.get("control", {}).get("inhibit"):
+        if (
+            not isinstance(tag, str)
+            or self.journal.get("control", {}).get("inhibit")
+            or self.journal.get("trial_phase") not in (None, "active")
+        ):
             return False
-        return tag in self.policy.allowed_tags or (
-            self.policy.trust_vendor_start_tags and self.authorisation.allows(tag)
+        selected = self._local_tag(tag) or (self.policy.trust_vendor_start_tags and self.authorisation.allows(tag))
+        if not selected or not self.policy.strict_cloud_authorization:
+            return bool(selected)
+        info = self.auth_info.get(tag)
+        if info is not None and info["status"] == "Accepted" and not self._local_tag(tag):
+            try:
+                self.auth_info.require_dynamic(info)
+            except RecoveryRequiredError:
+                return False
+        return (self._local_tag(tag) and info is None) or (info is not None and info["status"] == "Accepted")
+
+    # Lookup is case-insensitive while journal facts and outbound OCPP preserve their original tag text.
+    def _local_tag(self, tag: str) -> bool:
+        return any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
+
+    # An explicit owner Start may release a completed hold, but cannot bypass revocation or recovery mode.
+    def _local_start_allowed(self, tag: str) -> bool:
+        if not self._local_tag(tag) or self.journal.get("trial_phase") not in (None, "active"):
+            return False
+        info = self.auth_info.get(tag)
+        return info is None or info["status"] == "Accepted"
+
+    # Owner-approved local permissions have explicit local expiry, distinct from actual cloud metadata.
+    def _tag_info(self, tag: str) -> dict[str, Any]:
+        info = self.auth_info.get(tag)
+        if info is not None:
+            return info
+        return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
+
+    # Preserve the actual correlated backend decision, checking generation after every await.
+    async def _cloud_authorize(self, tag: str) -> dict[str, Any]:
+        epoch = self._vendor_epoch
+        await self._ensure_vendor_boot()
+        self._require_epoch("vendor", epoch)
+        result = await self.vendor.call(
+            "Authorize", {"idTag": tag}, priority=5, check=lambda: self._require_epoch("vendor", epoch)
         )
+        self._require_epoch("vendor", epoch)
+        if result[0] != 3 or set(result[2]) != {"idTagInfo"}:
+            raise UnavailableError("actual cloud authorization was unavailable")
+        info = validate_info(result[2]["idTagInfo"])
+        with self.journal.atomic():
+            self.auth_info.put(tag, info)
+        return info
+
+    # Nested Authorize during a forwarded RemoteStart uses its preflighted grant without acquiring the vendor gate.
+    async def _authorize_tag(self, tag: Any) -> dict[str, Any]:
+        if (
+            not isinstance(tag, str)
+            or self.journal.get("control", {}).get("inhibit")
+            or self.journal.get("trial_phase") not in (None, "active")
+        ):
+            return {"status": "Invalid"}
+        if self.authorisation.allows(tag):
+            if not self._local_tag(tag) and not self._tag_allowed(tag):
+                info = self._tag_info(tag)
+                return info if info.get("status") != "Accepted" else {"status": "Invalid"}
+            return self._tag_info(tag)
+        if not self._local_tag(tag):
+            return {"status": "Invalid"}
+        if self.vendor.sender is not None:
+            return await self._cloud_authorize(tag)
+        return self._tag_info(tag)
 
     # Opaque writes obey the same owner lock as standard mutations.
     def _extension_allowed(self, payload: dict[str, Any]) -> None:
@@ -334,6 +438,12 @@ class Gateway:
             self._check_vendor(action, original, require_cap=False)
             if self.policy.kind(action, original) == "write" and action != "RemoteStopTransaction":
                 await self.controls.ensure_ceiling()
+            if action == "RemoteStartTransaction" and self.policy.strict_cloud_authorization:
+                info = await self._cloud_authorize(original["idTag"])
+                if info["status"] != "Accepted":
+                    raise DeniedError("cloud refused the trial start tag")
+                if not self._local_tag(original["idTag"]):
+                    self.auth_info.require_dynamic(info)
 
             # Allocate profile ids and mutation intent only after the in-gate policy check succeeds.
             def prepare() -> dict[str, Any]:
@@ -351,6 +461,12 @@ class Gateway:
                     else:
                         payload = self._translated_command(action, original)
                     if action == "RemoteStartTransaction":
+                        if self.policy.strict_cloud_authorization:
+                            info = self.auth_info.get(original["idTag"])
+                            if info is None or info["status"] != "Accepted":
+                                raise DeniedError("trial authorization expired before forwarding")
+                            if not self._local_tag(original["idTag"]):
+                                self.auth_info.require_dynamic(info)
                         grant = self.authorisation.reserve(original["idTag"])
                     if self.policy.kind(action, original) == "write":
                         mutation = self.journal.mutation_intent("vendor", action, original)
@@ -384,6 +500,12 @@ class Gateway:
     # Recheck priority, owner and current transaction after acquiring the outgoing CALL gate.
     def _check_vendor(self, action: str, payload: dict[str, Any], require_cap: bool = True) -> None:
         kind = self.policy.kind(action, payload)
+        if (
+            kind == "write"
+            and action != "RemoteStopTransaction"
+            and self.journal.get("trial_phase") not in (None, "active")
+        ):
+            raise DeniedError("trial vendor controls are frozen")
         control = self.journal.get("control", {})
         if kind == "write" and action != "RemoteStopTransaction":
             self.journal.require_vendor_writes_reconciled()
@@ -448,6 +570,8 @@ class Gateway:
 
     # An explicit local start keeps any previous lower ceiling and restores zero if its outcome is uncertain.
     async def start(self, tag: str = "LOCAL_TEST") -> Frame:
+        if self.policy.strict_cloud_authorization and not self._local_start_allowed(tag):
+            raise DeniedError("current authorization does not permit a new local start")
         return await self.controls.start(tag)
 
     # A local stop installs a durable zero-current hold even when there is no known transaction to stop.
@@ -543,4 +667,25 @@ class Gateway:
                 if answer[0] != 3:
                     self.journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
                     raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
-                self.journal.acknowledge(item, answer[2])
+                metadata: dict[str, Any] | None = None
+                tag = item.payload.get("idTag")
+                if self.policy.strict_cloud_authorization and "idTagInfo" in answer[2]:
+                    metadata = validate_info(answer[2]["idTagInfo"])
+                    if item.action == "StartTransaction" and metadata["status"] != "Accepted":
+                        with self.journal.atomic():
+                            if isinstance(tag, str):
+                                self.auth_info.put(tag, metadata)
+                            self.journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
+                            control = self.journal.get("control", {})
+                            self.journal.put(
+                                "control", {**control, "owner": "local", "inhibit": True, "uncertain": True}
+                            )
+                        await self.controls.ensure_ceiling()
+                        raise RecoveryRequiredError("cloud rejected an already local session; zero hold retained")
+
+                # Cache updates and deletion of this durable event share its actual acknowledgement commit.
+                def acknowledged() -> None:
+                    if metadata is not None and isinstance(tag, str):
+                        self.auth_info.put(tag, metadata)
+
+                self.journal.acknowledge(item, answer[2], acknowledged)

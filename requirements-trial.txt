@@ -1,0 +1,2 @@
+# Standalone Linux/Python 3.14 trial runtime. /usr/bin/openssl is required for offline certificate preflight.
+websockets==15.0.1

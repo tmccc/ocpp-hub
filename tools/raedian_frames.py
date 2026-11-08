@@ -22,9 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "custom_components" / "ocpp_hub"))
-
-from core import raedian  # noqa: E402
+_component_path = str(ROOT / "custom_components" / "ocpp_hub")
+sys.path.insert(0, _component_path)
+try:
+    from core import raedian
+finally:
+    # Do not leave calendar.py and other integration modules shadowing the standard library for callers.
+    sys.path.remove(_component_path)
 
 # The commands the hub understands, by command byte. Everything else is reported as NEW.
 KNOWN_COMMANDS = {raedian.COMMAND_PLAN: "planning (decoded in core/raedian.py)"}

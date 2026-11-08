@@ -5,7 +5,8 @@ from __future__ import annotations
 import time
 import uuid
 
-from .store import ConflictError, Journal, fingerprint
+from .auth_info import tag_key
+from .store import ConflictError, Journal
 
 
 class VendorAuthorisation:
@@ -22,14 +23,14 @@ class VendorAuthorisation:
             raise ConflictError("an earlier vendor start is still awaiting a transaction")
         token = uuid.uuid4().hex
         self.journal.put(
-            "vendor_start_grant", {"digest": fingerprint(tag), "expires": time.time() + self.ttl, "token": token}
+            "vendor_start_grant", {"digest": tag_key(tag), "expires": time.time() + self.ttl, "token": token}
         )
         return token
 
     # A grant authorises only its bounded pending start or the currently open transaction bound to that grant.
     def allows(self, tag: str) -> bool:
         grant = self.journal.get("vendor_start_grant", {})
-        if grant.get("digest") != fingerprint(tag):
+        if grant.get("digest") != tag_key(tag):
             return False
         local = grant.get("local")
         return (local is None and grant.get("expires", 0) > time.time()) or (
@@ -39,7 +40,7 @@ class VendorAuthorisation:
     # Bind once; a subsequent transaction cannot reuse the pending grant after its original session stops.
     def consume(self, tag: str, local: int) -> None:
         grant = self.journal.get("vendor_start_grant", {})
-        if grant.get("digest") == fingerprint(tag):
+        if grant.get("digest") == tag_key(tag):
             self.journal.put("vendor_start_grant", {**grant, "local": local})
 
     # An actual refusal revokes this request only, never a replacement's newer grant.

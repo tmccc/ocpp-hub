@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased — offline iCS prototype
+## Unreleased — iCS prototype and commissioning package
+
+- Add a separate standalone commissioning package with dormant private-file preflight, exact endpoint admission,
+  independently configured credentials, certificate name/date checks and a bounded 6 A run. Keep offline adapters intact.
+- Add a complete read-only native observer with bounded asynchronous HTTP and strict JSON/framing validation.
+- Record trial resource intent independently of retired transaction aliases. Preserve originals, freeze rollback,
+  clear only verified owned profiles with the station cap last, and verify original-backend reconnection separately.
+- Add a restricted unplugged recovery listener and retain safety Stop during recovery; preserve ambiguous history.
+- Add strict expiry/parent/revocation handling, nested authorisation preflight and immutable lifecycle reply metadata.
+- Supply configuration/service examples and pinned runtime requirements. Nothing is deployed or connected to a live charger.
 
 - Add an isolated HA-free durable gateway and an offline TLS runtime. Keep the normal Home Assistant setup unchanged.
 - Keep local controls independent of cloud reconnects, registration retries, negotiated OCPP heartbeats, Ping/Pong and

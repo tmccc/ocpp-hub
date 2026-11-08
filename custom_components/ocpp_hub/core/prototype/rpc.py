@@ -83,6 +83,11 @@ class PriorityGate:
         self._serial = 0
         self._busy = False
 
+    # A nested authorization cannot wait behind the very command which is waiting for its response.
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
     # Enter in priority order; cancellation removes the waiting ticket.
     @asynccontextmanager
     async def enter(self, priority: int) -> AsyncIterator[None]:
@@ -117,6 +122,8 @@ class Peer:
         self.sender: Sender | None = None
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
+        self.before_send: Callable[[str, dict[str, Any]], None] | None = None
+        self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
 
     # Correlate replies by fresh, namespaced ids; unknown replies are ignored.
     def receive(self, frame: Frame) -> None:
@@ -173,8 +180,13 @@ class Peer:
                 actual = payload() if callable(payload) else payload
                 if before_send is not None:
                     before_send()
+                if self.before_send is not None:
+                    self.before_send(action, actual)
                 await sender(build_call(unique_id, action, actual))
-                return await future
+                answer = await future
+                if self.after_result is not None:
+                    self.after_result(action, actual, answer)
+                return answer
         except (TimeoutError, OSError) as error:
             raise UnavailableError("peer outcome is unconfirmed") from error
         finally:

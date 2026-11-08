@@ -93,6 +93,10 @@ class Journal:
                 token TEXT PRIMARY KEY, origin TEXT NOT NULL, action TEXT NOT NULL,
                 digest TEXT NOT NULL, state TEXT NOT NULL);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(transactions)")}
+        for name in ("start_info", "stop_info"):
+            if name not in columns:
+                self.db.execute("ALTER TABLE transactions ADD COLUMN " + name + " TEXT")
         with self.atomic():
             old = self.get("identity")
             if old is not None and old != identity:
@@ -207,15 +211,22 @@ class Journal:
 
     # Accept a start exactly once locally, including a retry sent under a fresh CALL id.
     def start(
-        self, token: str, payload: dict[str, Any], accepted: Callable[[int], None] | None = None
+        self,
+        token: str,
+        payload: dict[str, Any],
+        accepted: Callable[[int], None] | None = None,
+        info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.atomic():
             cached = self.receipt(token, "StartTransaction", payload)
             if cached is not None:
                 return cached
-            previous = self.db.execute("SELECT local FROM transactions WHERE start=?", (encoded(payload),)).fetchone()
+            previous = self.db.execute(
+                "SELECT local,start_info FROM transactions WHERE start=?", (encoded(payload),)
+            ).fetchone()
             if previous:
                 local = int(previous[0])
+                info = json.loads(previous[1]) if previous[1] is not None else {"status": "Accepted"}
             else:
                 if self.active(int(payload["connectorId"])) is not None:
                     raise ConflictError("connector already has an unresolved transaction")
@@ -224,24 +235,30 @@ class Journal:
                     raise RecoveryRequiredError("transaction counter exhausted")
                 self.put("next_transaction", local)
                 self.db.execute(
-                    "INSERT INTO transactions(local,connector,start,live) VALUES(?,?,?,0)",
-                    (local, payload["connectorId"], encoded(payload)),
+                    "INSERT INTO transactions(local,connector,start,live,start_info) VALUES(?,?,?,0,?)",
+                    (local, payload["connectorId"], encoded(payload), encoded(info or {"status": "Accepted"})),
                 )
                 self.enqueue("StartTransaction", payload, local)
                 if accepted is not None:
                     accepted(local)
-            answer = {"transactionId": local, "idTagInfo": {"status": "Accepted"}}
+            answer = {"transactionId": local, "idTagInfo": info or {"status": "Accepted"}}
             self.remember(token, "StartTransaction", payload, answer)
             return answer
 
     # Accept a stop once without ever clearing some other session on the connector.
-    def stop(self, token: str, payload: dict[str, Any], closed: Callable[[int], None] | None = None) -> dict[str, Any]:
+    def stop(
+        self,
+        token: str,
+        payload: dict[str, Any],
+        closed: Callable[[int], None] | None = None,
+        info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with self.atomic():
             cached = self.receipt(token, "StopTransaction", payload)
             if cached is not None:
                 return cached
             local = payload["transactionId"]
-            row = self.db.execute("SELECT stop,start FROM transactions WHERE local=?", (local,)).fetchone()
+            row = self.db.execute("SELECT stop,start,stop_info FROM transactions WHERE local=?", (local,)).fetchone()
             if row is None:
                 raise ConflictError("stop names an unknown transaction")
             start = json.loads(row["start"])
@@ -252,7 +269,10 @@ class Journal:
             if row[0] is not None and row[0] != encoded(payload):
                 raise ConflictError("stop contradicts a previously accepted stop")
             if row[0] is None:
-                self.db.execute("UPDATE transactions SET stop=?,live=0 WHERE local=?", (encoded(payload), local))
+                self.db.execute(
+                    "UPDATE transactions SET stop=?,live=0,stop_info=? WHERE local=?",
+                    (encoded(payload), encoded(info or {}), local),
+                )
                 self.enqueue("StopTransaction", payload, local)
                 profiles = self.get("vendor_profiles", {})
                 transactions = self.get("vendor_profile_transactions", {})
@@ -264,8 +284,9 @@ class Journal:
                 self.put("vendor_profile_transactions", transactions)
                 if closed is not None:
                     closed(local)
-            self.remember(token, "StopTransaction", payload, {})
-            return {}
+            answer = (info or {}) if row[0] is None else json.loads(row[2] or "{}")
+            self.remember(token, "StopTransaction", payload, answer)
+            return answer
 
     # Look up an open transaction; restored rows remain unconfirmed observations.
     def active(self, connector: int = 1) -> int | None:
@@ -301,7 +322,9 @@ class Journal:
         self.db.execute("UPDATE outbox SET state='inflight' WHERE token=?", (item.token,))
 
     # Commit the cloud acknowledgement and its transaction mapping atomically.
-    def acknowledge(self, item: Delivery, result: dict[str, Any]) -> None:
+    def acknowledge(
+        self, item: Delivery, result: dict[str, Any], acknowledged: Callable[[], None] | None = None
+    ) -> None:
         with self.atomic():
             if item.action == "StartTransaction":
                 if item.transaction is None:
@@ -321,6 +344,8 @@ class Journal:
                     self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
                 except sqlite3.IntegrityError:
                     raise ConflictError("cloud transaction already belongs to another local session") from None
+            if acknowledged is not None:
+                acknowledged()
             self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))
 
     # Explicitly reconcile a cloud Start with an independently established vendor id.

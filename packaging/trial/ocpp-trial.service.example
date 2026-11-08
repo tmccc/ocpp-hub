@@ -1,0 +1,35 @@
+[Unit]
+Description=Supervised OCPP commissioning trial
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocpp-trial
+Group=ocpp-trial
+WorkingDirectory=/opt/ocpp-trial
+StateDirectory=ocpp-trial
+StateDirectoryMode=0700
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TMPDIR=/var/lib/ocpp-trial/tmp
+ExecStartPre=/usr/bin/mkdir -p /var/lib/ocpp-trial/tmp
+ExecStartPre=/opt/ocpp-trial/venv/bin/python -B /opt/ocpp-trial/tools/trial_proxy.py check --config /etc/ocpp-trial/trial.json
+ExecStart=/opt/ocpp-trial/venv/bin/python -B /opt/ocpp-trial/tools/trial_proxy.py run --config /etc/ocpp-trial/trial.json --duration 900
+Restart=no
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=mixed
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ocpp-trial
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

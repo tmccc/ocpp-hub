@@ -6,7 +6,10 @@ import asyncio
 import math
 import sqlite3
 import ssl
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from typing import Protocol, Self
 
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import Server, ServerConnection
@@ -65,28 +68,29 @@ class RuntimeStatus:
     last_failure: str | None = None
 
 
-class OfflineRuntime:
+class Transport(Protocol):
+    # Bind only the transport's already validated endpoint.
+    def listen(self, handler: Callable[[ServerConnection], Awaitable[None]]) -> Awaitable[Server]: ...
+
+    # Connect only to the transport's fixed, already validated upstream.
+    def connect(self) -> AbstractAsyncContextManager[ClientConnection]: ...
+
+
+class ConnectionRuntime:
     """A cloud outage cannot stop local receive/control or erase durable events."""
 
     # Eagerly validate the fixed destination before even binding the local loopback listener.
     def __init__(
         self,
         gateway: Gateway,
-        admission: Admission,
-        vendor_url: str,
-        server_tls: ssl.SSLContext,
-        client_tls: ssl.SSLContext,
+        transport: Transport,
         settings: RuntimeSettings | None = None,
+        before_ceiling: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.gateway = gateway
-        self.admission = admission
         self.settings = settings or RuntimeSettings()
-        self._server_tls = server_tls
-        self._vendor_url = vendor_url
-        self._client_tls = client_tls
-        validate_offline_vendor(vendor_url, client_tls)
-        if server_tls.protocol != ssl.PROTOCOL_TLS_SERVER:
-            raise SecurityError("offline listener requires a server TLS context")
+        self.transport = transport
+        self.before_ceiling = before_ceiling
         self.status = RuntimeStatus()
         self._server: Server | None = None
         self._runner: asyncio.Task[None] | None = None
@@ -94,6 +98,7 @@ class OfflineRuntime:
         self._charger: ServerConnection | None = None
         self._charger_lock = asyncio.Lock()
         self._closing = False
+        self.vendor_enabled: Callable[[], bool] = lambda: True
 
     # Expose only the ephemeral test port after startup.
     @property
@@ -103,18 +108,10 @@ class OfflineRuntime:
         return int(self._server.sockets[0].getsockname()[1])
 
     # Start a literal-loopback, ephemeral listener and a separately owned cloud supervisor.
-    async def start(self) -> OfflineRuntime:
+    async def start(self) -> Self:
         if self._server is not None or self._closing:
             raise RuntimeError("offline runtime cannot be started twice")
-        s = self.settings
-        self._server = await offline_server(
-            self._charger_handler,
-            self.admission,
-            self._server_tls,
-            ping_interval=s.ping_interval,
-            ping_timeout=s.ping_timeout,
-            close_timeout=s.close_timeout,
-        )
+        self._server = await self.transport.listen(self._charger_handler)
         self._runner = asyncio.create_task(self._vendor_runner())
         return self
 
@@ -174,6 +171,8 @@ class OfflineRuntime:
             else:
                 await self.gateway.wait_for_boot(epoch)
             self.status.boot_observed = self.gateway.current_boot_seen(epoch)
+            if self.before_ceiling is not None:
+                await self.before_ceiling()
             await self.gateway.controls.ensure_ceiling()
         except UnavailableError, TimeoutError:
             self.status.last_failure = "BootOrCeilingUnavailable"
@@ -182,19 +181,15 @@ class OfflineRuntime:
     async def _vendor_runner(self) -> None:
         delay = self.settings.retry_min
         while not self._closing:
-            if self._charger is None or not self.gateway.current_boot_seen(self.gateway._charger_epoch):
+            if (
+                not self.vendor_enabled()
+                or self._charger is None
+                or not self.gateway.current_boot_seen(self.gateway._charger_epoch)
+            ):
                 await asyncio.sleep(self.settings.pump_interval)
                 continue
             try:
-                s = self.settings
-                async with offline_vendor(
-                    self._vendor_url,
-                    self.admission,
-                    self._client_tls,
-                    ping_interval=s.ping_interval,
-                    ping_timeout=s.ping_timeout,
-                    close_timeout=s.close_timeout,
-                ) as connection:
+                async with self.transport.connect() as connection:
                     self.status.vendor_connected = True
                     self.status.reconnects += 1
                     epoch = self.gateway.attach_vendor(self._sender(connection))
@@ -222,7 +217,7 @@ class OfflineRuntime:
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
-            while self.gateway.current_boot_seen(charger_epoch):
+            while self.vendor_enabled() and self.gateway.current_boot_seen(charger_epoch):
                 await asyncio.sleep(self.settings.pump_interval)
 
         tasks = [
@@ -293,3 +288,72 @@ class OfflineRuntime:
                 await asyncio.wait_for(self._server.wait_closed(), self.settings.close_timeout + 2)
         finally:
             await self.gateway.close()
+
+    # Rollback retains the local receiver while retiring the cloud supervisor and all its session children.
+    async def stop_vendor(self) -> None:
+        if self._runner is not None:
+            await self._retire([self._runner])
+            self._runner = None
+        await self._retire(list(self._session_tasks))
+
+
+class OfflineTransport:
+    """The original literal-loopback boundary remains independently enforced on both legs."""
+
+    # Validate without constructing a connector, binding or resolving a hostname.
+    def __init__(
+        self,
+        admission: Admission,
+        vendor_url: str,
+        server_tls: ssl.SSLContext,
+        client_tls: ssl.SSLContext,
+        settings: RuntimeSettings,
+    ) -> None:
+        validate_offline_vendor(vendor_url, client_tls)
+        if server_tls.protocol != ssl.PROTOCOL_TLS_SERVER:
+            raise SecurityError("offline listener requires a server TLS context")
+        self.admission, self.vendor_url = admission, vendor_url
+        self.server_tls, self.client_tls, self.settings = server_tls, client_tls, settings
+
+    # Bind only the existing authenticated ephemeral loopback listener.
+    def listen(self, handler: Callable[[ServerConnection], Awaitable[None]]) -> Awaitable[Server]:
+        s = self.settings
+        listener: Awaitable[Server] = offline_server(
+            handler,
+            self.admission,
+            self.server_tls,
+            ping_interval=s.ping_interval,
+            ping_timeout=s.ping_timeout,
+            close_timeout=s.close_timeout,
+        )
+        return listener
+
+    # The original adapter checks literal loopback again before returning its dormant connector.
+    def connect(self) -> AbstractAsyncContextManager[ClientConnection]:
+        s = self.settings
+        return offline_vendor(
+            self.vendor_url,
+            self.admission,
+            self.client_tls,
+            ping_interval=s.ping_interval,
+            ping_timeout=s.ping_timeout,
+            close_timeout=s.close_timeout,
+        )
+
+
+class OfflineRuntime(ConnectionRuntime):
+    """Public offline API: no production flags, destinations or household credential loading."""
+
+    # Preserve the original construction contract while sharing only transport-independent lifecycle code.
+    def __init__(
+        self,
+        gateway: Gateway,
+        admission: Admission,
+        vendor_url: str,
+        server_tls: ssl.SSLContext,
+        client_tls: ssl.SSLContext,
+        settings: RuntimeSettings | None = None,
+    ) -> None:
+        actual = settings or RuntimeSettings()
+        self.admission = admission
+        super().__init__(gateway, OfflineTransport(admission, vendor_url, server_tls, client_tls, actual), actual)

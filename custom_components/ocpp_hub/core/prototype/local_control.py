@@ -29,6 +29,7 @@ class LocalControl:
         self._operations: set[asyncio.Task[Any]] = set()
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
+        self.authorize: Callable[[str], bool] | None = None
 
     # Client cancellation cannot abandon a safety sequence halfway through its physical effects.
     async def _owned[T](self, operation: Coroutine[Any, Any, T]) -> T:
@@ -83,6 +84,11 @@ class LocalControl:
 
     # Record ownership and uncertainty before anything can be sent to the charger.
     def _claim(self, inhibit: bool, stopping: bool = False) -> tuple[int, str]:
+        phase = self.journal.get("trial_phase")
+        if stopping and phase in ("blocked", "recovering", "rollback", "backend_restore_pending"):
+            self.journal.put("trial_phase", "recovering")
+        elif phase not in (None, "active"):
+            raise DeniedError("trial local controls are frozen")
         previous = self.journal.get("control", {})
         ticket = uuid.uuid4().hex
         state = {
@@ -176,6 +182,10 @@ class LocalControl:
 
     # Establish or restore the desired ceiling before a start, native plan or new authenticated connection is used.
     async def ensure_ceiling(self) -> None:
+        phase = self.journal.get("trial_phase")
+        recovery_hold = phase in ("blocked", "recovering") and self.journal.get("control", {}).get("inhibit")
+        if phase not in (None, "active") and not recovery_hold:
+            raise UnavailableError("trial ceiling reapplication is disabled outside active mode")
         if self.ready:
             return
         epoch = self.epoch()
@@ -217,8 +227,11 @@ class LocalControl:
         async with self.peer.sequence(0, lambda: self._check(epoch, ticket)) as call:
             try:
                 answer = await self._cap(call, 0, epoch)
-            except UnavailableError as error:
-                cap_error = error
+            except (UnavailableError, DeniedError) as error:
+                self._check(epoch, ticket)
+                cap_error = (
+                    UnavailableError("station hold could not be confirmed") if isinstance(error, DeniedError) else error
+                )
             local = self.journal.active()
             if local is not None:
                 answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
@@ -238,13 +251,18 @@ class LocalControl:
         previous = self.journal.get("control", {})
         if previous.get("uncertain") or previous.get("start_pending"):
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
-        if tag not in self.policy.allowed_tags or self.journal.active() is not None:
+        if (
+            not any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
+            or self.journal.active() is not None
+        ):
             raise DeniedError("tag is not allowed or a transaction is unresolved")
         epoch, ticket = self._claim(previous.get("inhibit", False))
         async with self.peer.sequence(1, lambda: self._check(epoch, ticket)) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
+                if self.authorize is not None and not self.authorize(tag):
+                    raise DeniedError("authorization changed before forwarding a local start")
                 self._complete(ticket, inhibit=False, start_pending=True)
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":

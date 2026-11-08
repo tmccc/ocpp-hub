@@ -1,0 +1,21 @@
+{
+  "identity": "OFFLINE001",
+  "listener_host": "127.0.0.1",
+  "listener_port": 9001,
+  "listener_name": "127.0.0.1",
+  "charger_ip": "127.0.0.1",
+  "charger_path": "/charger/OFFLINE001",
+  "vendor_url": "wss://vendor.example.invalid:9113/ocpp/OFFLINE001",
+  "upstream_auth": "basic",
+  "incoming_secret": "/etc/ocpp-trial/incoming.json",
+  "upstream_secret": "/etc/ocpp-trial/upstream.json",
+  "native_secret": "/etc/ocpp-trial/native.json",
+  "certificate": "/etc/ocpp-trial/listener.pem",
+  "private_key": "/etc/ocpp-trial/listener.key",
+  "ca_file": null,
+  "journal": "/var/lib/ocpp-trial/state.db",
+  "baseline": "/var/lib/ocpp-trial/baseline.json",
+  "evidence": "/var/lib/ocpp-trial/evidence.json",
+  "max_current_a": 6,
+  "local_tags": []
+}

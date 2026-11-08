@@ -1,3 +1,137 @@
+## Standalone commissioning package — prepared, not deployed
+
+This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
+The charger and live Home Assistant have not been changed or connected to it. The normal integration does not load it.
+Actual charger admission, certificate trust, physical limit enforcement and cloud history acceptance still need a
+later supervised trial. Simulated success is not a claim of live readiness.
+
+`tools/trial_proxy.py` is the standalone entry point. Its default action is `check`, which reads private configuration,
+credentials, baseline and certificates without creating a journal, doing DNS, binding a listener or contacting a device.
+The original `OfflineRuntime` and its loopback-only adapters remain enforced independently. Both runtime paths share
+only transport-independent connection lifecycle code.
+
+```bash
+python3.14 tools/trial_proxy.py --config /private/trial.json
+```
+
+A dormant configuration example and an **uninstalled** service template are in `packaging/trial/`. Runtime dependencies
+are pinned in `requirements-trial.txt`; test/development dependencies remain in `requirements-offline.txt`.
+`/usr/bin/openssl` checks listener certificate validity and the configured listener IP/DNS name during preflight.
+
+### Connection and credential preparation
+
+- Configure one literal private listener address/port, one exact charger IP and full `/charger/<identity>` path,
+  and one exact upstream WSS URL including the original identity. Wildcard/public listeners, URL credentials,
+  redirects, query strings and ambient HTTP proxies are refused.
+- Incoming proxy Basic credentials and manufacturer-cloud credentials are independent. Each Basic secret is a private
+  JSON object with `username` and `password`; the configured identity must match. The LAN observer has its own separate
+  credential. Passwords are never command-line arguments or status/log fields. Android app Bearer tokens are not used.
+- Upstream authentication is explicitly `basic` with a private secret file, or explicitly `none` with
+  `upstream_secret: null`. There is no automatic fallback. Retained iCS configuration has empty OCPP authorisation-key
+  fields; that does not prove what its actual websocket upgrade sends. The selected cloud mode still needs live proof.
+- The incoming leg always requires its separately chosen Basic password. Applying that prospective password to the
+  charger's connection profile is part of a later authorised trial, not this preparation. Returning to the original
+  profile must restore its original empty/nonempty authentication fields exactly.
+- Both legs retain TLS. Upstream CA and hostname checks are mandatory; listener key pairing, SAN/IP name and certificate
+  dates are checked offline. Actual charger trust of the listener certificate remains unproven.
+- Files must be owned regular files, not symlinks. Secrets/configuration and state are private to the runtime user;
+  public certificates/CA files may be readable but cannot be writable by other users. Keys are loaded from verified
+  bytes through anonymous descriptors, avoiding a second pathname-open race. State directory permissions are checked
+  before SQLite creates its lock/WAL files.
+
+### Baseline and bounded operation
+
+The explicit `capture-baseline` action performs only the existing read-only LAN getters. It saves a private native
+profile/plan inventory and original configuration backup. It does not change the charger. The native reader uses the
+charger's existing LAN HTTP API at its exact IP, supports only seven observed read requests, rejects duplicate JSON
+keys and bounds each response and the entire observation without leaving background worker threads.
+
+```bash
+python3.14 tools/trial_proxy.py capture-baseline --config /private/trial.json
+```
+
+A fresh first trial requires native CP A, unplugged, zero current/power and an actually closed transaction. It refuses
+pre-existing station-ceiling profiles and profile 7001 collisions. Original plans and profiles remain protected.
+A new private journal is required; an old journal can resume only with its exact original trial baseline.
+
+Only the explicit `run` action opens the trial connections. It is restricted to a 6 A single-phase ceiling and a
+60–1800 second duration, defaulting to 900 seconds. Its duration includes startup. No trial service is installed or
+started by this repository or by preflight.
+
+```bash
+python3.14 tools/trial_proxy.py run --config /private/trial.json --duration 900 --interactive
+```
+
+The optional terminal interface accepts one JSON object per line:
+
+```json
+{"command":"status"}
+{"command":"start"}
+{"command":"stop"}
+{"command":"release"}
+{"command":"rollback-plan"}
+{"command":"rollback"}
+{"command":"confirm-original-backend"}
+{"command":"exit"}
+```
+
+Local Start requires exactly one explicitly approved owner tag. Start/stop/ceiling operations retain their original
+priority and ownership checks. Status separates transport connection, actual Boot, vendor registration, effective
+composite confirmation, local hold and blocked history delivery. The service also writes a private status file.
+A timer expiry or shutdown attempts a zero-current hold and known-session Stop, retains uncertainty if either cannot
+be confirmed, and leaves its journal intact. It does not automatically restore the manufacturer's connection.
+
+The first trial intentionally permits only constant relative ampere profiles and the observed metadata/Fast/delayed-stop
+commands. Plan editing and Eco/EcoPlus changes remain disabled in this narrower trial path. New profiles cannot replace
+any original connector/purpose scope, including a different transaction at that scope: actual iCS captures showed that
+setting a new TxProfile can replace an older one. The existing offline codecs and tests still cover those wider app
+shapes; enabling them live requires independently proven restoration semantics.
+
+### Authorisation behaviour
+
+Strict trial mode validates actual status, expiry and optional parent metadata. Trusted cloud RemoteStart performs
+its upstream Authorize before acquiring the charger's outgoing gate. A nested Authorize/Start can then receive the
+validated grant without a lock cycle. Dynamic starts require an actual future cloud expiry; missing expiry is never
+invented as cloud evidence. Case-insensitive lookups preserve original wire text, and a parent tag never grants
+permission to arbitrary sibling tags.
+
+Configured local owner tags remain an explicit local authority with bounded local replies. Actual cloud denial or
+expiry blocks a new Start, including a local API Start; permission is checked again inside its cap/control sequence.
+A local Stop wins if it arrives while cloud authorisation is awaited. Metadata is bounded, and configured/current
+revocations cannot be evicted into a fallback permission. A later missing-expiry response cannot widen a dynamic grant.
+Start/Stop reply metadata is committed with the original lifecycle fact and retained exactly on historical retries.
+Actual acknowledgement metadata updates the book atomically. Stop without an idTag never guesses which tag its
+optional cloud metadata describes. Late cloud rejection of an already local Start retains the event and installs zero.
+
+### Rollback and recovery
+
+Rollback records resource intent before every write and keeps those receipts after normal transaction/profile aliases
+retire. Adopted or original native resources are never treated as trial-owned. After verified deletion, an id which
+reappears cannot become owned again without a new recorded trial intent.
+
+`rollback-plan` observes the complete native inventory. `rollback` requires fresh native unplugged/zero-power evidence,
+an actual closed session, no pending Start and reconciled mutating/lifecycle outcomes. It freezes charging-capable work,
+retires the cloud runner while retaining the local receiver, removes only independently matching owned profiles and
+clears station profile 7001 last. Every deletion is checked against a fresh physical inventory, including after a lost
+ACK/restart. An ACK without actual removal cannot complete cleanup; reconnect cannot automatically reinstall a cleared cap.
+
+Resource cleanup ends in `backend_restore_pending`. Restore the charger's original connection profile from its private
+backup as a separate operation. `confirm-original-backend` succeeds only once the proxy charger socket has retired and
+fresh native readings show the original configuration, original resources, no owned profiles and a connected backend.
+Configuration restoration alone cannot prove that reconnection has happened. History and any unsent observations remain
+in the journal; they are not erased to make rollback look successful.
+
+After process loss, an existing trial may open a restricted recovery listener once the vehicle is physically unplugged,
+even if iCS still considers its session open. It persists zero-current local ownership before binding, blocks new starts,
+and can receive lifecycle retries, stop the known session and deliver/reconcile retained history. Unknown cloud Starts
+and pending-start uncertainty still require independent reconciliation; they are never automatically retried or discarded.
+A failed native audit does not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
+
+The next live step remains a separately authorised unplugged admission/Boot test. The commissioning package has been
+exercised only with synthetic peers on literal loopback under `tools/offline_validate.py`.
+
+---
+
 ## Offline iCS coexistence prototype — this branch
 
 This branch builds on OCPP Hub 0.2.1 (`1229028b4b56cb474b04686e5fdf71f079a0888f`) with an isolated durable gateway
@@ -70,7 +204,9 @@ For the complete recorded request sequence through both real TLS legs:
 The Python audit guard rejects non-loopback socket/DNS operations and named Unix service sockets before they occur.
 It disables unrelated pytest plugin discovery and keeps temporary outputs under `TMPDIR`. It is a Python-level guard
 for reviewed tests, not an operating-system network namespace. The runtime also rejects non-loopback destinations
-before creating a socket. There is deliberately no production endpoint or credential-loading command.
+before creating a socket. The offline runtime accepts no production endpoint or household credentials. The separate
+trial command described above performs private-file preflight by default; only its explicit run action enables the
+trial transport.
 
 ### Actual iCS evidence
 

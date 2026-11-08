@@ -52,6 +52,7 @@ class Policy:
     phases: int = 1
     local_stack_level: int = 16
     trust_vendor_start_tags: bool = False
+    strict_cloud_authorization: bool = False
     vendor_tag_ttl_s: int = 120
     allowed_tags: frozenset[str] = frozenset({"LOCAL_TEST"})
     extensions: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -64,7 +65,7 @@ class Policy:
             raise DeniedError("prototype requires a 6–32 A single-phase ceiling")
         integer(self.local_stack_level, 1, 255)
         integer(self.vendor_tag_ttl_s, 1, 300)
-        if type(self.trust_vendor_start_tags) is not bool:
+        if type(self.trust_vendor_start_tags) is not bool or type(self.strict_cloud_authorization) is not bool:
             raise DeniedError("vendor tag trust must be explicit")
         if any(mode not in ("read", "write") for mode in self.extensions.values()):
             raise DeniedError("extensions must be explicitly classified as read or write")
@@ -118,7 +119,9 @@ class Policy:
             dynamic = (
                 self.trust_vendor_start_tags and isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,20}", tag)
             )
-            if not isinstance(tag, str) or (tag not in self.allowed_tags and not dynamic):
+            if not isinstance(tag, str) or (
+                not any(tag.casefold() == approved.casefold() for approved in self.allowed_tags) and not dynamic
+            ):
                 raise DeniedError("start tag or connector is not allowed")
             integer(payload.get("connectorId", 1), 1, 1)
             if "chargingProfile" in payload:
