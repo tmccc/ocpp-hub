@@ -14,8 +14,10 @@
 - Bound ids/resources, retire transaction profiles without alias reuse, reject malformed JSON/time/type variants and
   preserve actual peer CALLERROR fields. Generated OCPP request ids fit the 36-character maximum.
 - Retain complete privacy-transformed 517-, 551- and 721-frame captures with provenance. Replay all 365 CALLs of the
-  largest capture through both authenticated loopback TLS legs, including independently modelled 6 A profile effects,
+  controls capture through both authenticated loopback TLS legs, including independently modelled 6 A profile effects,
   nine explicitly simulated missing meter acknowledgements and one deliberately refused diagnostic upload.
+- Capture a subsequent vehicle-reported finished charge: physical power stops and SuspendedEV is reported while
+  the OCPP transaction remains open even after unplugging. Replay the complete 789-frame trace without inventing a StopTransaction.
 - Document actual authorised Android-app trials and their restoration limits. Those trials used the original backend;
   no proxy was connected and no live Home Assistant setup changed. Hardware ceiling enforcement, authenticated cutover,
   full authorisation/cache semantics and real cloud history replay remain unvalidated. This is not a release.

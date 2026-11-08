@@ -86,6 +86,7 @@ These complete, sanitised fixtures overlap; their frame counts must not be added
 | `ics-log7628.sanitized.json` | 517 | Initial status/metering, authorisation, historical lifecycle and metadata reads. |
 | `ics-app-controls.sanitized.json` | 551 | Fast/Eco/EcoPlus, disabled/enabled/edited/deleted temporary plan and original daily plan. |
 | `ics-vehicle-controls.sanitized.json` | 721 | Actual vehicle, current changes, remote starts/stops and delayed-stop set/cancel. |
+| `ics-completion-observation.sanitized.json` | 789 | Vehicle-reported finish and subsequent unplugging, with the transaction still open. |
 
 They are sanitised, reserialised derivatives, **not byte-identical wire data**. No parsed frame was dropped. Each
 records its original archive SHA-256 and transformations. Consistent aliases replace ids/tags, one date shift applies
@@ -110,7 +111,7 @@ Observed proprietary traffic uses `DataTransfer.data` as a JSON **string**:
 Metadata reads were captured only with `eco: Fast`; allowing Eco/EcoPlus read values is inferred from the observed
 write-mode enum and is not evidence of actual metadata replies in those modes.
 
-All observed write replies are exactly `{"status":"Accepted","data":""}`. Plans use wire amperes such as `32.0`;
+All observed proprietary write replies are exactly `{"status":"Accepted","data":""}`. Plans use wire amperes such as `32.0`;
 retained native fields encode tenths of an ampere. Scaling is applied only where actual evidence establishes it.
 The app's fresh RemoteStart uses a new tag, and its current slider installs a new transaction-specific profile.
 A previous session's 6 A TxProfile did not constrain the next session; the app had to apply a new 6 A profile.
@@ -121,8 +122,22 @@ Captured OCPP current samples in that part of the trial were zero; they do not e
 DelayStop's 15-minute minimum was set and immediately cancelled. The original 32 A setting, Fast mode and daily
 schedule were restored, then Stop was confirmed at zero power with the cable still plugged in. That trial necessarily
 added history and replaced an old unrelated profile; session/history/profile bytes were not restored to their baseline.
-An uninterrupted full-charge observation is ongoing and separate from these committed fixtures; an automatic
-full-charge stop is not yet demonstrated.
+A subsequent uninterrupted charge used the original app/backend at its restored 32 A setting. The owner reported
+that the SEAT app said charging had finished. Native readings reached 0 A / 0 W with CP B, and the charger sent
+`SuspendedEV`. At the retained observation boundary, its fourth transaction was still open: no StopTransaction
+was invented for the replay. Finishing power delivery and closing an OCPP session are separate events.
+Removing the lead also left the native transaction open while the charger reported unplugged at 0 A / 0 W.
+The complete 789-frame trace contains 399 CALLs and is covered by a second TLS replay, ending with an open transaction.
+The retained final OCPP current sample was 0.4 A; zero current/power was established separately from native reads.
+Manual cleanup through the original Android app is recorded separately from this fixture. This bounds the observation;
+it does not prove that an automatic Stop could never arrive later. The final OCPP status remained SuspendedEV even
+after native readings showed unplugged. A future Home Assistant adapter must retain the existing LAN plug indicator
+rather than infer vehicle connection from OCPP status alone.
+
+After that capture boundary, manual Stop in the Android app received Accepted, generated a matching
+StopTransaction with reason Remote and received its acknowledgement. Native readback confirmed no active
+transaction, unplugged and 0 A / 0 W. Configuration, schedule and SMART profile data exactly matched the baseline
+for this uninterrupted trial. Its real session added one history record (5 to 6) and 769 Wh; history was not erased.
 
 ### Remaining boundaries before a live proxy trial
 

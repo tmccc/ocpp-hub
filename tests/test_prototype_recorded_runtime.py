@@ -8,6 +8,7 @@ import ssl
 from pathlib import Path
 from typing import Any
 
+import pytest
 from ocpp_hub_core.frames import build_call, build_call_result
 from ocpp_hub_core.prototype.gateway import Gateway, decode
 from ocpp_hub_core.prototype.policy import Policy
@@ -23,10 +24,6 @@ from tests.test_prototype_runtime import FAST, NOW, until
 from tests.test_prototype_tls import admission as admission
 from tests.test_prototype_tls import tls as tls
 
-CAPTURE = json.loads((Path(__file__).parent / "fixtures/ics-vehicle-controls.sanitized.json").read_text())
-ROWS = CAPTURE["frames"]
-REPLIES = {(row["direction"], row["frame"][1]): row["frame"] for row in ROWS if row["frame"][0] != 2}
-
 
 # Compare embedded JSON without requiring whitespace/key order to remain identical after translation.
 def semantic(payload: dict[str, Any]) -> dict[str, Any]:
@@ -38,13 +35,30 @@ def semantic(payload: dict[str, Any]) -> dict[str, Any]:
 
 # Intent: exercise every captured CALL through the actual TLS runtime, including new vendor-generated tags.
 # Why: isolated payload tests cannot establish request ordering, grant lifetimes or transaction/profile alignment.
+@pytest.mark.parametrize(
+    ("fixture_name", "frame_count", "expected_open_vendor"),
+    [
+        ("ics-vehicle-controls.sanitized.json", 721, None),
+        ("ics-completion-observation.sanitized.json", 789, 6000004),
+    ],
+)
 async def test_complete_recorded_runtime(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], admission: Admission
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    admission: Admission,
+    fixture_name: str,
+    frame_count: int,
+    expected_open_vendor: int | None,
 ) -> None:
-    assert len(ROWS) == CAPTURE["frame_count"] == 721
+    capture = json.loads((Path(__file__).parent / "fixtures" / fixture_name).read_text())
+    rows = capture["frames"]
+    replies = {(row["direction"], row["frame"][1]): row["frame"] for row in rows if row["frame"][0] != 2}
+    assert len(rows) == capture["frame_count"] == frame_count
     server_tls, client_tls, _ = tls
-    starts = [r["frame"][3] for r in ROWS if r["frame"][0] == 2 and r["frame"][2] == "StartTransaction"]
-    assert len(starts) == 3 and starts[-1]["idTag"] != starts[0]["idTag"]
+    start_calls = [r["frame"] for r in rows if r["frame"][0] == 2 and r["frame"][2] == "StartTransaction"]
+    vendor_ids = [replies[("cloud_to_charger", f[1])][2]["transactionId"] for f in start_calls]
+    starts = [f[3] for f in start_calls]
+    assert len(starts) >= 3 and starts[-1]["idTag"] != starts[0]["idTag"]
     policy = Policy(
         max_current_a=32,
         allowed_tags=frozenset({starts[0]["idTag"]}),
@@ -163,13 +177,13 @@ async def test_complete_recorded_runtime(
                     missing_meter_acks = 0
                     expected_refusals = 0
                     count = 0
-                    for row in ROWS:
+                    for row in rows:
                         frame = row["frame"]
                         if frame[0] != 2:
                             continue
                         direction = row["direction"]
                         opposite = "cloud_to_charger" if direction == "charger_to_cloud" else "charger_to_cloud"
-                        reply = REPLIES.get((opposite, frame[1]))
+                        reply = replies.get((opposite, frame[1]))
                         if direction == "charger_to_cloud":
                             if reply is None:
                                 assert frame[2] == "MeterValues"
@@ -200,11 +214,18 @@ async def test_complete_recorded_runtime(
                                 assert answer[0] == 3, frame[2:]
                                 assert semantic(answer[2]) == semantic(reply[2])
                         count += 1
-                    assert count == sum(row["frame"][0] == 2 for row in ROWS)
+                    assert count == sum(row["frame"][0] == 2 for row in rows)
                     assert missing_meter_acks == 9 and expected_refusals == 1
                     assert forwarded > 200
-                    assert store.active() is None
-                    assert store.vendor_id(1003) == 6000003
+                    active = store.active()
+                    assert (None if active is None else store.vendor_id(active)) == expected_open_vendor
+                    if expected_open_vendor is not None:
+                        assert (
+                            store.db.execute("SELECT stop FROM transactions WHERE local=?", (active,)).fetchone()[0]
+                            is None
+                        )
+                        assert store.get("last_status")["status"] == "SuspendedEV"
+                    assert [store.vendor_id(1001 + i) for i in range(len(starts))] == vendor_ids
                     assert not gateway.failures
                     assert store.get("vendor_profiles") == {}
                     assert list(firmware.plans) == [2000001]
