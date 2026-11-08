@@ -16,6 +16,9 @@
   oversized journal tokens. Reject duplicate JSON keys and malformed nested text before forwarding.
 - Keep newly accepted historical Starts unconfirmed until current observations arrive. Document real app/API evidence,
   missing upstream heartbeat runtime, untested boot/authentication, schedules/current changes and cutover reconciliation.
+- Record an authorised app follow-up capturing actual `IoCharger/setTransaction`, `clearPlans` and `setPlan` exchanges.
+  Verify restored mode/timer controls, including the original plan activation time, while preserving existing profiles.
+  These proprietary writes remain explicitly blocked pending codecs and policy; no live proxy was deployed.
 - This remains an offline prototype, not a release or a fully validated iCS2.0Lite/hardware integration.
 
 ## 0.2.1

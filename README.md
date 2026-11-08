@@ -93,7 +93,7 @@ dropped or presented as a confirmed cloud acknowledgement.
 | Diagnostics | An actual GetDiagnostics request is retained in the fixture and explicitly refused in replay. | Vendor diagnostic upload/support is intentionally unavailable under the default policy. |
 | Authorisation | Observed Authorize status matches an explicitly approved local tag. | Local replies do not reproduce the cloud's optional expiry/parent-tag metadata, including optional StopTransaction `idTagInfo`. Full cloud authorisation/cache semantics remain unverified. |
 | Current ceiling | Retained settings and GetConfiguration show a 32 A configured limit; explicitly configured synthetic profiles at 32 A pass and 33 A fail. The default remains 16 A. | No actual SetChargingProfile or current-change exchange was captured. Device acceptance, profile precedence and minimum-current semantics are unverified. |
-| Schedules and app controls | Static Android code establishes separate authenticated HTTP APIs and schedule models. App remote start uses point/connector ids, stop uses an API transaction id, and limit setting is a mutating GET with a string current value. | HTTP API ids must not be assumed interchangeable with OCPP ids. Schedule create/update/toggle and fractional-current behavior have no corresponding wire capture or end-to-end test. |
+| Schedules and app controls | Static Android code establishes separate authenticated HTTP APIs and schedule models. App remote start uses point/connector ids, stop uses an API transaction id, and limit setting is a mutating GET with a string current value. The subsequent authorised app trial below captures existing-plan toggling. | HTTP API ids must not be assumed interchangeable with OCPP ids. Plan creation/editing and fractional-current behavior remain unverified. |
 | Admission and idle operation | Both loopback WSS legs verify synthetic credentials and certificates; the exact iCS codec is tested over real local TLS websockets. | Actual Boot, Basic credentials and websocket admission remain untested. The engine answers charger Heartbeats locally but has no independent upstream heartbeat scheduler; negotiated intervals, reconnect/outbox scheduling and long-idle Ping/Pong need a runtime runner. |
 | Existing sessions | Retained LAN history contains several unresolved/open records; unknown pre-cutover ids and overlapping Starts are refused. | A future cutover requires a clean session boundary or independently verified migration/reconciliation. No historical Stop may be invented. |
 
@@ -108,7 +108,45 @@ observation arrives. The read-only historical mapping never permits a stop/profi
 **Assessment: the observed message subset is compatible with the explicit offline policy after these fixes; full app
 coexistence and a live switchover are not yet validated.** The idle-runtime gap, actual authentication/boot, session
 reconciliation and uncaptured schedule/current commands must be addressed or validated before a controlled trial.
-The prototype is deliberately not wired into the existing integration setup or its UI. Original documentation follows.
+The prototype is deliberately not wired into the existing integration setup or its UI.
+
+### Follow-up: authorised Android app observations
+
+A later, explicitly authorised trial used the existing iCS2.0Lite 1.7.3 app on the owner's USB-connected phone.
+Its installed APK matched the previously inspected package. Readable process-scoped HTTP logs were available without
+TLS interception, an app modification, certificates or proxy changes. Matching native station ids/serials verified
+that app and charger referred to the same equipment. The original charger/cloud connection remained in place.
+
+Six actual correlated charger/cloud control exchanges were captured: three `IoCharger/setTransaction` requests
+(Fast on opening the page, then Eco, then Fast), one `IoCharger/clearPlans` and two `IoCharger/setPlan` requests.
+All are OCPP DataTransfer messages with **JSON-string** data and actual replies `{"status":"Accepted","data":""}`.
+Private complete exports and ring snapshots are retained outside the repository; the six redacted pairs are explicitly
+selected message-type evidence, not a complete or byte-identical session fixture.
+
+- `setTransaction` carries `transactionId` and `eco`. Merely opening the transaction page sent `eco: Fast` automatically.
+- `clearPlans` carries an array of plan ids; the observed id matches the existing plan.
+- `setPlan` carries the same plan id, type/stop model, `limitCurrent`, `stopValue`, `validTime`, start time, connector,
+  recurrence, authorisation tag and eco mode. Observed wire current `32.0` becomes native plan current `320`; this proves
+  scaling for this plan field only and must not be assumed for unrelated SMART profile fields.
+
+Fast → Eco → Fast and the existing future plan's enabled → disabled → enabled controls were tested. Re-enabling the
+plan through the app also changed its `validTime`. Replaying the observed status API with the original instant in the
+app's millisecond ISO format restored the exact native plan, including its original activation time and record id.
+The API rejected the same instant without milliseconds; no timestamp was rounded. Final readback verified exact
+configuration, schedule, profile and history equality with baseline, plus the same enabled cloud schedule record.
+The current slider was left at 32 A; no current-limit or start/stop test disturbed the separate historical SMART profile.
+Opening the app populated one previously `NA` historical session mode field with `Fast`; actual operating mode was
+already Fast. This metadata difference is retained explicitly rather than described as an exact session-state rollback.
+
+The app API reported a stale `Plugged`/active session while native readings remained unplugged with zero current and
+power. The detailed app page displayed 0.0 A/Suspended even while the station list said Charging. These are not evidence
+of actual charging. No Home Assistant configuration or charger backend was changed, and the temporary phone logging
+property was restored.
+
+**Compatibility consequence:** the prototype correctly refuses all six newly observed proprietary writes under its
+current policy. They need explicit codecs, identifier translation and ownership/current-limit rules before support
+can be enabled. This trial supplies actual mode/timer evidence; it does not establish a working live proxy, actual
+current-change behavior, schedule creation/editing or successful history replay. Original documentation follows.
 
 ---
 
