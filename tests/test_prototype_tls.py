@@ -26,6 +26,7 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import InvalidStatus
 
+from tests.prototype_firmware import Firmware
 from tests.test_prototype_ics import CALLS, ICS_POLICY, STARTS
 
 
@@ -70,6 +71,28 @@ def admission() -> Admission:
     return Admission("OFFLINE001", basic_auth_header("OFFLINE001", "synthetic-secret-only")[1])
 
 
+# A fake device answers server RPCs independently while waiting for its own correlated local reply.
+async def charger_reply(charger: Any, token: str, firmware: Firmware) -> list[Any]:
+    while True:
+        frame = decode(await charger.recv())
+        if frame[0] == 2:
+            await charger.send(build_call_result(frame[1], firmware.answer(frame[2], frame[3])))
+        elif frame[1] == token:
+            if token == "start":
+                firmware.active = frame[2]["transactionId"]
+            elif token == "stop":
+                firmware.active = None
+            return frame
+
+
+# Complete a real station-profile exchange and answer the following composite read from device state.
+async def accept_cap(charger: Any, command: list[Any], firmware: Firmware) -> None:
+    await charger.send(build_call_result(command[1], firmware.answer(command[2], command[3])))
+    verification = decode(await charger.recv())
+    assert verification[2] == "GetCompositeSchedule"
+    await charger.send(build_call_result(verification[1], firmware.answer(verification[2], verification[3])))
+
+
 # Intent: run the actual gateway across two authenticated TLS websocket legs and replay a session.
 # Why: unit-level message tests alone do not prove framing, encryption or upstream header/path preservation.
 async def test_prototype_tls_two_leg_gateway(
@@ -79,6 +102,7 @@ async def test_prototype_tls_two_leg_gateway(
     server_context, client_context, _ = tls
     journal = Journal(tmp_path / "journal.db", admission.identity)
     gateway = Gateway(journal, timeout=0.5)
+    firmware = Firmware()
     vendor_headers: list[list[str]] = []
     vendor_paths: list[str] = []
     vendor_calls: list[list[Any]] = []
@@ -94,7 +118,7 @@ async def test_prototype_tls_two_leg_gateway(
                 {"transactionId": 9001, "idTagInfo": {"status": "Accepted"}} if frame[2] == "StartTransaction" else {}
             )
             if frame[2] == "BootNotification":
-                result = {"status": "Accepted", "interval": 60}
+                result = {"status": "Accepted", "interval": 60, "currentTime": "2030-01-01T00:00:00Z"}
             await connection.send(build_call_result(frame[1], result))
 
     # Authentication already ran before this handler can attach the charger.
@@ -119,7 +143,7 @@ async def test_prototype_tls_two_leg_gateway(
                 proxy=None,
             ) as charger:
                 await charger.send(build_call("boot", "BootNotification", {"chargePointVendor": "SYNTHETIC"}))
-                assert decode(await charger.recv())[2]["status"] == "Accepted"
+                assert (await charger_reply(charger, "boot", firmware))[2]["status"] == "Accepted"
                 await charger.send(
                     build_call(
                         "start",
@@ -132,7 +156,7 @@ async def test_prototype_tls_two_leg_gateway(
                         },
                     )
                 )
-                assert decode(await charger.recv())[2]["transactionId"] == 1001
+                assert (await charger_reply(charger, "start", firmware))[2]["transactionId"] == 1001
 
                 # Connect only to the fake cloud and keep its receiver free for correlated replies.
                 async with offline_vendor(base, admission, client_context) as vendor:
@@ -149,7 +173,7 @@ async def test_prototype_tls_two_leg_gateway(
                     limit = asyncio.create_task(gateway.set_limit(12))
                     command = decode(await charger.recv())
                     assert command[2] == "SetChargingProfile"
-                    await charger.send(build_call_result(command[1], {"status": "Accepted"}))
+                    await accept_cap(charger, command, firmware)
                     assert (await limit)[2]["status"] == "Accepted"
                     reader.cancel()
                     await asyncio.gather(reader, return_exceptions=True)
@@ -171,6 +195,7 @@ async def test_prototype_tls_ics_transaction_query(
     server_context, client_context, _ = tls
     journal = Journal(tmp_path / "journal.db", admission.identity)
     gateway = Gateway(journal, ICS_POLICY, timeout=1)
+    firmware = Firmware()
     vendor_connection: asyncio.Future[ServerConnection] = asyncio.get_running_loop().create_future()
     cloud_replies: asyncio.Queue[list[Any]] = asyncio.Queue()
 
@@ -184,7 +209,7 @@ async def test_prototype_tls_ics_transaction_query(
                 continue
             result: dict[str, Any] = {}
             if frame[2] == "BootNotification":
-                result = {"status": "Accepted", "interval": 60}
+                result = {"status": "Accepted", "interval": 60, "currentTime": "2030-01-01T00:00:00Z"}
             elif frame[2] == "StartTransaction":
                 result = {"transactionId": 6000001, "idTagInfo": {"status": "Accepted"}}
             await connection.send(build_call_result(frame[1], result))
@@ -211,9 +236,9 @@ async def test_prototype_tls_ics_transaction_query(
             ) as charger:
                 # Boot is synthetic because no actual boot frame was present in the exported logs.
                 await charger.send(build_call("boot", "BootNotification", {"chargePointVendor": "SYNTHETIC"}))
-                assert decode(await charger.recv())[2]["status"] == "Accepted"
+                assert (await charger_reply(charger, "boot", firmware))[2]["status"] == "Accepted"
                 await charger.send(build_call("start", "StartTransaction", STARTS[0]))
-                assert decode(await charger.recv())[2]["transactionId"] == 1001
+                assert (await charger_reply(charger, "start", firmware))[2]["transactionId"] == 1001
                 async with offline_vendor(
                     f"wss://127.0.0.1:{vendor_port}/ocpp/charger", admission, client_context
                 ) as vendor:
@@ -235,7 +260,7 @@ async def test_prototype_tls_ics_transaction_query(
                                 await charger.send(
                                     build_call("stop", "StopTransaction", {**stop, "transactionId": 1001})
                                 )
-                                assert decode(await charger.recv())[2] == {}
+                                assert (await charger_reply(charger, "stop", firmware))[2] == {}
                                 await gateway.flush()
                             token = f"query-{completed}"
                             await cloud.send(build_call(token, "DataTransfer", query))

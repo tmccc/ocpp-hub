@@ -78,6 +78,6 @@ class TransactionQuery:
         if payload.get("status") != "Accepted" or set(payload) != {"status", "data"}:
             raise DeniedError("unobserved iCS transaction response")
         data = data_object(payload["data"], {"transactionId", "eco"})
-        if data["transactionId"] != self.local or data["eco"] != "Fast":
+        if data["transactionId"] != self.local or data["eco"] not in ("Fast", "Eco", "EcoPlus"):
             raise DeniedError("iCS response differs from observed transaction metadata")
         return [3, frame[1], {**payload, "data": encoded({**data, "transactionId": self.vendor})}]

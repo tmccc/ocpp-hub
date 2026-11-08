@@ -105,6 +105,10 @@ def offline_server(
     context: ssl.SSLContext,
     host: str = "127.0.0.1",
     port: int = 0,
+    *,
+    ping_interval: float = 20,
+    ping_timeout: float = 20,
+    close_timeout: float = 2,
 ) -> serve:
     if not loopback(host) or context.protocol != ssl.PROTOCOL_TLS_SERVER:
         raise SecurityError("offline server requires loopback and a server TLS context")
@@ -117,11 +121,14 @@ def offline_server(
         process_request=admission.process,
         logger=TRANSPORT_LOG,
         max_size=131072,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+        close_timeout=close_timeout,
     )
 
 
-# Forward the admitted header only to one fixed, verified loopback vendor endpoint.
-def offline_vendor(base_url: str, admission: Admission, context: ssl.SSLContext) -> FixedVendorConnect:
+# Validate the destination without constructing a connector, resolving DNS or requiring a running loop.
+def validate_offline_vendor(base_url: str, context: ssl.SSLContext) -> None:
     parts = urlsplit(base_url)
     if (
         parts.scheme != "wss"
@@ -133,6 +140,19 @@ def offline_vendor(base_url: str, admission: Admission, context: ssl.SSLContext)
     ):
         raise SecurityError("offline vendor must be a fixed authenticated loopback WSS endpoint")
     require_verified_tls(context)
+
+
+# Forward the admitted header only to one fixed, verified loopback vendor endpoint.
+def offline_vendor(
+    base_url: str,
+    admission: Admission,
+    context: ssl.SSLContext,
+    *,
+    ping_interval: float = 20,
+    ping_timeout: float = 20,
+    close_timeout: float = 2,
+) -> FixedVendorConnect:
+    validate_offline_vendor(base_url, context)
     return FixedVendorConnect(
         join_websocket_url(base_url, admission.identity),
         ssl=context,
@@ -141,4 +161,8 @@ def offline_vendor(base_url: str, admission: Admission, context: ssl.SSLContext)
         logger=TRANSPORT_LOG,
         proxy=None,
         open_timeout=1,
+        max_size=131072,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+        close_timeout=close_timeout,
     )

@@ -1,25 +1,24 @@
 # Changelog
 
-## Unreleased — offline ICS prototype
+## Unreleased — offline iCS prototype
 
-- Add an isolated, HA-free local-authoritative gateway with private durable transactions, outbox and mutation
-  uncertainty, using OCPP Hub's frame and command helpers. Normal integration setup remains unchanged.
-- Add explicit vendor passthrough with actual peer replies, request deduplication, both-direction transaction
-  translation, priority for local stop, owned profile ids and strict single-phase limits.
-- Add authenticated loopback WSS adapters and an offline network-guarded test runner. Cover restart and storage
-  failures, duplicate messages, uncertain cloud acknowledgements, reconnect races, TLS trust and authorization.
-- Validate a complete privacy-transformed 517-frame actual iCS log capture; exercise its 263 requests with simulated
-  peers, preserving unmatched records and explicitly identifying a blocked diagnostic upload and local authorisation.
-- Add the observed cloud-origin `IoCharger/getTransaction` read codec: translate nested JSON-string ids in requests and
-  actual Accepted metadata replies, including completed sessions; reject unknown shapes and mappings.
-- Fix generated OCPP request ids to fit the 36-character limit, reject oversized incoming ids and quarantine old
-  oversized journal tokens. Reject duplicate JSON keys and malformed nested text before forwarding.
-- Keep newly accepted historical Starts unconfirmed until current observations arrive. Document real app/API evidence,
-  missing upstream heartbeat runtime, untested boot/authentication, schedules/current changes and cutover reconciliation.
-- Record an authorised app follow-up capturing actual `IoCharger/setTransaction`, `clearPlans` and `setPlan` exchanges.
-  Verify restored mode/timer controls, including the original plan activation time, while preserving existing profiles.
-  These proprietary writes remain explicitly blocked pending codecs and policy; no live proxy was deployed.
-- This remains an offline prototype, not a release or a fully validated iCS2.0Lite/hardware integration.
+- Add an isolated HA-free durable gateway and an offline TLS runtime. Keep the normal Home Assistant setup unchanged.
+- Keep local controls independent of cloud reconnects, registration retries, negotiated OCPP heartbeats, Ping/Pong and
+  quarantined history delivery. Retire a cloud session when its actual charger connection disappears or changes.
+- Give local stop priority and persist/reapply a zero-current station profile in the offline model. Verify schedule coverage,
+  preserve lower resume ceilings, finish owned operations after client cancellation and roll back failed releases.
+- Add exact observed `IoCharger` metadata, Fast/Eco/EcoPlus, recurring/one-off plan and delayed-stop codecs, with explicit
+  policy opt-in, active-transaction translation, stable plan namespaces and confirmed ownership before clearing.
+- Handle changing app-generated tags with optional bounded single-start grants. Commit grants, lifecycle facts,
+  receipts and queued events atomically; quarantine ambiguous mutations and storage failures rather than invent success.
+- Bound ids/resources, retire transaction profiles without alias reuse, reject malformed JSON/time/type variants and
+  preserve actual peer CALLERROR fields. Generated OCPP request ids fit the 36-character maximum.
+- Retain complete privacy-transformed 517-, 551- and 721-frame captures with provenance. Replay all 365 CALLs of the
+  largest capture through both authenticated loopback TLS legs, including independently modelled 6 A profile effects,
+  nine explicitly simulated missing meter acknowledgements and one deliberately refused diagnostic upload.
+- Document actual authorised Android-app trials and their restoration limits. Those trials used the original backend;
+  no proxy was connected and no live Home Assistant setup changed. Hardware ceiling enforcement, authenticated cutover,
+  full authorisation/cache semantics and real cloud history replay remain unvalidated. This is not a release.
 
 ## 0.2.1
 

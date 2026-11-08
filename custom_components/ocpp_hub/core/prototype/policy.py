@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,9 @@ class Policy:
 
     max_current_a: float = 16.0
     phases: int = 1
+    local_stack_level: int = 16
+    trust_vendor_start_tags: bool = False
+    vendor_tag_ttl_s: int = 120
     allowed_tags: frozenset[str] = frozenset({"LOCAL_TEST"})
     extensions: dict[tuple[str, str], str] = field(default_factory=dict)
     configuration_keys: frozenset[str] = frozenset()
@@ -58,6 +62,10 @@ class Policy:
     def __post_init__(self) -> None:
         if number(self.max_current_a, 32) < 6 or self.phases != 1:
             raise DeniedError("prototype requires a 6–32 A single-phase ceiling")
+        integer(self.local_stack_level, 1, 255)
+        integer(self.vendor_tag_ttl_s, 1, 300)
+        if type(self.trust_vendor_start_tags) is not bool:
+            raise DeniedError("vendor tag trust must be explicit")
         if any(mode not in ("read", "write") for mode in self.extensions.values()):
             raise DeniedError("extensions must be explicitly classified as read or write")
 
@@ -68,6 +76,15 @@ class Policy:
             if not isinstance(vendor, str) or not isinstance(message, str):
                 raise DeniedError("vendor extension identifiers must be strings")
             rule = self.extensions.get((vendor, message))
+            intrinsic = {
+                "getTransaction": "read",
+                "setTransaction": "write",
+                "setPlan": "write",
+                "clearPlans": "write",
+                "delayStop": "write",
+            }
+            if vendor == "IoCharger" and message in intrinsic and rule != intrinsic[message]:
+                raise DeniedError("known iCS commands require their intrinsic read/write classification")
             if rule is None:
                 raise DeniedError("vendor extension is not explicitly allowed")
             return rule
@@ -79,7 +96,12 @@ class Policy:
 
     # Validate a cloud command on the single connector before its transaction ids are translated.
     def validate(self, action: str, payload: dict[str, Any]) -> None:
-        if action == "SetChargingProfile":
+        if action == "DataTransfer" and payload.get("vendorId") == "IoCharger":
+            from .ics_writes import known_write, validate_write
+
+            if known_write(payload):
+                validate_write(payload, self)
+        elif action == "SetChargingProfile":
             self.profile(payload)
         elif action == "ClearChargingProfile":
             if set(payload) != {"id"} or integer(payload["id"]) == HUB_PROFILE_ID:
@@ -93,7 +115,10 @@ class Policy:
                 raise DeniedError("configuration key is not explicitly allowed")
         elif action == "RemoteStartTransaction":
             tag = payload.get("idTag")
-            if not isinstance(tag, str) or tag not in self.allowed_tags:
+            dynamic = (
+                self.trust_vendor_start_tags and isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,20}", tag)
+            )
+            if not isinstance(tag, str) or (tag not in self.allowed_tags and not dynamic):
                 raise DeniedError("start tag or connector is not allowed")
             integer(payload.get("connectorId", 1), 1, 1)
             if "chargingProfile" in payload:
@@ -116,12 +141,12 @@ class Policy:
             raise DeniedError("charging profile must be an object")
         if integer(profile.get("chargingProfileId")) == HUB_PROFILE_ID:
             raise DeniedError("cloud cannot replace the local profile")
-        integer(profile.get("stackLevel"), maximum=255)
+        stack = integer(profile.get("stackLevel"), maximum=255)
         purpose = profile.get("chargingProfilePurpose")
         if purpose not in ("ChargePointMaxProfile", "TxDefaultProfile", "TxProfile"):
             raise DeniedError("unsupported profile purpose")
-        if purpose == "ChargePointMaxProfile" and connector != 0:
-            raise DeniedError("station profile requires connector zero")
+        if purpose == "ChargePointMaxProfile" and (connector != 0 or stack >= self.local_stack_level):
+            raise DeniedError("station profile cannot replace the reserved local ceiling stack")
         if purpose == "TxProfile":
             integer(profile.get("transactionId"))
             if connector != 1:

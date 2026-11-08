@@ -9,17 +9,18 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from .. import commands
-from ..control import HUB_PROFILE_ID
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
+from .authorisation import VendorAuthorisation
 from .events import validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
+from .ics_writes import IcsWrite, known_write
+from .local_control import LocalControl
+from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
-from .rpc import InboundCache, Peer, Sender, UnavailableError, reply_as
+from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
 from .store import ConflictError, Journal, RecoveryRequiredError, encoded, fingerprint
 
 
@@ -69,14 +70,22 @@ class Gateway:
     # Nothing connects here; an offline harness must explicitly supply the peer senders.
     def __init__(self, journal: Journal, policy: Policy | None = None, timeout: float = 1.0) -> None:
         self.journal = journal
+        self.plans = PlanBook(journal)
         self.policy = policy or Policy()
         self.charger = Peer("local", timeout)
         self.vendor = Peer("vendor", timeout)
+        self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
+        self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self._tasks: set[asyncio.Task[None]] = set()
         self._flush_lock = asyncio.Lock()
         self._boot_lock = asyncio.Lock()
         self._vendor_ready = False
+        self.vendor_interval = 60
+        self.vendor_registration = "disconnected"
+        self._boot_retry_at = 0.0
         self._charger_epoch = 0
+        self._boot_charger_epoch = -1
+        self._boot_seen = asyncio.Event()
         self._vendor_epoch = 0
         self._inbound = InboundCache()
         self.failures: list[str] = []
@@ -86,22 +95,49 @@ class Gateway:
         epoch = self.journal.connection_epoch()
         self.charger.detach()
         self._charger_epoch = epoch
+        self._boot_seen.clear()
         self._inbound.retire("charger", epoch)
         self.charger.sender = sender
         return epoch
 
     # Reconnecting the vendor requires a fresh BootNotification before queued traffic.
-    def attach_vendor(self, sender: Sender) -> None:
+    def attach_vendor(self, sender: Sender) -> int:
         self.vendor.detach()
         self._vendor_epoch += 1
         self._inbound.retire("vendor", self._vendor_epoch)
         self.vendor.sender = sender
         self._vendor_ready = False
+        self.vendor_registration = "connected"
+        return self._vendor_epoch
+
+    # A retired reader cannot detach a newer authenticated charger.
+    def detach_charger(self, epoch: int) -> None:
+        if epoch == self._charger_epoch:
+            self.charger.detach()
+            self._charger_epoch = self.journal.connection_epoch()
+
+    # A vendor outage never closes the local charger or cancels its handlers.
+    def detach_vendor(self, epoch: int) -> None:
+        if epoch == self._vendor_epoch:
+            self.vendor.detach()
+            self._vendor_epoch += 1
+            self._vendor_ready = False
+            self.vendor_registration = "disconnected"
+
+    # A persisted introduction is useful for history but is not proof of the current charger generation.
+    def current_boot_seen(self, epoch: int) -> bool:
+        return epoch == self._charger_epoch and self._boot_charger_epoch == epoch
+
+    # Waiters still check generation after waking, so a replacement's Boot cannot introduce an old connection.
+    async def wait_for_boot(self, epoch: int) -> None:
+        await self._boot_seen.wait()
+        self._require_epoch("charger", epoch)
 
     # Stop pending work without delivering another command or discarding durable events.
     async def close(self) -> None:
         self.charger.detach()
         self.vendor.detach()
+        await self.controls.close()
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -176,7 +212,7 @@ class Gateway:
         vendor_epoch = self._vendor_epoch
         try:
             if action == "DataTransfer":
-                if is_transaction_query(payload):
+                if is_transaction_query(payload) or known_write(payload):
                     raise DeniedError("this iCS query is supported only from the cloud")
                 self._extension_allowed(payload)
                 await self._ensure_vendor_boot()
@@ -196,6 +232,8 @@ class Gateway:
                     self.journal.mutation_finished(mutation, True)
                 text = reply_as(answer, token)
             else:
+                if action in ("Authorize", "StartTransaction") and self._tag_allowed(payload.get("idTag")):
+                    await self.controls.ensure_ceiling()
                 receipt = f"{epoch}:{token}"
                 text = build_call_result(token, self._local_answer(receipt, action, payload))
         except DeniedError, ConflictError:
@@ -204,7 +242,10 @@ class Gateway:
             )
         except UnavailableError, RecoveryRequiredError, sqlite3.Error:
             if mutation:
-                self.journal.mutation_finished(mutation, False)
+                try:
+                    self.journal.mutation_finished(mutation, False)
+                except sqlite3.Error:
+                    self.failures.append("JournalUnavailable")
             text = build_call_error(token, "InternalError", "outcome unavailable; success was not confirmed")
         return text
 
@@ -212,25 +253,35 @@ class Gateway:
     def _local_answer(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "BootNotification":
             self.journal.put("boot", payload)
+            self._boot_charger_epoch = self._charger_epoch
+            self._boot_seen.set()
             return {"status": "Accepted", "interval": 60, "currentTime": datetime.now(UTC).isoformat()}
         if action == "Heartbeat":
             return {"currentTime": datetime.now(UTC).isoformat()}
         if action == "Authorize":
             tag = payload.get("idTag")
-            allowed = isinstance(tag, str) and tag in self.policy.allowed_tags
+            allowed = self._tag_allowed(tag)
             return {"idTagInfo": {"status": "Accepted" if allowed else "Invalid"}}
         if action == "StartTransaction":
             integer(payload.get("connectorId"), 1, 1)
             number(payload.get("meterStart"), 1e12)
             timestamp(payload.get("timestamp"))
-            if not isinstance(payload.get("idTag"), str) or payload["idTag"] not in self.policy.allowed_tags:
+            known = self.journal.known_start(payload)
+            if not known and not self._tag_allowed(payload.get("idTag")):
                 raise DeniedError("tag is not approved for local authorization")
-            return self.journal.start(token, payload)
+
+            # Permission binding and the pending flag belong to the very same commit as the new Start fact.
+            def accepted(local: int) -> None:
+                self.authorisation.consume(payload["idTag"], local)
+                control = self.journal.get("control", {})
+                self.journal.put("control", {**control, "start_pending": False})
+
+            return self.journal.start(token, payload, accepted)
         if action == "StopTransaction":
             integer(payload.get("transactionId"))
             number(payload.get("meterStop"), 1e12)
             timestamp(payload.get("timestamp"))
-            return self.journal.stop(token, payload)
+            return self.journal.stop(token, payload, self.authorisation.retire)
         if action in (
             "StatusNotification",
             "MeterValues",
@@ -254,6 +305,14 @@ class Gateway:
             return {}
         raise DeniedError("unsupported charger request")
 
+    # Local stop overrides both the static allowlist and an app-generated trusted vendor start grant.
+    def _tag_allowed(self, tag: Any) -> bool:
+        if not isinstance(tag, str) or self.journal.get("control", {}).get("inhibit"):
+            return False
+        return tag in self.policy.allowed_tags or (
+            self.policy.trust_vendor_start_tags and self.authorisation.allows(tag)
+        )
+
     # Opaque writes obey the same owner lock as standard mutations.
     def _extension_allowed(self, payload: dict[str, Any]) -> None:
         kind = self.policy.kind("DataTransfer", payload)
@@ -266,14 +325,19 @@ class Gateway:
         original: dict[str, Any] = frame[3]
         mutation: str | None = None
         query: TransactionQuery | None = None
+        ics_write: IcsWrite | None = None
+        grant: str | None = None
         charger_epoch = self._charger_epoch
         try:
             self.policy.kind(action, original)
             self.policy.validate(action, original)
+            self._check_vendor(action, original, require_cap=False)
+            if self.policy.kind(action, original) == "write" and action != "RemoteStopTransaction":
+                await self.controls.ensure_ceiling()
 
             # Allocate profile ids and mutation intent only after the in-gate policy check succeeds.
             def prepare() -> dict[str, Any]:
-                nonlocal mutation, query
+                nonlocal mutation, query, ics_write, grant
                 self._require_epoch("vendor", epoch)
                 self._require_epoch("charger", charger_epoch)
                 self._check_vendor(action, original)
@@ -281,8 +345,13 @@ class Gateway:
                     if action == "DataTransfer" and is_transaction_query(original):
                         query = TransactionQuery.from_request(original, self.journal.historical_local_id)
                         payload = query.request(original)
+                    elif action == "DataTransfer" and known_write(original):
+                        ics_write = IcsWrite.prepare(original, self.policy, self.journal, self.plans)
+                        payload = ics_write.payload
                     else:
                         payload = self._translated_command(action, original)
+                    if action == "RemoteStartTransaction":
+                        grant = self.authorisation.reserve(original["idTag"])
                     if self.policy.kind(action, original) == "write":
                         mutation = self.journal.mutation_intent("vendor", action, original)
                 return payload
@@ -290,28 +359,44 @@ class Gateway:
             answer = await self.charger.call(action, prepare)
             if query is not None:
                 answer = query.response(answer)
-            if mutation:
-                self.journal.mutation_finished(mutation, True)
+            if grant is not None and (answer[0] != 3 or answer[2].get("status") != "Accepted"):
+                self.authorisation.revoke(grant)
+            with self.journal.atomic():
+                if ics_write is not None and ics_write.accepted(answer):
+                    self.plans.accepted(ics_write.plans, ics_write.clearing)
+                if mutation:
+                    confirmed = answer[0] != 4
+                    self.journal.mutation_finished(mutation, confirmed)
             text = reply_as(answer, token)
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, sqlite3.Error:
-            if mutation:
-                self.journal.mutation_finished(mutation, False)
-            self.journal.put("uncertain_vendor_command", {"action": action, "digest": fingerprint(original)})
+            # Storage may itself be unavailable; the already durable pre-send intent remains the recovery boundary.
+            try:
+                if mutation:
+                    self.journal.mutation_finished(mutation, False)
+                self.journal.put("uncertain_vendor_command", {"action": action, "digest": fingerprint(original)})
+            except sqlite3.Error:
+                self.failures.append("JournalUnavailable")
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
         return text
 
     # Recheck priority, owner and current transaction after acquiring the outgoing CALL gate.
-    def _check_vendor(self, action: str, payload: dict[str, Any]) -> None:
+    def _check_vendor(self, action: str, payload: dict[str, Any], require_cap: bool = True) -> None:
         kind = self.policy.kind(action, payload)
         control = self.journal.get("control", {})
+        if kind == "write" and action != "RemoteStopTransaction":
+            self.journal.require_vendor_writes_reconciled()
+            if require_cap and not self.controls.ready:
+                raise UnavailableError("station ceiling is not confirmed for this charger connection")
         if (
             kind == "write"
             and action != "RemoteStopTransaction"
             and (control.get("owner") == "local" or control.get("inhibit"))
         ):
             raise DeniedError("explicit local control has priority")
+        if action == "RemoteStartTransaction" and self.journal.active() is not None:
+            raise DeniedError("a transaction is already unresolved on this connector")
         if action == "RemoteStopTransaction" and self.journal.local_id(payload["transactionId"]) is None:
             raise DeniedError("cloud stop no longer names the active transaction")
         if action == "SetChargingProfile":
@@ -335,9 +420,13 @@ class Gateway:
             if key not in profiles:
                 if action == "ClearChargingProfile":
                     raise DeniedError("cloud does not own this profile")
-                if len(profiles) >= 128:
+                if len(profiles) >= self.journal.capacity:
                     raise DeniedError("vendor profile namespace is full")
-                profiles[key] = 100000 + len(profiles)
+                local_profile = int(self.journal.get("next_vendor_profile", 99999)) + 1
+                if local_profile >= 2**31:
+                    raise RecoveryRequiredError("vendor profile counter exhausted")
+                self.journal.put("next_vendor_profile", local_profile)
+                profiles[key] = local_profile
                 self.journal.put("vendor_profiles", profiles)
             if action == "SetChargingProfile":
                 profile["chargingProfileId"] = profiles[key]
@@ -346,82 +435,28 @@ class Gateway:
                     if local is None:
                         raise DeniedError("profile names an unknown cloud transaction")
                     profile["transactionId"] = local
+                    transactions = self.journal.get("vendor_profile_transactions", {})
+                    transactions[key] = local
+                    self.journal.put("vendor_profile_transactions", transactions)
             else:
                 payload["id"] = profiles[key]
         return payload
 
-    # Claim local ownership before queueing; an uncertain stop continues to inhibit cloud restart after a crash.
-    async def _local_command(self, action: str, payload: dict[str, Any]) -> Frame:
-        if action not in ("RemoteStartTransaction", "RemoteStopTransaction", "SetChargingProfile"):
-            raise DeniedError("unsupported local control")
-        previous = self.journal.get("control", {})
-        charger_epoch = self._charger_epoch
-        epoch = previous.get("stop_epoch", 0) + (1 if action == "RemoteStopTransaction" else 0)
-        ticket = uuid.uuid4().hex
-        inhibit = action == "RemoteStopTransaction" or (
-            previous.get("inhibit", False) and action != "RemoteStartTransaction"
-        )
-        self.journal.put(
-            "control", {"owner": "local", "inhibit": inhibit, "uncertain": True, "stop_epoch": epoch, "ticket": ticket}
-        )
-
-        # A stop cancels older queued local work as well as holding off cloud writes.
-        def check() -> None:
-            self._require_epoch("charger", charger_epoch)
-            current = self.journal.get("control", {})
-            if current.get("stop_epoch", 0) != epoch:
-                raise DeniedError("a newer local stop superseded this request")
-            if current.get("inhibit") and action == "RemoteStartTransaction":
-                raise DeniedError("a local stop inhibits this start")
-
-        try:
-            answer = await self.charger.call(
-                action, payload, priority=0 if action == "RemoteStopTransaction" else 1, check=check
-            )
-        except UnavailableError:
-            raise
-        else:
-            control = self.journal.get("control")
-            if control.get("ticket") == ticket and control.get("stop_epoch", 0) == epoch:
-                self.journal.put("control", {**control, "uncertain": False})
-            return answer
-
-    # Build the local limit with the upstream command builder under this prototype's explicit ceiling.
+    # The dedicated local service serializes safety-cap and command sequences under one priority gate.
     async def set_limit(self, value: Any) -> Frame:
-        amps = number(value, self.policy.max_current_a)
-        amps = 0.0 if amps < 6 else amps
-        return await self._local_command(
-            "SetChargingProfile",
-            commands.set_charging_profile(0, commands.PURPOSE_CHARGE_POINT_MAX, amps, HUB_PROFILE_ID),
-        )
+        return await self.controls.set_limit(value)
 
-    # Start only through an explicitly approved synthetic/local tag; never enable automatic starts.
+    # An explicit local start keeps any previous lower ceiling and restores zero if its outcome is uncertain.
     async def start(self, tag: str = "LOCAL_TEST") -> Frame:
-        if self.journal.get("control", {}).get("uncertain"):
-            raise RecoveryRequiredError("previous local command outcome is unconfirmed")
-        if tag not in self.policy.allowed_tags or self.journal.active() is not None:
-            raise DeniedError("tag is not allowed or a transaction is unresolved")
-        return await self._local_command("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
+        return await self.controls.start(tag)
 
-    # Stop the known session; a missing transaction still leaves an explicit local inhibit.
+    # A local stop installs a durable zero-current hold even when there is no known transaction to stop.
     async def stop(self) -> Frame:
-        local = self.journal.active()
-        if local is None:
-            previous = self.journal.get("control", {})
-            self.journal.put(
-                "control",
-                {**previous, "owner": "local", "inhibit": True, "stop_epoch": previous.get("stop_epoch", 0) + 1},
-            )
-            raise DeniedError("no known active transaction")
-        return await self._local_command("RemoteStopTransaction", commands.remote_stop_transaction(local))
+        return await self.controls.stop()
 
-    # Release ownership only by explicit local intent, with uncertainty acknowledged separately.
-    def release(self, acknowledge_uncertainty: bool = False) -> None:
-        if self.journal.get("control", {}).get("uncertain") and not acknowledge_uncertainty:
-            raise RecoveryRequiredError("previous command outcome is unconfirmed")
-        self.journal.put(
-            "control", {**self.journal.get("control", {}), "owner": "shared", "inhibit": False, "uncertain": False}
-        )
+    # Releasing ownership confirms the physical resume ceiling before permitting vendor writes again.
+    async def release(self, acknowledge_uncertainty: bool = False) -> None:
+        await self.controls.release(acknowledge_uncertainty)
 
     # Introduce the virtual charge point once per cloud connection without blocking the local receiver.
     async def _ensure_vendor_boot(self) -> None:
@@ -430,14 +465,46 @@ class Gateway:
             self._require_epoch("vendor", epoch)
             if self._vendor_ready:
                 return
+            remaining = self._boot_retry_at - asyncio.get_running_loop().time()
+            if remaining > 0:
+                raise RegistrationDeferredError(remaining)
             boot = self.journal.get("boot")
             if boot is None:
                 raise UnavailableError("charger has not introduced itself")
             answer = await self.vendor.call("BootNotification", boot, priority=5)
             self._require_epoch("vendor", epoch)
-            if answer[0] != 3 or answer[2].get("status") != "Accepted":
-                raise UnavailableError("vendor has not accepted the charger")
+            if answer[0] != 3:
+                raise UnavailableError("vendor registration returned a protocol error")
+            status, interval = answer[2].get("status"), answer[2].get("interval")
+            if (
+                status not in ("Accepted", "Pending", "Rejected")
+                or type(interval) is not int
+                or not 1 <= interval <= 86400
+            ):
+                raise UnavailableError("vendor registration response is invalid")
+            try:
+                timestamp(answer[2].get("currentTime"))
+            except DeniedError:
+                raise UnavailableError("vendor registration time is invalid") from None
+            self.vendor_registration = status
+            self.vendor_interval = interval
+            if status != "Accepted":
+                self._boot_retry_at = asyncio.get_running_loop().time() + interval
+                raise RegistrationDeferredError(float(interval))
             self._vendor_ready = True
+
+    # OCPP heartbeat is independent of charger traffic and even an ambiguous retained transaction.
+    async def heartbeat(self) -> None:
+        epoch = self._vendor_epoch
+        await self._ensure_vendor_boot()
+        answer = await self.vendor.call("Heartbeat", {}, priority=5, check=lambda: self._require_epoch("vendor", epoch))
+        self._require_epoch("vendor", epoch)
+        if answer[0] != 3:
+            raise UnavailableError("vendor heartbeat failed")
+        try:
+            timestamp(answer[2].get("currentTime"))
+        except DeniedError:
+            raise UnavailableError("vendor heartbeat time is invalid") from None
 
     # Deliver durable events in order; a cloud-accepted Start with a lost reply requires explicit reconciliation.
     async def flush(self) -> None:

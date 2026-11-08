@@ -1,0 +1,295 @@
+"""An independent local listener and reconnecting vendor runner, restricted to offline loopback TLS."""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import sqlite3
+import ssl
+from dataclasses import dataclass
+
+from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.server import Server, ServerConnection
+from websockets.exceptions import ConnectionClosed, InvalidHandshake
+
+from .gateway import Gateway
+from .policy import DeniedError
+from .rpc import RegistrationDeferredError, Sender, UnavailableError
+from .security import Admission, SecurityError, offline_server, offline_vendor, validate_offline_vendor
+from .store import ConflictError, RecoveryRequiredError
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    """Bounded timings; endpoint and credentials are deliberately absent from representations."""
+
+    retry_min: float = 1
+    retry_max: float = 30
+    pump_interval: float = 0.1
+    ping_interval: float = 20
+    ping_timeout: float = 20
+    close_timeout: float = 1
+    boot_probe_after: float = 0
+
+    # Reject invalid timings before opening any socket or starting a task.
+    def __post_init__(self) -> None:
+        values = (
+            self.retry_min,
+            self.retry_max,
+            self.pump_interval,
+            self.ping_interval,
+            self.ping_timeout,
+            self.close_timeout,
+        )
+        if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 300 for value in values):
+            raise ValueError("runtime timing must be finite, positive and bounded")
+        if (
+            self.retry_max < self.retry_min
+            or type(self.boot_probe_after) not in (int, float)
+            or not math.isfinite(self.boot_probe_after)
+            or not 0 <= self.boot_probe_after <= 300
+        ):
+            raise ValueError("invalid retry or boot-probe timing")
+
+
+@dataclass
+class RuntimeStatus:
+    """Observability contains counts and classifications, never frames or credentials."""
+
+    charger_connected: bool = False
+    vendor_connected: bool = False
+    reconnects: int = 0
+    heartbeats: int = 0
+    delivery_blocked: bool = False
+    boot_observed: bool = False
+    last_failure: str | None = None
+
+
+class OfflineRuntime:
+    """A cloud outage cannot stop local receive/control or erase durable events."""
+
+    # Eagerly validate the fixed destination before even binding the local loopback listener.
+    def __init__(
+        self,
+        gateway: Gateway,
+        admission: Admission,
+        vendor_url: str,
+        server_tls: ssl.SSLContext,
+        client_tls: ssl.SSLContext,
+        settings: RuntimeSettings | None = None,
+    ) -> None:
+        self.gateway = gateway
+        self.admission = admission
+        self.settings = settings or RuntimeSettings()
+        self._server_tls = server_tls
+        self._vendor_url = vendor_url
+        self._client_tls = client_tls
+        validate_offline_vendor(vendor_url, client_tls)
+        if server_tls.protocol != ssl.PROTOCOL_TLS_SERVER:
+            raise SecurityError("offline listener requires a server TLS context")
+        self.status = RuntimeStatus()
+        self._server: Server | None = None
+        self._runner: asyncio.Task[None] | None = None
+        self._session_tasks: set[asyncio.Task[None]] = set()
+        self._charger: ServerConnection | None = None
+        self._charger_lock = asyncio.Lock()
+        self._closing = False
+
+    # Expose only the ephemeral test port after startup.
+    @property
+    def port(self) -> int:
+        if self._server is None:
+            raise RuntimeError("offline runtime is not started")
+        return int(self._server.sockets[0].getsockname()[1])
+
+    # Start a literal-loopback, ephemeral listener and a separately owned cloud supervisor.
+    async def start(self) -> OfflineRuntime:
+        if self._server is not None or self._closing:
+            raise RuntimeError("offline runtime cannot be started twice")
+        s = self.settings
+        self._server = await offline_server(
+            self._charger_handler,
+            self.admission,
+            self._server_tls,
+            ping_interval=s.ping_interval,
+            ping_timeout=s.ping_timeout,
+            close_timeout=s.close_timeout,
+        )
+        self._runner = asyncio.create_task(self._vendor_runner())
+        return self
+
+    # Translate closed socket sends into the gateway's durable uncertain-outcome boundary.
+    @staticmethod
+    def _sender(connection: ClientConnection | ServerConnection) -> Sender:
+        # A bounded peer call owns the send timeout; the receiver remains independent.
+        async def send(raw: str) -> None:
+            try:
+                await connection.send(raw)
+            except ConnectionClosed:
+                raise UnavailableError("transport closed during send") from None
+
+        return send
+
+    # Admission already ran before replacement; every receive and finalizer is generation-scoped.
+    async def _charger_handler(self, connection: ServerConnection) -> None:
+        async with self._charger_lock:
+            previous = self._charger
+            epoch = self.gateway.attach_charger(self._sender(connection))
+            self._charger = connection
+            self.status.charger_connected = True
+            self.status.boot_observed = False
+        probe: asyncio.Task[None] | None = None
+        try:
+            if previous is not None:
+                await previous.close(code=1012)
+            probe = asyncio.create_task(self._boot_probe(epoch))
+            async for raw in connection:
+                await self.gateway.receive("charger", raw, epoch)
+        except (ConnectionClosed, UnavailableError, DeniedError) as error:
+            self.status.last_failure = type(error).__name__
+        finally:
+            if probe is not None:
+                probe.cancel()
+                await asyncio.gather(probe, return_exceptions=True)
+            self.gateway.detach_charger(epoch)
+            if self._charger is connection:
+                self._charger = None
+                self.status.charger_connected = False
+
+    # Explicitly enabled read-only probing never fabricates a boot or changes charger configuration.
+    async def _boot_probe(self, epoch: int) -> None:
+        try:
+            if self.settings.boot_probe_after:
+                try:
+                    await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
+                except TimeoutError:
+                    result = await self.gateway.charger.call(
+                        "TriggerMessage",
+                        {"requestedMessage": "BootNotification"},
+                        check=lambda: self.gateway._require_epoch("charger", epoch),
+                    )
+                    if result[0] != 3 or result[2].get("status") != "Accepted":
+                        raise UnavailableError("charger refused the read-only boot probe")
+                    await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
+            else:
+                await self.gateway.wait_for_boot(epoch)
+            self.status.boot_observed = self.gateway.current_boot_seen(epoch)
+            await self.gateway.controls.ensure_ceiling()
+        except UnavailableError, TimeoutError:
+            self.status.last_failure = "BootOrCeilingUnavailable"
+
+    # Recover transport loss with bounded backoff while the local listener stays alive.
+    async def _vendor_runner(self) -> None:
+        delay = self.settings.retry_min
+        while not self._closing:
+            if self._charger is None or not self.gateway.current_boot_seen(self.gateway._charger_epoch):
+                await asyncio.sleep(self.settings.pump_interval)
+                continue
+            try:
+                s = self.settings
+                async with offline_vendor(
+                    self._vendor_url,
+                    self.admission,
+                    self._client_tls,
+                    ping_interval=s.ping_interval,
+                    ping_timeout=s.ping_timeout,
+                    close_timeout=s.close_timeout,
+                ) as connection:
+                    self.status.vendor_connected = True
+                    self.status.reconnects += 1
+                    epoch = self.gateway.attach_vendor(self._sender(connection))
+                    try:
+                        await self._vendor_session(connection, epoch)
+                    finally:
+                        if self.gateway.vendor_registration == "Accepted":
+                            delay = self.settings.retry_min
+                        self.gateway.detach_vendor(epoch)
+                        self.status.vendor_connected = False
+            except (OSError, ConnectionClosed, InvalidHandshake, UnavailableError, DeniedError) as error:
+                self.status.last_failure = type(error).__name__
+            if not self._closing:
+                await asyncio.sleep(delay)
+                delay = min(self.settings.retry_max, delay * 2)
+
+    # Stop all session children when any transport/heartbeat child ends; quarantine leaves the pump alive.
+    async def _vendor_session(self, connection: ClientConnection, epoch: int) -> None:
+        charger_epoch = self.gateway._charger_epoch
+
+        # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
+        async def receive() -> None:
+            async for raw in connection:
+                await self.gateway.receive("vendor", raw, epoch)
+
+        # A virtual charge point must not stay online after its physical connection has gone away or changed.
+        async def charger_presence() -> None:
+            while self.gateway.current_boot_seen(charger_epoch):
+                await asyncio.sleep(self.settings.pump_interval)
+
+        tasks = [
+            asyncio.create_task(receive()),
+            asyncio.create_task(self._pump()),
+            asyncio.create_task(self._heartbeat()),
+            asyncio.create_task(charger_presence()),
+        ]
+        self._session_tasks.update(tasks)
+        for task in tasks:
+            task.add_done_callback(self._session_tasks.discard)
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task
+        finally:
+            await self._retire(tasks)
+
+    # Keep strong references to any uncooperative task and surface failure instead of abandoning it.
+    async def _retire(self, tasks: list[asyncio.Task[None]]) -> None:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=self.settings.close_timeout + 1)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+            if pending:
+                self.status.last_failure = "RetirementTimeout"
+                raise RuntimeError("offline runtime task retirement exceeded its deadline")
+
+    # Registration retry and durable delivery are independent of heartbeat and local command handling.
+    async def _pump(self) -> None:
+        while True:
+            try:
+                if self.gateway.journal.get("boot") is None:
+                    await asyncio.sleep(self.settings.pump_interval)
+                    continue
+                await self.gateway.flush()
+                self.status.delivery_blocked = False
+            except RegistrationDeferredError as error:
+                await asyncio.sleep(error.retry_after)
+            except (RecoveryRequiredError, ConflictError, sqlite3.Error) as error:
+                self.status.delivery_blocked = True
+                self.status.last_failure = type(error).__name__
+            await asyncio.sleep(self.settings.pump_interval)
+
+    # OCPP data-frame heartbeats are distinct from websocket Ping/Pong and continue through journal quarantine.
+    async def _heartbeat(self) -> None:
+        while True:
+            if self.gateway.vendor_registration != "Accepted":
+                await asyncio.sleep(self.settings.pump_interval)
+                continue
+            await asyncio.sleep(self.gateway.vendor_interval)
+            await self.gateway.heartbeat()
+            self.status.heartbeats += 1
+
+    # Bound shutdown and leave journal ownership to the caller; no connection survives its runtime.
+    async def close(self) -> None:
+        self._closing = True
+        if self._server is not None:
+            self._server.close()
+        try:
+            if self._runner is not None:
+                await self._retire([self._runner])
+            await self._retire(list(self._session_tasks))
+            if self._server is not None:
+                await asyncio.wait_for(self._server.wait_closed(), self.settings.close_timeout + 2)
+        finally:
+            await self.gateway.close()

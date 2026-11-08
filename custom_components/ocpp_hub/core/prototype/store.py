@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -154,9 +154,23 @@ class Journal:
         ).fetchone()
         if pending:
             raise RecoveryRequiredError("a matching mutation has an unconfirmed outcome")
+        count = self.db.execute("SELECT COUNT(*) FROM mutations").fetchone()[0]
+        if count >= self.capacity:
+            self.db.execute(
+                "DELETE FROM mutations WHERE token IN "
+                "(SELECT token FROM mutations WHERE state='confirmed' ORDER BY rowid LIMIT ?)",
+                (count - self.capacity + 1,),
+            )
+            if self.db.execute("SELECT COUNT(*) FROM mutations").fetchone()[0] >= self.capacity:
+                raise RecoveryRequiredError("mutation receipt capacity reached; uncertain writes were retained")
         token = uuid.uuid4().hex
         self.db.execute("INSERT INTO mutations VALUES(?,?,?,?,?)", (token, origin, action, digest, "pending"))
         return token
+
+    # A changed body must not bypass uncertainty about an earlier write to the same remote device.
+    def require_vendor_writes_reconciled(self) -> None:
+        if self.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed' LIMIT 1").fetchone():
+            raise RecoveryRequiredError("an earlier vendor write requires explicit reconciliation")
 
     # Confirm only an actual peer response; uncertain writes are never automatically replayed after restart.
     def mutation_finished(self, token: str, confirmed: bool) -> None:
@@ -187,8 +201,14 @@ class Journal:
     def remember(self, token: str, action: str, payload: dict[str, Any], answer: dict[str, Any]) -> None:
         self.db.execute("INSERT INTO receipts VALUES(?,?,?,?)", (token, action, fingerprint(payload), encoded(answer)))
 
+    # Historical replays retain their accepted fact even after a short-lived authorisation grant expires.
+    def known_start(self, payload: dict[str, Any]) -> bool:
+        return self.db.execute("SELECT 1 FROM transactions WHERE start=?", (encoded(payload),)).fetchone() is not None
+
     # Accept a start exactly once locally, including a retry sent under a fresh CALL id.
-    def start(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def start(
+        self, token: str, payload: dict[str, Any], accepted: Callable[[int], None] | None = None
+    ) -> dict[str, Any]:
         with self.atomic():
             cached = self.receipt(token, "StartTransaction", payload)
             if cached is not None:
@@ -208,12 +228,14 @@ class Journal:
                     (local, payload["connectorId"], encoded(payload)),
                 )
                 self.enqueue("StartTransaction", payload, local)
+                if accepted is not None:
+                    accepted(local)
             answer = {"transactionId": local, "idTagInfo": {"status": "Accepted"}}
             self.remember(token, "StartTransaction", payload, answer)
             return answer
 
     # Accept a stop once without ever clearing some other session on the connector.
-    def stop(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def stop(self, token: str, payload: dict[str, Any], closed: Callable[[int], None] | None = None) -> dict[str, Any]:
         with self.atomic():
             cached = self.receipt(token, "StopTransaction", payload)
             if cached is not None:
@@ -232,6 +254,16 @@ class Journal:
             if row[0] is None:
                 self.db.execute("UPDATE transactions SET stop=?,live=0 WHERE local=?", (encoded(payload), local))
                 self.enqueue("StopTransaction", payload, local)
+                profiles = self.get("vendor_profiles", {})
+                transactions = self.get("vendor_profile_transactions", {})
+                retired = [key for key, value in transactions.items() if value == local]
+                for key in retired:
+                    profiles.pop(key, None)
+                    transactions.pop(key, None)
+                self.put("vendor_profiles", profiles)
+                self.put("vendor_profile_transactions", transactions)
+                if closed is not None:
+                    closed(local)
             self.remember(token, "StopTransaction", payload, {})
             return {}
 

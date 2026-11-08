@@ -19,6 +19,15 @@ class UnavailableError(RuntimeError):
     """The peer did not give a confirmed outcome."""
 
 
+class RegistrationDeferredError(UnavailableError):
+    """The backend requires a bounded wait before the next registration attempt."""
+
+    # Retain only timing, never the backend response body or identity.
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("vendor registration deferred")
+        self.retry_after = retry_after
+
+
 class InboundCache:
     """Per-connection in-flight and completed replies; opaque bodies stay in memory only."""
 
@@ -126,27 +135,54 @@ class Peer:
         before_send: Callable[[], None] | None = None,
     ) -> Frame:
         async with self.gate.enter(priority):
-            if check is not None:
-                check()
-            sender = self.sender
-            if sender is None:
-                raise UnavailableError("peer is disconnected")
-            unique_id = token or self.name[:1] + "-" + uuid.uuid4().hex
-            if not 1 <= len(unique_id) <= 36:
-                raise RecoveryRequiredError("stored OCPP message identifier requires explicit reconciliation")
-            future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
-            self._pending[unique_id] = future
-            try:
-                async with asyncio.timeout(self.timeout):
-                    actual = payload() if callable(payload) else payload
-                    if before_send is not None:
-                        before_send()
-                    await sender(build_call(unique_id, action, actual))
-                    return await future
-            except (TimeoutError, OSError) as error:
-                raise UnavailableError("peer outcome is unconfirmed") from error
-            finally:
-                self._pending.pop(unique_id, None)
+            return await self._call_locked(action, payload, check, token, before_send)
+
+    # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
+    @asynccontextmanager
+    async def sequence(
+        self, priority: int, check: Callable[[], None]
+    ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
+        async with self.gate.enter(priority):
+            # Recheck generation and ownership before every step, not merely on sequence entry.
+            async def call(action: str, payload: dict[str, Any]) -> Frame:
+                return await self._call_locked(action, payload, check, None, None)
+
+            yield call
+
+    # Send one request only while the caller owns the outgoing gate.
+    async def _call_locked(
+        self,
+        action: str,
+        payload: dict[str, Any] | Callable[[], dict[str, Any]],
+        check: Callable[[], None] | None,
+        token: str | None,
+        before_send: Callable[[], None] | None,
+    ) -> Frame:
+        if check is not None:
+            check()
+        sender = self.sender
+        if sender is None:
+            raise UnavailableError("peer is disconnected")
+        unique_id = token if token is not None else self.name[:1] + "-" + uuid.uuid4().hex
+        if not 1 <= len(unique_id) <= 36:
+            raise RecoveryRequiredError("stored OCPP message identifier requires explicit reconciliation")
+        future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
+        self._pending[unique_id] = future
+        try:
+            async with asyncio.timeout(self.timeout):
+                actual = payload() if callable(payload) else payload
+                if before_send is not None:
+                    before_send()
+                await sender(build_call(unique_id, action, actual))
+                return await future
+        except (TimeoutError, OSError) as error:
+            raise UnavailableError("peer outcome is unconfirmed") from error
+        finally:
+            self._pending.pop(unique_id, None)
+            if future.done() and not future.cancelled():
+                future.exception()
+            elif not future.done():
+                future.cancel()
 
     # Fail pending work immediately on a disconnect without affecting the other peer.
     def detach(self) -> None:

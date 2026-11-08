@@ -17,6 +17,8 @@ from ocpp_hub_core.prototype.policy import DeniedError, Policy
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.store import ConflictError, Journal, RecoveryRequiredError
 
+from tests.prototype_firmware import Firmware
+
 START = {"connectorId": 1, "idTag": "LOCAL_TEST", "meterStart": 1000, "timestamp": "2026-01-01T00:00:00Z"}
 BOOT = {"chargePointVendor": "SYNTHETIC", "chargePointModel": "OFFLINE_TEST"}
 
@@ -36,6 +38,7 @@ class Rig:
         self.drop_charger = False
         self.crash_reply = False
         self.next_vendor = 9000
+        self.firmware = Firmware()
         self.gateway.attach_charger(self.charger_send)
 
     # Record charger-bound requests and return synthetic peer results under their actual correlation id.
@@ -47,7 +50,12 @@ class Rig:
                 raise OSError("simulated crash before local ACK delivery")
             return
         if not self.drop_charger:
-            await self.gateway.receive("charger", build_call_result(frame[1], self.charger_result))
+            answer = self.charger_result
+            if frame[2] == "GetCompositeSchedule":
+                answer = self.firmware.answer(frame[2], frame[3])
+            elif frame[2] == "SetChargingProfile" and answer.get("status") == "Accepted":
+                self.firmware.answer(frame[2], frame[3])
+            await self.gateway.receive("charger", build_call_result(frame[1], answer))
 
     # Record cloud-bound messages; each synthetic Start receives an independently assigned cloud id.
     async def vendor_send(self, raw: str) -> None:
@@ -61,7 +69,7 @@ class Rig:
             self.next_vendor += 1
             answer = {"transactionId": self.next_vendor, "idTagInfo": {"status": "Accepted"}}
         elif frame[2] == "BootNotification":
-            answer = {"status": "Accepted", "interval": 60}
+            answer = {"status": "Accepted", "interval": 60, "currentTime": "2030-01-01T00:00:00Z"}
         else:
             answer = self.vendor_result
         await self.gateway.receive("vendor", build_call_result(frame[1], answer))
@@ -74,7 +82,13 @@ class Rig:
     async def charger(self, token: str, action: str, payload: dict[str, Any]) -> list[Any]:
         await self.gateway.receive("charger", build_call(token, action, payload))
         await self.gateway.drain()
-        return next(frame for frame in reversed(self.charger_frames) if frame[0] != 2 and frame[1] == token)
+        answer = next(frame for frame in reversed(self.charger_frames) if frame[0] != 2 and frame[1] == token)
+        if action == "StartTransaction" and answer[0] == 3:
+            self.firmware.active = self.store.active()
+        elif action == "StopTransaction" and answer[0] == 3 and self.firmware.active == payload["transactionId"]:
+            self.firmware.active = None
+            self.firmware.requested_current = 0
+        return answer
 
     # Submit one vendor CALL and wait for its real charger reply or explicit refusal.
     async def vendor(self, token: str, action: str, payload: dict[str, Any]) -> list[Any]:
@@ -104,8 +118,13 @@ async def test_prototype_local_control_without_cloud(tmp_path: Path) -> None:
     assert (await rig.gateway.stop())[2]["status"] == "Accepted"
     assert started[2]["transactionId"] == 1001
     assert [f[2] for f in rig.charger_frames if f[0] == 2] == [
+        "SetChargingProfile",
+        "GetCompositeSchedule",
         "RemoteStartTransaction",
         "SetChargingProfile",
+        "GetCompositeSchedule",
+        "SetChargingProfile",
+        "GetCompositeSchedule",
         "RemoteStopTransaction",
     ]
     assert not rig.vendor_frames
@@ -307,7 +326,10 @@ async def test_prototype_nested_bidirectional_bridge_has_no_deadlock(tmp_path: P
         if frame[2] == "DataTransfer":
             await rig.gateway.receive("vendor", build_call("nested", "GetConfiguration", {}))
             await asyncio.wait_for(nested_done.wait(), 0.1)
-        await rig.gateway.receive("vendor", build_call_result(frame[1], {"status": "Accepted"}))
+        result = {"status": "Accepted"}
+        if frame[2] == "BootNotification":
+            result = {"status": "Accepted", "interval": 60, "currentTime": "2030-01-01T00:00:00Z"}
+        await rig.gateway.receive("vendor", build_call_result(frame[1], result))
 
     rig.gateway.attach_vendor(nested_vendor)
     result = await rig.charger("opaque", "DataTransfer", {"vendorId": "SYNTHETIC", "messageId": "Read"})
@@ -345,6 +367,7 @@ async def test_prototype_stop_priority_and_restart_inhibit(tmp_path: Path) -> No
             await original(raw)
 
     rig.gateway.attach_charger(hold_first)
+    before = len(rig.charger_frames)
     await rig.gateway.receive("vendor", build_call("first", "GetConfiguration", {}))
     await asyncio.wait_for(sent.wait(), 0.5)
     await rig.gateway.receive("vendor", build_call("second", "GetConfiguration", {}))
@@ -355,14 +378,23 @@ async def test_prototype_stop_priority_and_restart_inhibit(tmp_path: Path) -> No
     assert (await asyncio.wait_for(stop_task, 0.5))[2]["status"] == "Accepted"
     await asyncio.wait_for(rig.gateway.drain(), 0.5)
     await asyncio.gather(*delayed)
-    calls = [f[2] for f in rig.charger_frames if f[0] == 2]
-    assert calls == ["GetConfiguration", "RemoteStopTransaction", "GetConfiguration"]
+    calls = [f[2] for f in rig.charger_frames[before:] if f[0] == 2]
+    assert calls == [
+        "GetConfiguration",
+        "SetChargingProfile",
+        "GetCompositeSchedule",
+        "RemoteStopTransaction",
+        "GetConfiguration",
+    ]
     assert next(f for f in rig.vendor_frames if f[1] == "cloud-start")[0] == 4
+    await rig.charger(
+        "stopped", "StopTransaction", {"transactionId": 1001, "meterStop": 1000, "timestamp": START["timestamp"]}
+    )
     await rig.close()
     recovered = Rig(path)
     recovered.gateway.attach_vendor(recovered.vendor_send)
     assert (await recovered.vendor("restart", "RemoteStartTransaction", {"idTag": "LOCAL_TEST"}))[0] == 4
-    recovered.gateway.release()
+    await recovered.gateway.release()
     assert (await recovered.vendor("released", "RemoteStartTransaction", {"idTag": "LOCAL_TEST"}))[0] == 3
     await recovered.close()
 
@@ -440,11 +472,11 @@ async def test_prototype_uncertain_stop_remains_inhibited(tmp_path: Path) -> Non
     with pytest.raises(UnavailableError):
         await rig.gateway.stop()
     with pytest.raises(RecoveryRequiredError):
-        rig.gateway.release()
+        await rig.gateway.release()
     await rig.close()
     recovered = Rig(path)
     assert recovered.store.get("control")["inhibit"]
-    recovered.gateway.release(acknowledge_uncertainty=True)
+    await recovered.gateway.release(acknowledge_uncertainty=True)
     assert not recovered.store.get("control")["inhibit"]
     await recovered.close()
 
@@ -602,6 +634,7 @@ async def test_prototype_mutating_rpc_uncertainty_survives_restart(tmp_path: Pat
     policy = Policy(extensions={("SYNTHETIC", "Write"): "write"})
     rig = Rig(path, policy)
     rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.gateway.controls.ensure_ceiling()
     rig.drop_charger = True
     body = {"vendorId": "SYNTHETIC", "messageId": "Write", "data": "pretend-private-setting"}
     assert (await rig.vendor("write", "DataTransfer", body))[0] == 4
@@ -689,19 +722,29 @@ async def test_prototype_old_completion_cannot_clear_new_stop_uncertainty(tmp_pa
     finish = asyncio.Event()
     original = rig.charger_send
 
-    # Backpressure holds the first command while the no-session stop claims a newer epoch.
+    # Hold the actual Start result, then lose the newer zero-cap ACK without blocking the receive loop.
     async def wait_send(raw: str) -> None:
-        entered.set()
-        await finish.wait()
+        frame = decode(raw)
+        if frame[0] == 2 and frame[2] == "RemoteStartTransaction":
+            entered.set()
+            await finish.wait()
+        elif frame[0] == 2 and frame[2] == "SetChargingProfile":
+            limit = frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+            if limit == 0:
+                rig.charger_frames.append(frame)
+                return
         await original(raw)
 
     rig.gateway.attach_charger(wait_send)
     start = asyncio.create_task(rig.gateway.start())
     await entered.wait()
-    with pytest.raises(DeniedError):
-        await rig.gateway.stop()
+    stop = asyncio.create_task(rig.gateway.stop())
+    await asyncio.sleep(0)
     finish.set()
-    await start
+    assert (await start)[2]["status"] == "Accepted"
+    with pytest.raises(UnavailableError):
+        await stop
     control = rig.store.get("control")
     assert control["inhibit"] and control["uncertain"]
+    assert not rig.gateway.controls.ready
     await rig.close()
