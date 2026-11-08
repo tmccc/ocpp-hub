@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .. import commands
+from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .policy import DeniedError, Policy, number
 from .rpc import Peer, UnavailableError
@@ -75,7 +76,18 @@ class LocalControl:
     # A real Accepted result on the current transport is necessary before charging-capable vendor commands.
     @property
     def ready(self) -> bool:
-        return self._confirmed_epoch == self.epoch() and self._confirmed_limit == self.desired()
+        if self.journal.get("trial_phase") is not None:
+            receipt = self.journal.db.execute(
+                "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+            ).fetchone()
+            if receipt is None or receipt["state"] != "confirmed":
+                return False
+        return (
+            not self.journal.get("trial_preservation_fault")
+            and not self.journal.get("trial_inventory_fault")
+            and self._confirmed_epoch == self.epoch()
+            and self._confirmed_limit == self.desired()
+        )
 
     # A changed device introduction cannot inherit a confirmation or complete an older in-flight verification.
     def invalidate(self) -> None:
@@ -92,11 +104,14 @@ class LocalControl:
     # Record ownership and uncertainty before anything can be sent to the charger.
     def _claim(self, inhibit: bool, stopping: bool = False) -> tuple[int, str]:
         phase = self.journal.get("trial_phase")
-        if stopping and phase in ("blocked", "recovering", "rollback", "backend_restore_pending"):
+        previous = self.journal.get("control", {})
+        if stopping and phase in ("rollback", "backend_restore_pending"):
+            if self.journal.active() is None and not previous.get("start_pending"):
+                raise DeniedError("trial cleanup remains frozen without a known session to stop")
+        elif stopping and phase in ("blocked", "recovering"):
             self.journal.put("trial_phase", "recovering")
         elif phase not in (None, "active"):
             raise DeniedError("trial local controls are frozen")
-        previous = self.journal.get("control", {})
         ticket = uuid.uuid4().hex
         state = {
             **previous,
@@ -141,7 +156,8 @@ class LocalControl:
         if answer[0] != 3 or answer[2].get("status") != "Accepted":
             self._confirmed_epoch = -1
             raise UnavailableError("charger did not confirm the station ceiling")
-        verification = await call("GetCompositeSchedule", commands.get_composite_schedule(1, 1))
+        # Whole-second device timestamps and reply transit can consume a one-second observation window.
+        verification = await call("GetCompositeSchedule", commands.get_composite_schedule(1, 60))
         completed_at = datetime.now(UTC)
         check()
         result = verification[2]

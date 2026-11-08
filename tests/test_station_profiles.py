@@ -246,12 +246,12 @@ async def test_changed_station_selection_keeps_failed_owner_operation_held(tmp_p
         await rig.close()
 
 
-# Intent: native inventory resolves a lost Absolute ACK while preserving originals and refusing anchor drift.
+# Intent: native inventory resolves a lost Absolute ACK while preserving the original plan and refusing anchor drift.
 # Why: a missing response must neither prevent safe cleanup nor turn a different profile into owned state.
 @pytest.mark.parametrize("drift", [False, True])
 async def test_absolute_lost_ack_cleanup_and_anchor_drift(tmp_path: Path, drift: bool) -> None:
-    rig = StationRig(tmp_path / "state.db", StationChoice("Absolute", 1, ANCHOR), original_profile=True)
-    original = copy.deepcopy(rig.firmware.profiles[42])
+    rig = StationRig(tmp_path / "state.db", StationChoice("Absolute", 1, ANCHOR))
+    original = copy.deepcopy(rig.firmware.plans[9])
     try:
         await rig.boot()
         rig.drop_set = True
@@ -265,8 +265,8 @@ async def test_absolute_lost_ack_cleanup_and_anchor_drift(tmp_path: Path, drift:
             assert not rig.clear_order
         else:
             await rig.rollback.run(rig.quiesce)
-            assert rig.clear_order == [7001] and set(rig.firmware.profiles) == {42}
-        assert rig.firmware.profiles[42] == original and rig.firmware.plans[9]["limitCurrent"] == 32
+            assert rig.clear_order == [7001] and not rig.firmware.profiles
+        assert rig.firmware.plans[9] == original
     finally:
         await rig.close()
 
@@ -398,8 +398,8 @@ def test_independent_firmware_obeys_absolute_time_and_rejection() -> None:
 
 # Intent: near-future and already-ended composite schedules never confirm a present ceiling.
 # Why: the previous two-second tolerance could mark a not-yet-effective or expired schedule as ready.
-@pytest.mark.parametrize("offset", [1, -2])
-async def test_composite_covers_response_completion(tmp_path: Path, offset: int) -> None:
+@pytest.mark.parametrize("duration,offset,valid", [(60, 1, False), (60, -61, False), (1, -2, False), (60, -2, True)])
+async def test_composite_covers_response_completion(tmp_path: Path, duration: int, offset: int, valid: bool) -> None:
     rig = Rig(tmp_path / "state.db")
     original = rig.charger_send
 
@@ -409,6 +409,7 @@ async def test_composite_covers_response_completion(tmp_path: Path, offset: int)
         if frame[0] == 2 and frame[2] == "GetCompositeSchedule":
             rig.charger_frames.append(frame)
             answer = rig.firmware.answer(frame[2], frame[3])
+            answer["chargingSchedule"]["duration"] = duration
             answer["scheduleStart"] = (datetime.now(UTC) + timedelta(seconds=offset)).isoformat()
             await rig.gateway.receive("charger", build_call_result(frame[1], answer))
         else:
@@ -416,9 +417,12 @@ async def test_composite_covers_response_completion(tmp_path: Path, offset: int)
 
     rig.gateway.attach_charger(charger)
     try:
-        with pytest.raises(UnavailableError):
+        if valid:
             await rig.gateway.controls.ensure_ceiling()
-        assert not rig.gateway.controls.ready
+        else:
+            with pytest.raises(UnavailableError):
+                await rig.gateway.controls.ensure_ceiling()
+        assert rig.gateway.controls.ready is valid
     finally:
         await rig.close()
 

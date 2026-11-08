@@ -47,6 +47,7 @@ class Rollback:
             "owned_profiles_to_clear": len(present),
             "station_ceiling_cleared_last": True,
             "backend_restore_automatic": False,
+            "automatic_clear_blocked": bool(present and self.book.original_profile_count),
         }
 
     # Freeze first, then inspect before each exact-id clear; the station ceiling is always the last resource removed.
@@ -54,10 +55,14 @@ class Rollback:
         journal = self.gateway.journal
         if journal.get("trial_phase") == "complete":
             raise RecoveryRequiredError("this rollback is already complete")
+        if journal.get("trial_phase") not in ("rollback", "backend_restore_pending"):
+            # Freeze charging-capable work while retaining shutdown Stop and cloud history if the idle audit fails.
+            journal.put("trial_phase", "blocked")
         evidence = await self.observe()
         self.require_idle(evidence)
         self.book.owned_present(evidence)
         journal.put("trial_phase", "rollback")
+        self.gateway.controls.invalidate()
         await quiesce()
         epoch = self.gateway._charger_epoch
         async with self.gateway.charger.sequence(0, lambda: self.gateway._require_epoch("charger", epoch)) as call:
@@ -67,6 +72,7 @@ class Rollback:
                 present = self.book.owned_present(evidence)
                 if not present:
                     break
+                self.book.require_profile_free_baseline()
                 resource = present[0]
                 if resource.kind != "profile":
                     raise SecurityError("first trial cannot automatically remove native plans")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from datetime import datetime
 from pathlib import Path
@@ -11,9 +12,9 @@ from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import Policy
-from ocpp_hub_core.prototype.store import fingerprint
+from ocpp_hub_core.prototype.store import encoded, fingerprint
 from ocpp_hub_core.prototype.trial_config import TrialConfig
-from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection
+from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection, profile_projection
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
 from ocpp_hub_core.prototype.trial_rollback import Rollback
 from ocpp_hub_core.prototype.trial_session import save_private
@@ -54,9 +55,11 @@ class TrialRig(Rig):
     """The actual gateway writes to an independent fake device and reads an independent complete inventory."""
 
     # Seed genuine original resources before taking a baseline; the new journal owns none of them.
-    def __init__(self, path: Path, original_profile: bool = True) -> None:
+    def __init__(self, path: Path, original_profile: bool = False, original_purpose: str = "TxProfile") -> None:
         super().__init__(path, Policy(max_current_a=6))
-        original = commands.set_charging_profile(1, commands.PURPOSE_TX, 32, 42, stack_level=1, transaction_id=77)
+        original = commands.set_charging_profile(
+            1, original_purpose, 32, 42, stack_level=1, transaction_id=77 if original_purpose == "TxProfile" else None
+        )
         if original_profile:
             self.firmware.answer("SetChargingProfile", original)
         self.firmware.plans[9] = {"planId": 9, "limitCurrent": 32}
@@ -76,6 +79,16 @@ class TrialRig(Rig):
         self.gateway.charger.after_result = self.book.after_result
         self.rollback = Rollback(self.gateway, self.book, self.observe)
 
+    # Load a profile and its historical receipt as an older journal, without bypassing the new write gate at runtime.
+    def seed_legacy_profile(self, payload: dict[str, Any]) -> None:
+        canonical = profile_projection(payload)
+        self.firmware.answer("SetChargingProfile", payload)
+        self.connectors[canonical["id"]] = payload["connectorId"]
+        self.store.db.execute(
+            "INSERT INTO trial_resources VALUES(?,?,?,'confirmed',NULL)",
+            ("profile:" + str(canonical["id"]), encoded(canonical), encoded(canonical)),
+        )
+
     # Translate only the fake device's own stored profiles, rather than sharing the proxy's receipt table.
     def evidence(self) -> Evidence:
         resources = []
@@ -92,7 +105,10 @@ class TrialRig(Rig):
                     native_profile_projection(body, connector, body["purpose"], time.time()),
                 )
             )
-        resources += [Resource("plan", key, body, {"unsupported": True}) for key, body in self.firmware.plans.items()]
+        resources += [
+            Resource("plan", key, copy.deepcopy(body), {"unsupported": True})
+            for key, body in self.firmware.plans.items()
+        ]
         return Evidence(
             fingerprint(self.store.identity),
             time.time() - self.age,
@@ -123,11 +139,11 @@ class TrialRig(Rig):
         action, payload = frame[2:]
         if action == "ClearChargingProfile":
             self.clear_order.append(payload["id"])
+            answer = {"status": "Accepted"}
             if not self.ack_without_clear:
-                self.firmware.profiles.pop(payload["id"], None)
+                answer = self.firmware.answer(action, payload)
             if self.drop_clear:
                 return
-            answer = {"status": "Accepted"}
         else:
             if action == "SetChargingProfile":
                 self.connectors[payload["csChargingProfiles"]["chargingProfileId"]] = payload["connectorId"]

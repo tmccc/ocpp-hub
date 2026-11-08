@@ -21,6 +21,13 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 
 ## In progress
 
+- [~] Standalone iCS coexistence proxy (2026-11-08): second unplugged trial accepted an Absolute stack1 6 A station
+  profile, reported a matching composite schedule and retained an accepted manufacturer-cloud session. A one-second
+  verification window is corrected and tested offline. Existing original profiles now block new trial writes/clears;
+  preservation failures remain durable. Cleanup also lost a saved inactive TxProfile, so selective clearing, automatic
+  readiness on the corrected path, physical current enforcement and full app control remain unproven. The original
+  cloud connection, configuration, saved schedule and history are verified. Live Home Assistant remains unchanged.
+
 - [~] One charging plan shared with the Raedian app (`ocpp_hub.set_plan`, answers and takes over the app's planning, written to the charger as a recurring profile). Tested with a fake charger and vendor.
 - [~] Schedule helper and weekly schedules: a Home Assistant schedule helper applied with a button (daily or weekly profile), and the vendor answered with the charger's real schedule. Tested with a fake charger; see the schedule item below for what is unproven.
 - [~] Schedule: read-back of the charger's 24-hour schedule and the service `ocpp_hub.set_schedule` (daily, recurring, under the ceiling). Tested with a fake charger; the NEO's behaviour with a recurring profile is unproven.

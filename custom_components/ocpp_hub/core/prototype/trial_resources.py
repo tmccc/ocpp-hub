@@ -112,6 +112,8 @@ class ResourceBook:
 
     # Public health information includes no endpoints, identifiers, body contents or credentials.
     def status(self) -> dict[str, Any]:
+        fault = self.journal.get("trial_preservation_fault", {})
+        inventory_fault = self.journal.get("trial_inventory_fault", {})
         return {
             "phase": self.journal.get("trial_phase"),
             "resources": self.journal.db.execute("SELECT COUNT(*) FROM trial_resources").fetchone()[0],
@@ -119,17 +121,76 @@ class ResourceBook:
                 "SELECT COUNT(*) FROM trial_resources WHERE state='uncertain'"
             ).fetchone()[0],
             "transaction_open": self.journal.active() is not None,
+            "original_profiles": self.original_profile_count,
+            "new_profile_writes_blocked": bool(self.original_profile_count or fault or inventory_fault),
+            "automatic_clear_blocked": bool(self.original_profile_count or fault or inventory_fault),
+            "preservation_failed": bool(fault),
+            "inventory_failed": bool(inventory_fault),
+            "missing_original_resources": len(fault.get("missing", [])),
+            "changed_original_resources": len(fault.get("changed", [])),
         }
+
+    # Inactive transaction profiles are still original resources; selective deletion is not yet proven on this device.
+    @property
+    def original_profile_count(self) -> int:
+        return sum(resource.kind == "profile" for resource in self.baseline.resources)
+
+    # Block new trials and automatic clears without making older journals unreadable for diagnosis or safe recovery.
+    def require_profile_free_baseline(self) -> None:
+        if self.original_profile_count:
+            raise SecurityError("existing original profiles block trial writes until selective cleanup is proven")
+
+    # Freeze unexplained owned/unknown inventory changes without reclassifying them as original-resource loss.
+    def _inventory_failure(self, reason: str, key: str | None = None) -> None:
+        if not self.journal.get("trial_inventory_fault"):
+            self.journal.put("trial_inventory_fault", {"reason": reason, "resource": key})
+        self.journal.db.execute(
+            "UPDATE trial_resources SET state='uncertain' WHERE key=? AND state!='absent_verified'",
+            (key or "profile:" + str(HUB_PROFILE_ID),),
+        )
+        if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
+            self.journal.put("trial_phase", "blocked")
+        raise SecurityError("native inventory fault: " + reason + "; independent reconciliation is required")
+
+    # An existing hold may be lowered to zero, but verified absence must never authorize recreating it after cleanup.
+    def _safety_write(self, action: str, payload: dict[str, Any]) -> bool:
+        if action == "RemoteStopTransaction":
+            active = self.journal.active()
+            return active is not None and payload.get("transactionId") == active
+        if action != "SetChargingProfile":
+            return False
+        profile = profile_projection(payload)
+        receipt = self.journal.db.execute(
+            "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+        ).fetchone()
+        return (
+            profile["id"] == HUB_PROFILE_ID
+            and profile["connector"] == 0
+            and profile["purpose"] == "ChargePointMaxProfile"
+            and profile["limit"] == 0
+            and receipt is not None
+            and receipt["state"] != "absent_verified"
+        )
 
     # Preserve every original resource, including adopted plans and inactive transaction-specific profiles.
     def check_originals(self, evidence: Evidence) -> None:
         if evidence.identity_digest != self.baseline.identity_digest:
             raise SecurityError("native evidence belongs to another charger")
         current = {r.key: r for r in evidence.resources}
-        for original in self.baseline.resources:
-            present = current.get(original.key)
-            if present is None or present.digest != original.digest:
-                raise SecurityError("an original native resource changed; independent reconciliation is required")
+        missing = [resource.key for resource in self.baseline.resources if resource.key not in current]
+        changed = [
+            resource.key
+            for resource in self.baseline.resources
+            if resource.key in current and current[resource.key].digest != resource.digest
+        ]
+        fault = self.journal.get("trial_preservation_fault")
+        if not fault and (missing or changed):
+            fault = {"missing": missing, "changed": changed, "observed_at": evidence.observed_at}
+            self.journal.put("trial_preservation_fault", fault)
+        if fault:
+            if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
+                self.journal.put("trial_phase", "blocked")
+            raise SecurityError("original resource preservation failed; independent reconciliation is required")
 
     # Arm only a fresh independently observed station with a genuinely empty lifecycle and outbox.
     def activate(self, evidence: Evidence) -> None:
@@ -145,26 +206,31 @@ class ResourceBook:
     def before_send(self, action: str, payload: dict[str, Any]) -> None:
         phase = self.journal.get("trial_phase")
         reads = ("GetConfiguration", "GetCompositeSchedule", "TriggerMessage")
+        if action not in reads:
+            safety = self._safety_write(action, payload)
+            if (
+                self.journal.get("trial_preservation_fault") or self.journal.get("trial_inventory_fault")
+            ) and not safety:
+                raise DeniedError("native resource audit failed; mutations remain frozen")
+            if self.original_profile_count and (
+                action == "ClearChargingProfile" or action == "SetChargingProfile" and not safety
+            ):
+                raise DeniedError("original profiles prevent new profile writes and automatic clears")
         if phase != "active" and action not in reads:
             key = "profile:" + str(payload.get("id"))
             if (
-                phase in ("blocked", "recovering")
+                phase in ("blocked", "recovering", "rollback", "backend_restore_pending")
                 and action == "RemoteStopTransaction"
-                and payload.get("transactionId") == self.journal.active()
+                and safety
             ):
                 return
             if phase in ("blocked", "recovering") and action == "SetChargingProfile":
                 projected = profile_projection(payload)
-                if (
-                    projected["id"] == HUB_PROFILE_ID
-                    and projected["limit"] == 0
-                    and self.journal.db.execute(
-                        "SELECT 1 FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-                    ).fetchone()
-                ):
+                if projected["id"] == HUB_PROFILE_ID and projected["limit"] == 0 and safety:
                     phase = "active"  # Only this recorded zero-current intent proceeds through normal ownership checks.
             if phase == "rollback" and action == "ClearChargingProfile" and set(payload) == {"id"}:
-                if self.journal.db.execute("SELECT 1 FROM trial_resources WHERE key=?", (key,)).fetchone():
+                receipt = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
+                if receipt is not None and receipt["state"] != "absent_verified":
                     return
             if phase != "active":
                 raise DeniedError("trial is not accepting mutations")
@@ -195,10 +261,8 @@ class ResourceBook:
                     )
         elif action == "ClearChargingProfile":
             key = "profile:" + str(payload.get("id"))
-            if (
-                set(payload) != {"id"}
-                or not self.journal.db.execute("SELECT 1 FROM trial_resources WHERE key=?", (key,)).fetchone()
-            ):
+            receipt = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
+            if set(payload) != {"id"} or receipt is None or receipt["state"] == "absent_verified":
                 raise DeniedError("trial clear does not name an owned resource")
         elif action == "DataTransfer":
             if payload.get("vendorId") != "IoCharger" or payload.get("messageId") not in (
@@ -232,27 +296,33 @@ class ResourceBook:
 
     # Independent complete inventory reconciles a lost ACK without blindly replaying its physical mutation.
     def owned_present(self, evidence: Evidence) -> list[Resource]:
-        self.check_originals(evidence)
+        evidence.require_fresh(self.journal.identity)
         current = {r.key: r for r in evidence.resources}
         originals = {r.key for r in self.baseline.resources}
         rows = self.journal.db.execute("SELECT * FROM trial_resources").fetchall()
+        # Record observed owned absence even when a separate original-resource loss keeps rollback incomplete.
+        for row in rows:
+            if row["key"] not in current:
+                self.journal.db.execute(
+                    "UPDATE trial_resources SET state='absent_verified',observed_digest=NULL WHERE key=?", (row["key"],)
+                )
+        self.check_originals(evidence)
+        if self.journal.get("trial_inventory_fault"):
+            raise SecurityError("native inventory reconciliation is still required")
         if set(current) - originals - {row["key"] for row in rows}:
-            raise SecurityError("unexpected native resources require independent reconciliation")
+            self._inventory_failure("unexpected_resources")
         result = []
         for row in rows:
             resource = current.get(row["key"])
             if resource is None:
-                self.journal.db.execute(
-                    "UPDATE trial_resources SET state='absent_verified',observed_digest=NULL WHERE key=?", (row["key"],)
-                )
                 continue
             if row["state"] == "absent_verified":
-                raise SecurityError("a resource reappeared after verified absence without a new trial intent")
+                self._inventory_failure("resource_reappeared", resource.key)
             possible = [json.loads(row[key]) for key in ("desired", "confirmed") if row[key] is not None]
             if resource.canonical not in possible:
-                raise SecurityError("owned profile differs from every recorded trial intent")
+                self._inventory_failure("owned_profile_changed", resource.key)
             if row["observed_digest"] is not None and row["observed_digest"] != resource.digest:
-                raise SecurityError("owned profile changed after rollback verification")
+                self._inventory_failure("owned_profile_bytes_changed", resource.key)
             self.journal.db.execute(
                 "UPDATE trial_resources SET observed_digest=? WHERE key=?", (resource.digest, resource.key)
             )

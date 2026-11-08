@@ -18,7 +18,7 @@ from tests.test_prototype import START
 from tests.trial_helpers import TrialRig, no_cloud
 
 
-# Intent: remove only newly created resources, keep originals byte-equal and clear the station ceiling last.
+# Intent: remove only newly created profiles, keep the original plan byte-equal and clear the station ceiling last.
 # Why: restoring a backend URL alone can leave a persistent zero-current hold or erase someone else's plan.
 async def test_rollback_preserves_original_resources_and_requires_backend_verification(tmp_path: Path) -> None:
     rig = TrialRig(tmp_path / "state.db")
@@ -30,7 +30,7 @@ async def test_rollback_preserves_original_resources_and_requires_backend_verifi
     result = await rig.rollback.run(rig.quiesce)
     assert result == {"profiles_restored": True, "original_backend_restore_required": True, "complete": False}
     assert rig.clear_order == [100001, 7001]
-    assert list(rig.firmware.profiles) == [42] and list(rig.firmware.plans) == [9]
+    assert not rig.firmware.profiles and list(rig.firmware.plans) == [9]
     assert rig.book.baseline.value() == originals
     with pytest.raises(UnavailableError):
         await rig.gateway.controls.ensure_ceiling()
@@ -130,8 +130,10 @@ async def test_rollback_physical_and_lifecycle_preconditions(tmp_path: Path, cha
 # Intent: baseline collisions and edits to original profile scopes fail before the fake device sees a write.
 # Why: actual iCS firmware can replace the previous TxProfile at the same stack despite a different transaction id.
 async def test_baseline_and_original_scope_collisions(tmp_path: Path) -> None:
-    rig = TrialRig(tmp_path / "state.db")
-    await rig.gateway.set_limit(6)
+    rig = TrialRig(tmp_path / "state.db", original_profile=True)
+    rig.seed_legacy_profile(
+        commands.set_charging_profile(0, commands.PURPOSE_CHARGE_POINT_MAX, 6, 7001, stack_level=16)
+    )
     with pytest.raises(SecurityError):
         Baseline.capture(rig.store.identity, rig.evidence())
     count = len(rig.charger_frames)
@@ -153,7 +155,7 @@ async def test_rollback_rejects_changed_inventory(tmp_path: Path, change: str) -
     rig = TrialRig(tmp_path / "state.db")
     await rig.gateway.set_limit(6)
     if change == "original-changed":
-        rig.firmware.profiles[42]["stackLevel"] = 9
+        rig.firmware.plans[9]["limitCurrent"] = 16
     elif change == "unknown-profile":
         rig.firmware.answer(
             "SetChargingProfile",

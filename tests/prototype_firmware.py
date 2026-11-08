@@ -18,6 +18,7 @@ class Firmware:
         self.active: int | None = None
         self.requested_current = 0.0
         self.timer_fires = 0
+        self.clear_mode = "scoped"
         self.clock = clock or (lambda: datetime.now(UTC))
         self.profile_kinds = frozenset({"Relative", "Absolute", "Recurring"})
         self.configuration = {
@@ -114,13 +115,25 @@ class Firmware:
             return {
                 "status": "Accepted",
                 "connectorId": 1,
-                "scheduleStart": self.clock().isoformat(),
+                "scheduleStart": self.clock().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "chargingSchedule": {
-                    "duration": 1,
+                    "duration": payload["duration"],
                     "chargingRateUnit": "A",
                     "chargingSchedulePeriod": [{"startPeriod": 0, "limit": self.effective_limit()}],
                 },
             }
+        elif action == "ClearChargingProfile":
+            existed = self.profiles.pop(payload["id"], None) is not None
+            # These two fault modes are separate hypotheses, not established iCS firmware semantics.
+            if self.clear_mode == "all_profiles":
+                self.profiles.clear()
+            elif self.clear_mode == "prune_inactive":
+                self.profiles = {
+                    key: profile
+                    for key, profile in self.profiles.items()
+                    if profile["chargingProfilePurpose"] != "TxProfile" or profile.get("transactionId") == self.active
+                }
+            return {"status": "Accepted" if existed else "Unknown"}
         elif action == "RemoteStopTransaction":
             self.requested_current = 0.0
         elif action == "DataTransfer":

@@ -80,6 +80,8 @@ class PreparedTrial:
             "hardware_admission_verified": False,
             "hardware_ceiling_verified": False,
             "original_resources": len(self.baseline.resources),
+            "original_profiles": sum(resource.kind == "profile" for resource in self.baseline.resources),
+            "new_profile_writes_blocked": any(resource.kind == "profile" for resource in self.baseline.resources),
             "ceiling_a": 6,
             "station_profile": StationChoice(
                 self.config.station_profile_kind, self.config.station_stack_level, self.config.station_profile_start
@@ -183,6 +185,7 @@ class TrialSession:
         evidence = await self.observe()
         phase = self.journal.get("trial_phase")
         if phase == "prepared":
+            self.book.require_profile_free_baseline()
             self.book.activate(evidence)
         elif phase == "active":
             evidence.require_disconnected(self.journal.identity)

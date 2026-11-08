@@ -2,6 +2,15 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Request a 60-second composite schedule while retaining strict coverage-at-response, limit and connection checks.
+  Reproduce the old one-second failure with whole-second timestamps and delayed real TLS peer replies.
+- Block fresh trials, new profile writes and automatic clears when saved original profiles could be affected.
+  Keep legacy journals readable and retain a recorded zero hold/known-session Stop without resurrecting removed profiles.
+- Persist original-resource preservation faults, independently record owned absence, freeze rollback before auditing,
+  and expose safe fault counts. Model broad clearing and inactive-profile pruning as separate unproven hypotheses.
+- Revoke cached readiness and freeze writes after owned-profile drift or unexpected inventory, retaining safety Stop.
+- Record the second unplugged trial: the 6 A Absolute profile and cloud observation worked; cleanup lost an original
+  inactive profile. Original connection/settings, schedule and history are verified, but resource restoration is incomplete.
 - Standardise new local Boot/Heartbeat clocks to UTC seconds without rewriting retained event timestamps.
 - Preserve registration acceptance, per-leg failures, request stages, reply-match lengths and numeric close codes,
   including normal remote closes; exclude protocol bodies, identities and arbitrary remote reasons from diagnostics.
@@ -9,7 +18,7 @@
   Pin choice/capabilities to the device introduction, discard mixed-Boot discovery, and keep Stop authoritative.
 - Carry Absolute anchors through ownership and native rollback checks; verify schedules at response completion.
   Extend the independent firmware model and real TLS tests for timing, rejection, recovery and unchanged replay.
-- Keep these corrections offline. Actual iCS profile acceptance and continuing cloud compatibility remain unproven.
+- Keep subsequent corrections offline. Physical current enforcement and full app control remain unproven.
 - Separate the original OCPP identity from the native hardware serial and validate both before native admission.
 - Correct credential preparation: iCS authentication keys are write-only, so blank native backups cannot restore them.
 - Add explicitly configured absent-header admission while retaining exact source/path/TLS; never infer a fallback.

@@ -1,12 +1,13 @@
-## Standalone commissioning package — unplugged trial completed, original setup restored
+## Standalone commissioning package — two unplugged trials, cleanup issue remains
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-An authorised unplugged trial connected the charger temporarily on 8 November 2026. Its original connection and
-settings have been restored and independently verified. Live Home Assistant was not changed; its integration does not
-load this package. The trial found unresolved limit and cloud-session compatibility gaps, so this is not ready for
-unattended use or a charging test.
+Two authorised unplugged trials connected the charger temporarily on 8 November 2026. Its original cloud connection,
+connection settings, saved overnight schedule and charging history are independently verified after the second trial.
+One inactive profile from a completed charging session disappeared during cleanup, so full resource restoration is
+not established. Live Home Assistant was not changed; its integration does not load this package. The prototype is
+not ready for unattended use or a charging test.
 
-The actual trial established:
+The first trial established:
 
 - The charger accepted an encrypted TLS 1.2 local connection and introduced itself with BootNotification. It sent no
   Authorization header, including after a Basic challenge. Its original identity and write-only keys were preserved.
@@ -21,7 +22,27 @@ The actual trial established:
   session history, zero current/power, original backend online, no proxy profiles and retirement of the proxy socket.
   The trial process and independent restoration fallback have stopped. The car remained unplugged throughout.
 
-### Offline corrections after the unplugged trial
+The second trial established:
+
+- The charger reported maximum stack 10, 96 schedule periods and capacity for 33 profiles. The earlier stack 16 was
+  outside that reported range. An Absolute, stack 1, 6 A station profile was Accepted and independently visible in
+  native inventory. This proves profile installation, not physical current enforcement with a vehicle.
+- One manufacturer-cloud session remained accepted for at least nine minutes, acknowledged both Available statuses
+  and recorded no reconnect or cloud fault. The refreshed Android app displayed Idle. Charging controls in the app
+  and a complete charging session through the proxy remain untested.
+- The first composite reply reported 6 A but its one-second interval had already ended at response completion.
+  An independent read-only 60-second composite also reported 6 A and covered completion. The manual check did not
+  override automatic readiness; that path remained unconfirmed during the live trial.
+- Cleanup removed the owned station profile, but subsequent inventory also lacked the original closed-transaction
+  TxProfile. The original-resource check correctly refused completion. The retained wire logs do not include the
+  Clear exchange; the reviewed exact-id request path and receipt do not distinguish broad clearing from pruning an
+  inactive profile. Neither explanation is established. No further clear or stale-profile recreation was attempted.
+- Original configuration, schedule, session and history match the baseline; the original backend accepted Boot and
+  Available statuses. Native readings show unplugged, zero current/power and no trial profile. The standalone
+  listener and restoration watcher stopped, and temporary phone preferences were restored. The journal remains
+  incomplete because the original resource inventory differs.
+
+### Compatibility corrections and offline checks
 
 New local Boot and Heartbeat replies now use whole-second UTC `Z`, matching the observed manufacturer's clock replies.
 An independent fake charger copies that clock representation, and a deliberately format-sensitive fake cloud accepts
@@ -33,7 +54,7 @@ reconnect and process restart and can be delivered unchanged when the synthetic 
 The standalone configuration now explicitly selects `station_profile_kind`, `station_stack_level` and
 `station_profile_start`. Relative mode requires a null start; Absolute mode requires a whole-second UTC anchor in
 the past, within the supported native epoch range. The example selects Absolute, stack 1 and a fixed 2020 anchor.
-That is a candidate for a later trial, not a finding that iCS accepts it. The same choice is used for the 6 A ceiling,
+That choice was accepted in the second unplugged trial. The same choice is used for the 6 A ceiling,
 zero hold, reconnect, ownership receipts and rollback. Rejection never switches kind or falls back to a transaction limit.
 
 Before any station profile write, the trial reads six capabilities, one key per RPC: `NumberOfConnectors`,
@@ -47,20 +68,38 @@ reads discards the entire snapshot. A changed introduction also invalidates read
 A concurrent Stop wins over a positive ceiling prepared before its capability replies arrived. Discovery failure
 retains local inhibit and still permits the known-session Stop; it cannot falsely confirm a physical zero hold.
 
-Absolute ownership includes the exact requested start instant. The candidate native decoder accepts only narrowly
-matching records and checks current/future coverage conservatively; its Absolute representation still needs actual
-device evidence. A different or unsupported representation blocks automatic cleanup. The independent firmware model
+Absolute ownership includes the exact requested start instant. The native decoder accepts only narrowly
+matching records and checks current/future coverage conservatively; its supported Absolute representation matches
+the second trial's independently observed record. A different or unsupported representation blocks automatic cleanup.
+The independent firmware model
 now enforces kind, stack, start time, duration and capacity, and does not apply a future profile early. Composite
-verification requires a schedule covering response completion, rather than a nearby future or already-ended interval.
+verification now requests 60 seconds and still requires the returned schedule to cover response completion. A real TLS
+fake-device regression delays a whole-second schedule reply beyond one second: the old request fails, and the longer
+request succeeds. Expired, future, short returned intervals, high limits and changed device introductions still fail.
+
+Until selective clearing is proven, any original profile blocks a fresh trial and new profile writes, even if its
+transaction is closed. Older journals remain readable for diagnosis and recovery, but cannot issue automatic clears
+while their baseline contains original profiles. A recorded, still-present station profile can be lowered to zero
+and the known transaction can be stopped; verified absence never permits recreating the profile during recovery.
+Saved plans remain separately protected and do not count as charging profiles.
+
+An original resource loss or change records a durable preservation fault and freezes further mutations. Independently
+verified absence of an owned profile is recorded separately, even when that fault prevents completion. Status reports
+the fault and missing/changed original counts without exposing identifiers or bodies. Later matching inventory does
+not silently clear the fault. Separate synthetic broad-clear and inactive-profile-pruning models reproduce the
+observed discrepancy without choosing an explanation or automatically recreating an old transaction profile.
+Observed changes to an owned profile or unexpected native resources produce a separate durable inventory fault,
+revoke cached readiness and block further writes/clears. A narrowly scoped zero hold and known-session Stop remain
+available; repairing a matching readback alone does not silently reconcile that fault.
 
 Private status now separates charger and vendor faults, preserves accepted registration counts after disconnect,
 and reports request stage, whitelisted action, reply-id matching/length and numeric close codes. Endpoints, identities,
-payloads, close reasons and exception messages are excluded. Raw private evidence from the previous trial remains
-outside the repository. This work performs no new charger, vendor or Home Assistant connection or deployment.
+payloads, close reasons and exception messages are excluded. Raw private evidence from both trials remains outside
+the repository. These later corrections perform no new charger, vendor or Home Assistant connection or deployment.
 
 The station discovery and explicit Absolute option follow the
 [pinned reference integration](https://github.com/lbbrhzn/ocpp/blob/c6a2fa0f994f5b25160c6cf77eb1fcdbf3f60d5b/custom_components/ocpp/ocppv16.py),
-with stricter refusal of unknown capabilities. They remain hardware-unverified on this charger.
+with stricter refusal of unknown capabilities. Physical current enforcement and full app control remain unverified.
 
 `tools/trial_proxy.py` is the standalone entry point. Its default action is `check`, which reads private configuration,
 credentials, baseline and certificates without creating a journal, doing DNS, binding a listener or contacting a device.
@@ -115,7 +154,8 @@ python3.14 tools/trial_proxy.py capture-baseline --config /private/trial.json
 ```
 
 A fresh first trial requires native CP A, unplugged, zero current/power and an actually closed transaction. It refuses
-pre-existing station-ceiling profiles and profile 7001 collisions. Original plans and profiles remain protected.
+all pre-existing profiles, including an inactive TxProfile, until selective clearing is proven. A baseline can still
+be captured and inspected without admitting a new trial. Original plans and profile 7001 collisions remain protected.
 A new private journal is required; an old journal can resume only with its exact original trial baseline.
 
 Only the explicit `run` action opens the trial connections. It is restricted to a 6 A single-phase ceiling and a
@@ -174,10 +214,13 @@ retire. Adopted or original native resources are never treated as trial-owned. A
 reappears cannot become owned again without a new recorded trial intent.
 
 `rollback-plan` observes the complete native inventory. `rollback` requires fresh native unplugged/zero-power evidence,
-an actual closed session, no pending Start and reconciled mutating/lifecycle outcomes. It freezes charging-capable work,
-retires the cloud runner while retaining the local receiver, removes only independently matching owned profiles and
+an actual closed session, no pending Start and reconciled mutating/lifecycle outcomes. It freezes charging-capable work
+before auditing. If the idle audit fails, safety Stop and cloud history delivery remain
+available. After proving idle it retires the cloud runner while retaining the local receiver, removes only independently
+matching owned profiles when the original baseline has no profiles, and
 clears station profile 7001 last. Every deletion is checked against a fresh physical inventory, including after a lost
 ACK/restart. An ACK without actual removal cannot complete cleanup; reconnect cannot automatically reinstall a cleared cap.
+An original-resource discrepancy remains a durable blocker even after connection restoration or matching later reads.
 
 Resource cleanup ends in `backend_restore_pending`. Restore the charger's original connection profile from its private
 backup as a separate operation. `confirm-original-backend` succeeds only once the proxy charger socket has retired and
@@ -191,8 +234,8 @@ and can receive lifecycle retries, stop the known session and deliver/reconcile 
 and pending-start uncertainty still require independent reconciliation; they are never automatically retried or discarded.
 A failed native audit does not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
 
-The offline corrections above are prepared for another authorised unplugged trial; actual profile acceptance and
-continuing iCS cloud behaviour still need live confirmation before any charging test.
+The second trial supports profile acceptance and continuing cloud observations, but selective cleanup, automatic
+readiness on the corrected path and physical enforcement still need independent live confirmation before a charging test.
 The synthetic commissioning tests remain restricted to literal loopback under `tools/offline_validate.py`.
 
 ---

@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ssl
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call, build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection
-from ocpp_hub_core.prototype.trial_session import TrialSession, preflight
+from ocpp_hub_core.prototype.trial_resources import Baseline
+from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_private
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 
@@ -42,9 +45,13 @@ class Bench:
         self.reader: asyncio.Task[None] | None = None
         self.received_profiles: list[int] = []
         self.received_limits: list[float] = []
+        self.composite_reply_delay = 0.0
+        self.observation_failure = False
 
     # Use the actual fake firmware's profile list as independent native inventory evidence.
     async def observe(self) -> Evidence:
+        if self.observation_failure:
+            raise OSError("synthetic native observation failure")
         resources = []
         for identifier, profile in self.firmware.profiles.items():
             connector = 0 if profile["chargingProfilePurpose"] == "ChargePointMaxProfile" else 1
@@ -57,6 +64,10 @@ class Bench:
                     native_profile_projection(body, connector, body["purpose"], time.time()),
                 )
             )
+        resources.extend(
+            Resource("plan", identifier, copy.deepcopy(body), {"unsupported": True})
+            for identifier, body in self.firmware.plans.items()
+        )
         return Evidence(
             fingerprint("OFFLINE001"),
             time.time(),
@@ -97,11 +108,9 @@ class Bench:
                 self.replies[frame[1]].set_result(frame)
                 continue
             action, payload = frame[2:]
-            if action == "ClearChargingProfile":
-                self.firmware.profiles.pop(payload["id"], None)
-                answer = {"status": "Accepted"}
-            else:
-                answer = self.firmware.answer(action, payload)
+            answer = self.firmware.answer(action, payload)
+            if action == "GetCompositeSchedule":
+                await asyncio.sleep(self.composite_reply_delay)
             if action == "SetChargingProfile":
                 self.received_profiles.append(payload["csChargingProfiles"]["chargingProfileId"])
                 self.received_limits.append(
@@ -136,6 +145,134 @@ class Bench:
             logger=TRANSPORT_LOG,
             proxy=None,
         )
+
+
+# Intent: whole-second device timestamps and a delayed real TLS reply still confirm a presently effective ceiling.
+# Why: a one-second request can expire in transit even when the charger accepted and applied the requested limit.
+async def test_rounded_composite_survives_reply_delay(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+) -> None:
+    bench = Bench()
+    bench.composite_reply_delay = 1.05
+    async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
+        _, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        session = TrialSession(preflight(path), FAST, bench.observe)
+        try:
+            await session.start()
+            async with bench.connection_to(session) as charger:
+                reader = asyncio.create_task(bench.read_charger(charger))
+                try:
+                    await bench.call(charger, "boot", "BootNotification", BOOT)
+                    await until(
+                        lambda: session.gateway.controls.ready and session.gateway.vendor_registration == "Accepted"
+                    )
+                    assert bench.firmware.effective_limit() == 6
+                    assert (await session.command({"command": "rollback"}))["profiles_restored"]
+                finally:
+                    reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+        finally:
+            await session.close()
+
+
+# Intent: an existing inactive profile prevents a fresh standalone trial before any listener or cloud is started.
+# Why: file validation must remain available, but a known preservation risk must block live admission.
+async def test_original_profile_blocks_fresh_trial_before_binding(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+) -> None:
+    bench = Bench()
+    bench.firmware.answer(
+        "SetChargingProfile", commands.set_charging_profile(1, commands.PURPOSE_TX, 32, 42, transaction_id=77)
+    )
+    config, path = config_files(tmp_path, unused_tcp_port, unused_tcp_port)
+    save_private(config.baseline, Baseline.capture(config.identity, await bench.observe()).value())
+    prepared = preflight(path)
+    assert prepared.summary()["new_profile_writes_blocked"]
+    session = TrialSession(prepared, FAST, bench.observe)
+    try:
+        with pytest.raises(SecurityError, match="selective cleanup"):
+            await session.start()
+        assert not session.started and not session.runtime.status.charger_connected
+        assert not session.runtime.status.vendor_connected and not bench.received_profiles
+        assert session.journal.get("trial_phase") == "prepared"
+    finally:
+        await session.close()
+
+
+# Intent: shutdown after a preservation failure and verified profile absence sends no new profile or clear.
+# Why: the zero-hold recovery exception must not resurrect a trial limit after cleanup has removed it.
+async def test_fault_shutdown_does_not_recreate_absent_profile(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+) -> None:
+    bench = Bench()
+    bench.firmware.plans[9] = {"planId": 9, "limitCurrent": 32}
+    async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
+        config, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        save_private(config.baseline, Baseline.capture(config.identity, await bench.observe()).value())
+        session = TrialSession(preflight(path), FAST, bench.observe)
+        try:
+            await session.start()
+            async with bench.connection_to(session) as charger:
+                reader = asyncio.create_task(bench.read_charger(charger))
+                try:
+                    await bench.call(charger, "boot", "BootNotification", BOOT)
+                    await until(lambda: session.gateway.controls.ready)
+                    bench.firmware.profiles.clear()
+                    bench.firmware.plans.clear()
+                    with pytest.raises(SecurityError):
+                        session.book.owned_present(await bench.observe())
+                    received = list(bench.received_limits)
+                    await session.close()
+                    assert bench.received_limits == received and not bench.firmware.profiles
+                    assert session.final_status is not None and session.final_status["preservation_failed"]
+                    assert session.final_status["shutdown_uncertain"]
+                finally:
+                    reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+        finally:
+            await session.close()
+
+
+# Intent: a failed idle audit still permits shutdown to install zero and stop a known plugged-in transaction.
+# Why: freezing cleanup before validation must not bypass the session's normal safety shutdown path.
+@pytest.mark.parametrize("failure", ["plugged", "observation"])
+async def test_failed_rollback_keeps_safety_shutdown(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, failure: str
+) -> None:
+    bench = Bench()
+    async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
+        _, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
+        session = TrialSession(preflight(path), FAST, bench.observe)
+        try:
+            await session.start()
+            async with bench.connection_to(session) as charger:
+                reader = asyncio.create_task(bench.read_charger(charger))
+                try:
+                    await bench.call(charger, "boot", "BootNotification", BOOT)
+                    await until(lambda: session.gateway.controls.ready)
+                    await bench.call(charger, "start", "StartTransaction", START)
+                    bench.cp, bench.connection = "B", "Plug"
+                    bench.firmware.requested_current = 6
+                    bench.observation_failure = failure == "observation"
+                    with pytest.raises(SecurityError if failure == "plugged" else OSError):
+                        await session.command({"command": "rollback"})
+                    assert session.journal.get("trial_phase") == "blocked"
+                    closing = asyncio.create_task(session.close())
+                    await asyncio.wait_for(bench.remote_stop.wait(), 2)
+                    assert bench.firmware.current == 0
+                    await bench.call(
+                        charger,
+                        "stop",
+                        "StopTransaction",
+                        {"transactionId": 1001, "timestamp": START["timestamp"], "meterStop": 1000},
+                    )
+                    await closing
+                    assert session.final_status is not None and not session.final_status["shutdown_uncertain"]
+                finally:
+                    reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+        finally:
+            await session.close()
 
 
 # Intent: exercise start, authorization, mirroring, stop and rollback through the real transport with fake TLS peers.
