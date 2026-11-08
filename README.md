@@ -1,11 +1,37 @@
-## Standalone commissioning package — two unplugged trials, cleanup issue remains
+## Standalone commissioning package — verified unplugged controls, physical test pending
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-Two authorised unplugged trials connected the charger temporarily on 8 November 2026. Its original cloud connection,
-connection settings, saved overnight schedule and charging history are independently verified after the second trial.
-One inactive profile from a completed charging session disappeared during cleanup, so full resource restoration is
-not established. Live Home Assistant was not changed; its integration does not load this package. The prototype is
-not ready for unattended use or a charging test.
+Four authorised unplugged trials connected the charger temporarily on 8 November 2026. The two latest trials restored
+their complete fresh baselines: original cloud connection, configuration, profile inventory, saved overnight schedule
+and charging history. An inactive profile disappeared during the second trial; its cause remains unresolved, and the
+new trials do not recreate that old resource or prove selective clearing beside unrelated profiles. Live Home Assistant
+was not changed; its integration does not load this package. Physical current enforcement and full app control remain
+unproven, so this is not ready for unattended use.
+
+The third trial verified ordinary Stop at 0 A and Release back to 6 A with accepted 60-second composites and the same
+accepted cloud session. Exact-id removal of the owned profile succeeded from a profile-free baseline; fresh native
+readings and the journal independently confirmed complete restoration. The refreshed Android app displayed Idle.
+
+The fourth trial recorded the exact startup failure after two successful introductions. At host completion
+`16:38:44.845726Z`, the otherwise valid 60-second schedule began at `16:38:45Z`: 154.274 ms in the future. Socket epoch
+and Boot revision matched. Observational instrumentation retained the actual validator sample without changing the
+control outcome. This identifies a coverage timing failure rather than a connection loss or the former one-second
+expiry. The trial then removed its owned profile and independently restored its complete fresh baseline.
+
+### Bounded read-only startup retry
+
+`prototype/composite.py` now validates the complete reply, every period, ampere limit and optional phase count before
+classifying a small future start. The controller still requires `0 <= age < returned duration` at actual response
+completion. After one Accepted profile write, a future offset of at most one second permits at most two additional
+read-only schedule queries, separated by 250 ms. A shared one-second monotonic budget covers both retry waits and RPCs;
+the initial request retains its ordinary timeout. Expired, malformed, excessive-current or more distant future replies
+are not retried. Persistent skew remains unready; the code never repeats the profile write to conceal a bad read.
+
+Each reply and each short wait rechecks the socket, Boot revision, actual operation ticket and original desired state.
+A newer Stop or same-value operation supersedes the old verification. Release from a zero hold still works because
+the desired-state snapshot is not incorrectly equated with the positive limit being prepared. Synthetic tests reproduce
+the observed 154 ms failure, prove recovery through a fresh present-time read, bound a stalled retry, and retain strict
+failure and safety-Stop behaviour. The retry correction is prepared offline and still needs its own supervised live trial.
 
 The first trial established:
 

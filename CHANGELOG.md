@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Reproduce the exact 154 ms future schedule that caused intermittent startup rejection with unchanged epoch/Boot.
+- Validate complete composite replies before classifying clock jitter; retain strict present-time coverage.
+- Retry only read-only schedule queries after a single Accepted profile: at most three reads, small future offsets,
+  250 ms waits and one monotonic second including retry RPCs. Preserve Stop, ticket, desired-state and device guards.
+- Record verified unplugged Stop0/Release6, profile-free cleanup and exact fresh-baseline restoration in later trials.
 - Request a 60-second composite schedule while retaining strict coverage-at-response, limit and connection checks.
   Reproduce the old one-second failure with whole-second timestamps and delayed real TLS peer replies.
 - Block fresh trials, new profile writes and automatic clears when saved original profiles could be affected.

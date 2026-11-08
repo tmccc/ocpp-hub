@@ -11,6 +11,7 @@ from typing import Any
 from .. import commands
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
+from .composite import FutureScheduleError, verify_composite
 from .policy import DeniedError, Policy, number
 from .rpc import Peer, UnavailableError
 from .station import StationChoice
@@ -135,12 +136,16 @@ class LocalControl:
     async def _cap(self, call: Call, limit: float, epoch: int) -> Frame:
         self._confirmed_epoch = -1
         revision = self._revision
+        ticket = self.journal.get("control", {}).get("ticket")
+        desired = self.desired()
 
         # Boot may change on the same socket while a capability or composite RPC awaits its reply.
         def check() -> None:
             self._check(epoch)
             if revision != self._revision:
                 raise UnavailableError("device introduction changed during station verification")
+            if self.journal.get("control", {}).get("ticket") != ticket or self.desired() != desired:
+                raise DeniedError("a newer local operation superseded station verification")
 
         choice = (
             await self.prepare_station(call, epoch)
@@ -156,60 +161,44 @@ class LocalControl:
         if answer[0] != 3 or answer[2].get("status") != "Accepted":
             self._confirmed_epoch = -1
             raise UnavailableError("charger did not confirm the station ceiling")
-        # Whole-second device timestamps and reply transit can consume a one-second observation window.
-        verification = await call("GetCompositeSchedule", commands.get_composite_schedule(1, 60))
-        completed_at = datetime.now(UTC)
-        check()
-        result = verification[2]
-        schedule = result.get("chargingSchedule", {}) if verification[0] == 3 else {}
-        periods = schedule.get("chargingSchedulePeriod") if isinstance(schedule, dict) else None
-        if (
-            verification[0] != 3
-            or result.get("status") != "Accepted"
-            or result.get("connectorId") != 1
-            or not isinstance(schedule, dict)
-            or schedule.get("chargingRateUnit") != "A"
-            or not isinstance(periods, list)
-            or not 1 <= len(periods) <= 128
-        ):
-            self._confirmed_epoch = -1
-            raise UnavailableError("charger did not confirm an effective ampere ceiling")
-        if (
-            type(result.get("connectorId")) is not int
-            or not isinstance(periods[0], dict)
-            or type(periods[0].get("startPeriod")) is not int
-            or periods[0]["startPeriod"] != 0
-            or type(schedule.get("duration")) is not int
-            or not 1 <= schedule["duration"] <= 86400
-        ):
-            raise UnavailableError("composite schedule does not cover the present connector")
-        try:
-            raw_start = result.get("scheduleStart")
-            if not isinstance(raw_start, str):
-                raise DeniedError("schedule start is missing")
-            start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
-            if start.tzinfo is None:
-                raise DeniedError("schedule start requires a timezone")
-            age = (completed_at - start).total_seconds()
-            if not 0 <= age < schedule["duration"]:
-                raise DeniedError("schedule does not cover the requested instant")
-        except DeniedError, ValueError:
-            raise UnavailableError("composite schedule does not cover the requested instant") from None
-        previous_period = -1
-        for period in periods:
-            if not isinstance(period, dict):
-                raise UnavailableError("invalid composite schedule")
-            offset = period.get("startPeriod")
-            if type(offset) is not int or not previous_period < offset < schedule["duration"]:
-                raise UnavailableError("invalid composite schedule periods")
-            previous_period = offset
-            try:
-                number(period.get("limit"), limit)
-            except DeniedError:
-                self._confirmed_epoch = -1
-                raise UnavailableError("effective current exceeds the requested ceiling") from None
+        await self._verify_ceiling(call, limit, check)
         self._confirmed_epoch, self._confirmed_limit = epoch, limit
         return answer
+
+    # Retry only a small future clock offset; every extra request is read-only and shares one monotonic deadline.
+    async def _verify_ceiling(self, call: Call, limit: float, check: Callable[[], None]) -> None:
+        loop = asyncio.get_running_loop()
+        retry_deadline: float | None = None
+        for attempt in range(3):
+            check()
+            if retry_deadline is None:
+                verification = await call("GetCompositeSchedule", commands.get_composite_schedule(1, 60))
+            else:
+                remaining = retry_deadline - loop.time()
+                if remaining <= 0:
+                    raise UnavailableError("composite verification retry budget expired")
+                try:
+                    async with asyncio.timeout(remaining):
+                        verification = await call("GetCompositeSchedule", commands.get_composite_schedule(1, 60))
+                except TimeoutError:
+                    raise UnavailableError("composite verification retry budget expired") from None
+            completed_at = datetime.now(UTC)
+            check()
+            try:
+                verify_composite(verification, limit, completed_at)
+            except FutureScheduleError as error:
+                if error.ahead_seconds > 1 or attempt == 2:
+                    raise UnavailableError("composite schedule remains outside present coverage") from None
+                if retry_deadline is None:
+                    retry_deadline = loop.time() + 1
+                wait_until = min(loop.time() + 0.25, retry_deadline)
+                while loop.time() < wait_until:
+                    check()
+                    await asyncio.sleep(min(0.025, max(0, wait_until - loop.time())))
+                check()
+            else:
+                return
+        raise UnavailableError("composite schedule remains outside present coverage")
 
     # Establish or restore the desired ceiling before a start, native plan or new authenticated connection is used.
     async def ensure_ceiling(self) -> None:

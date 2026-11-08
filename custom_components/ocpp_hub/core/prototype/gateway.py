@@ -248,7 +248,13 @@ class Gateway:
                             and not self.controls.ready
                         ):
                             raise UnavailableError("nested authorization cannot bypass an unconfirmed ceiling")
-                        await self.controls.ensure_ceiling()
+                        try:
+                            await self.controls.ensure_ceiling()
+                        except DeniedError:
+                            # A newer Stop still returns the normal denied Authorize result, never a stale grant.
+                            if self._tag_allowed(payload.get("idTag")):
+                                raise
+                            info = {"status": "Invalid"}
                     self._require_epoch("charger", epoch)
                     if info["status"] == "Accepted":
                         latest = self._tag_info(payload["idTag"])
