@@ -17,6 +17,7 @@ from .. import commands
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
 from .events import validate_observation
+from .ics import TransactionQuery, is_transaction_query, unique_object
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, Sender, UnavailableError, reply_as
 from .store import ConflictError, Journal, RecoveryRequiredError, encoded, fingerprint
@@ -24,14 +25,16 @@ from .store import ConflictError, Journal, RecoveryRequiredError, encoded, finge
 
 # Reject malformed or non-finite input before handing it to the upstream frame vocabulary.
 def decode(raw: str | bytes) -> Frame:
-    if not isinstance(raw, str) or len(raw.encode()) > 131072:
-        raise DeniedError("frame must be bounded text")
+    if not isinstance(raw, str):
+        raise DeniedError("frame must be text")
     try:
-        encoded(json.loads(raw))
+        if len(raw.encode()) > 131072:
+            raise DeniedError("frame must be bounded text")
+        encoded(json.loads(raw, object_pairs_hook=unique_object))
         frame = parse_frame(raw)
     except ValueError, RecursionError:
         raise DeniedError("invalid JSON frame") from None
-    if frame is None or type(frame[0]) is not int or not isinstance(frame[1], str) or not 1 <= len(frame[1]) <= 64:
+    if frame is None or type(frame[0]) is not int or not isinstance(frame[1], str) or not 1 <= len(frame[1]) <= 36:
         raise DeniedError("invalid frame identifier")
     if frame[0] == 2 and len(frame) == 4 and isinstance(frame[2], str) and isinstance(frame[3], dict):
         return frame
@@ -173,6 +176,8 @@ class Gateway:
         vendor_epoch = self._vendor_epoch
         try:
             if action == "DataTransfer":
+                if is_transaction_query(payload):
+                    raise DeniedError("this iCS query is supported only from the cloud")
                 self._extension_allowed(payload)
                 await self._ensure_vendor_boot()
 
@@ -260,6 +265,7 @@ class Gateway:
         token, action = str(frame[1]), str(frame[2])
         original: dict[str, Any] = frame[3]
         mutation: str | None = None
+        query: TransactionQuery | None = None
         charger_epoch = self._charger_epoch
         try:
             self.policy.kind(action, original)
@@ -267,17 +273,23 @@ class Gateway:
 
             # Allocate profile ids and mutation intent only after the in-gate policy check succeeds.
             def prepare() -> dict[str, Any]:
-                nonlocal mutation
+                nonlocal mutation, query
                 self._require_epoch("vendor", epoch)
                 self._require_epoch("charger", charger_epoch)
                 self._check_vendor(action, original)
                 with self.journal.atomic():
-                    payload = self._translated_command(action, original)
+                    if action == "DataTransfer" and is_transaction_query(original):
+                        query = TransactionQuery.from_request(original, self.journal.historical_local_id)
+                        payload = query.request(original)
+                    else:
+                        payload = self._translated_command(action, original)
                     if self.policy.kind(action, original) == "write":
                         mutation = self.journal.mutation_intent("vendor", action, original)
                 return payload
 
             answer = await self.charger.call(action, prepare)
+            if query is not None:
+                answer = query.response(answer)
             if mutation:
                 self.journal.mutation_finished(mutation, True)
             text = reply_as(answer, token)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import ssl
 import subprocess
@@ -24,6 +25,8 @@ from ocpp_hub_core.prototype.store import Journal
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import InvalidStatus
+
+from tests.test_prototype_ics import CALLS, ICS_POLICY, STARTS
 
 
 # Intent: create one synthetic trust root and hostname-valid test certificate.
@@ -158,6 +161,102 @@ async def test_prototype_tls_two_leg_gateway(
     assert admission.authorization not in caplog.text and "synthetic-secret-only" not in caplog.text
     assert admission.authorization not in repr(admission)
     assert admission.authorization.encode() not in (tmp_path / "journal.db").read_bytes()
+
+
+# Intent: translate the observed iCS query over both real TLS legs for an open and then completed transaction.
+# Why: nested JSON and historical mappings must survive actual websocket framing, not just memory transports.
+async def test_prototype_tls_ics_transaction_query(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], admission: Admission
+) -> None:
+    server_context, client_context, _ = tls
+    journal = Journal(tmp_path / "journal.db", admission.identity)
+    gateway = Gateway(journal, ICS_POLICY, timeout=1)
+    vendor_connection: asyncio.Future[ServerConnection] = asyncio.get_running_loop().create_future()
+    cloud_replies: asyncio.Queue[list[Any]] = asyncio.Queue()
+
+    # Reply as the simulated vendor; use the real capture's aliased cloud transaction id.
+    async def vendor_handler(connection: ServerConnection) -> None:
+        vendor_connection.set_result(connection)
+        async for raw in connection:
+            frame = decode(raw)
+            if frame[0] != 2:
+                await cloud_replies.put(frame)
+                continue
+            result: dict[str, Any] = {}
+            if frame[2] == "BootNotification":
+                result = {"status": "Accepted", "interval": 60}
+            elif frame[2] == "StartTransaction":
+                result = {"transactionId": 6000001, "idTagInfo": {"status": "Accepted"}}
+            await connection.send(build_call_result(frame[1], result))
+
+    # Attach only the already authenticated, loopback-only fake charger.
+    async def charger_handler(connection: ServerConnection) -> None:
+        gateway.attach_charger(connection.send)
+        async for raw in connection:
+            await gateway.receive("charger", raw)
+
+    async with serve(
+        vendor_handler, "127.0.0.1", 0, ssl=server_context, subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG
+    ) as vendor_server:
+        vendor_port = vendor_server.sockets[0].getsockname()[1]
+        async with offline_server(charger_handler, admission, server_context) as charger_server:
+            port = charger_server.sockets[0].getsockname()[1]
+            async with connect(
+                f"wss://127.0.0.1:{port}/charger/{admission.identity}",
+                ssl=client_context,
+                additional_headers=[("Authorization", admission.authorization)],
+                subprotocols=["ocpp1.6"],
+                logger=TRANSPORT_LOG,
+                proxy=None,
+            ) as charger:
+                # Boot is synthetic because no actual boot frame was present in the exported logs.
+                await charger.send(build_call("boot", "BootNotification", {"chargePointVendor": "SYNTHETIC"}))
+                assert decode(await charger.recv())[2]["status"] == "Accepted"
+                await charger.send(build_call("start", "StartTransaction", STARTS[0]))
+                assert decode(await charger.recv())[2]["transactionId"] == 1001
+                async with offline_vendor(
+                    f"wss://127.0.0.1:{vendor_port}/ocpp/charger", admission, client_context
+                ) as vendor:
+                    gateway.attach_vendor(vendor.send)
+
+                    # Keep cloud replies flowing while the gateway waits for the fake charger's response.
+                    async def receive_vendor() -> None:
+                        async for raw in vendor:
+                            await gateway.receive("vendor", raw)
+
+                    reader = asyncio.create_task(receive_vendor())
+                    try:
+                        await gateway.flush()
+                        cloud = await vendor_connection
+                        query = next(row["frame"][3] for row in CALLS if row["frame"][2] == "DataTransfer")
+                        for completed in (False, True):
+                            if completed:
+                                stop = next(row["frame"][3] for row in CALLS if row["frame"][2] == "StopTransaction")
+                                await charger.send(
+                                    build_call("stop", "StopTransaction", {**stop, "transactionId": 1001})
+                                )
+                                assert decode(await charger.recv())[2] == {}
+                                await gateway.flush()
+                            token = f"query-{completed}"
+                            await cloud.send(build_call(token, "DataTransfer", query))
+                            async with asyncio.timeout(2):
+                                command = decode(await charger.recv())
+                                assert json.loads(command[3]["data"]) == {"transactionId": 1001}
+                                await charger.send(
+                                    build_call_result(
+                                        command[1],
+                                        {"status": "Accepted", "data": '{"transactionId":1001,"eco":"Fast"}'},
+                                    )
+                                )
+                                answer = await cloud_replies.get()
+                            assert answer[1] == token
+                            assert json.loads(answer[2]["data"]) == {"transactionId": 6000001, "eco": "Fast"}
+                    finally:
+                        reader.cancel()
+                        await asyncio.gather(reader, return_exceptions=True)
+    assert not gateway.failures
+    await gateway.close()
+    journal.close()
 
 
 # Intent: unauthenticated or wrong-identity clients never reach the handler or displace an admitted connection.

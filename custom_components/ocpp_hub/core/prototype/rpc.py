@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
-from .store import fingerprint
+from .store import RecoveryRequiredError, fingerprint
 
 Sender = Callable[[str], Awaitable[None]]
 
@@ -131,7 +131,9 @@ class Peer:
             sender = self.sender
             if sender is None:
                 raise UnavailableError("peer is disconnected")
-            unique_id = token or self.name + "-" + uuid.uuid4().hex
+            unique_id = token or self.name[:1] + "-" + uuid.uuid4().hex
+            if not 1 <= len(unique_id) <= 36:
+                raise RecoveryRequiredError("stored OCPP message identifier requires explicit reconciliation")
             future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
             self._pending[unique_id] = future
             try:

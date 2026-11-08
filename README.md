@@ -14,6 +14,7 @@ not synthetic acknowledgements. Core charger observations are accepted locally a
 | `prototype/store.py` | Private SQLite WAL journal, atomic acceptance before local replies, persistent ids, outbox and mutation uncertainty. |
 | `prototype/gateway.py` | Local transaction authority, ordered replay, both-direction passthrough, reconnect generations and explicit local ownership. |
 | `prototype/rpc.py` | One outgoing CALL per direction, stop priority, bounded retries/receipts, independent receive paths. |
+| `prototype/ics.py` | Exact observed `IoCharger/getTransaction` JSON-string metadata codec with historical id translation. |
 | `prototype/policy.py` | Explicit single-phase ceiling, profile ownership, local tag and vendor extension/configuration allowlists. |
 | `prototype/security.py` | Authenticated TLS test adapters, exact identity/header preservation, certificate checks and redirect refusal. |
 | `tools/offline_validate.py` | Test runner restricting Python sockets and DNS to literal loopback; named Unix service sockets are denied. |
@@ -53,9 +54,9 @@ commands, **not an operating-system network namespace**. No production configura
 
 ### Deliberate boundaries
 
-This is not a deployment package or a claim of iCS2.0Lite compatibility. Proprietary fixtures are explicitly
-synthetic; no real iCS message codec or authorization behavior is inferred from them. Unknown extensions and tags
-are refused. There are no automatic starts or automatic charger configuration writes. Firmware/reset/diagnostic
+This is not a deployment package or a claim of full iCS2.0Lite compatibility. The original generic extension tests
+are synthetic; the additional iCS checks below use a complete, privacy-transformed actual log capture. One exact
+observed read codec is implemented. Unknown extensions, tags and unobserved codec variants are refused. There are no automatic starts or automatic charger configuration writes. Firmware/reset/diagnostic
 operations are refused by default rather than acknowledged without execution.
 
 An opaque exchange needs an explicit `(vendorId, messageId)` read/write rule. Opaque write contents cannot be
@@ -68,9 +69,46 @@ Same-connection RPC duplicates are cached, but full opaque replies are not persi
 across a fresh connection is not an exactly-once guarantee. Historical transaction records are retained as tombstones;
 restored sessions are marked unconfirmed until current evidence arrives. Replayed old meter samples are not live data.
 
-The real server's certificate trust, authentication, app schedules/settings/history and charger behavior still need
-separate compatibility validation before any future controlled trial. The prototype is deliberately not wired into
-the existing integration setup or its UI. Original upstream documentation follows.
+### iCS2.0Lite compatibility evidence
+
+Validation on 8 November 2026 used an existing charger log export, retained LAN records and static inspection of the
+installed Android app package. No charger settings, charging actions or live Home Assistant configuration were changed.
+A strict certificate/hostname-verified TLS-only connection to the existing public backend succeeded without a client
+certificate. No HTTP upgrade, Authorization header, charger identity, app login or OCPP exchange was sent to that backend.
+This verifies TLS reachability and trust only, not websocket admission or the actual device credentials.
+
+`tests/fixtures/ics-log7628.sanitized.json` contains **all 517 complete parsed OCPP frames** from the existing LOG7628
+export: 263 requests and 254 replies. This is a sanitized, reserialized derivative, **not byte-identical wire data**.
+The fixture records the original archive SHA-256 and transformations. Consistent aliases replace request/transaction
+ids and tags; all dates share one shift; a common energy-counter offset preserves Wh/kWh deltas. Private originals and
+the reversible redaction map remain outside the repository. Nine MeterValues requests have no recorded reply; none were
+dropped or presented as a confirmed cloud acknowledgement.
+
+| Area | Evidence and offline result | Remaining limit |
+| --- | --- | --- |
+| Status and metering | 47 StatusNotification and 194 MeterValues requests parse and are accepted by the real engine; decimal-string kWh, V, A and Celsius samples are preserved. | A transaction id or fresh meter report alone does not mean a vehicle is connected or charging. |
+| Transactions and history | Two observed Starts and one Stop replay with distinct local/cloud ids. The completed session retains its 43.683 kWh delta. | A synthetic Boot and simulated peers are necessary; replay does not prove the vendor app stores mirrored/offline history correctly. |
+| Vendor requests | Actual RemoteStartTransaction and both GetConfiguration exchanges pass with an explicit offline policy. | The actual authorisation tag is private and differs from the test default. This does not authorise a real start. |
+| iCS metadata | Both observed `IoCharger/getTransaction` requests contain a JSON **string** with `transactionId`; Accepted replies add `eco: Fast`. The new codec translates ids in both directions, including completed sessions. | Only this exact cloud-origin read shape is supported and explicitly allowlisted. It is metadata, not a complete history response. Other modes, fields and directions fail closed. |
+| Diagnostics | An actual GetDiagnostics request is retained in the fixture and explicitly refused in replay. | Vendor diagnostic upload/support is intentionally unavailable under the default policy. |
+| Authorisation | Observed Authorize status matches an explicitly approved local tag. | Local replies do not reproduce the cloud's optional expiry/parent-tag metadata, including optional StopTransaction `idTagInfo`. Full cloud authorisation/cache semantics remain unverified. |
+| Current ceiling | Retained settings and GetConfiguration show a 32 A configured limit; explicitly configured synthetic profiles at 32 A pass and 33 A fail. The default remains 16 A. | No actual SetChargingProfile or current-change exchange was captured. Device acceptance, profile precedence and minimum-current semantics are unverified. |
+| Schedules and app controls | Static Android code establishes separate authenticated HTTP APIs and schedule models. App remote start uses point/connector ids, stop uses an API transaction id, and limit setting is a mutating GET with a string current value. | HTTP API ids must not be assumed interchangeable with OCPP ids. Schedule create/update/toggle and fractional-current behavior have no corresponding wire capture or end-to-end test. |
+| Admission and idle operation | Both loopback WSS legs verify synthetic credentials and certificates; the exact iCS codec is tested over real local TLS websockets. | Actual Boot, Basic credentials and websocket admission remain untested. The engine answers charger Heartbeats locally but has no independent upstream heartbeat scheduler; negotiated intervals, reconnect/outbox scheduling and long-idle Ping/Pong need a runtime runner. |
+| Existing sessions | Retained LAN history contains several unresolved/open records; unknown pre-cutover ids and overlapping Starts are refused. | A future cutover requires a clean session boundary or independently verified migration/reconciliation. No historical Stop may be invented. |
+
+All 517 frames are parsed, and all 263 recorded requests are exercised against simulated peers: the diagnostic request
+is an expected refusal, Authorize/Heartbeat are local responses, and supported lifecycle records use the durable outbox.
+Nine absent MeterValues replies are explicitly simulated as empty acknowledgements. Request ids generated by the
+prototype now fit the [OCPP-J 1.6 §4.1.4](https://raw.githubusercontent.com/mobilityhouse/ocpp/master/docs/v16/ocpp-j-1.6-specification.pdf)
+36-character maximum; previously persisted oversized ids require explicit
+reconciliation rather than silently changed. Newly accepted historical Starts remain unconfirmed until a current meter
+observation arrives. The read-only historical mapping never permits a stop/profile command for a completed session.
+
+**Assessment: the observed message subset is compatible with the explicit offline policy after these fixes; full app
+coexistence and a live switchover are not yet validated.** The idle-runtime gap, actual authentication/boot, session
+reconciliation and uncaptured schedule/current commands must be addressed or validated before a controlled trial.
+The prototype is deliberately not wired into the existing integration setup or its UI. Original documentation follows.
 
 ---
 

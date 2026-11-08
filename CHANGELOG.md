@@ -8,7 +8,15 @@
   translation, priority for local stop, owned profile ids and strict single-phase limits.
 - Add authenticated loopback WSS adapters and an offline network-guarded test runner. Cover restart and storage
   failures, duplicate messages, uncertain cloud acknowledgements, reconnect races, TLS trust and authorization.
-- This is a synthetic offline prototype, not a release or a validated iCS2.0Lite/hardware integration.
+- Validate a complete privacy-transformed 517-frame actual iCS log capture; exercise its 263 requests with simulated
+  peers, preserving unmatched records and explicitly identifying a blocked diagnostic upload and local authorisation.
+- Add the observed cloud-origin `IoCharger/getTransaction` read codec: translate nested JSON-string ids in requests and
+  actual Accepted metadata replies, including completed sessions; reject unknown shapes and mappings.
+- Fix generated OCPP request ids to fit the 36-character limit, reject oversized incoming ids and quarantine old
+  oversized journal tokens. Reject duplicate JSON keys and malformed nested text before forwarding.
+- Keep newly accepted historical Starts unconfirmed until current observations arrive. Document real app/API evidence,
+  missing upstream heartbeat runtime, untested boot/authentication, schedules/current changes and cutover reconciliation.
+- This remains an offline prototype, not a release or a fully validated iCS2.0Lite/hardware integration.
 
 ## 0.2.1
 

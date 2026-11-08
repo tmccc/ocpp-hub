@@ -132,7 +132,7 @@ class Journal:
     def enqueue(self, action: str, payload: dict[str, Any], local: int | None = None) -> str:
         if self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] >= self.capacity:
             raise RecoveryRequiredError("cloud journal capacity reached; event was not accepted")
-        token = "event-" + uuid.uuid4().hex
+        token = "e-" + uuid.uuid4().hex
         self.db.execute(
             "INSERT INTO outbox(token,action,payload,local) VALUES(?,?,?,?)", (token, action, encoded(payload), local)
         )
@@ -204,7 +204,7 @@ class Journal:
                     raise RecoveryRequiredError("transaction counter exhausted")
                 self.put("next_transaction", local)
                 self.db.execute(
-                    "INSERT INTO transactions(local,connector,start,live) VALUES(?,?,?,1)",
+                    "INSERT INTO transactions(local,connector,start,live) VALUES(?,?,?,0)",
                     (local, payload["connectorId"], encoded(payload)),
                 )
                 self.enqueue("StartTransaction", payload, local)
@@ -250,6 +250,11 @@ class Journal:
     # Translate a cloud transaction only while its corresponding local session is still open.
     def local_id(self, vendor: int) -> int | None:
         row = self.db.execute("SELECT local FROM transactions WHERE vendor=? AND stop IS NULL", (vendor,)).fetchone()
+        return int(row[0]) if row else None
+
+    # Read-only historical queries may name a completed session; controls still use active-only local_id.
+    def historical_local_id(self, vendor: int) -> int | None:
+        row = self.db.execute("SELECT local FROM transactions WHERE vendor=?", (vendor,)).fetchone()
         return int(row[0]) if row else None
 
     # Peek rather than delete: a process death must not remove an unacknowledged event.
