@@ -29,8 +29,10 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   local Stop/release and nominal 6 A limiting (reported peak 6.2 A). Every lifecycle was acknowledged; all old history
   remains alongside the new charges, and full fresh-baseline restoration is independently verified.
   A sixth unplugged trial also verifies a local zero hold with the cloud link retired, followed by successful
-  reconnection/release and complete restoration. Physical local Start and history backfill during an outage remain
-  unverified; the corresponding guarded TLS-loopback path passes.
+  reconnection/release and complete restoration. A seventh verifies real local Start/charge/Stop with the vendor
+  runner retired and actual acknowledgement of queued history after reconnect, including elapsed local authorization.
+  All prior history remains plus the new 38 Wh session, and full restoration is verified. A private tested bootstrap
+  reserves fresh session numbers above native history; automatic CLI bootstrap remains future work.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

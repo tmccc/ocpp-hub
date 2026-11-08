@@ -1,7 +1,7 @@
 ## Standalone iCS prototype — real app and local control verified in a supervised trial
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-Six authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
+Seven authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
 the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
 control, metadata reads and the existing Fast-mode write. The station setting was 6 A; the meter reported about
 6.1 A while settled, with a peak of 6.2 A and 1,518 W. This is evidence of nominal current limiting, not an exact
@@ -22,11 +22,27 @@ was not changed; its normal integration does not load this prototype.
 The sixth trial deliberately retired the vendor connection while keeping the physical charger connected locally.
 Ordinary local Stop installed and confirmed the zero-current hold with the cloud absent. The original cloud runner
 then reconnected and registered successfully, and Release restored the confirmed 6 A setting without a fault or
-queued event. This test was unplugged: physical local Start and actual session-history backfill during a cloud outage
-remain unverified. A guarded TLS-loopback test covers that full Start/Stop/backfill path, including real synthetic
+queued event. That test was unplugged; physical local Start and actual session-history backfill were exercised in the
+seventh trial below. A guarded TLS-loopback test also covers the full Start/Stop/backfill path, including real synthetic
 acknowledgements and retention of the zero hold. The sixth trial again restored the complete fresh baseline: original
 configuration, empty profile inventory, saved schedule and all nine existing full history records, with the original
 backend online and no charging session open. Its journal completed and all experiment processes stopped.
+
+The seventh trial started a real charge locally while the vendor runner, sender and session tasks were retired.
+The car charged at a nominal 6 A, peaking at 6.1 A and 1,528 W. Local Stop then installed the verified zero-current
+hold and closed the real session, delivering 38 Wh. Throughout charging and Stop, vendor counters remained unchanged
+and the local transaction had no cloud mapping. Start, Meter and Stop facts remained queued locally.
+After the local authorization expiry had passed, the normal vendor runner reconnected. Actual cloud responses to Boot
+and all seven queued events created the cloud mapping and emptied the queue, while the zero hold stayed active.
+The original Start/Stop payloads and accepted local authorization metadata remained byte-for-byte unchanged.
+After unplugging, normal guarded cleanup removed the trial profile and restored the original connection, full
+configuration and schedule. All nine previous history bodies remain alongside the one new completed session.
+
+Before that seventh trial, a separately reviewed private bootstrap reserved the fresh journal's transaction counter
+strictly above every ID in complete native history, avoiding reuse of earlier proxy session numbers. Guarded tests
+verified persistence across restart, a real TLS Start/Stop/backfill sequence using that range, and rejection of invalid
+or exhausted IDs. The standard commissioning CLI does not automatically bootstrap that counter from native history;
+charging with a fresh journal remains an explicitly prepared, supervised procedure.
 
 The earlier loss of an inactive profile during the second trial remains unexplained. Later successes start from a
 profile-free baseline; they neither recreate that old resource nor prove selective clearing beside unrelated profiles.

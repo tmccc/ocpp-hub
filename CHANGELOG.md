@@ -2,10 +2,14 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Verify physical local Start, nominal 6 A charging and local Stop with the vendor link retired, then real cloud
+  acknowledgement of all seven queued events after local authorization expiry, preserving immutable session data.
+- Preserve all nine previous history bodies plus the new 38 Wh session; complete guarded cleanup and normal-backend
+  restoration. Verify a private fresh-journal allocation bootstrap above native history; automatic CLI bootstrap
+  remains future work.
 - Verify an unplugged local zero-current hold while the vendor connection is deliberately retired, followed by
   successful cloud reconnection, 6 A release and complete restoration with all nine history records unchanged.
-- Keep physical local Start and actual history backfill during an outage explicitly unproven; verify that path with
-  guarded synthetic TLS peers without inventing cloud acknowledgements.
+- Verify the corresponding Start/Stop/backfill path with guarded synthetic TLS peers before the physical test.
 - Record three real charging sessions through iCS2.0Lite with app Start/Stop/restart and local Stop/release.
   A 6 A station setting gave about 6.1 A reported current, peaking at 6.2 A; retain the measurement distinction.
 - Verify all lifecycle acknowledgements, preserved original history plus three new records, unchanged app current
