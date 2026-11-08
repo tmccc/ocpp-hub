@@ -2,6 +2,12 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Record three real charging sessions through iCS2.0Lite with app Start/Stop/restart and local Stop/release.
+  A 6 A station setting gave about 6.1 A reported current, peaking at 6.2 A; retain the measurement distinction.
+- Verify all lifecycle acknowledgements, preserved original history plus three new records, unchanged app current
+  setting/schedule/configuration, guarded profile cleanup and original-backend restoration after the physical trial.
+- Record successful automatic confirmation on three introductions of the corrected source, while retaining explicit
+  limits for wider app features, unrelated-profile deletion, connected-vehicle restart and unattended installation.
 - Reproduce the exact 154 ms future schedule that caused intermittent startup rejection with unchanged epoch/Boot.
 - Validate complete composite replies before classifying clock jitter; retain strict present-time coverage.
 - Retry only read-only schedule queries after a single Accepted profile: at most three reads, small future offsets,

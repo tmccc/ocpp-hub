@@ -1,12 +1,29 @@
-## Standalone commissioning package — verified unplugged controls, physical test pending
+## Standalone iCS prototype — real app and local control verified in a supervised trial
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-Four authorised unplugged trials connected the charger temporarily on 8 November 2026. The two latest trials restored
-their complete fresh baselines: original cloud connection, configuration, profile inventory, saved overnight schedule
-and charging history. An inactive profile disappeared during the second trial; its cause remains unresolved, and the
-new trials do not recreate that old resource or prove selective clearing beside unrelated profiles. Live Home Assistant
-was not changed; its integration does not load this package. Physical current enforcement and full app control remain
-unproven, so this is not ready for unattended use.
+Five authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
+the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
+control, metadata reads and the existing Fast-mode write. The station setting was 6 A; the meter reported about
+6.1 A while settled, with a peak of 6.2 A and 1,518 W. This is evidence of nominal current limiting, not an exact
+mathematical maximum of 6.0 A.
+
+Three actual sessions delivered 77, 20 and 32 Wh. Every session closed and received its cloud acknowledgement; all six
+original full history records remain alongside the three new records. The app's original 32 A setting was untouched:
+the separate station profile limited the actual charge. The same accepted cloud connection handled all three sessions
+and the local/app transitions without a queued lifecycle event or unexpected cloud fault.
+
+After lead removal, two more charger introductions automatically confirmed the station limit. The owned profile was
+then removed through the normal guarded path. Native snapshots independently verified the original full configuration,
+empty profile inventory and saved overnight schedule, preserved history, a closed unplugged zero-power state and the
+original backend online. The journal reached complete; the trial listener, runtime, capture processes and watchdog
+stopped, and temporary phone preferences were restored exactly. No permanent service was installed. Live Home Assistant
+was not changed; its normal integration does not load this prototype.
+
+The earlier loss of an inactive profile during the second trial remains unexplained. Later successes start from a
+profile-free baseline; they neither recreate that old resource nor prove selective clearing beside unrelated profiles.
+Eco/EcoPlus, saved-schedule editing, indefinite operation, automatic recovery while a vehicle remains connected and
+full-battery auto-stop through the proxy remain unproven. This is a verified supervised control path, not a claim of
+complete app compatibility or unattended production readiness.
 
 The third trial verified ordinary Stop at 0 A and Release back to 6 A with accepted 60-second composites and the same
 accepted cloud session. Exact-id removal of the owned profile succeeded from a profile-free baseline; fresh native
@@ -31,7 +48,9 @@ Each reply and each short wait rechecks the socket, Boot revision, actual operat
 A newer Stop or same-value operation supersedes the old verification. Release from a zero hold still works because
 the desired-state snapshot is not incorrectly equated with the positive limit being prepared. Synthetic tests reproduce
 the observed 154 ms failure, prove recovery through a fresh present-time read, bound a stalled retry, and retain strict
-failure and safety-Stop behaviour. The retry correction is prepared offline and still needs its own supervised live trial.
+failure and safety-Stop behaviour. The corrected source passed all three introductions in the fifth live trial without
+manual arming. The transient retry branch is reproduced deterministically offline; those live introductions each
+received present-time coverage on their first read.
 
 The first trial established:
 
@@ -125,7 +144,8 @@ the repository. These later corrections perform no new charger, vendor or Home A
 
 The station discovery and explicit Absolute option follow the
 [pinned reference integration](https://github.com/lbbrhzn/ocpp/blob/c6a2fa0f994f5b25160c6cf77eb1fcdbf3f60d5b/custom_components/ocpp/ocppv16.py),
-with stricter refusal of unknown capabilities. Physical current enforcement and full app control remain unverified.
+with stricter refusal of unknown capabilities. Nominal physical current limiting and core app/local controls are now
+verified in the supervised trial; the wider app and unattended-operation limitations above remain.
 
 `tools/trial_proxy.py` is the standalone entry point. Its default action is `check`, which reads private configuration,
 credentials, baseline and certificates without creating a journal, doing DNS, binding a listener or contacting a device.
@@ -260,8 +280,8 @@ and can receive lifecycle retries, stop the known session and deliver/reconcile 
 and pending-start uncertainty still require independent reconciliation; they are never automatically retried or discarded.
 A failed native audit does not disable a narrowly scoped safety Stop. Recovery does not implicitly release the hold.
 
-The second trial supports profile acceptance and continuing cloud observations, but selective cleanup, automatic
-readiness on the corrected path and physical enforcement still need independent live confirmation before a charging test.
+The fifth trial verifies automatic readiness, nominal physical current limiting and core app/local controls from a
+profile-free baseline. Selective clearing beside unrelated profiles and the wider unattended-operation cases remain blocked.
 The synthetic commissioning tests remain restricted to literal loopback under `tools/offline_validate.py`.
 
 ---
