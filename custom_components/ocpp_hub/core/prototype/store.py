@@ -1,0 +1,297 @@
+"""Durable acceptance, session correlation and cloud delivery for the offline prototype."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+class RecoveryRequiredError(RuntimeError):
+    """An uncertain remote outcome needs reconciliation instead of automatic replay."""
+
+
+class ConflictError(ValueError):
+    """A retry contradicts an already accepted fact."""
+
+
+# Encode deterministically and reject non-finite JSON before anything is accepted.
+def encoded(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+# Fingerprint the complete request; a reused CALL id must not silently change its meaning.
+def fingerprint(value: Any) -> str:
+    return hashlib.sha256(encoded(value).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """One durable cloud request, still expressed using local transaction ids."""
+
+    token: str
+    action: str
+    payload: dict[str, Any]
+    transaction: int | None
+    state: str
+
+
+class Journal:
+    """A private SQLite WAL journal; failures propagate before any successful charger reply."""
+
+    # Open one exclusive prototype owner and recover interrupted sends conservatively.
+    def __init__(self, path: Path, identity: str, capacity: int = 10000) -> None:
+        import fcntl
+
+        self.path = path
+        self.identity = identity
+        self.capacity = capacity
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Failed construction must release both the private lock and database handle.
+        with ExitStack() as cleanup:
+            self._lock = open(str(path) + ".lock", "a+b")
+            cleanup.callback(self._lock.close)
+            os.chmod(str(path) + ".lock", 0o600)
+            try:
+                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RecoveryRequiredError("journal already has an active owner") from None
+            self.db = sqlite3.connect(path, isolation_level=None)
+            cleanup.callback(self.db.close)
+            self._initialize(path, identity)
+            cleanup.pop_all()
+
+    # Validate the private database and recover only known incomplete operations.
+    def _initialize(self, path: Path, identity: str) -> None:
+        os.chmod(path, 0o600)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        if self.db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RecoveryRequiredError("journal integrity check failed")
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS transactions(
+                local INTEGER PRIMARY KEY, connector INTEGER NOT NULL, start TEXT UNIQUE NOT NULL,
+                stop TEXT, vendor INTEGER UNIQUE, live INTEGER NOT NULL DEFAULT 0);
+            CREATE UNIQUE INDEX IF NOT EXISTS one_open_connector ON transactions(connector) WHERE stop IS NULL;
+            CREATE TABLE IF NOT EXISTS receipts(
+                token TEXT PRIMARY KEY, action TEXT NOT NULL, digest TEXT NOT NULL, response TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, action TEXT NOT NULL,
+                payload TEXT NOT NULL, local INTEGER, state TEXT NOT NULL DEFAULT 'queued');
+            CREATE TABLE IF NOT EXISTS mutations(
+                token TEXT PRIMARY KEY, origin TEXT NOT NULL, action TEXT NOT NULL,
+                digest TEXT NOT NULL, state TEXT NOT NULL);
+        """)
+        with self.atomic():
+            old = self.get("identity")
+            if old is not None and old != identity:
+                raise ConflictError("journal belongs to another charger")
+            self.put("identity", identity)
+            # An upstream Start may have been accepted before its response was lost.
+            self.db.execute("UPDATE outbox SET state='ambiguous' WHERE state='inflight' AND action='StartTransaction'")
+            self.db.execute("UPDATE outbox SET state='queued' WHERE state='inflight'")
+            self.db.execute("UPDATE transactions SET live=0")
+
+    # Commit all related facts together, or publish none of them.
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    # Close the durable store and release its single-owner lock.
+    def close(self) -> None:
+        self.db.close()
+        self._lock.close()
+
+    # Read a typed JSON setting without carrying authentication material.
+    def get(self, key: str, default: Any = None) -> Any:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    # Store a setting inside the caller's transaction when one exists.
+    def put(self, key: str, value: Any) -> None:
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, encoded(value)))
+
+    # Queue a lifecycle event before acknowledging it; retain its stable upstream request id.
+    def enqueue(self, action: str, payload: dict[str, Any], local: int | None = None) -> str:
+        if self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] >= self.capacity:
+            raise RecoveryRequiredError("cloud journal capacity reached; event was not accepted")
+        token = "event-" + uuid.uuid4().hex
+        self.db.execute(
+            "INSERT INTO outbox(token,action,payload,local) VALUES(?,?,?,?)", (token, action, encoded(payload), local)
+        )
+        return token
+
+    # Scope CALL-id reuse to a newly authenticated charger connection, while lifecycle bodies retain their identity.
+    def connection_epoch(self) -> int:
+        with self.atomic():
+            epoch = int(self.get("connection_epoch", 0)) + 1
+            self.put("connection_epoch", epoch)
+        return epoch
+
+    # Retain only a digest of a mutating RPC, never its possibly secret proprietary body.
+    def mutation_intent(self, origin: str, action: str, payload: dict[str, Any]) -> str:
+        digest = fingerprint(payload)
+        pending = self.db.execute(
+            "SELECT token FROM mutations WHERE origin=? AND action=? AND digest=? AND state!='confirmed'",
+            (origin, action, digest),
+        ).fetchone()
+        if pending:
+            raise RecoveryRequiredError("a matching mutation has an unconfirmed outcome")
+        token = uuid.uuid4().hex
+        self.db.execute("INSERT INTO mutations VALUES(?,?,?,?,?)", (token, origin, action, digest, "pending"))
+        return token
+
+    # Confirm only an actual peer response; uncertain writes are never automatically replayed after restart.
+    def mutation_finished(self, token: str, confirmed: bool) -> None:
+        self.db.execute(
+            "UPDATE mutations SET state=? WHERE token=?", ("confirmed" if confirmed else "uncertain", token)
+        )
+
+    # An explicit operator decision can release a quarantined digest after independently checking the peer.
+    def reconcile_mutation(self, token: str) -> None:
+        row = self.db.execute("SELECT state FROM mutations WHERE token=?", (token,)).fetchone()
+        if row is None:
+            raise ConflictError("unknown mutation intent")
+        self.mutation_finished(token, True)
+
+    # Return a previous critical response, rejecting a changed body under the same CALL id.
+    def receipt(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM receipts WHERE token=?", (token,)).fetchone()
+        if row is None:
+            return None
+        if row["action"] != action or row["digest"] != fingerprint(payload):
+            raise ConflictError("CALL id was reused with different transaction data")
+        value: dict[str, Any] = json.loads(row["response"])
+        if not isinstance(value, dict):
+            raise RecoveryRequiredError("invalid durable receipt")
+        return value
+
+    # Save the critical reply in the same commit as its transaction and cloud event.
+    def remember(self, token: str, action: str, payload: dict[str, Any], answer: dict[str, Any]) -> None:
+        self.db.execute("INSERT INTO receipts VALUES(?,?,?,?)", (token, action, fingerprint(payload), encoded(answer)))
+
+    # Accept a start exactly once locally, including a retry sent under a fresh CALL id.
+    def start(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.atomic():
+            cached = self.receipt(token, "StartTransaction", payload)
+            if cached is not None:
+                return cached
+            previous = self.db.execute("SELECT local FROM transactions WHERE start=?", (encoded(payload),)).fetchone()
+            if previous:
+                local = int(previous[0])
+            else:
+                if self.active(int(payload["connectorId"])) is not None:
+                    raise ConflictError("connector already has an unresolved transaction")
+                local = int(self.get("next_transaction", 1000)) + 1
+                if local >= 2**31:
+                    raise RecoveryRequiredError("transaction counter exhausted")
+                self.put("next_transaction", local)
+                self.db.execute(
+                    "INSERT INTO transactions(local,connector,start,live) VALUES(?,?,?,1)",
+                    (local, payload["connectorId"], encoded(payload)),
+                )
+                self.enqueue("StartTransaction", payload, local)
+            answer = {"transactionId": local, "idTagInfo": {"status": "Accepted"}}
+            self.remember(token, "StartTransaction", payload, answer)
+            return answer
+
+    # Accept a stop once without ever clearing some other session on the connector.
+    def stop(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.atomic():
+            cached = self.receipt(token, "StopTransaction", payload)
+            if cached is not None:
+                return cached
+            local = payload["transactionId"]
+            row = self.db.execute("SELECT stop,start FROM transactions WHERE local=?", (local,)).fetchone()
+            if row is None:
+                raise ConflictError("stop names an unknown transaction")
+            start = json.loads(row["start"])
+            if payload["meterStop"] < start["meterStart"] or datetime.fromisoformat(
+                payload["timestamp"].replace("Z", "+00:00")
+            ) < datetime.fromisoformat(start["timestamp"].replace("Z", "+00:00")):
+                raise ConflictError("stop precedes its accepted start")
+            if row[0] is not None and row[0] != encoded(payload):
+                raise ConflictError("stop contradicts a previously accepted stop")
+            if row[0] is None:
+                self.db.execute("UPDATE transactions SET stop=?,live=0 WHERE local=?", (encoded(payload), local))
+                self.enqueue("StopTransaction", payload, local)
+            self.remember(token, "StopTransaction", payload, {})
+            return {}
+
+    # Look up an open transaction; restored rows remain unconfirmed observations.
+    def active(self, connector: int = 1) -> int | None:
+        row = self.db.execute(
+            "SELECT local FROM transactions WHERE connector=? AND stop IS NULL", (connector,)
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    # Translate a known local transaction without guessing from connector number.
+    def vendor_id(self, local: int) -> int | None:
+        row = self.db.execute("SELECT vendor FROM transactions WHERE local=?", (local,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    # Translate a cloud transaction only while its corresponding local session is still open.
+    def local_id(self, vendor: int) -> int | None:
+        row = self.db.execute("SELECT local FROM transactions WHERE vendor=? AND stop IS NULL", (vendor,)).fetchone()
+        return int(row[0]) if row else None
+
+    # Peek rather than delete: a process death must not remove an unacknowledged event.
+    def next_delivery(self) -> Delivery | None:
+        row = self.db.execute("SELECT * FROM outbox ORDER BY seq LIMIT 1").fetchone()
+        if row is None:
+            return None
+        return Delivery(row["token"], row["action"], json.loads(row["payload"]), row["local"], row["state"])
+
+    # Record possible delivery before putting a Start onto the wire.
+    def mark_sent(self, item: Delivery) -> None:
+        self.db.execute("UPDATE outbox SET state='inflight' WHERE token=?", (item.token,))
+
+    # Commit the cloud acknowledgement and its transaction mapping atomically.
+    def acknowledge(self, item: Delivery, result: dict[str, Any]) -> None:
+        with self.atomic():
+            if item.action == "StartTransaction":
+                if item.transaction is None:
+                    raise RecoveryRequiredError("start is missing its local transaction")
+                vendor = result.get("transactionId")
+                if (
+                    type(vendor) is not int
+                    or vendor < 0
+                    or not isinstance(result.get("idTagInfo"), dict)
+                    or result["idTagInfo"].get("status") != "Accepted"
+                ):
+                    raise RecoveryRequiredError("cloud did not accept the local transaction")
+                old = self.vendor_id(int(item.transaction))
+                if old is not None and old != vendor:
+                    raise ConflictError("cloud attempted to change a transaction mapping")
+                try:
+                    self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
+                except sqlite3.IntegrityError:
+                    raise ConflictError("cloud transaction already belongs to another local session") from None
+            self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))
+
+    # Explicitly reconcile a cloud Start with an independently established vendor id.
+    def reconcile_start(self, local: int, vendor: int) -> None:
+        if type(local) is not int or type(vendor) is not int or min(local, vendor) < 0:
+            raise ConflictError("invalid reconciliation ids")
+        row = self.db.execute("SELECT * FROM outbox WHERE local=? AND action='StartTransaction'", (local,)).fetchone()
+        if row is None or row["state"] not in ("ambiguous", "inflight"):
+            raise ConflictError("transaction is not awaiting explicit reconciliation")
+        item = Delivery(row["token"], row["action"], json.loads(row["payload"]), local, row["state"])
+        self.acknowledge(item, {"transactionId": vendor, "idTagInfo": {"status": "Accepted"}})

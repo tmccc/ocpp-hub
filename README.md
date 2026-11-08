@@ -1,3 +1,79 @@
+## Offline ICS coexistence prototype — this branch
+
+This branch adds an isolated prototype in `custom_components/ocpp_hub/core/prototype/`, based on OCPP Hub
+`1229028b4b56cb474b04686e5fdf71f079a0888f` (0.2.1). It reuses Hub's OCPP frame vocabulary and command builders,
+with a separate durable gateway boundary. **The normal Home Assistant entry point is unchanged and does not load
+the prototype. Nothing here has been connected to an actual charger or the iCS backend.**
+
+The intended arrangement is a local controller with a vendor mirror. Local start, stop and current limits work
+without the simulated cloud. Approved vendor commands and proprietary exchanges use real correlated peer replies,
+not synthetic acknowledgements. Core charger observations are accepted locally and delivered to the cloud in order.
+
+| Component | Responsibility |
+| --- | --- |
+| `prototype/store.py` | Private SQLite WAL journal, atomic acceptance before local replies, persistent ids, outbox and mutation uncertainty. |
+| `prototype/gateway.py` | Local transaction authority, ordered replay, both-direction passthrough, reconnect generations and explicit local ownership. |
+| `prototype/rpc.py` | One outgoing CALL per direction, stop priority, bounded retries/receipts, independent receive paths. |
+| `prototype/policy.py` | Explicit single-phase ceiling, profile ownership, local tag and vendor extension/configuration allowlists. |
+| `prototype/security.py` | Authenticated TLS test adapters, exact identity/header preservation, certificate checks and redirect refusal. |
+| `tools/offline_validate.py` | Test runner restricting Python sockets and DNS to literal loopback; named Unix service sockets are denied. |
+
+### What the prototype tests
+
+- Commit Start/Stop state, local replies and cloud events before replying to the charger. Disk failures cannot
+  produce a successful acceptance. Duplicate lifecycle messages retain the same transaction id across restarts.
+- Restore session correlation and queued records after restart. Translate cloud/local transaction ids in both
+  directions, including a complete charge that started and finished while the cloud was absent.
+- Keep pending or uncertain mutation intent as hashes, without saving proprietary bodies or credentials.
+  An upstream Start with a possibly lost acknowledgement is quarantined instead of automatically duplicated.
+- Forward explicitly allowed proprietary requests, configuration reads/writes and their actual results/errors.
+  Receive loops remain available during nested exchanges; duplicate requests share one execution per connection.
+- Give an explicit local stop priority over queued cloud work. Keep its inhibit across restart until explicitly
+  released. Reject blanket profile clears, profiles above the ceiling and single-phase watt/phase bypasses.
+- Reject queued requests from retired connections, including stale boot replies and replies from older local work.
+- Verify both TLS legs with synthetic credentials and certificates, including wrong credentials, duplicate headers,
+  wrong certificate trust/hostname, redirects and credential-safe logs/storage.
+
+### Reproduce without a live system
+
+Use Python 3.14 on Linux and an absolute task scratch directory. Test peers use ephemeral loopback ports and
+synthetic identities only. Dependencies are installed in that private virtual environment, not Home Assistant.
+
+```bash
+export TMPDIR=/absolute/path/to/task-scratch
+mkdir -p "$TMPDIR"
+python3.14 -m venv "$TMPDIR/venv"
+"$TMPDIR/venv/bin/python" -m pip install --require-virtualenv -r requirements-offline.txt
+"$TMPDIR/venv/bin/python" tools/offline_validate.py tests
+```
+
+The runner disables unrelated pytest plugin discovery, stores pytest temporary files under `TMPDIR` and rejects
+non-loopback Python socket/DNS operations before they occur. This is a Python audit guard with reviewed test
+commands, **not an operating-system network namespace**. No production configuration or credentials are loaded.
+
+### Deliberate boundaries
+
+This is not a deployment package or a claim of iCS2.0Lite compatibility. Proprietary fixtures are explicitly
+synthetic; no real iCS message codec or authorization behavior is inferred from them. Unknown extensions and tags
+are refused. There are no automatic starts or automatic charger configuration writes. Firmware/reset/diagnostic
+operations are refused by default rather than acknowledged without execution.
+
+An opaque exchange needs an explicit `(vendorId, messageId)` read/write rule. Opaque write contents cannot be
+proven to respect a current ceiling without their real codec; they are blocked while local control owns the charger.
+The synthetic prototype ceiling is 16 A on one phase. It grants no permission for an actual charger write.
+
+Exactly-once effects across a failed remote connection cannot be guaranteed by OCPP alone. Uncertain cloud Starts
+and pending/uncertain mutating RPCs require independent reconciliation; no automatic retry invents success.
+Same-connection RPC duplicates are cached, but full opaque replies are not persisted, so generic RPC retry identity
+across a fresh connection is not an exactly-once guarantee. Historical transaction records are retained as tombstones;
+restored sessions are marked unconfirmed until current evidence arrives. Replayed old meter samples are not live data.
+
+The real server's certificate trust, authentication, app schedules/settings/history and charger behavior still need
+separate compatibility validation before any future controlled trial. The prototype is deliberately not wired into
+the existing integration setup or its UI. Original upstream documentation follows.
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/MarkBovee/ocpp-hub/main/docs/images/logo.svg" alt="OCPP Hub" width="420">
 </p>

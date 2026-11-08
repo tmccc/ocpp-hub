@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — offline ICS prototype
+
+- Add an isolated, HA-free local-authoritative gateway with private durable transactions, outbox and mutation
+  uncertainty, using OCPP Hub's frame and command helpers. Normal integration setup remains unchanged.
+- Add explicit vendor passthrough with actual peer replies, request deduplication, both-direction transaction
+  translation, priority for local stop, owned profile ids and strict single-phase limits.
+- Add authenticated loopback WSS adapters and an offline network-guarded test runner. Cover restart and storage
+  failures, duplicate messages, uncertain cloud acknowledgements, reconnect races, TLS trust and authorization.
+- This is a synthetic offline prototype, not a release or a validated iCS2.0Lite/hardware integration.
+
 ## 0.2.1
 
 First public release. The same as 0.2.0, whose release job did not run.
