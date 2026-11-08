@@ -14,6 +14,7 @@ from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
 from .policy import number
 from .rpc import UnavailableError
+from .seat_pause import SeatPauseReport, SeatPauseVerifier
 from .security import SecurityError
 from .store import RecoveryRequiredError, fingerprint
 from .trial_evidence import Resource
@@ -44,9 +45,12 @@ class ConnectedHandover:
         provider: PauseProvider | None = None,
         vehicle_digest: str | None = None,
         original_configuration: dict[str, Any] | None = None,
+        pause_verifier: SeatPauseVerifier | None = None,
     ) -> None:
         self.gateway, self.book, self.observe, self.hardware = gateway, book, observe, hardware
         self.provider, self.vehicle_digest, self.original = provider, vehicle_digest, original_configuration
+        self.pause_verifier = pause_verifier
+        self.last_pause_report: SeatPauseReport | None = None
         self.lock = asyncio.Lock()
         if provider is not None:
             require_digest(provider.digest)
@@ -69,11 +73,28 @@ class ConnectedHandover:
         state = self.gateway.journal.get("connected_handover", {})
         return {
             "provider_configured": self.provider is not None,
+            "car_pause_verifier_configured": self.pause_verifier is not None,
+            "car_pause_check": self.last_pause_report.summary() if self.last_pause_report else None,
             "stage": state.get("stage", "not_started"),
             "complete": state.get("stage") == "complete",
             "automatic_backend_restore": False,
             "vehicle_permission_restore_confirmed": bool(state.get("vehicle_restoration")),
         }
+
+    # A cloud diagnostic can explain a blocker without freezing a trial, changing permission or opening OCPP.
+    async def verify_car_pause(self) -> dict[str, Any]:
+        if self.pause_verifier is None:
+            return {"car_pause_check": "not_configured", "current_pause_verified": False, "handover_authority": False}
+        self.last_pause_report = await self.pause_verifier.check()
+        return self.last_pause_report.summary()
+
+    # Undated SEAT charging data never becomes permission to begin or freeze connected handover.
+    async def require_reported_pause(self) -> None:
+        if self.pause_verifier is not None:
+            await self.verify_car_pause()
+            raise UnavailableError(
+                "SEAT current car pause is unverified: vehicle source age and pause lifetime unknown"
+            )
 
     # Never mutate the journal or freeze an ordinary trial merely because an unconfigured command was attempted.
     def require_provider(self) -> PauseProvider:
@@ -230,6 +251,7 @@ class ConnectedHandover:
     # Inspect without weakening the legacy unplugged plan or opening a new transport.
     async def plan(self) -> dict[str, Any]:
         async with self.lock:
+            await self.require_reported_pause()
             native = await self.protected("plan")
             present = self.book.owned_present(native.physical)
             self.require_zero_station(present)
@@ -246,6 +268,7 @@ class ConnectedHandover:
     # Freeze first; retain USER6 and the vehicle pause while selectively removing only journal-owned resources.
     async def run(self, quiesce: Callable[[], Awaitable[None]]) -> dict[str, Any]:
         async with self.lock:
+            await self.require_reported_pause()
             self.require_provider()
             state = self.begin()
             if state["stage"] == "complete":

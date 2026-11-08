@@ -16,6 +16,7 @@ from .gateway import Gateway
 from .policy import Policy
 from .rpc import UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
+from .seat_pause import SeatPauseVerifier
 from .security import SecurityError
 from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -123,6 +124,7 @@ class TrialSession:
         handover_vehicle_digest: str | None = None,
         handover_observe: ObserveHandover | None = None,
         handover_original_configuration: dict[str, Any] | None = None,
+        car_pause_verifier: SeatPauseVerifier | None = None,
     ) -> None:
         self.prepared = prepared
         self.observe = observe or prepared.observer.observe
@@ -195,6 +197,7 @@ class TrialSession:
                 handover_provider,
                 handover_vehicle_digest,
                 original,
+                car_pause_verifier,
             )
             self.connected_cleanup_only = False
             self.runtime.ceiling_enabled = lambda: not self.connected_cleanup_only
@@ -372,6 +375,8 @@ class TrialSession:
             if self.journal.get("connected_handover"):
                 return await self.handover.confirm_unplugged_backend(self.rollback)
             return await self.rollback.confirm_original_backend()
+        if command == "verify-car-pause":
+            return await self.handover.verify_car_pause()
         if command == "connected-handover-plan":
             return await self.handover.plan()
         if command == "connected-handover":

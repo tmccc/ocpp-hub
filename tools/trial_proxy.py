@@ -32,6 +32,7 @@ def load_core() -> None:
 
 
 load_core()
+from ocpp_hub_core.prototype.seat_access import configured_verifier  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig  # noqa: E402
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import Baseline  # noqa: E402
@@ -68,9 +69,10 @@ async def interactive(session: Any, stopped: asyncio.Event) -> None:
 
 
 # Bound a supervised run; shutdown keeps its zero hold and history unless rollback has independently completed.
-async def run(config_path: Path, duration: int, terminal: bool) -> int:
+async def run(config_path: Path, duration: int, terminal: bool, car_pause_config: Path | None = None) -> int:
     prepared = preflight(config_path)
-    session = TrialSession(prepared)
+    verifier = configured_verifier(car_pause_config) if car_pause_config is not None else None
+    session = TrialSession(prepared, car_pause_verifier=verifier) if verifier is not None else TrialSession(prepared)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -134,16 +136,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--car-pause-config", type=Path)
     args = parser.parse_args(argv)
     if not 60 <= args.duration <= 1800:
         parser.error("duration must be 60 to 1800 seconds")
     try:
+        if args.action != "run" and args.car_pause_config is not None:
+            configured_verifier(args.car_pause_config)
         if args.action == "check":
             emit(preflight(args.config).summary())
             return 0
         if args.action == "capture-baseline":
             return capture(args.config)
-        return asyncio.run(run(args.config, args.duration, args.interactive))
+        return asyncio.run(run(args.config, args.duration, args.interactive, args.car_pause_config))
     except Exception as error:
         # This outer boundary must never turn a parser/TLS/network error into a credential-bearing traceback.
         emit({"trial_action_failed": type(error).__name__, "live_readiness_proven": False})

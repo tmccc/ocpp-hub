@@ -38,7 +38,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   and fresh 6 A Start offer, with restoration while the lead stays attached. Connected-handover checks now have their
   own fresh provider/vehicle evidence, native USER6/closed-zero gates, journalled cleanup continuation and staged
   restoration. This separate path is tested offline and remains disabled without a real current-state provider;
-  the earlier pilot cannot authorise it. No live Home Assistant or permanent service deployment has been made.
+  the earlier pilot cannot authorise it. An automatic read-only SEAT checker now reads the real charging endpoint
+  and blocks preflight before mutation. A live read confirms manual mode/connected with optional power absent.
+  The endpoint provides no established vehicle observation timestamp or durable pause lease, so the checker reports
+  that uncertainty and cannot grant handover authority. No live Home Assistant or permanent service deployment has
+  been made.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

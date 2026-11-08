@@ -2,6 +2,9 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add automatic read-only SEAT pause assessment with a fixed TLS GET, current access borrowed without refresh,
+  explicit cloud-source-age uncertainty and a preflight blocker before connected-handover mutation. Keep diagnostic
+  reports separate from permission authority; validate the live idle response with optional power absent.
 - Add a separate connected-handover controller with fresh vehicle/provider/nonce/Boot bindings, independent native
   USER6 verification, distinct closed-zero samples, explicit-release pause lifetime and staged original restoration.
   Keep production disabled without an explicitly integrated live provider; historical pilot files cannot enable it.

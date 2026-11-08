@@ -355,8 +355,36 @@ The separate connected path is exposed through `connected-handover-plan`, `conne
 `confirm-connected-original-backend`, `confirm-connected-original-settings` and
 `restore-connected-vehicle-permission`. A commissioning adapter must explicitly supply a `PauseProvider`, the vehicle
 identity digest and the immutable original full configuration to `TrialSession`; the default CLI supplies none.
-There is deliberately no production SEAT endpoint/auth implementation or file-based permission import in this change.
+The read-only SEAT checker described below is separate from that provider; there is no file-based permission import.
 Home Assistant's deliberately read-only SEAT integration is not used for vehicle writes.
+
+#### Automatic SEAT pause check
+
+`prototype/seat_pause.py` reads the inspected SEAT charging endpoint through one TLS-verified GET. It pins the
+vehicle and host, refuses redirects and does not refresh authentication, wake the car, send charging commands or
+reuse cached success. `prototype/seat_access.py` can borrow current access and device proof from the existing private
+production SEAT store, read-only and as its owner. It never exports or redeems the refresh token. Expired access,
+rejected proof or an unresolved authentication rotation makes the check unavailable.
+
+Use a private configuration file containing `session` (the absolute existing store path) and `vehicle_digest`
+(the store's 64-character vehicle SHA-256). `python tools/seat_pause.py check --config /private/seat-pause.json`
+validates files/access offline. The explicit `verify` action makes the read and prints only classified status.
+Exit 3 means current pause is unverified; exit 2 means private access is unavailable. No credential belongs on the
+command line. Do not copy the store or run another authentication-refresh client to make this checker work.
+
+The standalone proxy accepts `--car-pause-config /private/seat-pause.json`. Its `verify-car-pause` command runs the
+check on demand, and connected-handover planning/execution checks it automatically before any freeze or mutation.
+Default preflight remains offline. The checker does not constitute a `PauseProvider` or enable connected admission.
+
+The real endpoint has no established vehicle observation timestamp. Exact mode `stopped` is reported as
+`pause_reported_source_age_unknown`; manual/timer/off modes, a completed charge or zero power do not prove the car's
+pause permission. Missing optional power stays unknown, rather than becoming zero. Malformed or contradictory
+readings fail closed. HTTP fetch time, HTTP Date and the separate vehicle-status timestamp never establish freshness.
+Every report therefore retains `current_pause_verified=false`, `durable_pause_verified=false` and
+`handover_authority=false`. No permission revision, release-only guarantee or pause lifetime is fabricated.
+
+A read-only live check confirmed manual mode with a connected car; the genuine response omitted optional charging
+power. This verifies the reader and its conservative classification, not current pause or unattended handover.
 
 Each protected step requires a new provider response bound to the car, charger, hardware, baseline, operation nonce,
 current Boot/connection and complete native snapshot. The response must prove current pause, unchanged owner revision,
