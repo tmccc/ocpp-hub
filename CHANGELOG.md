@@ -2,6 +2,10 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Verify an unplugged local zero-current hold while the vendor connection is deliberately retired, followed by
+  successful cloud reconnection, 6 A release and complete restoration with all nine history records unchanged.
+- Keep physical local Start and actual history backfill during an outage explicitly unproven; verify that path with
+  guarded synthetic TLS peers without inventing cloud acknowledgements.
 - Record three real charging sessions through iCS2.0Lite with app Start/Stop/restart and local Stop/release.
   A 6 A station setting gave about 6.1 A reported current, peaking at 6.2 A; retain the measurement distinction.
 - Verify all lifecycle acknowledgements, preserved original history plus three new records, unchanged app current

@@ -1,7 +1,7 @@
 ## Standalone iCS prototype — real app and local control verified in a supervised trial
 
 This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-Five authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
+Six authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
 the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
 control, metadata reads and the existing Fast-mode write. The station setting was 6 A; the meter reported about
 6.1 A while settled, with a peak of 6.2 A and 1,518 W. This is evidence of nominal current limiting, not an exact
@@ -18,6 +18,15 @@ empty profile inventory and saved overnight schedule, preserved history, a close
 original backend online. The journal reached complete; the trial listener, runtime, capture processes and watchdog
 stopped, and temporary phone preferences were restored exactly. No permanent service was installed. Live Home Assistant
 was not changed; its normal integration does not load this prototype.
+
+The sixth trial deliberately retired the vendor connection while keeping the physical charger connected locally.
+Ordinary local Stop installed and confirmed the zero-current hold with the cloud absent. The original cloud runner
+then reconnected and registered successfully, and Release restored the confirmed 6 A setting without a fault or
+queued event. This test was unplugged: physical local Start and actual session-history backfill during a cloud outage
+remain unverified. A guarded TLS-loopback test covers that full Start/Stop/backfill path, including real synthetic
+acknowledgements and retention of the zero hold. The sixth trial again restored the complete fresh baseline: original
+configuration, empty profile inventory, saved schedule and all nine existing full history records, with the original
+backend online and no charging session open. Its journal completed and all experiment processes stopped.
 
 The earlier loss of an inactive profile during the second trial remains unexplained. Later successes start from a
 profile-free baseline; they neither recreate that old resource nor prove selective clearing beside unrelated profiles.
