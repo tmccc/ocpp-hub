@@ -540,8 +540,23 @@ the separate post-recovery Start/Stop. All three sessions received real cloud ma
 Final independent observation confirmed the exact original 32 A configuration/cloud link, unchanged saved plans,
 all 20 original history bodies plus the three genuine test sessions, no trial profiles and an empty outbox. The lead
 stayed attached and Home Assistant remained unchanged. These sessions drew zero power: the trial establishes
-control/lifecycle, cloud-outage handling and restricted process recovery, while charging under load remains a
-separate validation. It does not install an unattended service.
+control/lifecycle, cloud-outage handling and restricted process recovery. That trial did not validate charging under
+load or install an unattended service.
+
+A subsequent short load trial on 2026-11-09 verified real charging through the same proxy. The charger recorded
+50 Wh over 138 seconds. Sixteen independent fresh native observations showed 6.1 A and 1447–1449 W with saved/runtime
+USER6, HW32 and an owned station6 profile. The acknowledged session continued unchanged through deliberate vendor
+disconnection: positive samples covered 43.91 seconds with the cloud connected and 32.84 seconds while disconnected.
+Local Stop while offline established native/local closure, zero output and all seven meter channels at zero. The
+queued Stop and observations received genuine cloud acknowledgements after reconnect, without changing their stored
+bodies. The short-charge harness had a 180-second Stop deadline, rejected an expired budget or unbudgeted release,
+and retained exact session/owner/Boot/mutation checks around the active cloud cut.
+
+Final independent native observation confirmed original 32 A/cloud/configuration and saved plans, no trial profiles,
+an empty outbox, all 22 fresh-baseline history bodies and the one genuine50 Wh charge. One older completed record was
+already absent from the native list before this trial; its archived body remains available and the cause is unknown.
+The lead stayed attached, no Home Assistant settings changed and no permanent proxy service was installed. Longer
+operation, unattended recovery policy and permanent deployment remain separate work.
 
 ---
 

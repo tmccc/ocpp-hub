@@ -2,6 +2,10 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Validate a real connected 6 A load session through the proxy: 50 Wh in 138 seconds, stable 6.1 A/approximately 1.45 kW
+  before and during an active cloud outage, local offline Stop with independently verified all-phase zero, and genuine
+  queued-event upload/acknowledgement. Restore original 32 A/cloud/configuration/plans, preserve the fresh 22-record
+  baseline plus the new charge, and remove all trial profiles with the lead attached. No permanent deployment.
 - Add explicit native-bounded recovery acknowledgement that requires fresh native6/closed-zero evidence, current
   introduction, confirmed station0 and real history delivery before rearming controls. Retain zero, reconcile exact
   known active Stop and actual Stop replay after process loss, and keep an interrupted cleanup frozen.

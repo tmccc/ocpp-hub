@@ -61,7 +61,13 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   the same journal, zero recovery and blocked Start until explicit acknowledgement, then a separate Start/Stop.
   Charger reconnection required no reboot. All 20 old history bodies remain plus three genuine acknowledged sessions;
   final original 32 A/cloud/plans restoration and absence of trial profiles were independently verified. All new
-  sessions drew zero power, so these are control/recovery proofs. Load operation, wider unattended compatibility
+  sessions drew zero power, so those were control/recovery proofs.
+  A subsequent connected load trial passed on 2026-11-09: 50 Wh over 138 seconds with 16 positive native samples at 6.1 A
+  and 1447–1449 W. The same acknowledged session continued through deliberate active vendor disconnection; local Stop
+  offline established closure/all-phase zero, followed by real cloud ACKs and an empty outbox. Native6/owned6 remained
+  verified. Full original 32 A/cloud/configuration/plans restoration, no trial profiles and preservation of the fresh 22
+  history bodies plus the new charge were independently verified. One older record was already absent before this
+  baseline and its cause is unknown; the raw archive remains. The lead stayed attached. Longer unattended operation
   and permanent Home Assistant/service deployment remain separate work.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
