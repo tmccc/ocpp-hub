@@ -571,6 +571,13 @@ This option requires disabled local Start and is enabled only by the managed run
 connection separately from service connectivity. Detailed future native validation failures stay in the private
 journal even when the next sample recovers.
 
+The unplugging correction was deployed on 2026-11-09 after1088 offline tests and12 targeted condition mutations
+passed. Unplug/replug and restart with the vehicle absent were exercised with independent native HTTP/TLS peers;
+the physical lead was left connected during installation. The old inhibition was acknowledged only after fresh
+closed-zero/owned0, exact history and empty-ledger verification. Controlled replacement recovered genuine Boot,
+cloud registration and shared6A control. A final independent native/ledger audit confirmed zero power, no Start or
+transaction, unchanged plans/all26 history bodies, and a successful independent health check.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

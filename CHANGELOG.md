@@ -6,6 +6,9 @@
   `A`/`Unplug`, a closed session, all-phase zero and output0 under unchanged native6/configuration/history/resources.
   Recover an already admitted service while unplugged without Start. Keep initial connected admission and32A
   restoration strict, expose actual vehicle connection and retain private validation failure details.
+- Validate1088 offline cases and12 unplugged-condition mutations, deploy the correction, reconcile the reported
+  unplugging fault under independently verified owned0/closed-zero, and recover shared6A app/schedule control.
+  Confirm zero power, no Start/transaction, intact26-record history/plans and successful health monitoring.
 
 - Add persistent bounded app/schedule supervision with durable records, process watchdog/status, disabled local
   Start and verified zero-to6 owner-control restoration without RemoteStart. Preserve native timetable identities,

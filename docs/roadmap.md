@@ -89,7 +89,10 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   managed monitor's connected-only check: it latched inhibition after three samples and remained blocked after
   reconnection. Explicit closed/all-phase-zero unplugged monitoring/recovery is now implemented without weakening
   original connected admission, unknown-session rejection, resource/history protection or32A restoration.
-  Home Assistant remains unchanged.
+  The correction is deployed after1088 offline cases and12 condition mutations; unplug/replug and absent-vehicle
+  restart were tested offline. Independent zero/owned0/history/empty-ledger proof preceded fault acknowledgement;
+  real connected replacement recovered shared6A/Boot/cloud with zero power, no Start and all26 history bodies/plans
+  intact. The physical lead stayed connected. Home Assistant remains unchanged.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
