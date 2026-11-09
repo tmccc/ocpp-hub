@@ -53,6 +53,7 @@ class Policy:
     local_stack_level: int = 16
     trust_vendor_start_tags: bool = False
     strict_cloud_authorization: bool = False
+    allow_local_start: bool = True
     vendor_tag_ttl_s: int = 120
     allowed_tags: frozenset[str] = frozenset({"LOCAL_TEST"})
     extensions: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -65,7 +66,10 @@ class Policy:
             raise DeniedError("prototype requires a 6–32 A single-phase ceiling")
         integer(self.local_stack_level, 0, 255)
         integer(self.vendor_tag_ttl_s, 1, 300)
-        if type(self.trust_vendor_start_tags) is not bool or type(self.strict_cloud_authorization) is not bool:
+        if any(
+            type(value) is not bool
+            for value in (self.trust_vendor_start_tags, self.strict_cloud_authorization, self.allow_local_start)
+        ):
             raise DeniedError("vendor tag trust must be explicit")
         if any(mode not in ("read", "write") for mode in self.extensions.values()):
             raise DeniedError("extensions must be explicitly classified as read or write")

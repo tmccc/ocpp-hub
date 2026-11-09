@@ -128,6 +128,7 @@ class TrialSession:
         handover_original_configuration: dict[str, Any] | None = None,
         car_pause_verifier: SeatPauseVerifier | None = None,
         native_bounded: NativeBoundedSpec | None = None,
+        allow_local_start: bool = True,
     ) -> None:
         self.prepared = prepared
         self.observe = observe or prepared.observer.observe
@@ -135,12 +136,18 @@ class TrialSession:
         config = prepared.config
         self.journal = Journal(config.journal, config.identity)
         try:
+            managed = self.journal.get("managed_mode")
+            if managed is not None and (
+                managed.get("mode") != "app_schedule" or managed.get("local_start") is not False or allow_local_start
+            ):
+                raise SecurityError("managed journal requires its saved local Start restriction")
             self.book = ResourceBook(self.journal, prepared.baseline)
             policy = Policy(
                 max_current_a=6,
                 allowed_tags=config.local_tags,
                 trust_vendor_start_tags=True,
                 strict_cloud_authorization=True,
+                allow_local_start=allow_local_start,
                 local_stack_level=config.station_stack_level,
                 extensions={
                     ("IoCharger", name): mode

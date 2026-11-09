@@ -9,6 +9,7 @@ from typing import Any
 
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
+from .ics import is_safe_transaction_query
 from .policy import DeniedError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
@@ -216,7 +217,8 @@ class ResourceBook:
     def before_send(self, action: str, payload: dict[str, Any]) -> None:
         phase = self.journal.get("trial_phase")
         reads = ("GetConfiguration", "GetCompositeSchedule", "TriggerMessage")
-        if action not in reads:
+        reading = action in reads or action == "DataTransfer" and is_safe_transaction_query(payload)
+        if not reading:
             safety = self._safety_write(action, payload)
             if (
                 self.journal.get("trial_preservation_fault") or self.journal.get("trial_inventory_fault")
@@ -226,7 +228,7 @@ class ResourceBook:
                 action == "ClearChargingProfile" or action == "SetChargingProfile" and not safety
             ):
                 raise DeniedError("original profiles prevent new profile writes and automatic clears")
-        if phase != "active" and action not in reads:
+        if phase != "active" and not reading:
             key = "profile:" + str(payload.get("id"))
             if (
                 phase in ("blocked", "recovering", "rollback", "backend_restore_pending")

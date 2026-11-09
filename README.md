@@ -522,6 +522,35 @@ the charger. `capture-bounded-baseline` is a separate read-only action for the o
 `run` still requires independently verified native6 before admission and explicit external route/configuration steps.
 The native strategy and `--car-pause-config` are mutually exclusive.
 
+`tools/managed_proxy.py` provides a persistent, bounded `app_schedule` mode with explicit `check`, `serve` and
+read-only `health` actions. It uses the same private configuration/native specification and durable journal as
+the commissioning engine. Only `serve` opens connections. Deploy it as a dedicated user service with boot linger,
+`Restart=on-failure`, `Type=notify` and `WatchdogSec=60`; retain the journal, baseline, specification and credentials
+outside immutable versioned code releases. Use a dedicated Python 3.14 environment with `requirements-trial.txt`
+and OpenSSL. A separate periodic `health` invocation detects a dead process or stale native observations without
+opening the journal or restarting the charger for a cloud outage.
+
+Local Start is disabled before it can change ownership, and that restriction is persisted in the journal across
+all entry points. The owner app's Start and the charger's unchanged native timetable remain permitted at the
+initial 6 A ceiling. Include the exact independently verified native timetable identity in the explicit local tag
+allowlist. Startup/recovery verifies genuine Boot, current native6, actual owned station0, unchanged configuration,
+plans and retained history, and real cloud registration/history acknowledgements. It then acknowledges recovery
+at zero and releases the ceiling to6 once per introduction, without sending RemoteStart. If the firmware does
+not resume after a recovery Stop, the owner app or timetable must initiate another charge.
+
+The supervisor accepts a known, bounded owner charge as healthy. Unknown transactions, missing owned resources,
+configuration/history drift or uncertain delivery latch a durable fault, retain local inhibition and lower only
+an already owned station ceiling where authority permits. It never invents a Stop identity or recreates a verified
+absent resource. Shutdown retires pending release authority before retaining the normal zero/known-Stop hold;
+it does not clear profiles, restore32 or rewrite the backend. Service replacement preserves transaction numbers,
+receipts and history. Live Home Assistant integration is a separate deployment.
+
+Private atomic status and bounded `.events.jsonl` transitions sit beside the journal. Health requires recent status
+and independent native observation, actual Boot/cloud connectivity, active shared ownership, verified6A limits,
+preserved resources, disabled local Start and sufficient validity of the certificate actually loaded into TLS.
+The event-loop watchdog reports process responsiveness independently of cloud/native health. Listener certificate
+renewal requires a controlled service restart; file replacement alone cannot falsely renew its reported validity.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

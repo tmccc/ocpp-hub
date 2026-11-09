@@ -146,6 +146,8 @@ class TrialConfig:
             Path(str(self.journal) + "-wal"),
             Path(str(self.journal) + "-shm"),
             self.journal.with_suffix(".status.json"),
+            self.journal.with_suffix(".events.jsonl"),
+            self.journal.with_suffix(".events.jsonl.1"),
             self.baseline,
             self.baseline.with_suffix(".original-config.json"),
             self.evidence,
@@ -265,10 +267,11 @@ class PreparedTLS:
     client: ssl.SSLContext
     incoming: str | None
     upstream: str | None
+    certificate_expires_at: float = 0
 
 
 # OpenSSL checks the configured IP/DNS SAN; the public certificate dates must cover the whole bounded trial.
-def verify_listener_certificate(descriptor: int, name: str) -> None:
+def verify_listener_certificate(descriptor: int, name: str) -> float:
     try:
         try:
             ipaddress.ip_address(name)
@@ -295,6 +298,7 @@ def verify_listener_certificate(descriptor: int, name: str) -> None:
             < ssl.cert_time_to_seconds(dates["notAfter"]) - 1800
         ):
             raise ValueError
+        return ssl.cert_time_to_seconds(dates["notAfter"])
     except OSError, ValueError, KeyError, subprocess.TimeoutExpired:
         raise SecurityError("listener certificate name or validity does not cover the trial") from None
 
@@ -314,7 +318,7 @@ def prepare_tls(config: TrialConfig) -> PreparedTLS:
                 stream.write(payload)
             os.lseek(descriptor, 0, os.SEEK_SET)
         server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        verify_listener_certificate(descriptors[0], config.listener_name)
+        expires = verify_listener_certificate(descriptors[0], config.listener_name)
         os.lseek(descriptors[0], 0, os.SEEK_SET)
         server.minimum_version = ssl.TLSVersion.TLSv1_2
         server.load_cert_chain(
@@ -323,7 +327,7 @@ def prepare_tls(config: TrialConfig) -> PreparedTLS:
         ca_data = None if config.ca_file is None else read_file(config.ca_file, secret=False).decode("ascii")
         client = ssl.create_default_context(cadata=ca_data)
         client.minimum_version = ssl.TLSVersion.TLSv1_2
-        return PreparedTLS(server, client, incoming, upstream)
+        return PreparedTLS(server, client, incoming, upstream, expires)
     except OSError, ValueError, UnicodeError:
         raise SecurityError("trial TLS material could not be validated") from None
     finally:

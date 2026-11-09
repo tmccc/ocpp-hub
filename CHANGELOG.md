@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add persistent bounded app/schedule supervision with durable records, process watchdog/status, disabled local
+  Start and verified zero-to6 owner-control restoration without RemoteStart. Preserve native timetable identities,
+  exact history queries during recovery and saved mode restrictions across entry points. Faults retain inhibition;
+  fresh native/cloud/Boot/resource evidence is required for healthy status and shutdown retires pending releases.
+
 - Validate actual proxy process loss during acknowledged 6 A charging: observe the same session still drawing 6.1 A
   while the old process is absent, then genuine replacement Boot, station0/exact-known Stop, real closure/cloud ACKs,
   explicit zero-retaining recovery acknowledgement and a separate real charging restart. Preserve one original

@@ -44,6 +44,16 @@ def data_object(value: Any, keys: set[str]) -> dict[str, Any]:
     return data
 
 
+# A translated outgoing history read retains the exact observed envelope and duplicate-safe integer-only body.
+def is_safe_transaction_query(payload: dict[str, Any]) -> bool:
+    if not is_transaction_query(payload):
+        return False
+    if set(payload) != {"vendorId", "messageId", "data"}:
+        raise DeniedError("unobserved iCS transaction-query envelope")
+    data_object(payload["data"], {"transactionId"})
+    return True
+
+
 @dataclass(frozen=True)
 class TransactionQuery:
     """One request's verified mapping, retained until its actual charger reply arrives."""

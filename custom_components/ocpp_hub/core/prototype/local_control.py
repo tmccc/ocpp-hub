@@ -282,6 +282,8 @@ class LocalControl:
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
     async def _start(self, tag: str) -> Frame:
+        if not self.policy.allow_local_start:
+            raise DeniedError("local Start is disabled; charging remains under the app and charger schedule")
         if self.journal.get("trial_starting"):
             raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})

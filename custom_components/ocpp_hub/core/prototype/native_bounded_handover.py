@@ -10,6 +10,7 @@ from typing import Any
 from .. import commands
 from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
+from .ics import is_safe_transaction_query
 from .native_bounded import NativeBoundedSpec
 from .rpc import UnavailableError
 from .security import SecurityError
@@ -260,6 +261,8 @@ class NativeBoundedHandover:
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
     async def validate_send(self, action: str, payload: dict[str, Any]) -> None:
+        if action == "DataTransfer" and is_safe_transaction_query(payload):
+            return
         if action in ("GetConfiguration", "GetCompositeSchedule", "TriggerMessage", "RemoteStopTransaction"):
             return
         zero = action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0
