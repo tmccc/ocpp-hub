@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Validate actual proxy process loss during acknowledged 6 A charging: observe the same session still drawing 6.1 A
+  while the old process is absent, then genuine replacement Boot, station0/exact-known Stop, real closure/cloud ACKs,
+  explicit zero-retaining recovery acknowledgement and a separate real charging restart. Preserve one original
+  monotonic charge budget across processes and restore original 32 A/cloud/plans with the lead attached. All23 starting
+  history bodies remain plus three genuine sessions, including the safely stopped preparatory attempt.
 - Validate a real connected 6 A load session through the proxy: 50 Wh in 138 seconds, stable 6.1 A/approximately 1.45 kW
   before and during an active cloud outage, local offline Stop with independently verified all-phase zero, and genuine
   queued-event upload/acknowledgement. Restore original 32 A/cloud/configuration/plans, preserve the fresh 22-record

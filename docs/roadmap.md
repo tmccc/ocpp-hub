@@ -69,6 +69,15 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   history bodies plus the new charge were independently verified. One older record was already absent before this
   baseline and its cause is unknown; the raw archive remains. The lead stayed attached. Longer unattended operation
   and permanent Home Assistant/service deployment remain separate work.
+  Active process-loss recovery is now live-verified on 2026-11-09: the old proxy process was terminated during real
+  acknowledged 6 A charging; the same native transaction remained bounded at 6.1 A with USER6/owned6 while absent.
+  Replacement launch took 0.651 seconds, actual station0 was requested 21.618 seconds after the crash, and closed/all-phase
+  zero with real history ACKs was confirmed 30.854 seconds after the last pre-crash sample. The real trace proves zero
+  then exact-known RemoteStop. Explicit recovery acknowledgement stayed at zero before a different real charge.
+  One monotonic 180-second budget spanned both processes; invalid authority blocked positive control. Main sessions
+  delivered 17 Wh/8 Wh, plus 58 Wh in a preparatory attempt whose late restart was correctly refused and safely stopped.
+  Full original 32 A/cloud/configuration/plans and all 23 initial history bodies plus three genuine acknowledged sessions
+  were preserved. The lead stayed attached; no Home Assistant or permanent service deployment was performed.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

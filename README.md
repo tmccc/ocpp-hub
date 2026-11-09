@@ -558,6 +558,24 @@ already absent from the native list before this trial; its archived body remains
 The lead stayed attached, no Home Assistant settings changed and no permanent proxy service was installed. Longer
 operation, unattended recovery policy and permanent deployment remain separate work.
 
+An active process-loss trial on 2026-11-09 then verified restart while real charging was in progress. A preparatory
+charge was stopped and restored normally after the operator consumed the reserved recovery window; the guard refused
+that kill. The repeat used a fully prepared sequence and one original 180-second, same-host monotonic budget across
+both proxy processes. Missing, expired, malformed or differently bound budget data permitted only Stop/recovery.
+
+The old process was actually terminated during an acknowledged 6 A charge. An independent observation with that process
+absent still found the same native transaction drawing 6.1 A, with USER6/HW32 and owned station6. The replacement
+process launched 0.651 seconds after the crash witness. Its real outgoing/reply trace established station0 followed
+by RemoteStop for the exact original local transaction, both Accepted. Zero was requested 21.618 seconds after the
+crash; native/local closure, all-phase zero and real cloud history delivery were confirmed 30.854 seconds after the
+last pre-crash native sample. This is bounded-current continuity through the outage, not instantaneous zero on loss.
+
+Explicit native recovery acknowledgement retained zero, then a separate Start created a different actual transaction
+and drew power. The two main sessions recorded 17 Wh and 8 Wh; the preparatory charge recorded 58 Wh. Final independent
+verification found all 23 initial history bodies intact, those three genuine closed/cloud-mapped records added,
+no trial profiles/outbox, unchanged plans and the exact original 32 A/cloud configuration. The lead stayed connected
+and Home Assistant/permanent service setup remained unchanged. Longer unattended operation remains separate work.
+
 ---
 
 ## Offline iCS coexistence prototype — this branch
