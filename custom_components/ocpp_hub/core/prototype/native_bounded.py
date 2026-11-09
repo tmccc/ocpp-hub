@@ -54,11 +54,20 @@ def require_original(configuration: dict[str, Any], hardware: str) -> None:
 
 
 # Check direct native values independently of the proxy's desired profile, vendor availability or car permission.
-def require_native(native: HandoverEvidence, identity: str, hardware: str, user_a: int, closed: bool) -> None:
+def require_native(
+    native: HandoverEvidence,
+    identity: str,
+    hardware: str,
+    user_a: int,
+    closed: bool,
+    *,
+    allow_unplugged: bool = False,
+) -> None:
     try:
         physical = native.physical
-        if type(user_a) is not int or user_a not in {6, 32}:
+        if type(user_a) is not int or user_a not in {6, 32} or type(allow_unplugged) is not bool:
             raise ValueError
+        unplugged = allow_unplugged and user_a == 6 and physical.cp == "A" and physical.connection == "Unplug"
         current_max, power_max = (6.5, 2000) if user_a == 6 else (32.5, 8500)
         if type(physical.observed_at) not in (int, float) or not math.isfinite(physical.observed_at):
             raise ValueError
@@ -78,7 +87,9 @@ def require_native(native: HandoverEvidence, identity: str, hardware: str, user_
             or len(native.currents_a) != 3
             or len(native.powers_w) != 4
             or physical.cp not in {"B", "C"}
+            and not unplugged
             or physical.connection not in {"Plug", "Charging"}
+            and not unplugged
             or physical.cp == "C"
             and physical.connection != "Charging"
             or type(physical.transaction_open) is not bool
@@ -102,8 +113,9 @@ def require_native(native: HandoverEvidence, identity: str, hardware: str, user_
             or any(value != 0 for value in native.powers_w[1:3])
         ):
             raise ValueError
-        if closed and (
+        if (closed or unplugged) and (
             physical.cp != "B"
+            and not unplugged
             or physical.transaction_open
             or native.output_limit_a != 0
             or any(value != 0 for value in native.currents_a + native.powers_w)
@@ -190,12 +202,28 @@ class NativeBoundedSpec:
 
     # A fresh bounded read is not a paused car, a reconciled lifecycle, or proof that the original backend is online.
     def require(
-        self, native: HandoverEvidence, identity: str, route: str, user_a: int = 6, closed: bool = False
+        self,
+        native: HandoverEvidence,
+        identity: str,
+        route: str,
+        user_a: int = 6,
+        closed: bool = False,
+        *,
+        allow_unplugged: bool = False,
     ) -> None:
+        if type(allow_unplugged) is not bool:
+            raise SecurityError("unplugged monitoring requires an explicit boolean option")
         expected = self.configuration(route, user_a)
         if identity != expected["Id"]:
             raise SecurityError("native bounded specification belongs to another charger")
-        require_native(native, identity, self.hardware_identity, user_a, closed or user_a == 32)
+        require_native(
+            native,
+            identity,
+            self.hardware_identity,
+            user_a,
+            closed or user_a == 32,
+            allow_unplugged=allow_unplugged and route == "trial" and user_a == 6,
+        )
         if native.configuration != expected or native.saved_schedule_digest != self.saved_schedule_digest:
             raise SecurityError("native bounded configuration or saved schedule changed")
 

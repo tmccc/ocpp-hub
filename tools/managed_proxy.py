@@ -122,7 +122,7 @@ async def serve(config_path: Path, spec_path: Path) -> int:
     check_spec_path(prepared.config, spec_path)
     spec = native_spec(spec_path, prepared)
     expires = prepared.tls.certificate_expires_at
-    session = TrialSession(prepared, native_bounded=spec, allow_local_start=False)
+    session = TrialSession(prepared, native_bounded=spec, allow_local_start=False, allow_unplugged_native=True)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     controller: ManagedController | None = None

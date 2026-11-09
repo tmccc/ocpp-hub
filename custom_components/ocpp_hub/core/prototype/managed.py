@@ -78,7 +78,7 @@ class ManagedController:
     # The present owned zero, live introduction and actual reconciled events are prerequisites to any release.
     def require_zero(self, native: HandoverEvidence) -> None:
         s, g, j = self.session, self.session.gateway, self.session.journal
-        self.native.spec.require(native, j.identity, "trial", closed=True)
+        self.native.spec.require(native, j.identity, "trial", closed=True, allow_unplugged=self.native.allow_unplugged)
         self.native.require_known_session(native)
         present = s.book.owned_present(native.physical)
         row = j.db.execute(
@@ -227,9 +227,14 @@ class ManagedController:
             }
         except RecoveryRequiredError:
             return {**base, "state": "reconciling", "owner_control_enabled": False}
-        except SecurityError, DeniedError:
+        except (SecurityError, DeniedError) as error:
             if self.stopping:
                 return {**base, "state": "stopping", "owner_control_enabled": False}
+            # Keep exact diagnostic details private, including transient failures which recover before a minute check.
+            j.put(
+                "managed_native_failure",
+                {"type": type(error).__name__, "detail": str(error)[:1024], "at_epoch": time.time()},
+            )
             self.failures += 1
             if self.failures >= 3:
                 self.fault("native_authority_or_preservation_failed")
@@ -258,6 +263,7 @@ class ManagedController:
             "current_a": native.physical.current_a,
             "power_w": native.physical.power_w,
             "charging_session_open": native.physical.transaction_open,
+            "vehicle_connected": native.physical.connection != "Unplug",
             "history_records": len(native.history),
             "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
         }

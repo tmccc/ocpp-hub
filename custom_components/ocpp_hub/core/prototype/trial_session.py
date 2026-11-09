@@ -129,7 +129,14 @@ class TrialSession:
         car_pause_verifier: SeatPauseVerifier | None = None,
         native_bounded: NativeBoundedSpec | None = None,
         allow_local_start: bool = True,
+        allow_unplugged_native: bool = False,
     ) -> None:
+        if (
+            type(allow_unplugged_native) is not bool
+            or allow_unplugged_native
+            and (allow_local_start or native_bounded is None)
+        ):
+            raise SecurityError("unplugged native monitoring requires bounded mode and disabled local Start")
         self.prepared = prepared
         self.observe = observe or prepared.observer.observe
         self.observe_initial = observe or prepared.observer.observe_with_history
@@ -218,6 +225,7 @@ class TrialSession:
                     StationChoice(
                         config.station_profile_kind, config.station_stack_level, config.station_profile_start
                     ),
+                    allow_unplugged=allow_unplugged_native,
                 )
                 if native_bounded is not None
                 else None

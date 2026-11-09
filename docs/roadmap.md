@@ -85,7 +85,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   recovered automatically to verified USER6/owned6/shared control with zero power, no Start/transaction/outbox and
   all26 history bodies/plans preserved; the lead stayed attached. The first release had required manual independent
   zero reconciliation after an unconfirmed outcome whose cause was not captured; future errors retain private
-  diagnostics. Overnight/unattended operation remains to be observed. Home Assistant remains unchanged.
+  diagnostics. Overnight/unattended operation remains to be observed. A reported ordinary lead removal exposed the
+  managed monitor's connected-only check: it latched inhibition after three samples and remained blocked after
+  reconnection. Explicit closed/all-phase-zero unplugged monitoring/recovery is now implemented without weakening
+  original connected admission, unknown-session rejection, resource/history protection or32A restoration.
+  Home Assistant remains unchanged.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

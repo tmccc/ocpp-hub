@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Treat routine cable removal as healthy in explicitly configured managed mode only when native evidence proves
+  `A`/`Unplug`, a closed session, all-phase zero and output0 under unchanged native6/configuration/history/resources.
+  Recover an already admitted service while unplugged without Start. Keep initial connected admission and32A
+  restoration strict, expose actual vehicle connection and retain private validation failure details.
+
 - Add persistent bounded app/schedule supervision with durable records, process watchdog/status, disabled local
   Start and verified zero-to6 owner-control restoration without RemoteStart. Preserve native timetable identities,
   exact history queries during recovery and saved mode restrictions across entry points. Faults retain inhibition;

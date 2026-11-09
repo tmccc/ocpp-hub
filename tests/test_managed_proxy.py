@@ -59,7 +59,9 @@ async def managed_bench(
 
 # Register a real bounded session for teardown with the assistant Start path disabled from construction.
 def managed_session(rig: ConnectedBench) -> TrialSession:
-    session = TrialSession(rig.prepared, FAST, native_bounded=rig.spec, allow_local_start=False)
+    session = TrialSession(
+        rig.prepared, FAST, native_bounded=rig.spec, allow_local_start=False, allow_unplugged_native=True
+    )
     rig.sessions.append(session)
     return session
 
@@ -215,6 +217,8 @@ async def test_managed_authority_fault_latches_without_guessed_stop_or_start(
                 == "native_authority_or_preservation_failed"
             )
             assert session.journal.get("trial_phase") == "blocked"
+            diagnostic = session.journal.get("managed_native_failure")
+            assert diagnostic["type"] == "SecurityError" and diagnostic["detail"] and diagnostic["at_epoch"] > 0
             assert session.journal.get("control")["inhibit"] and session.gateway.controls.desired() == 0
             status = await controller.tick()
             assert status["state"] == "attention"

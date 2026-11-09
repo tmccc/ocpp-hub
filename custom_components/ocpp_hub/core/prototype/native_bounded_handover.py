@@ -37,8 +37,13 @@ class NativeBoundedHandover:
         observe: ObserveHandover,
         spec: NativeBoundedSpec,
         choice: StationChoice,
+        *,
+        allow_unplugged: bool = False,
     ) -> None:
+        if type(allow_unplugged) is not bool or allow_unplugged and gateway.policy.allow_local_start:
+            raise SecurityError("unplugged native monitoring requires disabled local Start")
         self.gateway, self.book, self.observe, self.spec, self.choice = gateway, book, observe, spec, choice
+        self.allow_unplugged = allow_unplugged
         self.lock = asyncio.Lock()
         self.last_verified_at = 0.0
         self.introduced_epoch: int | None = None
@@ -105,7 +110,9 @@ class NativeBoundedHandover:
             native = await self.observe()
             if before != self.authority():
                 raise UnavailableError("native bounded audit was superseded by local authority")
-            self.spec.require(native, self.gateway.journal.identity, route, closed=closed)
+            self.spec.require(
+                native, self.gateway.journal.identity, route, closed=closed, allow_unplugged=self.allow_unplugged
+            )
             history = self.gateway.journal.get("native_bounded_handover", {}).get("original_history", [])
             current = {row["transactionId"]: row for row in native.history}
             if any(current.get(row["transactionId"]) != row for row in history):

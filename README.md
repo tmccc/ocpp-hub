@@ -562,6 +562,15 @@ outbox and all26 retained history bodies/saved plans unchanged. The lead remaine
 Home Assistant deployment was performed. The midnight-to06 timetable remains enabled at6A; its next unattended
 overnight run still needs observation.
 
+Managed operation now explicitly permits a disconnected vehicle when the actual pilot/connection pair is
+`A`/`Unplug`, the native session is closed and every phase current/power and output limit is zero. Full native6,
+configuration, schedule, history and owned-profile checks still apply. Routine unplug/replug does not latch a fault
+or generate Start; an already admitted managed service can recover while unplugged using fresh Boot/owned0 and
+real delivery reconciliation before release6. Initial connected admission and original32 restoration remain strict.
+This option requires disabled local Start and is enabled only by the managed runner. Status reports actual vehicle
+connection separately from service connectivity. Detailed future native validation failures stay in the private
+journal even when the next sample recovers.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;
