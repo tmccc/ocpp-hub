@@ -7,6 +7,10 @@
   known active Stop and actual Stop replay after process loss, and keep an interrupted cleanup frozen.
 - Expose the native strategy through dormant CLI validation, explicit connected baseline capture and supervised run,
   with exact listener/baseline binding and mutually exclusive vehicle-pause configuration.
+- Validate connected local Start/Stop, real offline lifecycle retention/upload and actual proxy process replacement
+  under native6. Confirm automatic zero recovery, rejection before explicit acknowledgement and a subsequent separate
+  Start/Stop without unplugging. Restore original 32 A/cloud/plans, preserve all 20 earlier records and retain three real
+  cloud-acknowledged test sessions. No power was drawn in this control/lifecycle trial.
 - Add explicitly configured connected commissioning under the charger's persistent native6A limit, independent of
   SEAT pause telemetry. Recheck actual native limits at admission/Boot and inside positive/cleanup RPC gates; retain
   zero on introduction and reconnect, reconcile real lifecycle events, and restore the original route before32A.

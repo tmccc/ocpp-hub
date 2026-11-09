@@ -486,7 +486,7 @@ The synthetic commissioning tests remain restricted to literal loopback under `t
 `prototype/native_bounded.py` and `native_bounded_handover.py` provide a separate, explicitly configured supervised
 strategy. `TrialSession(..., native_bounded=NativeBoundedSpec(...))` requires the unchanged original configuration,
 the exact four trial connection fields, saved-plan digest and commissioned native-limit/actual-Boot evidence.
-`capture_native_bounded_baseline()` captures the original32A configuration while connected, closed and at zero.
+`capture_native_bounded_baseline()` captures the original 32 A configuration while connected, closed and at zero.
 Admission reserves fresh transaction numbers with the original route under independently read-back saved USER6,
 runtime USER60/HWCFG320, closed SESSION and all seven meter channels at zero. Actual Boot after routing repeats the
 native audit and installs a local zero hold. Reconnection retains zero; positive sends recheck native6 inside the
@@ -528,6 +528,20 @@ genuinely acknowledged lifecycle/outbox are required. It clears uncertainty whil
 Start or release is a later explicit command. An exact known active session receives zero then a real RemoteStop.
 If the charger finished while the process was absent, restricted recovery receives its actual Stop replay without
 creating a replacement event. Unknown transactions and any started cleanup remain blocked.
+
+A further connected trial on 2026-11-09 verified three real local Start/Stop sessions: with the cloud connected,
+with its supervisor deliberately retired, and after actual proxy process loss/replacement. Offline Start and Stop
+were retained without cloud mappings, then acknowledged through the normal vendor runner without changing their
+stored bodies. The terminated process left the independent USER6 and owned zero profile intact. The charger
+reconnected to a different process using the same journal, introduced itself through real Boot and re-established
+zero without a charger reboot. Start was rejected during recovery; explicit acknowledgement retained zero before
+the separate post-recovery Start/Stop. All three sessions received real cloud mappings and acknowledgements.
+
+Final independent observation confirmed the exact original 32 A configuration/cloud link, unchanged saved plans,
+all 20 original history bodies plus the three genuine test sessions, no trial profiles and an empty outbox. The lead
+stayed attached and Home Assistant remained unchanged. These sessions drew zero power: the trial establishes
+control/lifecycle, cloud-outage handling and restricted process recovery, while charging under load remains a
+separate validation. It does not install an unattended service.
 
 ---
 

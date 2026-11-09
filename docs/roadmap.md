@@ -56,8 +56,13 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   All 20 history bodies and saved plans remain unchanged; no lifecycle was fabricated. Home Assistant and permanent
   service deployment remain unchanged, and wider unattended compatibility remains open.
   Explicit native-mode recovery acknowledgement now retains zero until a separate Start/release, with actual known
-  Stop/replay reconciliation and offline-tested CLI admission. Connected local-control, cloud-outage and process-loss
-  validation is the next supervised step; no live Home Assistant change or permanent installation is included.
+  Stop/replay reconciliation and offline-tested CLI admission. A further connected trial passed on 2026-11-09:
+  local Start/Stop with and without the cloud, actual queued lifecycle upload/ACKs, real process replacement using
+  the same journal, zero recovery and blocked Start until explicit acknowledgement, then a separate Start/Stop.
+  Charger reconnection required no reboot. All 20 old history bodies remain plus three genuine acknowledged sessions;
+  final original 32 A/cloud/plans restoration and absence of trial profiles were independently verified. All new
+  sessions drew zero power, so these are control/recovery proofs. Load operation, wider unattended compatibility
+  and permanent Home Assistant/service deployment remain separate work.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
