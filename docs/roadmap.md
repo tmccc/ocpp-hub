@@ -43,6 +43,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   The endpoint provides no established vehicle observation timestamp or durable pause lease, so the checker reports
   that uncertainty and cannot grant handover authority. No live Home Assistant or permanent service deployment has
   been made.
+  Fresh physical verification is now live-validated (2026-11-09): genuine6A charging, two sampled zero windows over
+  a minute each and actual charging between them, with a fresh process-local source and explicit result expiry.
+  Normal USER32 overnight charging was independently confirmed after restoration, with the lead attached and all
+  pre-existing history retained. This proves current reversible behaviour; the durable permission/reconnection
+  guarantee required for unattended connected handover remains open.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

@@ -158,6 +158,8 @@ class HandoverEvidence:
     currents_a: tuple[float, ...]
     powers_w: tuple[float, ...]
     history: tuple[dict[str, Any], ...]
+    offered_current_a: float = 0
+    saved_schedule_digest: str = ""
 
     # Hash the complete private view, not a public boolean or the proxy's desired profile.
     @property
@@ -174,6 +176,8 @@ class HandoverEvidence:
                 "USER": self.runtime_user_a,
                 "HWCFG": self.runtime_hardware_a,
                 "outLimit": self.output_limit_a,
+                "offered": self.offered_current_a,
+                "saved_schedule": self.saved_schedule_digest,
                 "currents": self.currents_a,
                 "powers": self.powers_w,
                 "history": self.history,
@@ -228,6 +232,8 @@ def handover_evidence(config: Any, values: dict[str, Any], observed_at: float) -
             tuple(number(v, 10000) / 10 for v in meter["cur"]),
             tuple(number(v, 1000000) for v in meter["power"]),
             tuple(history),
+            number(values["CONNECTOR"][0].get("offerCur", 0), 320) / 10,
+            fingerprint(values["SETPLAN"]),
         )
     except KeyError, TypeError, ValueError, IndexError:
         raise SecurityError("complete connected-handover native evidence is required") from None

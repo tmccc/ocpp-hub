@@ -2,6 +2,9 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add a fresh reversible physical pause verifier with positive6A offers, complete native phase checks, sampled
+  60-second zero windows and five-second current-result expiry. Handle observed publication lag and live meter
+  telemetry without weakening completed-history, resource or durable handover-permission checks.
 - Add automatic read-only SEAT pause assessment with a fixed TLS GET, current access borrowed without refresh,
   explicit cloud-source-age uncertainty and a preflight blocker before connected-handover mutation. Keep diagnostic
   reports separate from permission authority; validate the live idle response with optional power absent.

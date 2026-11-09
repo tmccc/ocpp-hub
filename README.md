@@ -386,6 +386,57 @@ Every report therefore retains `current_pause_verified=false`, `durable_pause_ve
 A read-only live check confirmed manual mode with a connected car; the genuine response omitted optional charging
 power. This verifies the reader and its conservative classification, not current pause or unattended handover.
 
+#### Fresh physical pause verification
+
+`prototype/physical_pause.py` supplies a separate current-behaviour verifier. `PhysicalPauseObserver` brackets each
+complete direct native read with the process's monotonic clock. `PhysicalPauseVerifier` requires real nominal 6 A
+charging, an explicitly recorded car Stop, at least 60 seconds of sampled zero draw under an actual positive 6 A offer,
+a car Start that returns to real charging, then another Stop and second 60-second zero window. An accepted command,
+a full car or an app status alone cannot complete this reversible challenge.
+
+Saved and runtime USER must both be 6 A, HWCFG and original hardware rating 32 A, and both `offerCur` and effective
+`outLimit` must be 6 A. Native transaction identity, full configuration, schedules, profiles and history remain pinned.
+Only live `MeterValues` on the same explicitly open native history row (`stopTime` is integer0) may grow; every other
+field and every completed history body remain pinned. This only normalises the private comparison and never changes
+a native record. Each zero window requires at least 13 distinct observations, a maximum seven-second sampling gap,
+CP B and all three current/four power channels exactly zero. The observed session label may remain `Charging`:
+it describes the open session, not power demand. Both known `Plug`/`Charging` labels are accepted alongside the
+independent open-session and positive-offer checks. The current result expires five seconds from the
+last native read's start. Reads are bounded to two seconds; owned control transitions have a 90-second deadline and
+the whole challenge a ten-minute deadline.
+
+The charger's CP and meter files may publish at different instants during an owned transition. Residual current can
+remain unverified settling data within that deadline; it cannot start/count a zero window. Nonzero readings or loss
+of the required CP/offer/session after a zero window begins reject the challenge. Source failure, a new session,
+changed limits/resources or a later
+control invalidates current evidence. Call `supersede()` before restoring car permission and on observer failure.
+Process replacement cannot initialise current evidence from historical JSON.
+
+The classified result is `current_vehicle_refusal_verified`, alongside `reversible_challenge_passed`. It proves
+sampled present behaviour while the positive offer exists. `current_pause_permission_verified`,
+`durable_pause_verified` and `handover_authority` remain false. It supplies no permission revision, compare-and-set
+restoration or guarantee that pause survives a closed session/backend switch; the stronger handover gates remain.
+
+Operational control stays outside this read-only verifier. A connected normal-backend pilot must journal restoration
+authority before lowering USER, reconcile startup history/session publication lag, and support cleanup even when no
+charge starts. Observe a car Stop actually reaching zero before a later Start: overlapping an unapplied Stop with
+Start can make an already-charging observation look like restoration. Restore accepting permission at 6 A, verify real
+charging, then use ordinary iCS Stop and retain the actual completed history before closed-zero USER32 restoration.
+Keep the saved overnight schedule and the lead attached throughout; permit cleanup even after the experiment expires.
+
+A normal-backend live run on 2026-11-09 completed both fresh pause windows: 18 distinct samples over 63.5 seconds,
+then real 6 A charging after Start, followed by 16 zero samples over 62 seconds. The current flag was superseded before
+restoring car permission. The complete original USER32 configuration and unchanged 00:00–06:00 schedule were restored;
+two independent native reads confirmed normal charging, with all 12 pre-existing history bodies preserved and the lead
+still attached. An earlier vendor disconnection at midnight correctly invalidated an incomplete run rather than
+turning an old zero reading into current authority. No live Home Assistant setup or permanent proxy service changed.
+
+The isolated owner's control test used the normal authenticated SEAT service after the Android app became
+unavailable. Current real command replies contained a string `requestId`, whereas the inspected APK model names
+`actionId` and discards its value. These private submission receipts are separate from actual physical completion;
+neither field is a permission revision, an idempotency guarantee or a durable pause lease. Home Assistant's own
+read-only endpoint allowlist and authentication-refresh ownership were unchanged.
+
 Each protected step requires a new provider response bound to the car, charger, hardware, baseline, operation nonce,
 current Boot/connection and complete native snapshot. The response must prove current pause, unchanged owner revision,
 matching restart/positive-offer capability, observation age at most five seconds and known validity. The pause must
