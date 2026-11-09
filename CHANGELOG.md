@@ -6,6 +6,11 @@
   Start and verified zero-to6 owner-control restoration without RemoteStart. Preserve native timetable identities,
   exact history queries during recovery and saved mode restrictions across entry points. Faults retain inhibition;
   fresh native/cloud/Boot/resource evidence is required for healthy status and shutdown retires pending releases.
+- Install the bounded managed service with automatic startup/restart and independent minute health checks. Verify
+  actual idle process-loss recovery without Start, USER6/owned6, all-phase zero, empty ledger/outbox and unchanged
+  26-record native history/plans with the lead attached. Retain the initial unconfirmed release/manual zero
+  reconciliation as a limitation, and preserve private diagnostics for future release failures. Overnight operation
+  remains to be observed; no Home Assistant change.
 
 - Validate actual proxy process loss during acknowledged 6 A charging: observe the same session still drawing 6.1 A
   while the old process is absent, then genuine replacement Boot, station0/exact-known Stop, real closure/cloud ACKs,

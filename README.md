@@ -551,6 +551,17 @@ preserved resources, disabled local Start and sufficient validity of the certifi
 The event-loop watchdog reports process responsiveness independently of cloud/native health. Listener certificate
 renewal requires a controlled service restart; file replacement alone cannot falsely renew its reported validity.
 
+A bounded managed service was installed on 2026-11-09 in an isolated runtime with immutable code, private durable
+state, user-service boot linger/restart/watchdog and a separate minute health timer. The initial release was not
+confirmed and correctly retained zero; an independent closed-zero/owned0/empty-ledger reconciliation preceded
+operator acknowledgement and recovery. Its original cause was not captured, so later release errors now retain
+private diagnostics. A subsequent deliberate idle process kill triggered the supervisor's automatic replacement,
+genuine Boot/cloud reconciliation and successful app/schedule release without operator action. Independent final
+native/ledger checks confirmed USER6/owned6, closed session, all-phase zero, no proxy Start or transaction, empty
+outbox and all26 retained history bodies/saved plans unchanged. The lead remained attached. No test charge or
+Home Assistant deployment was performed. The midnight-to06 timetable remains enabled at6A; its next unattended
+overnight run still needs observation.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;
