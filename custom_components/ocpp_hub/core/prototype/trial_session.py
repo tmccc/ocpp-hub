@@ -304,7 +304,10 @@ class TrialSession:
                 await self.native_bounded.admit()
             elif phase in ("active", "recovering", "blocked"):
                 native = await self.native_bounded.read()
-                self.native_bounded.require_known_session(native)
+                if self.journal.get("trial_binding") is None:
+                    self.native_bounded.require_known_session(native)
+                else:
+                    self.native_bounded.require_recovery_session(native)
                 self.book.owned_present(native.physical)
                 control = self.journal.get("control", {})
                 self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
@@ -423,6 +426,10 @@ class TrialSession:
             if self.native_bounded is None:
                 raise UnavailableError("native bounded handover is not explicitly configured")
             return await self.native_bounded.cleanup(self.runtime.stop_vendor)
+        if command == "native-bounded-resume":
+            if self.native_bounded is None:
+                raise UnavailableError("native bounded recovery is not explicitly configured")
+            return await self.native_bounded.resume()
         if self.native_bounded is not None and command in (
             "rollback",
             "rollback-plan",

@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add explicit native-bounded recovery acknowledgement that requires fresh native6/closed-zero evidence, current
+  introduction, confirmed station0 and real history delivery before rearming controls. Retain zero, reconcile exact
+  known active Stop and actual Stop replay after process loss, and keep an interrupted cleanup frozen.
+- Expose the native strategy through dormant CLI validation, explicit connected baseline capture and supervised run,
+  with exact listener/baseline binding and mutually exclusive vehicle-pause configuration.
 - Add explicitly configured connected commissioning under the charger's persistent native6A limit, independent of
   SEAT pause telemetry. Recheck actual native limits at admission/Boot and inside positive/cleanup RPC gates; retain
   zero on introduction and reconnect, reconcile real lifecycle events, and restore the original route before32A.

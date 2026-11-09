@@ -55,6 +55,9 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   spanning 60.22 seconds, exact trial-profile cleanup, native original-backend reconnection and full 32 A restoration.
   All 20 history bodies and saved plans remain unchanged; no lifecycle was fabricated. Home Assistant and permanent
   service deployment remain unchanged, and wider unattended compatibility remains open.
+  Explicit native-mode recovery acknowledgement now retains zero until a separate Start/release, with actual known
+  Stop/replay reconciliation and offline-tested CLI admission. Connected local-control, cloud-outage and process-loss
+  validation is the next supervised step; no live Home Assistant change or permanent installation is included.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

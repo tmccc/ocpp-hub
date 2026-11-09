@@ -516,6 +516,19 @@ original configuration, all 20 original history bodies, unchanged saved plans, n
 lifecycle/outbox. This trial verified handover and restoration; it created no new charging session and did not deploy
 Home Assistant or a permanent proxy service.
 
+The standalone CLI also accepts `--native-bounded-spec /absolute/private/native-spec.json`. Its default `check`
+validates the specification against the immutable baseline and exact listener without opening a journal or contacting
+the charger. `capture-bounded-baseline` is a separate read-only action for the original32A connected, closed station;
+`run` still requires independently verified native6 before admission and explicit external route/configuration steps.
+The native strategy and `--car-pause-config` are mutually exclusive.
+
+After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
+Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
+genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;
+Start or release is a later explicit command. An exact known active session receives zero then a real RemoteStop.
+If the charger finished while the process was absent, restricted recovery receives its actual Stop replay without
+creating a replacement event. Unknown transactions and any started cleanup remain blocked.
+
 ---
 
 ## Offline iCS coexistence prototype — this branch

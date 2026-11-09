@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .. import commands
+from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
 from .native_bounded import NativeBoundedSpec
 from .rpc import UnavailableError
@@ -40,6 +41,7 @@ class NativeBoundedHandover:
         self.lock = asyncio.Lock()
         self.last_verified_at = 0.0
         self.introduced_epoch: int | None = None
+        self.introduced_revision: int | None = None
         if fingerprint(spec.original_configuration) != book.baseline.configuration_digest:
             raise SecurityError("native bounded mode requires the exact original full configuration")
         saved = gateway.journal.get("native_bounded_handover")
@@ -165,14 +167,24 @@ class NativeBoundedHandover:
             "boot_digest": self.spec.boot_digest,
         }:
             raise SecurityError("native bounded introduction binding changed")
-        self.require_known_session(native)
+        if binding is None:
+            self.require_known_session(native)
+        else:
+            self.require_recovery_session(native)
         self.book.owned_present(native.physical)
-        if binding is not None:
+        if binding is not None or journal.get("control", {}).get("uncertain"):
             control = journal.get("control", {})
             journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+            if binding is None:
+                # A first zero needs its ordinary write-ahead receipt before existing-resource recovery can own it.
+                await gateway.controls.ensure_ceiling()
+                gateway._require_epoch("charger", epoch)
             journal.put("trial_phase", "recovering")
         self.introduced_epoch = epoch
         journal.put("trial_starting", False)
+        if binding is not None and native.physical.transaction_open:
+            await gateway.stop()
+        self.introduced_revision = gateway.controls._revision
         return native
 
     # An unknown native transaction is external activity, never a proxy-created Start or inferred Stop.
@@ -183,6 +195,68 @@ class NativeBoundedHandover:
                 raise RecoveryRequiredError("bounded external native activity requires actual lifecycle reconciliation")
         elif native.physical.native_transaction_id is not None or known is not None:
             raise RecoveryRequiredError("native and local transaction closure disagree")
+
+    # A genuine Stop may have occurred while the process was absent; retain the ledger debt until its real replay.
+    def require_recovery_session(self, native: HandoverEvidence) -> None:
+        if native.physical.transaction_open:
+            self.require_known_session(native)
+        elif native.physical.native_transaction_id is not None:
+            raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")
+
+    # Acknowledge reconciled recovery explicitly, retaining the physical zero hold and independent native6 limit.
+    async def resume(self) -> dict[str, Any]:
+        async with self.lock:
+            gateway, journal = self.gateway, self.gateway.journal
+            epoch, revision = gateway._charger_epoch, gateway.controls._revision
+            ticket = journal.get("control", {}).get("ticket")
+            if (
+                journal.get("trial_phase") != "recovering"
+                or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
+                or gateway.charger.sender is None
+                or not gateway.current_boot_seen(epoch)
+                or self.introduced_epoch != epoch
+                or self.introduced_revision != revision
+            ):
+                raise RecoveryRequiredError("bounded resume requires the current restricted recovery introduction")
+            native = await self.read(closed=True)
+            gateway._require_epoch("charger", epoch)
+            self.spec.require_boot(journal.get("boot"))
+            if journal.get("trial_binding") != {
+                "configuration_digest": native.physical.configuration_digest,
+                "station": self.choice.value(),
+                "boot_digest": self.spec.boot_digest,
+            }:
+                raise SecurityError("bounded recovery binding changed before acknowledgement")
+            present = self.book.owned_present(native.physical)
+            receipt = journal.db.execute(
+                "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+            ).fetchone()
+            control = journal.get("control", {})
+            require_lifecycle_idle(gateway)
+            if (
+                journal.get("trial_phase") != "recovering"
+                or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
+                or revision != gateway.controls._revision
+                or ticket != control.get("ticket")
+                or not gateway.current_boot_seen(epoch)
+                or not control.get("inhibit")
+                or gateway.controls.desired() != 0
+                or not gateway.controls.ready
+                or receipt is None
+                or receipt["state"] != "confirmed"
+                or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
+                or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                or gateway.controls._operations
+                or gateway.charger._pending
+                or gateway.vendor._pending
+                or journal.get("uncertain_vendor_command")
+            ):
+                raise RecoveryRequiredError("bounded recovery needs confirmed zero and actual history reconciliation")
+            journal.require_allocation()
+            with journal.atomic():
+                journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": False})
+                journal.put("trial_phase", "active")
+            return {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
     async def validate_send(self, action: str, payload: dict[str, Any]) -> None:
@@ -199,7 +273,11 @@ class NativeBoundedHandover:
                 raise SecurityError("native bounded cleanup requires the exact next owned resource")
         else:
             self.require_known_session(native)
-            if self.gateway.journal.get("trial_phase") != "active" or self.gateway.journal.get("trial_starting"):
+            if (
+                self.gateway.journal.get("trial_phase") != "active"
+                or self.gateway.journal.get("trial_starting")
+                or self.gateway.journal.get("native_bounded_handover", {}).get("stage") != "admitted"
+            ):
                 raise RecoveryRequiredError("native bounded positive controls remain frozen")
 
     # Stop actual known work, drain real lifecycle delivery, then clear exact owned profiles with station last.
