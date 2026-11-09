@@ -13,6 +13,7 @@ from .policy import DeniedError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_evidence import Evidence, Resource, profile_projection
+from .trial_handover_evidence import HandoverEvidence
 
 
 @dataclass(frozen=True, repr=False)
@@ -195,6 +196,15 @@ class ResourceBook:
     # Arm only a fresh independently observed station with a genuinely empty lifecycle and outbox.
     def activate(self, evidence: Evidence) -> None:
         evidence.require_unplugged(self.journal.identity)
+        self._activate(evidence)
+
+    # Connected admission is explicitly separate and requires the independent native USER limit on every phase.
+    def activate_bounded(self, native: HandoverEvidence, hardware: str) -> None:
+        native.require_closed(self.journal.identity, hardware, 6, 32)
+        self._activate(native.physical)
+
+    # Share only the empty-ledger and preservation checks after the selected physical admission guard has passed.
+    def _activate(self, evidence: Evidence) -> None:
         self.owned_present(evidence)
         if self.journal.active() is not None or self.journal.next_delivery() is not None:
             raise RecoveryRequiredError("trial lifecycle requires reconciliation before activation")

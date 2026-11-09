@@ -2,6 +2,10 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add explicitly configured connected commissioning under the charger's persistent native6A limit, independent of
+  SEAT pause telemetry. Recheck actual native limits at admission/Boot and inside positive/cleanup RPC gates; retain
+  zero on introduction and reconnect, reconcile real lifecycle events, and restore the original route before32A.
+  Keep uncertainty pending, exact owned cleanup station-last, original data preserved and final completion atomic.
 - Add a fresh reversible physical pause verifier with positive6A offers, complete native phase checks, sampled
   60-second zero windows and five-second current-result expiry. Handle observed publication lag and live meter
   telemetry without weakening completed-history, resource or durable handover-permission checks.

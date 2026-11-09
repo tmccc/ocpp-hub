@@ -481,6 +481,32 @@ The fifth trial verifies automatic readiness, nominal physical current limiting 
 profile-free baseline. Selective clearing beside unrelated profiles and the wider unattended-operation cases remain blocked.
 The synthetic commissioning tests remain restricted to literal loopback under `tools/offline_validate.py`.
 
+#### Connected handover with an independent native current limit
+
+`prototype/native_bounded.py` and `native_bounded_handover.py` provide a separate, explicitly configured supervised
+strategy. `TrialSession(..., native_bounded=NativeBoundedSpec(...))` requires the unchanged original configuration,
+the exact four trial connection fields, saved-plan digest and commissioned native-limit/actual-Boot evidence.
+`capture_native_bounded_baseline()` captures the original32A configuration while connected, closed and at zero.
+Admission reserves fresh transaction numbers with the original route under independently read-back saved USER6,
+runtime USER60/HWCFG320, closed SESSION and all seven meter channels at zero. Actual Boot after routing repeats the
+native audit and installs a local zero hold. Reconnection retains zero; positive sends recheck native6 inside the
+outgoing RPC gate. Ordinary unplugged admission and the stronger vehicle-permission strategy are unchanged.
+
+This strategy permits unexpected charging at nominal6A; it never labels zero consumption as a paused vehicle.
+`native-bounded-handover` freezes positive controls, stops only actual known transactions, drains lifecycle delivery,
+and checks independent closed-zero evidence before every exact owned Clear, with station7001 last. Uncertainty leaves
+restoration pending. No unknown native session is adopted, guessed Stop sent or history event invented. Verified
+profile absence cannot rearm a ceiling during restart. Full original history bodies, plans and unrelated config stay
+pinned throughout.
+
+The coordinator's adapter callbacks perform only the four original route fields and, last, the saved USER32 scalar.
+`restore_route()` retires the proxy and requires a fresh native offline view while6 remains effective.
+`observe_backend()` requires a later independent original-route online view. `restore_settings()` repeats online,
+closed-session, profile-free and all-phase-zero checks immediately before the recorded USER32 write. Lost replies are
+reconciled from actual configuration; completion and trial phase commit together. Genuine manufacturer charging after
+the authorized final write is retained as external native activity. This remains a supervised commissioning API,
+without Home Assistant deployment, automatic service installation or a car-pause lifetime guarantee.
+
 ---
 
 ## Offline iCS coexistence prototype — this branch

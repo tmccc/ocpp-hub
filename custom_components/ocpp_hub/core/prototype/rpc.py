@@ -124,6 +124,7 @@ class Peer:
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
         self.before_send: Callable[[str, dict[str, Any]], None] | None = None
+        self.validate_send: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
         self.diagnostics = RpcDiagnostics()
 
@@ -181,6 +182,12 @@ class Peer:
         try:
             async with asyncio.timeout(self.timeout):
                 actual = payload() if callable(payload) else payload
+                if self.validate_send is not None:
+                    await self.validate_send(action, actual)
+                    if check is not None:
+                        check()
+                    if self.sender is not sender:
+                        raise UnavailableError("peer changed during outgoing validation")
                 if before_send is not None:
                     before_send()
                 if self.before_send is not None:

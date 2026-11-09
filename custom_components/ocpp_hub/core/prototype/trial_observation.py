@@ -57,6 +57,7 @@ class StableObserver:
             "binding": journal.get("trial_binding"),
             "resources": rows,
             "connected_handover": journal.get("connected_handover"),
+            "native_bounded_handover": journal.get("native_bounded_handover"),
         }
         return Authority(self.epoch(), self.revision(), journal.get("trial_phase"), fingerprint(value))
 
