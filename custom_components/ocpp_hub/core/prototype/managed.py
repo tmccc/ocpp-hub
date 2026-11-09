@@ -134,8 +134,18 @@ class ManagedController:
             raise UnavailableError("managed release authority changed during its native check")
         try:
             await g.release()
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
+        except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError) as error:
             if not self.stopping:
+                # Detailed peer/guard errors stay in the private journal; public status exposes classification only.
+                j.put(
+                    "managed_release_failure",
+                    {
+                        "type": type(error).__name__,
+                        "detail": str(error)[:1024],
+                        "at_epoch": time.time(),
+                        "charger_rpc": g.charger.diagnostics.snapshot(),
+                    },
+                )
                 self.fault("owner_release_unconfirmed")
             raise
         self.released_epoch = epoch
