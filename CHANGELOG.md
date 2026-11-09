@@ -6,6 +6,9 @@
   SEAT pause telemetry. Recheck actual native limits at admission/Boot and inside positive/cleanup RPC gates; retain
   zero on introduction and reconnect, reconcile real lifecycle events, and restore the original route before32A.
   Keep uncertainty pending, exact owned cleanup station-last, original data preserved and final completion atomic.
+- Validate native6 connected handover live with the lead attached through introduction, zero hold, profile cleanup
+  and original-backend restoration. Independently verify original 32 A configuration, all 20 history records, saved plans
+  and no remaining trial resources; preserve the live Home Assistant setup.
 - Add a fresh reversible physical pause verifier with positive6A offers, complete native phase checks, sampled
   60-second zero windows and five-second current-result expiry. Handle observed publication lag and live meter
   telemetry without weakening completed-history, resource or durable handover-permission checks.

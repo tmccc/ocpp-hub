@@ -50,8 +50,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   guarantee required for unattended connected handover remains open.
   A separate supervised connected strategy now uses the previously proven persistent native6A limit instead of
   vehicle-pause authority. Explicit connected admission, actual Boot binding, per-send native guards, exact closed-zero
-  cleanup and staged original-backend/32A restoration are implemented and tested offline. A connected live trial is
-  pending; neither Home Assistant nor a permanent service is changed by this API.
+  cleanup and staged original-backend/32A restoration are implemented and tested offline. A supervised connected live
+  trial passed on 2026-11-09 with the lead attached throughout: real Boot/cloud registration, twelve zero observations
+  spanning 60.22 seconds, exact trial-profile cleanup, native original-backend reconnection and full 32 A restoration.
+  All 20 history bodies and saved plans remain unchanged; no lifecycle was fabricated. Home Assistant and permanent
+  service deployment remain unchanged, and wider unattended compatibility remains open.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

@@ -507,6 +507,15 @@ reconciled from actual configuration; completion and trial phase commit together
 the authorized final write is retained as external native activity. This remains a supervised commissioning API,
 without Home Assistant deployment, automatic service installation or a car-pause lifetime guarantee.
 
+A supervised connected trial on 2026-11-09 verified this path with the lead attached throughout. The native6A limit
+survived actual charger restarts, the genuine Boot established the proxy's zero hold, and the manufacturer cloud
+registered successfully. Twelve fresh observations covered 60.22 seconds at zero draw with USER6/HW32 and a closed
+native session. Scoped cleanup established actual trial-profile absence before original-route restoration; a fresh
+native offline-to-online transition preceded USER32 restoration. A later independent audit confirmed the exact full
+original configuration, all 20 original history bodies, unchanged saved plans, no trial profiles and an empty proxy
+lifecycle/outbox. This trial verified handover and restoration; it created no new charging session and did not deploy
+Home Assistant or a permanent proxy service.
+
 ---
 
 ## Offline iCS coexistence prototype — this branch
