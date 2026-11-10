@@ -1,9 +1,13 @@
-## Standalone iCS prototype — real app and local control verified in a supervised trial
+## Standalone iCS proxy — managed 6 A deployment and supervised trial record
 
-This branch adds a separate Linux/Python 3.14 trial package on top of the recorded offline prototype below.
-The latest automatic allocation and restricted restart changes are validated offline only. They have not been run on
-the household charger, installed as a service or loaded into Home Assistant. The seven physical trials below describe
-the preceding supervised implementation.
+This branch adds a separate Linux/Python 3.14 proxy on top of the recorded offline prototype below. The durable
+service and a separate thin Home Assistant client are deployed at the proven 6 A boundary. On 10 November 2026,
+real HA Pause, proxy loss/restart with the pause retained, fault notification/recovery and explicit Return to app
+control passed with the lead attached and no new charging session. Fresh local readings and native charger history
+replace obsolete cloud controls and optional cached information on the charger dashboard. Local Start remains
+disabled; deliberately disabled EV/reserve automations remain off. Higher-current operation and complete app
+compatibility are separate work. The chronological trial notes below describe earlier implementations and limits;
+the current management details and acceptance record appear later in this document.
 
 Seven authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
 the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
@@ -587,12 +591,11 @@ The reason for earlier zero draw is not established. All 445 minute checks befor
 automatically with no service restart or persistent fault. The owner accepts overnight scheduling as complete and
 does not require another active-load 06:00 cutoff test.
 
-The next integration step is a separately authenticated management connection from Home Assistant to this existing
-durable service. Begin with measured status/history, fault notifications, an intentional local Stop hold and an
-explicit return to app control. The supervisor must first distinguish a valid requested local hold from a control
-failure and preserve that intent through replacement, without automatically releasing a requested Stop. The
-ordinary HA entry point uses the older engine and cannot substitute for this adapter. Retain the proven 6 A boundary
-for this work; a higher operating ceiling requires reviewed policy/native/recovery changes rather than a slider flip.
+Home Assistant now uses a separately authenticated management connection to this existing durable service for
+measured status/history, fault notifications, an intentional local Stop hold and explicit return to app control.
+Supervision distinguishes a valid requested local hold from a failure and preserves it through replacement.
+The older `ocpp_hub` HA listener is not installed for this adapter. The proven 6 A boundary remains; a higher
+operating ceiling requires reviewed policy/native/recovery changes rather than a slider flip.
 
 The local management implementation now uses an independent, authenticated websocket bound to literal
 `127.0.0.1`. It is intended for Home Assistant and the proxy running on the same host; it opens no LAN management
@@ -626,6 +629,23 @@ installing the older `ocpp_hub` listener. Actual-core HA client tests live in `t
 against HA2026.11.0 in a disposable container from the deployed image, with no live configuration mounted. The
 older available HA test plugin pins2026.10.4 and was left disabled; the fixture uses the actual core/config entries
 and substitutes only DNS construction for loopback-only tests.
+
+The service/API and thin client were deployed on 2026-11-10 after 1,117 passing offline tests and six actual-HA
+tests. Live HA Pause completed with native6/owned0, closed all-phase-zero and a successful independent health check.
+With the service stopped, direct charger reads still confirmed the zero hold; HA hid current readings and raised
+its debounced notification after 76 seconds. A real service restart recovered the persisted pause without releasing
+it, and the notification cleared after recovery. Explicit HA Return then confirmed native6/owned6, the app connection
+and zero draw. Both durable command receipts completed; no new transaction was created. All 27 charger records,
+including the 26 original bodies, and the saved timetable were preserved. A final HA freshness correction also
+expires the app-control label between polls, with the actual-HA regression rerun successfully before deployment.
+
+The published charger dashboard removes the old cloud Start/Stop, session-current slider and optional cloud-cached
+schedule/history cards. Its controls are explicit Pause and Return; Return is hidden while already in app mode.
+Fresh local plug/charging/current/power/health and read-only limits accompany native charger history, with no cached
+record presented as current when its source expires. The existing local 24-hour power graph is retained. Actual HA
+template rendering and dashboard readback verified the 5.614 kWh latest session and a continuous history table.
+All 21 functional automations retained their original on/off states, including all five deliberately disabled ones.
+Final native and health checks passed at zero power with no unexpected client error; the planned outage is logged.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,

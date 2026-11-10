@@ -98,9 +98,8 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   was zero from around 03:52; its cause is unconfirmed. All 445 minute checks before 07:25 were healthy, with three alerts
   clearing automatically and no restart/persistent fault. The owner accepts overnight scheduling as complete and
   waives another active-load 06:00 cutoff test.
-  Next: authenticated local management and a thin HA adapter for the existing durable service, initially status,
-  fault notifications, intentional local Stop and explicit return to app control. Persist desired ownership and
-  recognize a valid local hold through supervision/replacement before exposing these commands. Keep 6 A initially;
+  Authenticated local management and a thin HA adapter now provide status, fault notifications, intentional local
+  Stop and explicit return to app control. Desired ownership survives supervision/replacement. Keep 6 A;
   normal higher-current operation requires separate policy/native/recovery work. The older HA engine is not this
   adapter, and deliberately disabled EV/reserve automations remain disabled.
   The local management API and thin HA client are implemented: loopback-only authenticated websocket, atomic
@@ -108,11 +107,18 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   proof. No Start endpoint or command retry is added; native6A and the app/timetable path remain. Fresh local
   charger history replaces optional cloud-cache claims, entity expiry advances between polls, and sustained faults
   create a debounced HA notification. Isolated actual HA2026.11 tests cover passive lifecycle, controls and stale
-  readings. Deployment/live acceptance and the requested charger dashboard audit remain to be completed.
+  readings. Deployed on2026-11-10 after1117 offline and6 actual-HA tests. Real HA Pause, service loss/restart with
+  the pause retained, sustained-fault alert/recovery and explicit HA Return passed at zero power with the lead
+  attached. Native6/owned6, unchanged saved plans/all27 records and no new transaction were independently verified.
+  The dashboard now uses fresh local readings/history and supported Pause/Return, removing obsolete cloud controls,
+  the slider and optional cached schedule/history. Actual template rendering and readback passed; all21 functional
+  automation states, including5 disabled EV/reserve automations, are preserved. The final mode-label freshness
+  regression passed before the corrected HA client was deployed.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
-  cloud connection, configuration, saved schedule and history are verified. Live Home Assistant remains unchanged.
+  cloud connection, configuration, saved schedule and history are verified. Complete app compatibility and a
+  higher operating ceiling remain separate work.
 
 - [~] One charging plan shared with the Raedian app (`ocpp_hub.set_plan`, answers and takes over the app's planning, written to the charger as a recurring profile). Tested with a fake charger and vendor.
 - [~] Schedule helper and weekly schedules: a Home Assistant schedule helper applied with a button (daily or weekly profile), and the vendor answered with the charger's real schedule. Tested with a fake charger; see the schedule item below for what is unproven.

@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Deploy the thin HA client and verify real Pause, persisted pause through service loss/restart, fault alert and
+  recovery, and explicit Return at native6/owned6 with no new charge. Preserve saved plans and all27 native records.
+  Replace obsolete dashboard cloud controls, slider and optional cached schedule/history with fresh local status,
+  supported controls and native charger history. Expire the app-control label with its snapshot; verify actual HA
+  template rendering, history table and unchanged functional automations, including five deliberately disabled ones.
 - Add authenticated same-host management and a separate thin Home Assistant client, with measured status/history,
   explicit Pause/Return, timed stale-reading invalidation and persistent fault notifications after60seconds.
   Persist requested pauses atomically and across replacement; bind Return to its monotonic mode revision before
