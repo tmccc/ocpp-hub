@@ -747,8 +747,8 @@ Normal local Start also works during a cloud outage on an already introduced, ac
 fresh full native evidence, a known closed session, the exact owned zero hold, a current approved static tag and no
 ambiguous mutation, unbound grant or outstanding Start/Stop lifecycle debt. Ordinary queued observations do not
 prevent admission. Genuine offline Start/Meter/Stop records wait for actual cloud mapping and acknowledgement after
-reconnection. Local readiness and cloud connectivity are reported separately; Return and restart recovery retain
-their cloud-reconciliation requirements. The existing timed diagnostic remains restricted to a selected 6 A.
+reconnection. Local readiness and cloud connectivity are reported separately. Return retains cloud reconciliation;
+the managed zero-only restart recovery below can proceed locally. The timed diagnostic requires a selected 6 A.
 
 The extension was deployed and physically verified on 2026-11-10. All 27 integer settings from 6 through 32 A were
 read back in the actual owned station profile and composite without Start or a new transaction; lowering back to 6 A
@@ -762,6 +762,21 @@ with the lead connected at 0 W, an empty queue and no unconfirmed mutations. The
 full-configuration difference; saved schedules and all task-baseline automations, including five deliberately off,
 remain unchanged. All 26 admitted history bodies survive in 32 archived records; 29 are currently returned and three
 older omissions remain tolerated. Validation: 1273 full-suite and 67 actual-HA cases pass.
+
+Managed restart recovery now has a separate zero-only path during a cloud outage. It requires the same fresh actual
+Boot/introduction, unchanged full native configuration and saved plans, exact confirmed owned-zero profile, closed
+all-phase zero, current intent/ticket and admitted allocation/history. All prior transactions must be closed and
+actually cloud-mapped, with no lifecycle debt, unresolved mutation, permission, current operation or fault. Only
+queued Status, Meter, FirmwareStatus and DiagnosticsStatus observations may remain; their bodies, order and delivery
+states are retained without inventing an acknowledgement. The ordinary native recovery path still requires an empty
+queue. Local readiness is published only after the phase is active and control uncertainty is cleared.
+
+For a saved app intent, a real failed cloud attempt belonging to this exact charger introduction first commits a
+higher-revision Pause before recovery I/O. Slow initial cloud registration alone does not trigger that conversion,
+and a failure from an older introduction cannot authorize it. A saved Pause remains paused. Cloud reconnection never
+implicitly returns this locally recovered pause to app/schedule authority; explicit Return is still required. This
+path sends no Start or positive ceiling. Validation passes 1288 full-suite and 67 actual-HA cases; connected idle
+restart acceptance is pending.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,

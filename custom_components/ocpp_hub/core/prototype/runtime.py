@@ -68,6 +68,7 @@ class RuntimeStatus:
     boot_observed: bool = False
     last_failure: str | None = None
     vendor_attempts: int = 0
+    vendor_failed_charger_epoch: int | None = None
     charger_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
     vendor_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
 
@@ -223,6 +224,7 @@ class ConnectionRuntime:
                 await asyncio.sleep(self.settings.pump_interval)
                 continue
             fault_count = self.status.vendor_fault.count
+            attempted_charger_epoch = self.gateway._charger_epoch
             stage = "opening"
             self.status.vendor_attempts += 1
             try:
@@ -242,6 +244,8 @@ class ConnectionRuntime:
                 self.status.last_failure = type(error).__name__
                 if self.status.vendor_fault.count == fault_count:
                     self.status.vendor_fault.record(error, stage, self.gateway.vendor.diagnostics.action)
+            if self.status.vendor_fault.count > fault_count:
+                self.status.vendor_failed_charger_epoch = attempted_charger_epoch
             if not self._closing:
                 await asyncio.sleep(delay)
                 delay = min(self.settings.retry_max, delay * 2)

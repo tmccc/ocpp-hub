@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -12,6 +13,7 @@ from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .managed_current import managed_current_ceiling
+from .managed_recovery import local_recovery_binding
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .rpc import UnavailableError
@@ -238,10 +240,13 @@ class NativeBoundedHandover:
         elif native.physical.native_transaction_id is not None:
             raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")
 
-    # Acknowledge reconciled recovery explicitly, retaining the physical zero hold and independent native6 limit.
-    async def resume(self) -> dict[str, Any]:
+    # Default recovery requires an empty queue; managed local recovery retains queued observations and the zero hold.
+    async def resume(self, *, local_only: bool = False) -> dict[str, Any]:
+        if type(local_only) is not bool:
+            raise SecurityError("local recovery permission must be explicit")
         async with self.lock:
             gateway, journal = self.gateway, self.gateway.journal
+            local_binding = local_recovery_binding(gateway, self.spec.digest) if local_only else None
             epoch, revision = gateway._charger_epoch, gateway.controls._revision
             ticket = journal.get("control", {}).get("ticket")
             if (
@@ -264,8 +269,9 @@ class NativeBoundedHandover:
                 raise SecurityError("bounded recovery binding changed before acknowledgement")
             present = self.book.owned_present(native.physical)
             receipt = journal.db.execute(
-                "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+                "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
             ).fetchone()
+            station = [r for r in present if r.identifier == HUB_PROFILE_ID]
             control = journal.get("control", {})
             require_lifecycle_idle(gateway)
             if (
@@ -279,14 +285,20 @@ class NativeBoundedHandover:
                 or not gateway.controls.ready
                 or receipt is None
                 or receipt["state"] != "confirmed"
-                or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
-                or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                or len(station) != 1
+                or station[0].canonical.get("limit") != 0
+                or receipt["confirmed"] is None
+                or json.loads(receipt["confirmed"]) != station[0].canonical
+                or not local_only
+                and journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
                 or gateway.controls._operations
                 or gateway.charger._pending
                 or gateway.vendor._pending
                 or journal.get("uncertain_vendor_command")
             ):
                 raise RecoveryRequiredError("bounded recovery needs confirmed zero and actual history reconciliation")
+            if local_only and local_recovery_binding(gateway, self.spec.digest) != local_binding:
+                raise RecoveryRequiredError("local recovery intent changed during native verification")
             journal.require_allocation()
             with journal.atomic():
                 journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": False})

@@ -126,10 +126,28 @@ class ManagedController:
             raise RecoveryRequiredError("requested pause awaits actual physical closure")
         self.require_paused(native)
         g, j = self.session.gateway, self.session.journal
-        if j.get("trial_phase") == "recovering" and g.vendor_registration == "Accepted" and not j.next_delivery():
-            await self.native.resume()
+        if j.get("trial_phase") == "recovering":
+            cloud = self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"
+            if not cloud:
+                await self.native.resume(local_only=True)
+            elif not j.next_delivery():
+                await self.native.resume()
         self.requests.confirm_pauses()
         return native
+
+    # Offline replacement retires prior app authority before any recovery wait and never auto-Returns on reconnection.
+    def prepare_offline_pause(self) -> None:
+        g, j = self.session.gateway, self.session.journal
+        intent = self.requests.intent()
+        if (
+            j.get("trial_phase") == "recovering"
+            and not (self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
+            and self.session.runtime.status.vendor_failed_charger_epoch == g._charger_epoch
+            and intent.mode == "app"
+        ):
+            with j.atomic():
+                j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                g.controls._claim(True, stopping=True)
 
     # A newer stop ticket invalidates an awaited release before it can send a positive ceiling.
     def request_stop(self) -> None:
@@ -347,6 +365,7 @@ class ManagedController:
             return {**base, "state": "starting", "owner_control_enabled": False}
         verified_pause = False
         try:
+            self.prepare_offline_pause()
             pending_return = self.requests.pending_return()
             if self.requests.intent().mode == "paused" and pending_return is not None:
                 await self.return_requested(*pending_return)
@@ -404,7 +423,7 @@ class ManagedController:
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )
-        local_healthy = shared or verified_pause
+        local_healthy = (shared or verified_pause) and j.get("trial_phase") == "active" and not control.get("uncertain")
         healthy = local_healthy and cloud
         if healthy and not paused:
             pending_return = self.requests.pending_return()

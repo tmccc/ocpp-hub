@@ -155,7 +155,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
   cloud connection, configuration, saved schedule and history are verified. Complete app compatibility, current
-  changes during an open session and Start after a cloud-outage process replacement remain separate work.
+  changes during an open session remain separate work. Managed zero-only offline restart recovery is implemented:
+  a current-introduction cloud failure persists Pause, fresh complete native/Boot/owned0 and reconciled lifecycle
+  facts establish local readiness, queued observations remain untouched, and reconnect never implicitly releases
+  the hold. Slow registration alone preserves ordinary online startup. Validation: 1288 full-suite and 67 actual-HA
+  cases pass; connected idle acceptance is pending, with no additional charging test planned.
 
 - [~] One charging plan shared with the Raedian app (`ocpp_hub.set_plan`, answers and takes over the app's planning, written to the charger as a recurring profile). Tested with a fake charger and vendor.
 - [~] Schedule helper and weekly schedules: a Home Assistant schedule helper applied with a button (daily or weekly profile), and the vendor answered with the charger's real schedule. Tested with a fake charger; see the schedule item below for what is unproven.

@@ -2,6 +2,12 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add managed zero-only recovery after a proxy restart during cloud absence. Preserve queued observations without
+  acknowledging them; retain strict lifecycle, mutation, Boot, native configuration, history and exact zero-receipt
+  checks. A proven failed cloud attempt for the current introduction converts app intent to a durable Pause before
+  recovery; slow registration and older failures do not. Reconnection retains Pause until explicit Return. No Start
+  or positive ceiling is sent by recovery. Validation: 1288 full-suite and 67 actual-HA cases pass; connected idle
+  acceptance is pending.
 - Add an explicit, zero-protected native32 capability and an idle-only 6–32 A HA current selector. Preserve original
   admission/history bindings, separate selected current from the paused zero hold, bind request amperage and revision,
   verify actual owned profile/composite state, and retain Pause priority and interrupted-update recovery.
