@@ -8,6 +8,8 @@
   Add an exclusive offline acknowledgement with atomic archive/policy/receipt/fault retirement into inhibited
   recovery; fresh Boot and ordinary release remain mandatory. Apply the same history permission through guarded
   original-backend restoration. Test real TLS recovery, future omissions, alteration refusal and rollback.
+  Deploy the policy with27 archived/25 currently returned records, recover actual app/schedule authority at6A,
+  and verify the Leon connected at0W with no new transaction, no pending delivery and healthy HA status.
 - Deploy the thin HA client and verify real Pause, persisted pause through service loss/restart, fault alert and
   recovery, and explicit Return at native6/owned6 with no new charge. Preserve saved plans and all27 native records.
   Replace obsolete dashboard cloud controls, slider and optional cached schedule/history with fresh local status,

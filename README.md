@@ -664,6 +664,13 @@ exists in the tool. Fresh actual Boot, resource/ledger reconciliation and the or
 required after restart. The same acknowledged history policy follows that journal through eventual original-backend
 restoration, with all ordinary32A/hardware/resource checks intact. Other journals cannot inherit this permission.
 
+Live recovery on2026-11-10 retained27 full historical records locally while the charger returned25; the two absent
+older records remain an informational warning. Actual Boot/cloud/native recovery returned app/schedule authority at
+native6/owned6 with the Leon connected, zero power, no new transaction and an empty delivery queue. Original admission
+history, allocation, intent, configuration and saved schedule are unchanged. HA recovered live readings and cleared
+its problem state; all21 functional automations retained their on/off states. Validation includes1168 full-suite
+cases,54 final focused cases and40 condition mutations caught after strengthening two archive regressions.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

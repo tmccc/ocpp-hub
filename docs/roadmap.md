@@ -120,6 +120,10 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   policy/archive/operator receipt and retires only the independently verified history fault into inhibited
   recovery. Actual Boot/reconciliation/release remain required, allocation is unchanged, ordinary trials stay
   strict, and the same journal's eventual original-backend restoration honors the history policy.
+  Deployed and independently verified:27 archived/25 returned/2 absent, fresh Boot/cloud/native recovery to shared6A,
+  Leon connected at0W, no new transaction or pending delivery, and unchanged admission/allocation/intent/plans.
+  HA status is healthy; all21 functional automation states are preserved. Validation:1168 full-suite cases,
+  54 final focused cases and40 caught condition mutations.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
