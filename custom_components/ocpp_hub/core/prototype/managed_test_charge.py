@@ -40,6 +40,7 @@ class TestLease:
     first_mutation: int
     mode: str = "app"
     normal: bool = False
+    current_a: int = 6
 
 
 class ManagedChargeTests:
@@ -81,21 +82,26 @@ class ManagedChargeTests:
             and not j.get("managed_control_fault")
             and j.get("trial_phase") == "active"
             and g.controls.ready
-            and g.controls.desired() == (0 if c.requests.intent().mode == "paused" else 6)
+            and g.controls.desired() == (0 if c.requests.intent().mode == "paused" else c.current.selected())
+            and (normal or c.current.selected() == 6)
+            and not c.current.pending()
             and not g.policy.allow_local_start
             and (not local or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags))
             and not j.get("control", {}).get("uncertain")
             and not j.get("control", {}).get("start_pending")
             and j.active() is None
             and not j.get("vendor_start_grant")
-            and not j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+            and not j.db.execute(
+                "SELECT 1 FROM outbox WHERE action IN ('StartTransaction','StopTransaction') LIMIT 1"
+                if normal
+                else "SELECT 1 FROM outbox LIMIT 1"
+            ).fetchone()
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             and c.requests.pending_return() is None
             and j.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] < (4095 if normal else 4096)
             and self.state().get("state") not in ACTIVE
             and g.current_boot_seen(g._charger_epoch)
-            and c.session.runtime.status.vendor_connected
-            and g.vendor_registration == "Accepted"
+            and (normal or c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
             and (
                 native is None
                 or native.physical.connection == "Plug"
@@ -136,6 +142,7 @@ class ManagedChargeTests:
             j.db.execute("SELECT COALESCE(MAX(rowid),0) FROM mutations").fetchone()[0],
             mode=c.requests.intent().mode,
             normal=action == "start",
+            current_a=c.current.selected(),
         )
         with j.atomic():
             j.put(
@@ -150,6 +157,7 @@ class ManagedChargeTests:
                     "hard_deadline_epoch": time.time() + STARTUP_BUDGET + (0 if lease.normal else DURATION),
                     "duration_seconds": None if lease.normal else DURATION,
                     "start_rpc_accepted": False,
+                    "current_a": lease.current_a,
                 },
             )
             j.db.execute(
@@ -180,7 +188,9 @@ class ManagedChargeTests:
             or fingerprint(j.identity) != lease.identity
             or c.native.spec.digest != lease.spec
             or g.policy.allow_local_start
-            or g.policy.max_current_a != 6
+            or not 6 <= g.policy.max_current_a <= 32
+            or c.current.selected() != lease.current_a
+            or c.current.pending()
             or j.get("managed_control_fault")
             or j.get("trial_phase") != "active"
             or self.state().get("id") != lease.identifier
@@ -204,7 +214,7 @@ class ManagedChargeTests:
         try:
             self.guard(lease)
             initial = await c.settled_native()
-            c.native.spec.require(initial, j.identity, "trial", closed=True, allow_unplugged=True)
+            c.native.require(initial, closed=True)
             if initial.physical.connection != "Plug":
                 raise DeniedError("test requires a freshly connected idle vehicle")
             self.guard(lease)
@@ -217,7 +227,7 @@ class ManagedChargeTests:
                     self.guard(lease)
                     native = await c.native.read(closed=True)
                     try:
-                        c.require_zero(native)
+                        c.require_zero(native, allow_offline=lease.normal)
                         break
                     except RecoveryRequiredError:
                         await asyncio.sleep(0.1)

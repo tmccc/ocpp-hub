@@ -11,6 +11,7 @@ from .. import commands
 from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
+from .managed_current import managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .rpc import UnavailableError
@@ -63,7 +64,7 @@ class NativeBoundedHandover:
         return {
             "configured": True,
             "stage": state.get("stage", "not_admitted"),
-            "target_native_limit_a": 6,
+            "target_native_limit_a": managed_current_ceiling(self.gateway.journal, self.spec),
             "native_limit_freshly_verified": 0 <= time.time() - self.last_verified_at <= 5,
             "vehicle_pause_asserted": False,
             "restoration_pending": state.get("stage") != "complete",
@@ -100,6 +101,7 @@ class NativeBoundedHandover:
                 "binding": journal.get("trial_binding"),
                 "grant": journal.get("vendor_start_grant"),
                 "state": journal.get("native_bounded_handover"),
+                "current_capability": journal.get("managed_current_capability"),
                 "resources": [tuple(row) for row in journal.db.execute("SELECT * FROM trial_resources ORDER BY key")],
             }
         )
@@ -111,9 +113,7 @@ class NativeBoundedHandover:
             native = await self.observe()
             if before != self.authority():
                 raise UnavailableError("native bounded audit was superseded by local authority")
-            self.spec.require(
-                native, self.gateway.journal.identity, route, closed=closed, allow_unplugged=self.allow_unplugged
-            )
+            self.require(native, route=route, closed=closed)
             audit_history(
                 self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
             )
@@ -123,6 +123,33 @@ class NativeBoundedHandover:
             raise
         self.last_verified_at = native.physical.observed_at
         return native
+
+    # The explicit managed capability broadens only its native ceiling; selected-current enforcement stays independent.
+    def require(self, native: HandoverEvidence, *, route: str = "trial", closed: bool = False) -> None:
+        j = self.gateway.journal
+        if managed_current_ceiling(j, self.spec) == 32:
+            if route != "trial":
+                raise SecurityError("managed current capability must be retired before backend restoration")
+            self.spec.require_managed(native, j.identity, closed=closed, allow_unplugged=self.allow_unplugged)
+        else:
+            self.spec.require(native, j.identity, route, closed=closed, allow_unplugged=self.allow_unplugged)
+
+    # Measured selected-limit enforcement gates health and positive work, while absolute-bound reads still permit Stop.
+    def require_selected(self, native: HandoverEvidence) -> None:
+        j = self.gateway.journal
+        if managed_current_ceiling(j, self.spec) == 32:
+            selected = self.gateway.controls.policy.max_current_a
+            selected = j.get("control", {}).get("resume_limit", selected)
+            if type(selected) not in (int, float) or not 6 <= selected <= 32:
+                raise SecurityError("managed selected current is malformed")
+            if max(native.currents_a) > selected + 0.5 or max(native.powers_w) > min(8500, selected * 270 + 100):
+                raise SecurityError("actual native power exceeds the selected managed current")
+
+    # Only a copy of the already validated USER scalar is normalized; original admission bytes are never rewritten.
+    def binding_digest(self, native: HandoverEvidence) -> str:
+        if managed_current_ceiling(self.gateway.journal, self.spec) == 32:
+            return fingerprint(native.configuration | {"AmpLmt": "6"})
+        return native.physical.configuration_digest
 
     # Initial connected admission has its own guard; allocation is reserved before adding any mode metadata.
     async def admit(self) -> None:
@@ -164,13 +191,13 @@ class NativeBoundedHandover:
             journal.put(
                 "trial_binding",
                 {
-                    "configuration_digest": native.physical.configuration_digest,
+                    "configuration_digest": self.binding_digest(native),
                     "station": self.choice.value(),
                     "boot_digest": self.spec.boot_digest,
                 },
             )
         elif binding != {
-            "configuration_digest": native.physical.configuration_digest,
+            "configuration_digest": self.binding_digest(native),
             "station": self.choice.value(),
             "boot_digest": self.spec.boot_digest,
         }:
@@ -230,7 +257,7 @@ class NativeBoundedHandover:
             gateway._require_epoch("charger", epoch)
             self.spec.require_boot(journal.get("boot"))
             if journal.get("trial_binding") != {
-                "configuration_digest": native.physical.configuration_digest,
+                "configuration_digest": self.binding_digest(native),
                 "station": self.choice.value(),
                 "boot_digest": self.spec.boot_digest,
             }:
@@ -275,7 +302,11 @@ class NativeBoundedHandover:
         zero = action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0
         if zero:
             return  # Existing ledger guards still forbid recreating a station profile after verified absence.
-        native = await self.read(closed=action == "ClearChargingProfile")
+        selecting = self.gateway.journal.get("managed_current_change", {}).get("state") == "pending"
+        native = await self.read(
+            closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
+        )
+        self.require_selected(native)
         if action == "ClearChargingProfile":
             require_lifecycle_idle(self.gateway)
             present = self.book.owned_present(native.physical)
@@ -292,6 +323,8 @@ class NativeBoundedHandover:
 
     # Stop actual known work, drain real lifecycle delivery, then clear exact owned profiles with station last.
     async def cleanup(self, quiesce: Callable[[], Awaitable[None]]) -> dict[str, Any]:
+        if managed_current_ceiling(self.gateway.journal, self.spec) != 6:
+            raise SecurityError("retire the managed current capability before legacy cleanup")
         async with self.lock:
             gateway, journal = self.gateway, self.gateway.journal
             if journal.get("trial_phase") == "backend_restore_pending":

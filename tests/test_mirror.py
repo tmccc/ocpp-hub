@@ -215,6 +215,8 @@ async def test_vendor_outage_is_bridged_in_order(start_rig: Any) -> None:
     await charger.call("MeterValues", {"connectorId": 1, "meterValue": METER_VALUE})
     await rig.vendor.start()
     await eventually(lambda: len(rig.vendor.calls) >= first_connection_calls + 5, message="frames not replayed")
+    # Peer receipt precedes processing its ACK and retiring the last queued frame.
+    await eventually(lambda: rig.mirror.status(CHARGER).queue_length == 0, message="replayed frames not acknowledged")
 
     replayed = rig.vendor.calls[first_connection_calls:]
     assert [(call[2], call[3].get("connectorId"), call[3].get("status")) for call in replayed] == [

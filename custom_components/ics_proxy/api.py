@@ -62,8 +62,8 @@ class ProxyClient:
         return result
 
     # Acceptance is separate from actual zero/release confirmation; a lost response never repeats the physical write.
-    async def command(self, action: str, revision: int) -> None:
-        receipt = await self.request(action, revision=revision)
+    async def command(self, action: str, revision: int, **fields: Any) -> None:
+        receipt = await self.request(action, revision=revision, **fields)
         if not isinstance(receipt.get("id"), str) or not re.fullmatch(r"[a-f0-9]{32}", receipt["id"]):
             raise ProxyError("The local charger proxy returned an invalid command receipt")
         identifier = receipt["id"]

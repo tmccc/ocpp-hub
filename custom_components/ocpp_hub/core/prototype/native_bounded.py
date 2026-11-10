@@ -62,12 +62,18 @@ def require_native(
     closed: bool,
     *,
     allow_unplugged: bool = False,
+    allow_full_current: bool = False,
 ) -> None:
     try:
         physical = native.physical
         if type(user_a) is not int or user_a not in {6, 32} or type(allow_unplugged) is not bool:
             raise ValueError
-        unplugged = allow_unplugged and user_a == 6 and physical.cp == "A" and physical.connection == "Unplug"
+        unplugged = (
+            allow_unplugged
+            and (user_a == 6 or allow_full_current)
+            and physical.cp == "A"
+            and physical.connection == "Unplug"
+        )
         current_max, power_max = (6.5, 2000) if user_a == 6 else (32.5, 8500)
         if type(physical.observed_at) not in (int, float) or not math.isfinite(physical.observed_at):
             raise ValueError
@@ -226,6 +232,25 @@ class NativeBoundedSpec:
         )
         if native.configuration != expected or native.saved_schedule_digest != self.saved_schedule_digest:
             raise SecurityError("native bounded configuration or saved schedule changed")
+
+    # Separately commissioned managed operation keeps the original installation ceiling and full route/config binding.
+    def require_managed(
+        self, native: HandoverEvidence, identity: str, *, closed: bool = False, allow_unplugged: bool = False
+    ) -> None:
+        expected = self.original_configuration | self.trial_route | {"AmpLmt": "32"}
+        if identity != expected["Id"]:
+            raise SecurityError("managed current evidence belongs to another charger")
+        require_native(
+            native,
+            identity,
+            self.hardware_identity,
+            32,
+            closed,
+            allow_unplugged=allow_unplugged,
+            allow_full_current=True,
+        )
+        if native.configuration != expected or native.saved_schedule_digest != self.saved_schedule_digest:
+            raise SecurityError("managed full configuration or saved schedule changed")
 
     # Connected admission is stricter than bounded monitoring and cannot start from another open native session.
     def require_admission(self, native: HandoverEvidence, identity: str, route: str = "trial") -> None:

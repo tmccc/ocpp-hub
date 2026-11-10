@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import ProxyCoordinator
 
-PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON, Platform.NUMBER]
 type ProxyEntry = ConfigEntry[ProxyCoordinator]
 
 

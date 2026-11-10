@@ -48,6 +48,17 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ages = [self.age("status_age_seconds"), self.age("native_age_seconds")]
         return (self.data or {}).get("healthy") is True and all(a is not None and 0 <= a <= 15 for a in ages)
 
+    # Explicit local health can retain safe native control during a manufacturer-cloud outage.
+    @property
+    def fresh_local_healthy(self) -> bool:
+        data = self.data or {}
+        ages = [self.age("status_age_seconds"), self.age("native_age_seconds")]
+        return (
+            data.get("running") is True
+            and data.get("local_healthy", data.get("healthy")) is True
+            and all(a is not None and 0 <= a <= 15 for a in ages)
+        )
+
     # Retire a previous snapshot expiry when new data arrives or HA unloads the entry.
     @callback
     def cancel_expiry(self) -> None:

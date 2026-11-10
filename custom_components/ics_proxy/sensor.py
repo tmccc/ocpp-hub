@@ -92,7 +92,7 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def local_charge_progress(self) -> dict[str, Any] | None:
         value = self.coordinator.data.get("local_charge")
         if (
-            not self.coordinator.fresh_healthy
+            not self.coordinator.fresh_local_healthy
             or not isinstance(value, dict)
             or value.get("state")
             not in ("starting", "awaiting_session", "running", "stopping", "completed", "interrupted", "failed")

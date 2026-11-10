@@ -37,7 +37,8 @@ class ManagedRequests:
         self.intent()
         journal.db.execute(
             "UPDATE managed_requests SET state='uncertain',result=? "
-            "WHERE action IN ('app_control','start','start_test','arm_cloud_test') AND state IN ('accepted','running')",
+            "WHERE action IN ('app_control','start','start_test','arm_cloud_test','set_current') "
+            "AND state IN ('accepted','running')",
             (json.dumps({"classification": "process_replaced"}),),
         )
 
@@ -62,6 +63,7 @@ class ManagedRequests:
             "start",
             "start_test",
             "arm_cloud_test",
+            "set_current",
         ):
             raise SecurityError("management request shape is invalid")
         if type(revision) is not int or not 0 <= revision < 2**53:

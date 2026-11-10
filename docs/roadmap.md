@@ -142,6 +142,9 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   completed and the queue emptied. Explicit Return restored app/schedule control at 6 A with the lead connected.
   Configuration, saved plans and all 21 functional automation states remain unchanged. All 26 admitted history bodies
   are retained within 30 archived records; 27 are currently returned and three older omissions remain tolerated.
+  The next extension implements explicit zero-protected USER32 commissioning, an idle-only 6–32 A current selector
+  and normal local Start during cloud absence. It preserves old admission/history bytes, current/revision/Pause
+  guards and genuine cloud backfill. Physical setting readbacks and the two one-minute 32 A tests are pending.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

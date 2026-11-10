@@ -45,11 +45,22 @@ class ProxyButton(ProxyEntity, ButtonEntity):
         key = {"start": "can_start", "pause": "can_pause", "app_control": "can_return", "start_test": "can_start_test"}[
             self.action
         ]
+        fresh = self.coordinator.fresh_local_healthy if self.action == "start" else self.coordinator.fresh_healthy
+        requested = self.coordinator.data.get("requested_current_a", 6)
         return (
             super().available
             and self.coordinator.data.get(key) is True
-            and (self.action == "pause" or self.coordinator.fresh_healthy)
+            and (self.action == "pause" or fresh)
+            and (self.action != "start_test" or type(requested) is int and requested == 6)
         )
+
+    # A normal Start names the selected resume limit, while the separate two-minute test stays fixed at six amps.
+    @property
+    def name(self) -> str | None:
+        current = self.coordinator.data.get("requested_current_a")
+        if self.action == "start" and type(current) is int and 6 <= current <= 32:
+            return f"Start charging ({current} A)"
+        return super().name
 
     # A deliberately chosen action uses one request id; a timeout refreshes status without repeating the write.
     async def async_press(self) -> None:

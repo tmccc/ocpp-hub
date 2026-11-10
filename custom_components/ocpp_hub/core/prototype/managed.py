@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
+from .managed_current import ManagedCurrentLimits, managed_current_ceiling
 from .managed_intent import ControlIntent, ManagedRequests
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
@@ -41,17 +42,26 @@ class ManagedController:
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
+        self.current = ManagedCurrentLimits(self)
         self.tests = ManagedChargeTests(self)
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
-    def command(self, identifier: str, action: str, revision: int) -> dict[str, Any]:
+    def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
+        if action == "set_current":
+            if current_a is None:
+                raise SecurityError("a current selection requires an integer current")
+            return self.current.accept(identifier, revision, current_a)
+        if current_a is not None:
+            raise SecurityError("current is only supported by the current-selection command")
         if action in ("start", "start_test", "arm_cloud_test"):
             return self.tests.accept(identifier, action, revision)
         previous = self.requests.existing(identifier, action, revision)
         if previous is not None:
             return previous
+        if action == "app_control" and self.current.pending():
+            raise RecoveryRequiredError("return awaits the current-setting outcome")
         if action == "app_control" and self.session.journal.get("managed_control_fault"):
             raise RecoveryRequiredError("a latched fault requires independent operator reconciliation")
         if action == "app_control" and self.requests.intent().mode != "paused":
@@ -80,7 +90,7 @@ class ManagedController:
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
     def require_paused(self, native: HandoverEvidence) -> None:
         g, j = self.session.gateway, self.session.journal
-        self.native.spec.require(native, j.identity, "trial", closed=True, allow_unplugged=self.native.allow_unplugged)
+        self.native.require(native, closed=True)
         self.native.require_known_session(native)
         present = self.session.book.owned_present(native.physical)
         if (
@@ -161,9 +171,9 @@ class ManagedController:
             return  # Attention remains latched; an unconfirmed safety cap is never reported as measured zero.
 
     # The present owned zero, live introduction and actual reconciled events are prerequisites to any release.
-    def require_zero(self, native: HandoverEvidence) -> None:
+    def require_zero(self, native: HandoverEvidence, *, allow_offline: bool = False) -> None:
         s, g, j = self.session, self.session.gateway, self.session.journal
-        self.native.spec.require(native, j.identity, "trial", closed=True, allow_unplugged=self.native.allow_unplugged)
+        self.native.require(native, closed=True)
         self.native.require_known_session(native)
         present = s.book.owned_present(native.physical)
         row = j.db.execute(
@@ -178,16 +188,18 @@ class ManagedController:
             or self.native.introduced_epoch != g._charger_epoch
             or self.native.introduced_revision != g.controls._revision
             or g.charger.sender is None
-            or g.vendor.sender is None
-            or g.vendor_registration != "Accepted"
-            or not s.runtime.status.vendor_connected
+            or not allow_offline
+            and (
+                g.vendor.sender is None or g.vendor_registration != "Accepted" or not s.runtime.status.vendor_connected
+            )
             or not g.controls.ready
             or g.controls.desired() != 0
             or not j.get("control", {}).get("inhibit")
             or row is None
             or row["state"] != "confirmed"
             or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
-            or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+            or not allow_offline
+            and j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             or g.controls._operations
             or g.charger._pending
             or g.vendor._pending
@@ -280,6 +292,7 @@ class ManagedController:
             ):
                 raise SecurityError("managed native transaction has no exact accepted local counterpart")
             self.native.require_known_session(native)
+            self.native.require_selected(native)
             present = self.session.book.owned_present(native.physical)
             row = self.session.journal.db.execute(
                 "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
@@ -298,6 +311,7 @@ class ManagedController:
 
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
     async def tick(self) -> dict[str, Any]:
+        await self.current.settle()
         await self.tests.settle()
         s, g, j = self.session, self.session.gateway, self.session.journal
         base = {
@@ -390,7 +404,8 @@ class ManagedController:
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )
-        healthy = (shared or verified_pause) and cloud
+        local_healthy = shared or verified_pause
+        healthy = local_healthy and cloud
         if healthy and not paused:
             pending_return = self.requests.pending_return()
             if pending_return is not None:
@@ -399,16 +414,26 @@ class ManagedController:
                 )
         return {
             **base,
+            "local_healthy": bool(local_healthy),
             "checked_at": time.time(),
             "phase": j.get("trial_phase"),
             "cloud_connected": cloud,
-            "state": "stopping" if self.stopping else "healthy" if healthy else "degraded",
+            "state": "stopping"
+            if self.stopping
+            else "healthy"
+            if healthy
+            else "local_only"
+            if local_healthy
+            else "degraded",
             "owner_control_enabled": shared,
             "desired_control": self.requests.intent().mode,
             "control_revision": self.requests.intent().revision,
             "local_hold_verified": verified_pause,
             "native_observed_at": native.physical.observed_at,
             "native_limit_a": native.runtime_user_a,
+            "requested_current_a": self.current.selected(),
+            "current_capability": managed_current_ceiling(j, self.native.spec) == 32,
+            "can_set_current": self.current.available(native),
             "station_ceiling_a": g.controls.desired(),
             "current_a": native.physical.current_a,
             "power_w": native.physical.power_w,

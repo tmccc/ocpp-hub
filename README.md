@@ -725,6 +725,30 @@ history bodies remain archived. There are 30 archived records and 27 currently r
 tolerated. All 21 functional automation states, including the five disabled automations, remain unchanged. Validation
 includes 1220 full-suite cases, 72 focused control cases, 33 final normal/API cases and 44 actual-HA cases.
 
+Managed operation can now be explicitly commissioned for the charger's existing 32 A installation ceiling. The
+separate capability binds the existing identity and immutable native specification; it leaves admission, allocation,
+original history and the history-retention acknowledgement unchanged. While a verified owned zero profile holds the
+connected car, `tools/prepare_managed_current.py prepare-native32` requires exclusive journal ownership, an explicit
+paused intent, exact Boot/binding and complete reconciliation before its single native USER32 write. Fresh full native
+readback and the exact confirmed zero-profile receipt precede the capability commit. An interrupted write is
+reconciled from actual readback without repeating it. The default `check` action changes nothing.
+
+Home Assistant's **Charge current limit** selects an integer from 6 to 32 A for the next charge. Selection is available
+only while the session is closed and idle; Pause first to change a charging session's future setting. A paused
+selection retains the actual zero hold. An idle app selection verifies the owned station profile and composite
+schedule without sending Start. Request IDs bind the current as well as the intent revision; Pause supersedes every
+awaited write. Unconfirmed or interrupted updates retain a pause. The independent native USER32 ceiling, selected
+station limit and paused zero hold remain distinct, and measured current above the selected tolerance blocks health
+and positive controls while leaving zero/Stop recovery available. Legacy cleanup refuses the new capability.
+
+Normal local Start also works during a cloud outage on an already introduced, active service. It still requires
+fresh full native evidence, a known closed session, the exact owned zero hold, a current approved static tag and no
+ambiguous mutation, unbound grant or outstanding Start/Stop lifecycle debt. Ordinary queued observations do not
+prevent admission. Genuine offline Start/Meter/Stop records wait for actual cloud mapping and acknowledgement after
+reconnection. Local readiness and cloud connectivity are reported separately; Return and restart recovery retain
+their cloud-reconciliation requirements. The existing timed diagnostic remains restricted to a selected 6 A.
+Controlled physical setting and one-minute charging acceptance for this extension are pending.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

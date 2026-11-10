@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .gateway import Gateway
+from .managed_current import managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
 from .native_bounded_handover import NativeBoundedHandover
 from .policy import Policy
@@ -150,7 +151,9 @@ class TrialSession:
                 raise SecurityError("managed journal requires its saved local Start restriction")
             self.book = ResourceBook(self.journal, prepared.baseline)
             policy = Policy(
-                max_current_a=6,
+                max_current_a=managed_current_ceiling(self.journal, native_bounded)
+                if native_bounded is not None
+                else 6,
                 allowed_tags=config.local_tags,
                 trust_vendor_start_tags=True,
                 strict_cloud_authorization=True,

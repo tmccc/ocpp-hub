@@ -28,6 +28,8 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
     native_age = current - native if native is not None else math.inf
     remaining = finite_number(value.get("certificate_remaining_seconds"))
     paused = value.get("desired_control") == "paused"
+    selected = finite_number(value.get("requested_current_a", 6))
+    native_ceiling = 32 if value.get("current_capability") is True else 6
     authority = (
         value.get("local_hold_verified") is True
         and value.get("station_ceiling_a") == 0
@@ -35,28 +37,30 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
         and value.get("power_w") == 0
         and value.get("charging_session_open") is False
         if paused
-        else value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == 6
+        else value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == selected
     )
-    okay = (
+    local_okay = (
         0 <= age <= 45
         and 0 <= native_age <= 15
-        and value.get("state") == "healthy"
+        and value.get("state") in ("healthy", "local_only")
         and value.get("running") is True
         and value.get("local_start_disabled") is True
         and value.get("desired_control", "app") in ("app", "paused")
         and authority
-        and value.get("cloud_connected") is True
         and value.get("charger_connected") is True
         and value.get("boot_verified") is True
         and value.get("phase") == "active"
         and value.get("preservation_failed") is False
-        and value.get("native_limit_a") == 6
+        and selected is not None
+        and 6 <= selected <= native_ceiling
+        and value.get("native_limit_a") == native_ceiling
         and remaining is not None
         and remaining > 1800
     )
     return {
         **value,
-        "healthy": okay,
+        "healthy": local_okay and value.get("cloud_connected") is True,
+        "local_healthy": local_okay,
         "status_age_seconds": age if math.isfinite(age) else None,
         "native_age_seconds": native_age if math.isfinite(native_age) else None,
     }

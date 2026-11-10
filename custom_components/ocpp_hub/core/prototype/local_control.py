@@ -224,11 +224,13 @@ class LocalControl:
                 await self._cap(call, limit, epoch)
 
     # A positive slider update cannot silently release an explicit zero-current hold.
-    async def set_limit(self, value: Any) -> Frame:
-        return await self._owned(self._set_limit(value))
+    async def set_limit(self, value: Any, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
+        return await self._owned(self._set_limit(value, guard=guard, shared=shared))
 
     # Keep the complete claimed slider operation alive independently of an individual API client.
-    async def _set_limit(self, value: Any) -> Frame:
+    async def _set_limit(self, value: Any, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
+        if guard is not None:
+            guard()
         limit = number(value, self.policy.max_current_a)
         limit = 0.0 if limit < 6 else limit
         if limit > 0 and self.journal.get("trial_starting"):
@@ -239,9 +241,17 @@ class LocalControl:
         epoch, ticket = self._claim(previous.get("inhibit", False) or limit == 0)
         if limit > 0:
             self._complete(ticket, resume_limit=limit)
-        async with self.peer.sequence(1, lambda: self._check(epoch, ticket)) as call:
+
+        # The managed selector retains app authority only while its durable request generation still matches.
+        def check() -> None:
+            self._check(epoch, ticket)
+            if guard is not None:
+                guard()
+
+        async with self.peer.sequence(1, check) as call:
             answer = await self._cap(call, limit, epoch)
-        self._complete(ticket, uncertain=False)
+        check()
+        self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
         return answer
 
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
@@ -282,8 +292,8 @@ class LocalControl:
 
     # A managed test supplies a live per-request guard without enabling the unrestricted local Start policy.
     async def start_managed(self, tag: str, guard: Callable[[], None]) -> Frame:
-        if self.policy.allow_local_start or self.policy.max_current_a != 6:
-            raise DeniedError("managed test Start requires the unchanged six-ampere restricted policy")
+        if self.policy.allow_local_start or not 6 <= self.policy.max_current_a <= 32:
+            raise DeniedError("managed Start requires the restricted installation policy")
         return await self._owned(self._start(tag, guard=guard, shared=True))
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.

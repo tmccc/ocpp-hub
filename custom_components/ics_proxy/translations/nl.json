@@ -1,0 +1,37 @@
+{
+  "title": "Lokale iCS-proxy",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Verbind met de lokale laadpaalproxy",
+        "description": "Verbind met de bestaande proxy op deze Home Assistant-host.",
+        "data": {
+          "port": "Beheerpoort",
+          "token": "Beheertoken"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "De lokale proxy is niet bereikbaar of de aanmelding is mislukt.",
+      "invalid_auth": "Voer het ingestelde beheertoken in."
+    },
+    "abort": {
+      "already_configured": "De lokale proxy is al ingesteld."
+    }
+  },
+  "entity": {
+    "number": {
+      "charge_current_a": {
+        "name": "Laadstroomlimiet"
+      }
+    }
+  },
+  "exceptions": {
+    "invalid_current": {
+      "message": "Kies een gehele laadstroom van 6 tot en met 32 A."
+    },
+    "current_unavailable": {
+      "message": "De laadstroom kan op dit moment niet worden ingesteld."
+    }
+  }
+}

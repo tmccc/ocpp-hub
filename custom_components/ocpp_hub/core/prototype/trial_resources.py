@@ -248,8 +248,16 @@ class ResourceBook:
                 raise DeniedError("trial is not accepting mutations")
         if action == "SetChargingProfile":
             canonical = profile_projection(payload)
-            if canonical["limit"] > 6:
-                raise DeniedError("trial resource exceeds its six-ampere ceiling")
+            ceiling = 6
+            if self.journal.get("managed_current_capability") is not None:
+                # Imports stay local because the immutable native specification also uses the baseline data shape.
+                from .managed_current import managed_current_ceiling
+                from .native_bounded import NativeBoundedSpec
+
+                spec = NativeBoundedSpec.parse(self.journal.get("native_bounded_handover", {}).get("spec", {}))
+                ceiling = managed_current_ceiling(self.journal, spec)
+            if canonical["limit"] > ceiling:
+                raise DeniedError("trial resource exceeds its approved current ceiling")
             key = "profile:" + str(canonical["id"])
             for original in self.baseline.resources:
                 if original.key == key:

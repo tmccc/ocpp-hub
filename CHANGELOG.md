@@ -2,6 +2,12 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add an explicit, zero-protected native32 capability and an idle-only 6–32 A HA current selector. Preserve original
+  admission/history bindings, separate selected current from the paused zero hold, bind request amperage and revision,
+  verify actual owned profile/composite state, and retain Pause priority and interrupted-update recovery.
+  Permit guarded normal local Start during cloud absence using fresh local readiness and current static authorization;
+  retain lifecycle/uncertainty checks, actual deferred cloud acknowledgements and the stricter Return/restart gates.
+  Keep the two-minute diagnostic restricted to a selected 6 A. Physical acceptance is pending.
 - Add normal6A **Start charging** in HA from idle or verified pause, without the timed test's two-minute cutoff.
   Bind the actual transaction atomically and immutably; confirm known sessions at0W without claiming charging.
   Preserve Pause races, guarded post-ACK intent updates and restart-to-zero/no-replay. Complete genuine short
