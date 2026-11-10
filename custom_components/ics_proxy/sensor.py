@@ -56,7 +56,7 @@ class ProxySensor(ProxyEntity, SensorEntity):
         if self.key == "control_mode":
             if data.get("desired_control") == "paused":
                 return "Paused locally" if data.get("local_hold_verified") and self.native_fresh else "Pause requested"
-            if data.get("healthy") is True and data.get("owner_control_enabled") is True:
+            if self.coordinator.fresh_healthy and data.get("owner_control_enabled") is True:
                 return "App / schedule"
             return "Needs attention" if data.get("state") in ("attention", "degraded") else "Waiting for verification"
         if self.key == "last_session_energy":

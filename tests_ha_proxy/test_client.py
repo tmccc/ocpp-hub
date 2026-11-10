@@ -197,6 +197,7 @@ async def test_snapshot_expires_between_polls(actual_hass, peer):
     peer["state"]["native_age_seconds"] = 14
     entry = await setup(hass, peer)
     assert hass.states.get("sensor.ics_proxy_power").state == "0"
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
     requests = len(peer["commands"])
     await asyncio.sleep(1.2)
     await hass.async_block_till_done()
@@ -205,6 +206,8 @@ async def test_snapshot_expires_between_polls(actual_hass, peer):
     assert hass.states.get("binary_sensor.ics_proxy_vehicle_connected").state == "unavailable"
     assert hass.states.get("sensor.ics_proxy_last_session_energy").state == "unavailable"
     assert hass.states.get("binary_sensor.ics_proxy_problem").state == "on"
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
     peer["state"]["native_age_seconds"] = 0
     await entry.runtime_data.async_refresh()
     assert hass.states.get("sensor.ics_proxy_power").state == "0"
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
