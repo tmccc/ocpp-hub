@@ -7,6 +7,10 @@
   Preserve Pause races, guarded post-ACK intent updates and restart-to-zero/no-replay. Complete genuine short
   sessions without pausing later app/native activity. Reserve Pause capacity after Start and Return; report fresh
   local-session/charging state while retaining all existing timed-test controls and current safety gates.
+  Deploy the regular dashboard control and verify HA Start from pause, charging beyond two minutes, and HA Pause
+  to a closed session at 0 W: 65 Wh delivered, 1464 W peak, cloud acknowledged and no delivery debt. Explicit Return
+  restores app/schedule control at 6 A with the lead connected; configuration, saved schedule and automations remain
+  unchanged. Preserve all 26 admitted history bodies within 30 archived records, including three older omissions.
 - Add an explicit fixed6A two-minute HA test charge with a one-shot guarded local Start, fresh native admission,
   independent deadline Stop, durable paused completion and no automatic Start replay after replacement. Preserve
   the unrestricted-Start prohibition and all current/history/resource/authorization safeguards. Bind cloud-test

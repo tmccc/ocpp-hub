@@ -137,7 +137,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   real session confirmation. It atomically binds the first actual transaction, distinguishes0Wsession from measured
   charging, preserves Pause/preemption/restart-to-zero and ends genuine short sessions without stopping later app or
   native-timer activity. Start/Return reserve Pause capacity, and existing authorization/history/electrical gates and
-  timed diagnostics remain. Deployment and controlled live acceptance are pending.
+  timed diagnostics remain. The regular dashboard control is deployed: HA Start from verified pause charged beyond
+  two minutes at 6 A, delivering 65 Wh with a 1464 W peak. HA Pause closed the actual session at 0 W, cloud acknowledgement
+  completed and the queue emptied. Explicit Return restored app/schedule control at 6 A with the lead connected.
+  Configuration, saved plans and all 21 functional automation states remain unchanged. All 26 admitted history bodies
+  are retained within 30 archived records; 27 are currently returned and three older omissions remain tolerated.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

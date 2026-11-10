@@ -716,6 +716,15 @@ slot for a later Pause; new Return requests require a paused intent. Normal Star
 native/history/resource and authorization gates; it is a local OCPP command, not a new cloud-outage admission policy.
 Caller-selected current/tag/duration and the raw generic Start path remain unavailable. Existing timed tests remain.
 
+The normal Start control was deployed and tested with the connected Leon on 2026-11-10. HA Start resumed a verified
+pause at 6 A, distinguished the initial open session at 0 W from measured charging, and continued beyond two minutes.
+HA Pause then closed the session at 0 W. It delivered 65 Wh, peaked at 1464 W and received actual cloud acknowledgement
+with no queued deliveries. Explicit Return restored app/schedule control at 6 A with the lead connected. Independent
+native checks verified unchanged full configuration, saved schedule and admission/allocation evidence; all 26 admitted
+history bodies remain archived. There are 30 archived records and 27 currently returned, with three older omissions
+tolerated. All 21 functional automation states, including the five disabled automations, remain unchanged. Validation
+includes 1220 full-suite cases, 72 focused control cases, 33 final normal/API cases and 44 actual-HA cases.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;
@@ -916,6 +925,9 @@ transaction, unplugged and 0 A / 0 W. Configuration, schedule and SMART profile 
 for this uninterrupted trial. Its real session added one history record (5 to 6) and 769 Wh; history was not erased.
 
 ### Remaining boundaries after the first unplugged proxy trial
+
+This is the historical record of that first trial. The managed-operation and normal Start validation above record
+subsequent results.
 
 The commissioning package is separate from Home Assistant and does not establish full iCS2.0Lite compatibility.
 
