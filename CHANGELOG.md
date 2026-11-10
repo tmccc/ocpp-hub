@@ -2,6 +2,10 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Verify the first managed overnight native schedule:00:00:00 start,06:00:02 Stop,5614Wh, acknowledged cloud
+  lifecycle, empty outbox and preserved26old records plus the new session. Load ceased around03:52; the owner
+  accepts the scheduling check and waives further active-load06:00 cutoff testing. Retain the6A operating boundary.
+
 - Treat routine cable removal as healthy in explicitly configured managed mode only when native evidence proves
   `A`/`Unplug`, a closed session, all-phase zero and output0 under unchanged native6/configuration/history/resources.
   Recover an already admitted service while unplugged without Start. Keep initial connected admission and32A

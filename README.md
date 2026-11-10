@@ -578,6 +578,22 @@ closed-zero/owned0, exact history and empty-ledger verification. Controlled repl
 cloud registration and shared6A control. A final independent native/ledger audit confirmed zero power, no Start or
 transaction, unchanged plans/all26 history bodies, and a successful independent health check.
 
+The first unattended managed overnight schedule completed on 2026-11-10. Native and durable/cloud records agree
+on a00:00:00 start,06:00:02 local Stop and5614Wh meter difference. The27-record history retains every original26
+body, the schedule is unchanged, no Start/Stop was issued by the operator and the outbox is empty. Native6/owned6
+remain verified; sampled load was6.1A and about1.43–1.50kW. The last positive minute reading was03:51:46 and the
+first zero03:52:46, while the session stayed open until the scheduled Stop. The reason for earlier zero draw is
+not established.445minute checks before07:25 were healthy; three roughly six-second supervision alerts recovered
+automatically with no service restart or persistent fault. The owner accepts overnight scheduling as complete and
+does not require another active-load06:00 cutoff test.
+
+The next integration step is a separately authenticated management connection from Home Assistant to this existing
+durable service. Begin with measured status/history, fault notifications, an intentional local Stop hold and an
+explicit return to app control. The supervisor must first distinguish a valid requested local hold from a control
+failure and preserve that intent through replacement, without automatically releasing a requested Stop. The
+ordinary HA entry point uses the older engine and cannot substitute for this adapter. Retain the proven6A boundary
+for this work; a higher operating ceiling requires reviewed policy/native/recovery changes rather than a slider flip.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

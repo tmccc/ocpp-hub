@@ -85,7 +85,7 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   recovered automatically to verified USER6/owned6/shared control with zero power, no Start/transaction/outbox and
   all26 history bodies/plans preserved; the lead stayed attached. The first release had required manual independent
   zero reconciliation after an unconfirmed outcome whose cause was not captured; future errors retain private
-  diagnostics. Overnight/unattended operation remains to be observed. A reported ordinary lead removal exposed the
+  diagnostics. The first overnight schedule is now verified below; longer endurance remains open. Lead removal exposed the
   managed monitor's connected-only check: it latched inhibition after three samples and remained blocked after
   reconnection. Explicit closed/all-phase-zero unplugged monitoring/recovery is now implemented without weakening
   original connected admission, unknown-session rejection, resource/history protection or32A restoration.
@@ -93,6 +93,16 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   restart were tested offline. Independent zero/owned0/history/empty-ledger proof preceded fault acknowledgement;
   real connected replacement recovered shared6A/Boot/cloud with zero power, no Start and all26 history bodies/plans
   intact. The physical lead stayed connected. Home Assistant remains unchanged.
+  The first managed overnight schedule completed on2026-11-10:00:00:00 start,06:00:02 Stop,5614Wh, actual cloud
+  acknowledgements/empty outbox and all26 original records plus the new27th retained. Power was zero from around
+  03:52; its cause is unconfirmed.445minute checks before07:25 were healthy, with three brief supervision alerts
+  clearing automatically and no restart/persistent fault. The owner accepts overnight scheduling as complete and
+  waives another active-load06:00 cutoff test.
+  Next: authenticated local management and a thin HA adapter for the existing durable service, initially status,
+  fault notifications, intentional local Stop and explicit return to app control. Persist desired ownership and
+  recognize a valid local hold through supervision/replacement before exposing these commands. Keep6A initially;
+  normal higher-current operation requires separate policy/native/recovery work. The older HA engine is not this
+  adapter, and deliberately disabled EV/reserve automations remain disabled.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
