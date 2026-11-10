@@ -9,6 +9,9 @@
   Add fresh HA readiness/progress and tests for Pause races, capacity, storage failure, deadlines and both sources.
   Select a currently valid approved local tag while preserving expired/revoked cache entries; wait only for bounded
   zero-state reconciliation before the single Start attempt and retain private failure diagnostics.
+  Verify actual HA/local and Android iCS/cloud two-minute charges:53Wh and50Wh, real Stop about2seconds after each
+  target, both closed and cloud acknowledged. Restore app/schedule control at6A with the Leon connected at0W,
+  unchanged settings/plans/automations and29 archived records; publish the timed dashboard control and progress.
 - Allow general historical-record absence in explicitly acknowledged managed operation. Retain full originals and
   completed-record versions privately, report missing counts without blocking charging, and continue rejecting
   changed admitted records. Keep commissioning strict, allocation unchanged and all electrical/session guards.

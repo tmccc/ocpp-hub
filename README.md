@@ -686,6 +686,21 @@ by its consumed vendor grant, exact confirmed mutation and known native transact
 15seconds grace for the app's planned two-minute Stop, within the same immutable acceptance ceiling. Current,
 duration, tag and arbitrary RPC are never supplied by management callers. Generic Start remains unavailable.
 
+Both authorized physical tests passed on2026-11-10 at nominal6A. The HA/local OCPP test delivered53Wh; its first
+verified power was12:37:29, the two-minute Stop target12:39:29, and the actual Stop12:39:31. The signed-in Android
+iCS2.0Lite cloud test delivered50Wh; verified flow began12:41:15, the app Stop target was12:43:15 and actual Stop
+12:43:17. Native session timestamps also include preparation. Local Start was actually sent once by the managed
+HA action; cloud Start was bound to its consumed grant/exact mutation, and the app's actual RemoteStop completed
+before its backup deadline. Both sessions closed, were acknowledged by the cloud and left no delivery debt.
+
+A preliminary local attempt sent no Start and delivered no power because selection chose an expired approved tag.
+The corrected selection uses another currently valid approved tag, preserves expired/revoked evidence and rechecks
+authorization at actual sends;31 final focused regressions pass alongside the1200-case full run and25 actual-HA
+cases. Final independent native/ledger/HA checks verified app/schedule restoration, USER6/owned6, connected Leon at0W,
+unchanged full configuration/saved schedule/all21 functional automation states and no fault. Native history returned
+26 records against29 archived, with three older admitted records omitted and all complete original bodies retained.
+The timed test button and fresh progress are published on the charger dashboard; unrestricted Start remains disabled.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

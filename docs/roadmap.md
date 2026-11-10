@@ -128,7 +128,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   prohibition. Fresh native admission, per-request generation guards, independent deadline Stop and interrupted
   restart-to-pause apply; no caller-selected tag/current/duration or Start replay is exposed. Cloud arming performs
   no Start and requires actual consumed-grant/mutation/native-session proof. Both test routes finish paused before
-  an explicit Return. Real two-minute local and app charging acceptance remains pending.
+  an explicit Return. Both physical two-minute tests passed: HA/local53Wh and Android iCS/cloud50Wh, actualStops
+  about2seconds after theirtargets, cloudacknowledged/emptyqueue/verified0. ExplicitReturn restoredshared6A with
+  Leonconnected at0W, unchangedsettings/plans/all21functionalautomations and29archivedrecords(threeolderomissions).
+  The expired-first-tag selection bug was fixed without clearing cache evidence; final31 focused cases pass,
+  alongside1200 full-suite and25 actual-HA cases. The timed test control/progress is published on the dashboard.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
