@@ -1,0 +1,8 @@
+{
+  "title": "iCS local proxy",
+  "config": {
+    "step": {"user": {"title": "Connect to the local charger proxy", "description": "Connect to the existing managed proxy on this Home Assistant host.", "data": {"port": "Management port", "token": "Management token"}}},
+    "error": {"cannot_connect": "Unable to reach or authenticate the local proxy.", "invalid_auth": "Enter the configured management token."},
+    "abort": {"already_configured": "The local proxy is already configured."}
+  }
+}

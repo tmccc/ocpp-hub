@@ -103,6 +103,12 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   recognize a valid local hold through supervision/replacement before exposing these commands. Keep 6 A initially;
   normal higher-current operation requires separate policy/native/recovery work. The older HA engine is not this
   adapter, and deliberately disabled EV/reserve automations remain disabled.
+  The local management API and thin HA client are implemented: loopback-only authenticated websocket, atomic
+  paused intent/hold claim, restart-persistent Stop and revision-bound explicit Return with actual zero/release
+  proof. No Start endpoint or command retry is added; native6A and the app/timetable path remain. Fresh local
+  charger history replaces optional cloud-cache claims, entity expiry advances between polls, and sustained faults
+  create a debounced HA notification. Isolated actual HA2026.11 tests cover passive lifecycle, controls and stale
+  readings. Deployment/live acceptance and the requested charger dashboard audit remain to be completed.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

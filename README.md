@@ -594,6 +594,39 @@ failure and preserve that intent through replacement, without automatically rele
 ordinary HA entry point uses the older engine and cannot substitute for this adapter. Retain the proven 6 A boundary
 for this work; a higher operating ceiling requires reviewed policy/native/recovery changes rather than a slider flip.
 
+The local management implementation now uses an independent, authenticated websocket bound to literal
+`127.0.0.1`. It is intended for Home Assistant and the proxy running on the same host; it opens no LAN management
+listener. `--management-config /absolute/private/management.json` supplies exactly `host`, `port` and `token_file`;
+the host must be `127.0.0.1`, and the separate private credential file contains a random 64-character lowercase
+hexadecimal `token`. Browser origins, duplicate credentials, wrong hosts/paths, unbounded frames and unsupported
+commands are rejected. Only status, history, receipt, Pause and Return-to-app are exposed. No Start, arbitrary RPC,
+configuration or native settings endpoint exists. The configured bearer never appears in a URL or response body.
+
+Pause acceptance, monotonic intent revision and the local hold claim commit atomically before any physical effect.
+The user sees confirmation only after actual closed/all-phase zero and owned station0 are observed. A persisted
+pause remains authoritative after client disappearance, proxy replacement and HA restart. Returning to the app
+requires a current revision, fresh zero/Boot/resource proof, genuine lifecycle reconciliation and a physically
+confirmed6A release. Its guard runs before the owned release task claims authority and again at actual RPC sends.
+A newer Pause wins. Uncertain or interrupted Return requests are not automatically repeated after replacement.
+Local Start stays disabled. Health recognizes a deliberate verified0A hold while still requiring native6A and all
+the ordinary current/configuration/history safeguards.
+
+`custom_components/ics_proxy` is a separate thin HA client. Setup/reload/unload only poll the existing service;
+they do not import the protocol engine, open its journal, own a charger listener or change control intent. It adds
+fresh power/current/plug/charging/health/history, a read-only safety/local ceiling and explicit Pause/Return buttons.
+Snapshot ages continue advancing between polls, with timed entity invalidation when readings expire. Brief faults
+settle quietly; a problem lasting60seconds raises one HA persistent notification, dismissed after recovery. Lost
+command replies never cause an automatic mutation retry. Native history is bounded/redacted and separately named
+from proxy journal sessions. A completed proxy session is labelled cloud acknowledged only after its Stop has
+actually drained from the delivery queue.
+
+The deployment helper supports `--domain ics_proxy --container <name>` with a dry run, validated in-memory archive,
+external backup, source compilation, exact digest verification and ordinary write-failure rollback. This avoids
+installing the older `ocpp_hub` listener. Actual-core HA client tests live in `tests_ha_proxy`; they were exercised
+against HA2026.11.0 in a disposable container from the deployed image, with no live configuration mounted. The
+older available HA test plugin pins2026.10.4 and was left disabled; the fixture uses the actual core/config entries
+and substitutes only DNS construction for loopback-only tests.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

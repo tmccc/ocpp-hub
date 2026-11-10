@@ -314,18 +314,27 @@ class LocalControl:
         return answer
 
     # Releasing local ownership is a physical operation, never removal of the station safety profile.
-    async def release(self, acknowledge_uncertainty: bool = False) -> None:
-        await self._owned(self._release(acknowledge_uncertainty))
+    async def release(self, acknowledge_uncertainty: bool = False, *, guard: Callable[[], None] | None = None) -> None:
+        await self._owned(self._release(acknowledge_uncertainty, guard))
 
     # A failed physical release reinstalls zero instead of retaining only a misleading software hold.
-    async def _release(self, acknowledge_uncertainty: bool) -> None:
+    async def _release(self, acknowledge_uncertainty: bool, guard: Callable[[], None] | None = None) -> None:
+        if guard is not None:
+            guard()  # Check before claiming, including when a newer Pause ran before this owned task started.
         if self.journal.get("trial_starting"):
             raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("uncertain") and not acknowledge_uncertainty:
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
         epoch, ticket = self._claim(previous.get("inhibit", False))
-        async with self.peer.sequence(1, lambda: self._check(epoch, ticket)) as call:
+
+        # A mode generation supplements the ticket through asynchronous native validation and actual send.
+        def check() -> None:
+            self._check(epoch, ticket)
+            if guard is not None:
+                guard()
+
+        async with self.peer.sequence(1, check) as call:
             try:
                 await self._cap(
                     call,

@@ -6,10 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
 import signal
 import socket
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -21,6 +21,8 @@ from tools.trial_proxy import load_core  # noqa: E402
 
 load_core()
 from ocpp_hub_core.prototype.managed import ManagedController  # noqa: E402
+from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings  # noqa: E402
+from ocpp_hub_core.prototype.managed_view import health_snapshot  # noqa: E402
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
@@ -83,45 +85,26 @@ def event(path: Path, value: dict[str, Any]) -> None:
 
 # Human/monitor checks read private status only: no connection, journal ownership or physical command is created.
 def health(path: Path, now: float | None = None) -> dict[str, Any]:
-    value = private_json(path)
-    current = time.time() if now is None else now
-    checked, native = value.get("checked_at"), value.get("native_observed_at")
-    age = current - checked if type(checked) in (int, float) else math.inf
-    native_age = current - native if type(native) in (int, float) else math.inf
-    remaining = value.get("certificate_remaining_seconds")
-    okay = (
-        type(age) in (int, float)
-        and 0 <= age <= 45
-        and 0 <= native_age <= 15
-        and value.get("state") == "healthy"
-        and value.get("running") is True
-        and value.get("local_start_disabled") is True
-        and value.get("owner_control_enabled") is True
-        and value.get("cloud_connected") is True
-        and value.get("charger_connected") is True
-        and value.get("boot_verified") is True
-        and value.get("phase") == "active"
-        and value.get("preservation_failed") is False
-        and value.get("native_limit_a") == 6
-        and value.get("station_ceiling_a") == 6
-        and type(remaining) in (int, float)
-        and math.isfinite(remaining)
-        and remaining > 1800
-    )
-    return {
-        **value,
-        "healthy": okay,
-        "status_age_seconds": age if math.isfinite(age) else None,
-        "native_age_seconds": native_age if math.isfinite(native_age) else None,
-    }
+    return health_snapshot(private_json(path), now)
 
 
 # Start one journal owner and retain the same zero/recovery/event semantics through every supervised replacement.
-async def serve(config_path: Path, spec_path: Path) -> int:
+async def serve(config_path: Path, spec_path: Path, management_path: Path | None = None) -> int:
     prepared = preflight(config_path)
     check_spec_path(prepared.config, spec_path)
     spec = native_spec(spec_path, prepared)
     expires = prepared.tls.certificate_expires_at
+    management = None
+    if management_path is not None:
+        check_spec_path(prepared.config, management_path)
+        management = ManagementSettings.load(management_path)
+        check_spec_path(prepared.config, management.token_file)
+        if management.token_file in (
+            prepared.config.native_secret,
+            prepared.config.incoming_secret,
+            prepared.config.upstream_secret,
+        ):
+            raise SecurityError("management credential must be independent")
     session = TrialSession(prepared, native_bounded=spec, allow_local_start=False, allow_unplugged_native=True)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -133,7 +116,7 @@ async def serve(config_path: Path, spec_path: Path) -> int:
         if controller is not None:
             try:
                 controller.request_stop()
-            except DeniedError:
+            except DeniedError, sqlite3.Error, OSError:
                 pass  # A completed/frozen cleanup already has no positive managed release authority.
 
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -143,9 +126,14 @@ async def serve(config_path: Path, spec_path: Path) -> int:
     events_path = prepared.config.journal.with_suffix(".events.jsonl")
     started = time.time()
     last_state: tuple[Any, ...] | None = None
+    published: dict[str, Any] = {"running": True, "state": "starting"}
+    api: ManagementServer | None = None
     try:
         await session.start()
         controller = ManagedController(session)
+        if management is not None:
+            api = ManagementServer(management, controller, lambda: dict(published))
+            await api.start()
         notify("READY=1\nSTATUS=Waiting for verified charger and owner control")
         while not stopped.is_set():
             status = await controller.tick()
@@ -153,6 +141,7 @@ async def serve(config_path: Path, spec_path: Path) -> int:
             status.update(pid=os.getpid(), started_at=started, certificate_remaining_seconds=remaining, running=True)
             if remaining <= 1800:
                 status.update(state="degraded", fault="listener_certificate_expiring")
+            published = status
             save_private(status_path, status)
             classification = status.get("state"), status.get("fault"), status.get("phase")
             if classification != last_state:
@@ -165,10 +154,12 @@ async def serve(config_path: Path, spec_path: Path) -> int:
             except TimeoutError:
                 pass
     finally:
-        stopped.set()
+        request_stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         notify("STOPPING=1\nSTATUS=Retaining charger hold and persistent records")
+        if api is not None:
+            await api.close()
         try:
             await session.close()
         finally:
@@ -187,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=("check", "serve", "health"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--native-bounded-spec", type=Path)
+    parser.add_argument("--management-config", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.action == "health":
@@ -200,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
             prepared = preflight(args.config)
             check_spec_path(prepared.config, args.native_bounded_spec)
             native_spec(args.native_bounded_spec, prepared)
+            if args.management_config is not None:
+                check_spec_path(prepared.config, args.management_config)
+                management = ManagementSettings.load(args.management_config)
+                check_spec_path(prepared.config, management.token_file)
             remaining = prepared.tls.certificate_expires_at - time.time()
             print(
                 json.dumps(
@@ -207,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        return asyncio.run(serve(args.config, args.native_bounded_spec))
+        return asyncio.run(serve(args.config, args.native_bounded_spec, args.management_config))
     except Exception as error:
         # The executable boundary exposes a classification only, never native responses, credentials or parser text.
         print(json.dumps({"managed_action_failed": type(error).__name__}), flush=True)

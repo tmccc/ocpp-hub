@@ -17,11 +17,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -96,39 +99,39 @@ def target_from_env(
 
 # List the files to deploy relative to the integration folder: tracked and untracked-but-not-ignored, no caches.
 # What git knows is what ships; a stray local file or a __pycache__ must never reach the server.
-def relative_files(root: Path = ROOT) -> list[str]:
+def relative_files(root: Path = ROOT, integration: Path = INTEGRATION) -> list[str]:
     out = subprocess.run(
-        ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--", str(INTEGRATION)],
+        ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--", str(integration)],
         cwd=root,
         capture_output=True,
         check=True,
     ).stdout.decode()
-    prefix = INTEGRATION.as_posix() + "/"
+    prefix = integration.as_posix() + "/"
     return sorted(p[len(prefix) :] for p in out.split("\0") if p.startswith(prefix) and "__pycache__" not in p)
 
 
 # Write the commit the deployed code comes from into the integration's BUILD file and return it.
 # A log line must say which code wrote it; without a stamp an old build and the current one look identical.
-def write_build_stamp(root: Path = ROOT) -> str:
+def write_build_stamp(root: Path = ROOT, integration: Path = INTEGRATION) -> str:
     head = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True, check=True
     ).stdout.strip()
     dirty = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no", "--", str(INTEGRATION)],
+        ["git", "status", "--porcelain", "--untracked-files=no", "--", str(integration)],
         cwd=root,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
     stamp = head + ("+dirty" if dirty else "")
-    (root / INTEGRATION / BUILD_FILE).write_text(stamp + "\n")
+    (root / integration / BUILD_FILE).write_text(stamp + "\n")
     return stamp
 
 
 # Compute the sha256 of every local file to deploy.
 # The server copy is verified against these digests after the swap.
-def local_digests(files: list[str], root: Path = ROOT) -> dict[str, str]:
-    return {name: hashlib.sha256((root / INTEGRATION / name).read_bytes()).hexdigest() for name in files}
+def local_digests(files: list[str], root: Path = ROOT, integration: Path = INTEGRATION) -> dict[str, str]:
+    return {name: hashlib.sha256((root / integration / name).read_bytes()).hexdigest() for name in files}
 
 
 # Turn `sha256sum` output into a {relative path: digest} mapping; paths may start with './'.
@@ -316,8 +319,44 @@ def main() -> int:
     parser.add_argument("--skip-checks", action="store_true", help="do not run tools/validate.py first")
     parser.add_argument("--restart", action="store_true", help="validate the HA config and restart Home Assistant")
     parser.add_argument("--yes", action="store_true", help="with --restart: do not ask for confirmation")
+    parser.add_argument("--domain", choices=("ocpp_hub", "ics_proxy"), default="ocpp_hub")
+    parser.add_argument("--container", help="use an explicit local Docker container instead of SSH")
+    parser.add_argument("--ha-api-config", type=Path, help="private existing hass_url/token_file configuration")
     args = parser.parse_args()
     env = parse_env((ROOT / ".env").read_text()) if (ROOT / ".env").exists() else {}
+    if args.container:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", args.container) is None:
+            raise SystemExit("Invalid container name")
+        integration = Path("custom_components") / args.domain
+        files = sorted({*relative_files(integration=integration), BUILD_FILE})
+        if args.dry_run:
+            print(f"Dry run: {args.domain}, container {args.container}, {len(files)} files; no changes")
+            return 0
+        if not args.skip_checks:
+            run_checks()
+        print(f"Build {write_build_stamp(integration=integration)}")
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode="w") as package:
+            for name in files:
+                package.add(ROOT / integration / name, arcname=name, recursive=False)
+        expected = local_digests(files, integration=integration)
+        installer = (ROOT / "tools/ha_container_deploy.py").read_text()
+        subprocess.run(
+            ["docker", "exec", "-i", args.container, "python", "-c", installer, args.domain, json.dumps(expected)],
+            input=data.getvalue(),
+            check=True,
+        )
+        if args.restart:
+            if args.ha_api_config is not None:
+                private = json.loads(args.ha_api_config.read_text())
+                api_base = private["hass_url"].rstrip("/")
+                if not api_base.endswith("/api"):
+                    api_base += "/api"
+                env.update(HA_API_URL=api_base, HA_API_TOKEN=Path(private["token_file"]).read_text().strip())
+            restart_home_assistant(env, args.yes)
+        return 0
+    if args.domain != "ocpp_hub":
+        raise SystemExit("The separate proxy client requires explicit container transport")
     target = replace(target_from_env(env, args.host, args.user, args.key), sudo=not args.no_sudo)
     files = relative_files()
     if not files:

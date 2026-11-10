@@ -33,6 +33,7 @@ captures/
 
 # Written by tools/deploy_ha.py: the commit a deployed copy was built from
 custom_components/ocpp_hub/BUILD
+custom_components/ics_proxy/BUILD
 
 # Local Home Assistant logs
 home-assistant.log

@@ -2,6 +2,15 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add authenticated same-host management and a separate thin Home Assistant client, with measured status/history,
+  explicit Pause/Return, timed stale-reading invalidation and persistent fault notifications after60seconds.
+  Persist requested pauses atomically and across replacement; bind Return to its monotonic mode revision before
+  claims and actual sends. Confirm physical zero/release, never retry an uncertain Return and keep local Start
+  disabled/native6A unchanged. Require actual Stop delivery before reporting completed cloud acknowledgement.
+- Add validated Docker component delivery to the existing deployment helper, retaining an external backup and
+  digest verification without enabling the older OCPP listener. Add real native/OCPP/management socket tests and
+  actual HA2026.11 config-entry/entity/lifecycle tests in an isolated matching image.
+
 - Verify the first managed overnight native schedule: 00:00:00 start, 06:00:02 Stop, 5,614 Wh, acknowledged cloud
   lifecycle, empty outbox and 26 original records preserved alongside the new session. Load ceased around 03:52;
   the owner accepts scheduling and waives further active-load 06:00 cutoff testing. Retain the 6 A boundary.
