@@ -701,9 +701,10 @@ unchanged full configuration/saved schedule/all21 functional automation states a
 26 records against29 archived, with three older admitted records omitted and all complete original bodies retained.
 The timed test button and fresh progress are published on the charger dashboard; unrestricted Start remains disabled.
 
-Home Assistant also exposes **Start charging** for a regular locally issued session at6A. It can start from idle app
-control or a freshly verified local pause. The original intent/revision remains authoritative through every Start
-await; only a guarded actual Accepted reply commits the new app/shared revision. Pause always wins a race. An actual
+Home Assistant also exposes **Start charging** for a regular locally issued session at the selected current. Legacy
+six-ampere operation remains the default until the explicit current capability below is commissioned. Start can run
+from idle app control or a freshly verified local pause. The original intent/revision remains authoritative through
+every Start await; only a guarded actual Accepted reply commits the new app/shared revision. Pause always wins a race. An actual
 accepted StartTransaction is bound atomically to this one-shot request, and fresh known-session proof completes the
 receipt even when the car initially draws0W. The dashboard reports **Local session** separately from measured **Local
 charging**. The60second startup permission retires after session confirmation; regular charging has no two-minute
@@ -712,9 +713,10 @@ cutoff and continues until the car, app, native schedule or an explicit Pause en
 The first actual local transaction binding is immutable. Its real Stop completes normal metadata without pausing a
 later app or same-tag native session, including Start/Stop pairs between polls or before startup-deadline processing.
 Interrupted active normal sessions recover paused at zero and never replay Start. Start and Return reserve a receipt
-slot for a later Pause; new Return requests require a paused intent. Normal Start retains the existing connected-cloud,
-native/history/resource and authorization gates; it is a local OCPP command, not a new cloud-outage admission policy.
-Caller-selected current/tag/duration and the raw generic Start path remain unavailable. Existing timed tests remain.
+slot for a later Pause; new Return requests require a paused intent. Normal Start retains native/history/resource and
+static authorization gates. Scoped cloud-outage admission is described below; Return and process recovery retain
+cloud reconciliation. A Start payload cannot select its own current/tag/duration; current selection is a separate
+idle-only command. The raw generic Start path remains unavailable. Existing timed tests remain.
 
 The normal Start control was deployed and tested with the connected Leon on 2026-11-10. HA Start resumed a verified
 pause at 6 A, distinguished the initial open session at 0 W from measured charging, and continued beyond two minutes.
@@ -747,11 +749,24 @@ ambiguous mutation, unbound grant or outstanding Start/Stop lifecycle debt. Ordi
 prevent admission. Genuine offline Start/Meter/Stop records wait for actual cloud mapping and acknowledgement after
 reconnection. Local readiness and cloud connectivity are reported separately; Return and restart recovery retain
 their cloud-reconciliation requirements. The existing timed diagnostic remains restricted to a selected 6 A.
-Controlled physical setting and one-minute charging acceptance for this extension are pending.
+
+The extension was deployed and physically verified on 2026-11-10. All 27 integer settings from 6 through 32 A were
+read back in the actual owned station profile and composite without Start or a new transaction; lowering back to 6 A
+and returning to 32 A also passed. Choosing 16 or 32 A while paused retained the actual zero hold. Two actual HA local
+Starts then ran with a verified 32 A offer: cloud connected, and with the proxy's cloud endpoint blocked. The Leon drew
+up to 14.4 A (3515 W online, 3512 W offline), so these prove the 32 A offer rather than a 32 A vehicle load. Independent
+Pause was requested after 60.083 and 60.081 seconds of measured flow, delivering 61 and 64 Wh. Actual Stops closed
+both sessions at zero; the offline Start/Stop remained unmapped and queued until real cloud replay acknowledged them.
+Both tests finished before 14:38 GMT. Explicit HA Return restored app/schedule control at selected/native/owned 32 A
+with the lead connected at 0 W, an empty queue and no unconfirmed mutations. The approved USER change is the only
+full-configuration difference; saved schedules and all task-baseline automations, including five deliberately off,
+remain unchanged. All 26 admitted history bodies survive in 32 archived records; 29 are currently returned and three
+older omissions remain tolerated. Validation: 1273 full-suite and 67 actual-HA cases pass.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
-Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
-genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;
+Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,
+the current actual Boot/binding, confirmed owned station0 and an empty, genuinely acknowledged lifecycle/outbox are
+required. It clears uncertainty while retaining local ownership and zero;
 Start or release is a later explicit command. An exact known active session receives zero then a real RemoteStop.
 If the charger finished while the process was absent, restricted recovery receives its actual Stop replay without
 creating a replacement event. Unknown transactions and any started cleanup remain blocked.

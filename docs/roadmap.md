@@ -142,14 +142,20 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   completed and the queue emptied. Explicit Return restored app/schedule control at 6 A with the lead connected.
   Configuration, saved plans and all 21 functional automation states remain unchanged. All 26 admitted history bodies
   are retained within 30 archived records; 27 are currently returned and three older omissions remain tolerated.
-  The next extension implements explicit zero-protected USER32 commissioning, an idle-only 6–32 A current selector
+  The current extension implements explicit zero-protected USER32 commissioning, an idle-only 6–32 A current selector
   and normal local Start during cloud absence. It preserves old admission/history bytes, current/revision/Pause
-  guards and genuine cloud backfill. Physical setting readbacks and the two one-minute 32 A tests are pending.
+  guards and genuine cloud backfill. All 27 integer settings passed actual idle readback without Start, and paused
+  16/32 A selections retained zero. Both one-minute HA local charging tests passed with a 32 A offer: cloud connected
+  and deliberately disconnected, 61/64 Wh delivered, real Stop/zero and genuine offline acknowledgement afterward.
+  The Leon drew up to 14.4 A, so full 32 A vehicle load was not established. Both tests ended before 14:38 GMT.
+  HA Return restored app/schedule control at 32 A with the lead connected at 0 W; original admission/history bytes,
+  saved schedule and all task-baseline automation states remain unchanged. Validation: 1273 full-suite/67 actual-HA
+  cases pass. There are 32 archived/29 currently returned history records, including three tolerated older omissions.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
-  cloud connection, configuration, saved schedule and history are verified. Complete app compatibility and a
-  higher operating ceiling remain separate work.
+  cloud connection, configuration, saved schedule and history are verified. Complete app compatibility, current
+  changes during an open session and Start after a cloud-outage process replacement remain separate work.
 
 - [~] One charging plan shared with the Raedian app (`ocpp_hub.set_plan`, answers and takes over the app's planning, written to the charger as a recurring profile). Tested with a fake charger and vendor.
 - [~] Schedule helper and weekly schedules: a Home Assistant schedule helper applied with a button (daily or weekly profile), and the vendor answered with the charger's real schedule. Tested with a fake charger; see the schedule item below for what is unproven.

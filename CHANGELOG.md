@@ -7,7 +7,12 @@
   verify actual owned profile/composite state, and retain Pause priority and interrupted-update recovery.
   Permit guarded normal local Start during cloud absence using fresh local readiness and current static authorization;
   retain lifecycle/uncertainty checks, actual deferred cloud acknowledgements and the stricter Return/restart gates.
-  Keep the two-minute diagnostic restricted to a selected 6 A. Physical acceptance is pending.
+  Keep the two-minute diagnostic restricted to a selected 6 A. Deploy and verify all 27 integer settings without
+  Start, plus paused future selections retaining zero. Verify two one-minute HA local charges at a 32 A offer, with
+  cloud connected and disconnected: the car drew up to 14.4 A, delivering 61/64 Wh before real closed-zero Stops.
+  Confirm genuine offline replay/acknowledgements; restore app/schedule control at 32 A with the connected car at 0 W,
+  unchanged saved plans/automations and all original history bodies retained in the archive. Both tests finished
+  before 14:38 GMT.
 - Add normal6A **Start charging** in HA from idle or verified pause, without the timed test's two-minute cutoff.
   Bind the actual transaction atomically and immutably; confirm known sessions at0W without claiming charging.
   Preserve Pause races, guarded post-ACK intent updates and restart-to-zero/no-replay. Complete genuine short
