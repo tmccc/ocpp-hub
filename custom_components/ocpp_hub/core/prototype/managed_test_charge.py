@@ -69,7 +69,7 @@ class ManagedChargeTests:
         return value
 
     # Admission is conservative; the worker independently rechecks physical zero before Start.
-    def available(self, native: HandoverEvidence | None = None) -> bool:
+    def available(self, native: HandoverEvidence | None = None, *, local: bool = True) -> bool:
         c, j = self.controller, self.journal
         g = c.session.gateway
         return bool(
@@ -80,6 +80,7 @@ class ManagedChargeTests:
             and g.controls.ready
             and g.controls.desired() == 6
             and not g.policy.allow_local_start
+            and (not local or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags))
             and not j.get("control", {}).get("uncertain")
             and not j.get("control", {}).get("start_pending")
             and j.active() is None
@@ -110,7 +111,7 @@ class ManagedChargeTests:
             revision != c.requests.intent().revision
             or native is None
             or not 0 <= time.time() - native.physical.observed_at <= 15
-            or not self.available(native)
+            or not self.available(native, local=action == "start_test")
         ):
             raise RecoveryRequiredError("test requires current shared six-ampere authority and no pending work")
         if j.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] >= 4096:
@@ -204,16 +205,37 @@ class ManagedChargeTests:
             await c.session.gateway.stop()
             self.guard(lease, stopping=True)
             lease.stop_epoch = j.get("control", {}).get("stop_epoch", 0)
-            native = await c.native.read(closed=True)
-            c.require_zero(native)
+            async with asyncio.timeout(15):
+                while True:
+                    self.guard(lease)
+                    native = await c.native.read(closed=True)
+                    try:
+                        c.require_zero(native)
+                        break
+                    except RecoveryRequiredError:
+                        await asyncio.sleep(0.1)
             if native.physical.connection != "Plug":
                 raise DeniedError("test requires a connected vehicle")
             self.guard(lease)
-            tag = sorted(c.session.gateway.policy.allowed_tags)[0]
+            tags = sorted(
+                tag for tag in c.session.gateway.policy.allowed_tags if c.session.gateway._local_start_allowed(tag)
+            )
+            if not tags:
+                raise DeniedError("no current approved local tag is available for this test")
+            tag = tags[0]
             await c.session.gateway.start_managed(tag, lambda: self.guard(lease))
             self.guard(lease)
             j.put("managed_test_charge", {**self.state(), "state": "awaiting_power", "start_rpc_accepted": True})
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+        except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
+            j.put(
+                "managed_test_failure",
+                {
+                    "type": type(error).__name__,
+                    "detail": str(error)[:1024],
+                    "at_epoch": time.time(),
+                    "effects_started": effects,
+                },
+            )
             if not effects:
                 c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
                 if self.state().get("id") == lease.identifier:

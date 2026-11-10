@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -587,3 +587,44 @@ async def test_cloud_arm_acceptance_gap_recovers_without_start(
         finally:
             await recovered.tests.close()
             await replacement.close()
+
+
+# Intent: an expired earlier-sorted approved tag is skipped while another currently authorized local tag may charge.
+# Why: a valid alternative must not require deleting expired or revoked cloud authorization evidence.
+async def test_local_test_selects_currently_allowed_tag_without_erasing_expired_cache(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        gateway, journal = test.session.gateway, test.session.journal
+        gateway.policy = replace(gateway.policy, allowed_tags=frozenset({"A_EXPIRED", "NATIVE_TIMER"}))
+        gateway.controls.policy = gateway.policy
+        gateway.auth_info.put("A_EXPIRED", {"status": "Accepted", "expiryDate": "2001-01-01T00:00:00Z"})
+        expired_key = fingerprint("a_expired")
+        before = tuple(
+            journal.db.execute("SELECT digest,info,observed FROM auth_info WHERE digest=?", (expired_key,)).fetchone()
+        )
+        assert gateway.auth_info.get("A_EXPIRED")["status"] == "Expired"
+        assert gateway._local_start_allowed("NATIVE_TIMER") and not gateway._local_start_allowed("A_EXPIRED")
+
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start_test", 0)
+        await test.controller.tests.settle()
+        assert len(starts(test.rig)) == 1 and starts(test.rig)[0][3]["idTag"] == "NATIVE_TIMER"
+        local = await positive_flow(test)
+        assert (await healthy(test.controller))["power_w"] == 1440
+        assert test.controller.requests.receipt(identifier)["result"]["positive_power_verified"]
+        stopped = await actual_stop(test, local)
+        assert stopped["local_hold_verified"] and stopped["power_w"] == 0
+        assert len(starts(test.rig)) == 1 and test.rig.bench.firmware.effective_limit() == 0
+        assert (
+            tuple(
+                journal.db.execute(
+                    "SELECT digest,info,observed FROM auth_info WHERE digest=?", (expired_key,)
+                ).fetchone()
+            )
+            == before
+        )
+        assert gateway.auth_info.get("A_EXPIRED")["status"] == "Expired"
