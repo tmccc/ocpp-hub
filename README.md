@@ -647,6 +647,23 @@ template rendering and dashboard readback verified the 5.614 kWh latest session 
 All 21 functional automations retained their original on/off states, including all five deliberately disabled ones.
 Final native and health checks passed at zero power with no unexpected client error; the planned outage is logged.
 
+Managed operation also supports an explicitly acknowledged historical-retention policy. Missing old records no
+longer block charging: full admitted bodies and every observed completed-record version are retained in the private
+SQLite journal, while missing counts produce a redacted informational warning. Any admitted record which remains
+present or later reappears must still match its complete original JSON body. New active records are not frozen or
+turned into completed sessions, and historical absence never creates a Stop, cloud acknowledgement or allocation
+reset. The dashboard's native history continues to describe records actually returned by the charger.
+
+The default commissioning policy remains strict. `tools/acknowledge_native_history.py check --config <private-file>
+--native-bounded-spec <private-file>` is dormant input validation. Its explicit `acknowledge` action requires the
+service to be stopped and acquires the existing journal's exclusive lock before fresh native reads. It accepts only
+the specific history-preservation fault with actual native6/HW32, owned confirmed0, closed all-phase-zero, unchanged
+configuration/schedule, matching prior Boot and no lifecycle, unbound Start, command or mutation debt. Archive,
+policy, operator receipt and retirement of that fault commit atomically into inhibited recovery; no charger writer
+exists in the tool. Fresh actual Boot, resource/ledger reconciliation and the ordinary guarded release remain
+required after restart. The same acknowledged history policy follows that journal through eventual original-backend
+restoration, with all ordinary32A/hardware/resource checks intact. Other journals cannot inherit this permission.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

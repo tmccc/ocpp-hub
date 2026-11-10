@@ -12,6 +12,7 @@ from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .native_bounded import NativeBoundedSpec
+from .native_history import audit_history
 from .rpc import UnavailableError
 from .security import SecurityError
 from .station import StationChoice
@@ -113,10 +114,9 @@ class NativeBoundedHandover:
             self.spec.require(
                 native, self.gateway.journal.identity, route, closed=closed, allow_unplugged=self.allow_unplugged
             )
-            history = self.gateway.journal.get("native_bounded_handover", {}).get("original_history", [])
-            current = {row["transactionId"]: row for row in native.history}
-            if any(current.get(row["transactionId"]) != row for row in history):
-                raise SecurityError("native bounded handover must preserve every original history record")
+            audit_history(
+                self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
+            )
             self.book.check_originals(native.physical)
         except SecurityError, UnavailableError, TimeoutError:
             self.last_verified_at = 0
@@ -441,9 +441,7 @@ class NativeBoundedHandover:
             raise SecurityError("normal manufacturer settings and native connection remain unverified")
         self.book.check_originals(native.physical)
         original = journal.get("native_bounded_handover", {}).get("original_history", [])
-        history = {row["transactionId"]: row for row in native.history}
-        if any(history.get(row["transactionId"]) != row for row in original):
-            raise SecurityError("normal restoration changed an original history record")
+        audit_history(journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start)
         owned = {row[0] for row in journal.db.execute("SELECT key FROM trial_resources")}
         original_keys = {resource.key for resource in self.book.baseline.resources}
         original_ids = {row["transactionId"] for row in original}

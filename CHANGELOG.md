@@ -2,6 +2,12 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Allow general historical-record absence in explicitly acknowledged managed operation. Retain full originals and
+  completed-record versions privately, report missing counts without blocking charging, and continue rejecting
+  changed admitted records. Keep commissioning strict, allocation unchanged and all electrical/session guards.
+  Add an exclusive offline acknowledgement with atomic archive/policy/receipt/fault retirement into inhibited
+  recovery; fresh Boot and ordinary release remain mandatory. Apply the same history permission through guarded
+  original-backend restoration. Test real TLS recovery, future omissions, alteration refusal and rollback.
 - Deploy the thin HA client and verify real Pause, persisted pause through service loss/restart, fault alert and
   recovery, and explicit Return at native6/owned6 with no new charge. Preserve saved plans and all27 native records.
   Replace obsolete dashboard cloud controls, slider and optional cached schedule/history with fresh local status,

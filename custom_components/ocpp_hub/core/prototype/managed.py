@@ -396,6 +396,10 @@ class ManagedController:
             "charging_session_open": native.physical.transaction_open,
             "vehicle_connected": native.physical.connection != "Unplug",
             "history_records": len(native.history),
+            "history_archive": j.get("native_history_summary"),
+            "history_warning": "records_absent_from_charger"
+            if j.get("native_history_summary", {}).get("missing_records", 0)
+            else None,
             "charger_sessions": charger_history(native.history),
             "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
         }

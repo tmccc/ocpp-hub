@@ -114,6 +114,12 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   the slider and optional cached schedule/history. Actual template rendering and readback passed; all21 functional
   automation states, including5 disabled EV/reserve automations, are preserved. The final mode-label freshness
   regression passed before the corrected HA client was deployed.
+  Managed journals can explicitly tolerate missing historical records generally: full originals and completed
+  versions are archived privately; missing counts are informational, while changed admitted bodies and all
+  electrical/session/resource faults still block. An exclusive offline acknowledgement atomically records the
+  policy/archive/operator receipt and retires only the independently verified history fault into inhibited
+  recovery. Actual Boot/reconciliation/release remain required, allocation is unchanged, ordinary trials stay
+  strict, and the same journal's eventual original-backend restoration honors the history policy.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
