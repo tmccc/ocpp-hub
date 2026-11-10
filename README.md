@@ -701,6 +701,21 @@ unchanged full configuration/saved schedule/all21 functional automation states a
 26 records against29 archived, with three older admitted records omitted and all complete original bodies retained.
 The timed test button and fresh progress are published on the charger dashboard; unrestricted Start remains disabled.
 
+Home Assistant also exposes **Start charging** for a regular locally issued session at6A. It can start from idle app
+control or a freshly verified local pause. The original intent/revision remains authoritative through every Start
+await; only a guarded actual Accepted reply commits the new app/shared revision. Pause always wins a race. An actual
+accepted StartTransaction is bound atomically to this one-shot request, and fresh known-session proof completes the
+receipt even when the car initially draws0W. The dashboard reports **Local session** separately from measured **Local
+charging**. The60second startup permission retires after session confirmation; regular charging has no two-minute
+cutoff and continues until the car, app, native schedule or an explicit Pause ends it.
+
+The first actual local transaction binding is immutable. Its real Stop completes normal metadata without pausing a
+later app or same-tag native session, including Start/Stop pairs between polls or before startup-deadline processing.
+Interrupted active normal sessions recover paused at zero and never replay Start. Start and Return reserve a receipt
+slot for a later Pause; new Return requests require a paused intent. Normal Start retains the existing connected-cloud,
+native/history/resource and authorization gates; it is a local OCPP command, not a new cloud-outage admission policy.
+Caller-selected current/tag/duration and the raw generic Start path remain unavailable. Existing timed tests remain.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,
 genuinely acknowledged lifecycle/outbox are required. It clears uncertainty while retaining local ownership and zero;

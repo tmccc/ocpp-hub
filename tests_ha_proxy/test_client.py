@@ -36,6 +36,8 @@ async def peer():
         "vehicle_connected": True,
         "can_pause": True,
         "can_return": False,
+        "can_start": True,
+        "local_charge": None,
         "can_start_test": True,
         "test_charge": None,
         "control_revision": 0,
@@ -77,6 +79,7 @@ async def peer():
                 owner_control_enabled=not paused,
                 station_ceiling_a=0 if paused else 6,
                 can_return=paused,
+                can_start=True,
                 can_start_test=not paused,
             )
             result = {"id": value["id"], "state": "completed"}
@@ -91,6 +94,27 @@ async def peer():
             state.update(
                 can_start_test=False,
                 test_charge={"source": "local", "state": "armed", "duration_seconds": 120, "seconds_remaining": 120},
+            )
+            receipts[value["id"]] = {"id": value["id"], "state": "completed"}
+            result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
+            if control["lose_reply"]:
+                await socket.close()
+                return socket
+        elif command == "start":
+            if not state["can_start"] or value["revision"] != state["control_revision"]:
+                await socket.send_json({"ok": False, "error": "not_ready"})
+                await socket.close()
+                return socket
+            state.update(
+                desired_control="app",
+                control_revision=state["control_revision"] + 1,
+                can_start=False,
+                can_start_test=False,
+                can_return=False,
+                local_hold_verified=False,
+                station_ceiling_a=6,
+                owner_control_enabled=True,
+                local_charge={"state": "running", "charging": False},
             )
             receipts[value["id"]] = {"id": value["id"], "state": "completed"}
             result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
@@ -143,6 +167,7 @@ async def test_actual_setup_reload_and_unload_are_passive(actual_hass, peer):
     assert hass.states.get("button.ics_proxy_pause").state != "unavailable"
     assert hass.states.get("button.ics_proxy_app_control").state == "unavailable"
     assert hass.states.get("button.ics_proxy_start_test").state != "unavailable"
+    assert hass.states.get("button.ics_proxy_start").state != "unavailable"
     assert all(e.domain != "ocpp_hub" for e in hass.config_entries.async_entries())
     assert await hass.config_entries.async_reload(entry.entry_id)
     assert await hass.config_entries.async_unload(entry.entry_id)
@@ -231,11 +256,132 @@ async def test_snapshot_expires_between_polls(actual_hass, peer):
     assert hass.states.get("binary_sensor.ics_proxy_problem").state == "on"
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
     assert hass.states.get("button.ics_proxy_start_test").state == "unavailable"
+    assert hass.states.get("button.ics_proxy_start").state == "unavailable"
     peer["state"]["native_age_seconds"] = 0
     await entry.runtime_data.async_refresh()
     assert hass.states.get("sensor.ics_proxy_power").state == "0"
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
     assert hass.states.get("button.ics_proxy_start_test").state != "unavailable"
+    assert hass.states.get("button.ics_proxy_start").state != "unavailable"
+
+
+# Intent: a normal explicit Start works from ready app or paused control and a known zero-watt session stays idle.
+# Why: starting a session can resume a deliberate pause but cannot manufacture actual power or a test deadline.
+@pytest.mark.parametrize("paused", [False, True], ids=["app", "paused"])
+async def test_normal_start_from_ready_control_reports_zero_watt_session_honestly(actual_hass, peer, paused):
+    if paused:
+        peer["state"].update(
+            desired_control="paused",
+            owner_control_enabled=False,
+            local_hold_verified=True,
+            station_ceiling_a=0,
+            can_return=True,
+            can_start_test=False,
+        )
+    peer["pending_receipt"] = True
+    hass = actual_hass
+    entry = await setup(hass, peer)
+    assert hass.states.get("button.ics_proxy_start").state != "unavailable"
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    mode = hass.states.get("sensor.ics_proxy_control_mode")
+    assert mode.state == "Local session" and mode.attributes["local_charge"] == {"state": "running", "charging": False}
+    assert mode.attributes["test_charge"] is None
+    assert hass.states.get("sensor.ics_proxy_power").state == "0"
+    assert hass.states.get("binary_sensor.ics_proxy_charging").state == "off"
+    assert hass.states.get("button.ics_proxy_start").state == "unavailable"
+    request = next(value for value in peer["requests"] if value["command"] == "start")
+    assert set(request) == {"id", "command", "revision"} and request["revision"] == 0
+    assert peer["commands"].count("start") == 1 and peer["commands"].count("receipt") == 1
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    assert peer["commands"].count("start") == 1
+    peer["state"].update(power_w=1440, current_a=6, local_charge={"state": "running", "charging": True})
+    await entry.runtime_data.async_refresh()
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "Local charging"
+    assert hass.states.get("binary_sensor.ics_proxy_charging").state == "on"
+    assert "start_test" not in peer["commands"]
+
+
+# Intent: a normal Start with a lost response is refreshed from status without repeating the request.
+# Why: acknowledgement uncertainty cannot authorize a second session or silently convert it into a timed test.
+async def test_lost_normal_start_reply_does_not_retry(actual_hass, peer):
+    hass = actual_hass
+    entry = await setup(hass, peer)
+    peer["lose_reply"] = True
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    await entry.runtime_data.async_refresh()
+    assert peer["commands"].count("start") == 1 and set(peer["commands"]) <= {"status", "start"}
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "Local session"
+    assert hass.states.get("button.ics_proxy_start").state == "unavailable"
+
+
+# Intent: the normal Start uses both the explicit readiness flag and independently fresh health evidence.
+# Why: a stale ready flag or refused start condition cannot surface as an actionable charging control.
+@pytest.mark.parametrize(
+    "change", [{"can_start": False}, {"healthy": False}, {"native_age_seconds": 90}, {"status_age_seconds": 90}]
+)
+async def test_normal_start_requires_fresh_readiness(actual_hass, peer, change):
+    peer["state"].update(change)
+    await setup(actual_hass, peer)
+    assert actual_hass.states.get("button.ics_proxy_start").state == "unavailable"
+    await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    assert set(peer["commands"]) == {"status"}
+
+
+# Intent: local lifecycle labels are distinct from measured charging and disclose only the two public fields.
+# Why: a starting or stopping session does not prove present power, and private protocol identifiers stay private.
+@pytest.mark.parametrize(
+    "state,charging,label",
+    [
+        ("starting", False, "Starting locally"),
+        ("awaiting_session", False, "Starting locally"),
+        ("running", False, "Local session"),
+        ("running", True, "Local charging"),
+        ("stopping", False, "Stopping locally"),
+    ],
+)
+async def test_local_charge_labels_and_progress_are_redacted(actual_hass, peer, state, charging, label):
+    local = {"state": state, "charging": charging}
+    peer["state"].update(
+        can_start=False,
+        local_charge=local | {"transaction_id": "private", "id_tag": "secret"},
+    )
+    await setup(actual_hass, peer)
+    mode = actual_hass.states.get("sensor.ics_proxy_control_mode")
+    assert mode.state == label and mode.attributes["local_charge"] == local
+
+
+# Intent: expired local-session facts yield to verification status and remove their extra attributes.
+# Why: an old running session or charging flag must not survive its independent observation deadline.
+async def test_local_charge_progress_expires_between_polls(actual_hass, peer):
+    peer["state"].update(native_age_seconds=14, can_start=False, local_charge={"state": "running", "charging": True})
+    await setup(actual_hass, peer)
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Local charging"
+    requests = len(peer["commands"])
+    await asyncio.sleep(1.2)
+    await actual_hass.async_block_till_done()
+    mode = actual_hass.states.get("sensor.ics_proxy_control_mode")
+    assert mode.state == "Waiting for verification" and mode.attributes["local_charge"] is None
+    assert actual_hass.states.get("button.ics_proxy_start").state == "unavailable"
+    assert len(peer["commands"]) == requests
+
+
+# Intent: completed/interrupted/failed normal sessions yield to the authoritative app or retained pause mode.
+# Why: a terminal record describes the previous local session and cannot imply that charging continues.
+@pytest.mark.parametrize("state", ["completed", "interrupted", "failed"])
+@pytest.mark.parametrize("paused", [False, True])
+async def test_terminal_local_charge_returns_to_current_control_mode(actual_hass, peer, state, paused):
+    peer["state"].update(
+        local_charge={"state": state, "charging": False},
+        desired_control="paused" if paused else "app",
+        local_hold_verified=paused,
+        owner_control_enabled=not paused,
+        station_ceiling_a=0 if paused else 6,
+    )
+    await setup(actual_hass, peer)
+    mode = actual_hass.states.get("sensor.ics_proxy_control_mode")
+    assert mode.state == ("Paused locally" if paused else "App / schedule")
+    assert mode.attributes["local_charge"] == {"state": state, "charging": False}
 
 
 # Intent: one explicit press requests the fixed test once and polls its receipt without another Start command.

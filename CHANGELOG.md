@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add normal6A **Start charging** in HA from idle or verified pause, without the timed test's two-minute cutoff.
+  Bind the actual transaction atomically and immutably; confirm known sessions at0W without claiming charging.
+  Preserve Pause races, guarded post-ACK intent updates and restart-to-zero/no-replay. Complete genuine short
+  sessions without pausing later app/native activity. Reserve Pause capacity after Start and Return; report fresh
+  local-session/charging state while retaining all existing timed-test controls and current safety gates.
 - Add an explicit fixed6A two-minute HA test charge with a one-shot guarded local Start, fresh native admission,
   independent deadline Stop, durable paused completion and no automatic Start replay after replacement. Preserve
   the unrestricted-Start prohibition and all current/history/resource/authorization safeguards. Bind cloud-test

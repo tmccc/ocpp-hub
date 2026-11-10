@@ -119,12 +119,21 @@ class ManagementServer:
                 result["api_version"] = 1
                 result = health_snapshot(result)
                 result["can_pause"] = not self.controller.stopping
-                result["can_start_test"] = result["healthy"] and result.get("test_start_ready") is True
+                result["can_start_test"] = result["healthy"] and self.controller.tests.available(
+                    self.controller.latest_native
+                )
+                result["can_start"] = result["healthy"] and self.controller.tests.available(
+                    self.controller.latest_native, normal=True
+                )
                 result["can_return"] = (
                     intent.mode == "paused"
                     and result["healthy"]
                     and result.get("local_hold_verified") is True
                     and self.controller.requests.pending_return() is None
+                    and self.controller.session.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[
+                        0
+                    ]
+                    < 4095
                 )
                 result["sessions"] = session_history(self.controller.session.journal)
             return {"id": value["id"], "ok": True, "result": result}
@@ -133,7 +142,7 @@ class ManagementServer:
             if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
                 raise SecurityError("management receipt identifier is invalid")
             return {"id": value["id"], "ok": True, "result": self.controller.requests.receipt(identifier)}
-        if command in ("pause", "app_control", "start_test", "arm_cloud_test") and set(value) == {
+        if command in ("pause", "app_control", "start", "start_test", "arm_cloud_test") and set(value) == {
             "id",
             "command",
             "revision",

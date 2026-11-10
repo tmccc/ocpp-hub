@@ -79,6 +79,7 @@ class Gateway:
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
+        self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
@@ -325,6 +326,8 @@ class Gateway:
                 self.authorisation.consume(payload["idTag"], local)
                 control = self.journal.get("control", {})
                 self.journal.put("control", {**control, "start_pending": False})
+                if self.start_observer is not None:
+                    self.start_observer(local, payload)
 
             info = self._tag_info(payload["idTag"]) if self.policy.strict_cloud_authorization and not known else None
             if info is not None:

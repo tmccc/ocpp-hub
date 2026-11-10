@@ -1,4 +1,4 @@
-"""Explicit local controls and one bounded test charge; setup never initiates charging."""
+"""Explicit local Start, pause and bounded test controls; setup never initiates charging."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from .entity import ProxyEntity
 async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry, add_entities: AddEntitiesCallback) -> None:
     add_entities(
         [
+            ProxyButton(entry.runtime_data, "start", "Start charging"),
             ProxyButton(entry.runtime_data, "pause", "Pause charger"),
             ProxyButton(entry.runtime_data, "app_control", "Return to app / schedule"),
             ProxyButton(entry.runtime_data, "start_test", "Test charge (2 minutes)"),
@@ -32,6 +33,7 @@ class ProxyButton(ProxyEntity, ButtonEntity):
         super().__init__(coordinator, "button", action, name)
         self.action = action
         self._attr_icon = {
+            "start": "mdi:play-circle-outline",
             "pause": "mdi:pause-circle",
             "app_control": "mdi:calendar-clock",
             "start_test": "mdi:play-circle-outline",
@@ -40,7 +42,9 @@ class ProxyButton(ProxyEntity, ButtonEntity):
     # Returning requires the latest confirmed hold/revision; Stop remains available for an ordinary cloud outage.
     @property
     def available(self) -> bool:
-        key = {"pause": "can_pause", "app_control": "can_return", "start_test": "can_start_test"}[self.action]
+        key = {"start": "can_start", "pause": "can_pause", "app_control": "can_return", "start_test": "can_start_test"}[
+            self.action
+        ]
         return (
             super().available
             and self.coordinator.data.get(key) is True

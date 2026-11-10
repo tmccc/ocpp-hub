@@ -37,7 +37,7 @@ class ManagedRequests:
         self.intent()
         journal.db.execute(
             "UPDATE managed_requests SET state='uncertain',result=? "
-            "WHERE action IN ('app_control','start_test','arm_cloud_test') AND state IN ('accepted','running')",
+            "WHERE action IN ('app_control','start','start_test','arm_cloud_test') AND state IN ('accepted','running')",
             (json.dumps({"classification": "process_replaced"}),),
         )
 
@@ -59,6 +59,7 @@ class ManagedRequests:
         if re.fullmatch(r"[a-f0-9]{32}", identifier) is None or action not in (
             "pause",
             "app_control",
+            "start",
             "start_test",
             "arm_cloud_test",
         ):
@@ -80,7 +81,8 @@ class ManagedRequests:
         if existing is not None:
             return existing
         current = self.intent()
-        if self.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] >= 4096:
+        capacity = 4095 if action == "app_control" else 4096
+        if self.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] >= capacity:
             raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
         if action == "app_control" and (
             current.revision != revision

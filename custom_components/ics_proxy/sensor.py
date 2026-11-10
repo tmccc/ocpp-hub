@@ -55,6 +55,20 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def native_value(self) -> Any:
         data = self.coordinator.data
         if self.key == "control_mode":
+            local = data.get("local_charge")
+            if isinstance(local, dict) and local.get("state") in (
+                "starting",
+                "awaiting_session",
+                "running",
+                "stopping",
+            ):
+                if self.local_charge_progress is None:
+                    return "Waiting for verification"
+                if local["state"] in ("starting", "awaiting_session"):
+                    return "Starting locally"
+                if local["state"] == "stopping":
+                    return "Stopping locally"
+                return "Local charging" if local["charging"] else "Local session"
             test = data.get("test_charge")
             if (
                 isinstance(test, dict)
@@ -72,6 +86,20 @@ class ProxySensor(ProxyEntity, SensorEntity):
         if self.key == "last_session_energy":
             return next((r["energy_kwh"] for r in data.get("charger_sessions", []) if r.get("stopped_at")), None)
         return data.get(self.key)
+
+    # Normal local sessions expose their verified lifecycle and charging fact, without a fabricated duration.
+    @property
+    def local_charge_progress(self) -> dict[str, Any] | None:
+        value = self.coordinator.data.get("local_charge")
+        if (
+            not self.coordinator.fresh_healthy
+            or not isinstance(value, dict)
+            or value.get("state")
+            not in ("starting", "awaiting_session", "running", "stopping", "completed", "interrupted", "failed")
+            or type(value.get("charging")) is not bool
+        ):
+            return None
+        return {key: value[key] for key in ("state", "charging")}
 
     # Keep the fixed test's public progress fields only while its independent health proof remains current.
     @property
@@ -97,7 +125,7 @@ class ProxySensor(ProxyEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         if self.key == "control_mode":
-            return {"test_charge": self.charge_test_progress}
+            return {"test_charge": self.charge_test_progress, "local_charge": self.local_charge_progress}
         return (
             {
                 "charger_sessions": self.coordinator.data.get("charger_sessions", []),

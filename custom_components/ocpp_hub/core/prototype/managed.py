@@ -47,13 +47,15 @@ class ManagedController:
     def command(self, identifier: str, action: str, revision: int) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
-        if action in ("start_test", "arm_cloud_test"):
+        if action in ("start", "start_test", "arm_cloud_test"):
             return self.tests.accept(identifier, action, revision)
         previous = self.requests.existing(identifier, action, revision)
         if previous is not None:
             return previous
         if action == "app_control" and self.session.journal.get("managed_control_fault"):
             raise RecoveryRequiredError("a latched fault requires independent operator reconciliation")
+        if action == "app_control" and self.requests.intent().mode != "paused":
+            raise RecoveryRequiredError("return requires a current paused intent")
 
         # This claim shares the intent transaction, so no accepted Pause can leave old shared authority committed.
         def claim() -> None:
@@ -415,6 +417,8 @@ class ManagedController:
             "history_records": len(native.history),
             "test_charge": self.tests.summary(),
             "test_start_ready": self.tests.available(native),
+            "local_charge": self.tests.normal_summary(),
+            "normal_start_ready": self.tests.available(native, normal=True),
             "history_archive": j.get("native_history_summary"),
             "history_warning": "records_absent_from_charger"
             if j.get("native_history_summary", {}).get("missing_records", 0)

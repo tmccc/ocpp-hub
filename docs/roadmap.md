@@ -133,6 +133,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   Leonconnected at0W, unchangedsettings/plans/all21functionalautomations and29archivedrecords(threeolderomissions).
   The expired-first-tag selection bug was fixed without clearing cache evidence; final31 focused cases pass,
   alongside1200 full-suite and25 actual-HA cases. The timed test control/progress is published on the dashboard.
+  Normal6A local **Start charging** is implemented from app idle or verified pause, with no two-minute cutoff after
+  real session confirmation. It atomically binds the first actual transaction, distinguishes0Wsession from measured
+  charging, preserves Pause/preemption/restart-to-zero and ends genuine short sessions without stopping later app or
+  native-timer activity. Start/Return reserve Pause capacity, and existing authorization/history/electrical gates and
+  timed diagnostics remain. Deployment and controlled live acceptance are pending.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original
