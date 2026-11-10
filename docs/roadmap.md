@@ -93,14 +93,14 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   restart were tested offline. Independent zero/owned0/history/empty-ledger proof preceded fault acknowledgement;
   real connected replacement recovered shared6A/Boot/cloud with zero power, no Start and all26 history bodies/plans
   intact. The physical lead stayed connected. Home Assistant remains unchanged.
-  The first managed overnight schedule completed on2026-11-10:00:00:00 start,06:00:02 Stop,5614Wh, actual cloud
-  acknowledgements/empty outbox and all26 original records plus the new27th retained. Power was zero from around
-  03:52; its cause is unconfirmed.445minute checks before07:25 were healthy, with three brief supervision alerts
+  The first managed overnight schedule completed on 2026-11-10: 00:00:00 start, 06:00:02 Stop and 5,614 Wh, with
+  cloud acknowledgements, an empty outbox and all 26 original records preserved alongside the new session. Power
+  was zero from around 03:52; its cause is unconfirmed. All 445 minute checks before 07:25 were healthy, with three alerts
   clearing automatically and no restart/persistent fault. The owner accepts overnight scheduling as complete and
-  waives another active-load06:00 cutoff test.
+  waives another active-load 06:00 cutoff test.
   Next: authenticated local management and a thin HA adapter for the existing durable service, initially status,
   fault notifications, intentional local Stop and explicit return to app control. Persist desired ownership and
-  recognize a valid local hold through supervision/replacement before exposing these commands. Keep6A initially;
+  recognize a valid local hold through supervision/replacement before exposing these commands. Keep 6 A initially;
   normal higher-current operation requires separate policy/native/recovery work. The older HA engine is not this
   adapter, and deliberately disabled EV/reserve automations remain disabled.
   Existing original profiles now block new trial writes/clears;

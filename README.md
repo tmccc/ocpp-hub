@@ -578,20 +578,20 @@ closed-zero/owned0, exact history and empty-ledger verification. Controlled repl
 cloud registration and shared6A control. A final independent native/ledger audit confirmed zero power, no Start or
 transaction, unchanged plans/all26 history bodies, and a successful independent health check.
 
-The first unattended managed overnight schedule completed on 2026-11-10. Native and durable/cloud records agree
-on a00:00:00 start,06:00:02 local Stop and5614Wh meter difference. The27-record history retains every original26
-body, the schedule is unchanged, no Start/Stop was issued by the operator and the outbox is empty. Native6/owned6
-remain verified; sampled load was6.1A and about1.43–1.50kW. The last positive minute reading was03:51:46 and the
-first zero03:52:46, while the session stayed open until the scheduled Stop. The reason for earlier zero draw is
-not established.445minute checks before07:25 were healthy; three roughly six-second supervision alerts recovered
+The first unattended managed overnight schedule completed on 2026-11-10. Charger, proxy and cloud records agree
+on a 00:00:00 start, 06:00:02 local Stop and 5,614 Wh meter difference. The history now contains 27 records with
+all 26 original bodies unchanged. The schedule is unchanged, the operator issued no Start/Stop and the outbox is
+empty. Native and owned station limits remain at 6 A; sampled load was 6.1 A and about 1.43–1.50 kW. The last
+positive minute reading was 03:51:46 and the first zero 03:52:46; the session stayed open until the scheduled Stop.
+The reason for earlier zero draw is not established. All 445 minute checks before 07:25 were healthy; three brief alerts recovered
 automatically with no service restart or persistent fault. The owner accepts overnight scheduling as complete and
-does not require another active-load06:00 cutoff test.
+does not require another active-load 06:00 cutoff test.
 
 The next integration step is a separately authenticated management connection from Home Assistant to this existing
 durable service. Begin with measured status/history, fault notifications, an intentional local Stop hold and an
 explicit return to app control. The supervisor must first distinguish a valid requested local hold from a control
 failure and preserve that intent through replacement, without automatically releasing a requested Stop. The
-ordinary HA entry point uses the older engine and cannot substitute for this adapter. Retain the proven6A boundary
+ordinary HA entry point uses the older engine and cannot substitute for this adapter. Retain the proven 6 A boundary
 for this work; a higher operating ceiling requires reviewed policy/native/recovery changes rather than a slider flip.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
