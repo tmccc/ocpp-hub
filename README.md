@@ -787,6 +787,16 @@ allocated. Full configuration, saved schedules, original admission/allocation/hi
 were unchanged. The lead stayed connected. No charging test or Start was issued. The dashboard's offline paused
 explanation also remains accurate when queued observations temporarily disable current selection.
 
+Commissioning of this iCS installation is closed for routine use at the owner's request on 2026-11-10. The proxy and
+independent health timer are enabled, app/saved-schedule authority is the daily default, and the selected/native/owned
+ceiling is 32 A. HA Start and Pause remain available; current selection is idle-only. An offline process recovery
+retains Pause until an explicit Start or, once the cloud is reconciled, Return. The five deliberately disabled
+EV/reserve automations stay off. No additional dedicated charge, cable removal or phone test is an acceptance
+prerequisite. Follow-up should use ordinary charging logs and address a concrete fault or an explicitly requested
+feature. Active-session current modulation, selective cleanup beside original profiles and wider app-feature work
+are optional extensions and do not block the delivered daily operation. This is an operational handover for this
+installation, not a claim that every app feature or electrical load has been exercised.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,
 the current actual Boot/binding, confirmed owned station0 and an empty, genuinely acknowledged lifecycle/outbox are

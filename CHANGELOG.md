@@ -2,6 +2,10 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Close commissioning of the installed iCS setup for routine use. Verify app/schedule control at 32 A and enabled
+  proxy/health supervision; retain the five deliberately disabled automations. No further dedicated charge, cable or
+  phone test is required for the delivered features. Use normal operation logs for follow-up; optional features
+  remain separate from daily-use acceptance.
 - Add managed zero-only recovery after a proxy restart during cloud absence. Preserve queued observations without
   acknowledging them; retain strict lifecycle, mutation, Boot, native configuration, history and exact zero-receipt
   checks. A proven failed cloud attempt for the current introduction converts app intent to a durable Pause before

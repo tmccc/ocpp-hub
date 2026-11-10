@@ -164,6 +164,10 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   until separate HA Return restored app/schedule 32 A. All 43 native observations were zero/closed, with no new
   transaction/id and unchanged full configuration, saved plans and admission/history bindings. The lead stayed in;
   no additional charging test or Start was issued. The offline paused dashboard remains accurate during backfill.
+  Commissioning of this installation is closed for routine use on 2026-11-10 at the owner's request. App/schedule
+  authority remains the daily default at 32 A, proxy/health services are enabled, and the five deliberately disabled
+  EV/reserve automations remain off. No more dedicated charging, cable or phone tests are planned for the delivered
+  features. Follow-up uses normal charging logs or a concrete fault; optional extensions do not block daily use.
 
 - [~] One charging plan shared with the Raedian app (`ocpp_hub.set_plan`, answers and takes over the app's planning, written to the charger as a recurring profile). Tested with a fake charger and vendor.
 - [~] Schedule helper and weekly schedules: a Home Assistant schedule helper applied with a button (daily or weekly profile), and the vendor answered with the charger's real schedule. Tested with a fake charger; see the schedule item below for what is unproven.
