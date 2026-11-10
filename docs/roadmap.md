@@ -124,6 +124,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
   Leon connected at0W, no new transaction or pending delivery, and unchanged admission/allocation/intent/plans.
   HA status is healthy; all21 functional automation states are preserved. Validation:1168 full-suite cases,
   54 final focused cases and40 caught condition mutations.
+  A dedicated fixed6A/two-minute HA test action now adds scoped local Start while retaining the generic Start
+  prohibition. Fresh native admission, per-request generation guards, independent deadline Stop and interrupted
+  restart-to-pause apply; no caller-selected tag/current/duration or Start replay is exposed. Cloud arming performs
+  no Start and requires actual consumed-grant/mutation/native-session proof. Both test routes finish paused before
+  an explicit Return. Real two-minute local and app charging acceptance remains pending.
   Existing original profiles now block new trial writes/clears;
   preservation failures remain durable. Earlier cleanup lost a saved inactive TxProfile, so selective clearing beside
   unrelated profiles, wider app features and unattended operation remain unproven. The original

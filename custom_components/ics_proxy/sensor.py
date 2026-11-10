@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -54,6 +55,15 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def native_value(self) -> Any:
         data = self.coordinator.data
         if self.key == "control_mode":
+            test = data.get("test_charge")
+            if (
+                isinstance(test, dict)
+                and test.get("source") in ("local", "cloud")
+                and test.get("state") in ("armed", "starting", "awaiting_power", "charging", "stopping")
+            ):
+                if self.charge_test_progress is None:
+                    return "Waiting for verification"
+                return "Local test" if test["source"] == "local" else "App test"
             if data.get("desired_control") == "paused":
                 return "Paused locally" if data.get("local_hold_verified") and self.native_fresh else "Pause requested"
             if self.coordinator.fresh_healthy and data.get("owner_control_enabled") is True:
@@ -63,9 +73,31 @@ class ProxySensor(ProxyEntity, SensorEntity):
             return next((r["energy_kwh"] for r in data.get("charger_sessions", []) if r.get("stopped_at")), None)
         return data.get(self.key)
 
-    # Only redacted completed/live proxy session summaries are attached, with a bounded twenty-record history.
+    # Keep the fixed test's public progress fields only while its independent health proof remains current.
+    @property
+    def charge_test_progress(self) -> dict[str, Any] | None:
+        value = self.coordinator.data.get("test_charge")
+        if not self.coordinator.fresh_healthy or not isinstance(value, dict):
+            return None
+        remaining = value.get("seconds_remaining")
+        if (
+            value.get("source") not in ("local", "cloud")
+            or value.get("state")
+            not in ("armed", "starting", "awaiting_power", "charging", "stopping", "completed", "interrupted")
+            or type(value.get("duration_seconds")) is not int
+            or value["duration_seconds"] != 120
+            or type(remaining) not in (int, float)
+            or not math.isfinite(remaining)
+            or not 0 <= remaining <= 120
+        ):
+            return None
+        return {key: value[key] for key in ("source", "state", "duration_seconds", "seconds_remaining")}
+
+    # Test progress and bounded session summaries never expose protocol ids or other private server fields.
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.key == "control_mode":
+            return {"test_charge": self.charge_test_progress}
         return (
             {
                 "charger_sessions": self.coordinator.data.get("charger_sessions", []),

@@ -37,7 +37,7 @@ class ManagedRequests:
         self.intent()
         journal.db.execute(
             "UPDATE managed_requests SET state='uncertain',result=? "
-            "WHERE action='app_control' AND state IN ('accepted','running')",
+            "WHERE action IN ('app_control','start_test','arm_cloud_test') AND state IN ('accepted','running')",
             (json.dumps({"classification": "process_replaced"}),),
         )
 
@@ -56,7 +56,12 @@ class ManagedRequests:
 
     # Duplicate request identifiers bind both the action and caller's observed revision; no retry repeats a write.
     def existing(self, identifier: str, action: str, revision: int) -> dict[str, Any] | None:
-        if re.fullmatch(r"[a-f0-9]{32}", identifier) is None or action not in ("pause", "app_control"):
+        if re.fullmatch(r"[a-f0-9]{32}", identifier) is None or action not in (
+            "pause",
+            "app_control",
+            "start_test",
+            "arm_cloud_test",
+        ):
             raise SecurityError("management request shape is invalid")
         if type(revision) is not int or not 0 <= revision < 2**53:
             raise SecurityError("management revision is invalid")

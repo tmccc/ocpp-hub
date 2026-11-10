@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add an explicit fixed6A two-minute HA test charge with a one-shot guarded local Start, fresh native admission,
+  independent deadline Stop, durable paused completion and no automatic Start replay after replacement. Preserve
+  the unrestricted-Start prohibition and all current/history/resource/authorization safeguards. Bind cloud-test
+  proof to the actual consumed grant and exact vendor mutation; cloud arming itself never initiates charging.
+  Add fresh HA readiness/progress and tests for Pause races, capacity, storage failure, deadlines and both sources.
 - Allow general historical-record absence in explicitly acknowledged managed operation. Retain full originals and
   completed-record versions privately, report missing counts without blocking charging, and continue rejecting
   changed admitted records. Keep commissioning strict, allocation unchanged and all electrical/session guards.

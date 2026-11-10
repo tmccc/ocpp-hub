@@ -25,7 +25,8 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # Setup and refresh only read status; neither HA restart nor unload sends any control command.
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        super().__init__(hass, LOGGER, config_entry=entry, name=DOMAIN, update_interval=timedelta(seconds=10))
+        # Reports can already be several seconds old; poll before their strict 15-second native expiry.
+        super().__init__(hass, LOGGER, config_entry=entry, name=DOMAIN, update_interval=timedelta(seconds=5))
         self.client = ProxyClient(async_get_clientsession(hass), entry.data["port"], entry.data["token"])
         self.problem_since: float | None = None
         self.notified = False

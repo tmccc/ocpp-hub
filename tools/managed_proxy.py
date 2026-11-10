@@ -161,6 +161,10 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
         if api is not None:
             await api.close()
         try:
+            if controller is not None:
+                await controller.tests.close()
+                if controller.pause_task is not None:
+                    await asyncio.gather(controller.pause_task, return_exceptions=True)
             await session.close()
         finally:
             save_private(

@@ -280,9 +280,17 @@ class LocalControl:
     async def start(self, tag: str) -> Frame:
         return await self._owned(self._start(tag))
 
+    # A managed test supplies a live per-request guard without enabling the unrestricted local Start policy.
+    async def start_managed(self, tag: str, guard: Callable[[], None]) -> Frame:
+        if self.policy.allow_local_start or self.policy.max_current_a != 6:
+            raise DeniedError("managed test Start requires the unchanged six-ampere restricted policy")
+        return await self._owned(self._start(tag, guard=guard, shared=True))
+
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
-    async def _start(self, tag: str) -> Frame:
-        if not self.policy.allow_local_start:
+    async def _start(self, tag: str, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
+        if guard is not None:
+            guard()
+        if not self.policy.allow_local_start and guard is None:
             raise DeniedError("local Start is disabled; charging remains under the app and charger schedule")
         if self.journal.get("trial_starting"):
             raise DeniedError("initial native admission has not completed")
@@ -295,7 +303,14 @@ class LocalControl:
         ):
             raise DeniedError("tag is not allowed or a transaction is unresolved")
         epoch, ticket = self._claim(previous.get("inhibit", False))
-        async with self.peer.sequence(1, lambda: self._check(epoch, ticket)) as call:
+
+        # The request generation is checked again after native validation and immediately before each actual send.
+        def check() -> None:
+            self._check(epoch, ticket)
+            if guard is not None:
+                guard()
+
+        async with self.peer.sequence(1, check) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
@@ -310,7 +325,9 @@ class LocalControl:
                 self._check(epoch, ticket)
                 await self._cap(call, 0, epoch)
                 raise
-        self._complete(ticket, uncertain=False)
+        if guard is not None:
+            guard()
+        self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
         return answer
 
     # Releasing local ownership is a physical operation, never removal of the station safety profile.

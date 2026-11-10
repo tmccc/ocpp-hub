@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -498,6 +499,9 @@ class Gateway:
                         grant = self.authorisation.reserve(original["idTag"])
                     if self.policy.kind(action, original) == "write":
                         mutation = self.journal.mutation_intent("vendor", action, original)
+                        if grant is not None:
+                            current_grant = self.journal.get("vendor_start_grant", {})
+                            self.journal.put("vendor_start_grant", {**current_grant, "mutation": mutation})
                 return payload
 
             answer = await self.charger.call(action, prepare)
@@ -545,7 +549,9 @@ class Gateway:
             and (control.get("owner") == "local" or control.get("inhibit"))
         ):
             raise DeniedError("explicit local control has priority")
-        if action == "RemoteStartTransaction" and self.journal.active() is not None:
+        if action == "RemoteStartTransaction" and (
+            self.journal.active() is not None or self.journal.get("control", {}).get("start_pending")
+        ):
             raise DeniedError("a transaction is already unresolved on this connector")
         if action == "RemoteStopTransaction" and self.journal.local_id(payload["transactionId"]) is None:
             raise DeniedError("cloud stop no longer names the active transaction")
@@ -601,6 +607,17 @@ class Gateway:
         if self.policy.strict_cloud_authorization and not self._local_start_allowed(tag):
             raise DeniedError("current authorization does not permit a new local start")
         return await self.controls.start(tag)
+
+    # A bounded management request must keep its grant and the existing static authorization valid at every send.
+    async def start_managed(self, tag: str, guard: Callable[[], None]) -> Frame:
+        # Revocation or a newer Pause can invalidate authorization while native evidence is awaited.
+        def check() -> None:
+            guard()
+            if not self._local_start_allowed(tag):
+                raise DeniedError("managed test tag authorization is no longer current")
+
+        check()
+        return await self.controls.start_managed(tag, check)
 
     # A local stop installs a durable zero-current hold even when there is no known transaction to stop.
     async def stop(self) -> Frame:

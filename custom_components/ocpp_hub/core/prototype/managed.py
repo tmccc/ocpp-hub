@@ -8,6 +8,7 @@ from typing import Any
 
 from ..control import HUB_PROFILE_ID
 from .managed_intent import ControlIntent, ManagedRequests
+from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .policy import DeniedError
 from .rpc import UnavailableError
@@ -39,11 +40,15 @@ class ManagedController:
         session.journal.put("managed_mode", expected)
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
+        self.latest_native: HandoverEvidence | None = None
+        self.tests = ManagedChargeTests(self)
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
+        if action in ("start_test", "arm_cloud_test"):
+            return self.tests.accept(identifier, action, revision)
         previous = self.requests.existing(identifier, action, revision)
         if previous is not None:
             return previous
@@ -291,6 +296,7 @@ class ManagedController:
 
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
     async def tick(self) -> dict[str, Any]:
+        await self.tests.settle()
         s, g, j = self.session, self.session.gateway, self.session.journal
         base = {
             "checked_at": time.time(),
@@ -360,6 +366,17 @@ class ManagedController:
                 self.fault("native_authority_or_preservation_failed")
             return {**base, "state": "degraded", "fault": "native_authority_or_preservation_failed"}
         self.failures = 0
+        self.latest_native = native
+        previous_intent = self.requests.intent()
+        self.tests.observed(native)
+        if self.requests.intent() != previous_intent:
+            return {
+                **base,
+                "state": "pausing",
+                "owner_control_enabled": False,
+                "desired_control": self.requests.intent().mode,
+                "control_revision": self.requests.intent().revision,
+            }
         control = j.get("control", {})
         shared = control.get("owner") == "shared" and not control.get("inhibit") and not control.get("uncertain")
         paused = self.requests.intent().mode == "paused"
@@ -396,6 +413,8 @@ class ManagedController:
             "charging_session_open": native.physical.transaction_open,
             "vehicle_connected": native.physical.connection != "Unplug",
             "history_records": len(native.history),
+            "test_charge": self.tests.summary(),
+            "test_start_ready": self.tests.available(native),
             "history_archive": j.get("native_history_summary"),
             "history_warning": "records_absent_from_charger"
             if j.get("native_history_summary", {}).get("missing_records", 0)

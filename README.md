@@ -602,7 +602,7 @@ The local management implementation now uses an independent, authenticated webso
 listener. `--management-config /absolute/private/management.json` supplies exactly `host`, `port` and `token_file`;
 the host must be `127.0.0.1`, and the separate private credential file contains a random 64-character lowercase
 hexadecimal `token`. Browser origins, duplicate credentials, wrong hosts/paths, unbounded frames and unsupported
-commands are rejected. Only status, history, receipt, Pause and Return-to-app are exposed. No Start, arbitrary RPC,
+commands are rejected. Status, history, receipt, Pause, Return-to-app and fixed test actions are exposed. No unrestricted Start, arbitrary RPC,
 configuration or native settings endpoint exists. The configured bearer never appears in a URL or response body.
 
 Pause acceptance, monotonic intent revision and the local hold claim commit atomically before any physical effect.
@@ -670,6 +670,21 @@ native6/owned6 with the Leon connected, zero power, no new transaction and an em
 history, allocation, intent, configuration and saved schedule are unchanged. HA recovered live readings and cleared
 its problem state; all21 functional automations retained their on/off states. Validation includes1168 full-suite
 cases,54 final focused cases and40 condition mutations caught after strengthening two archive regressions.
+
+The separate HA **Test charge (2 minutes)** action supplies a deliberately bounded local Start. The unrestricted
+Start policy stays disabled. One durable request binds its approved tag, identity/specification, current actual Boot,
+mode/control generations and monotonic deadline; native plugged/closed/zero proof precedes its first control effect.
+A duplicate request or client disappearance cannot repeat Start. Pause, revocation, replacement or expiry invalidates
+positive sends. Actual known Start and positive native power are required before its Start receipt completes.
+
+The proxy owns Stop independently of HA and polling: startup is limited to60seconds, followed by120seconds from the
+first verified power flow, with an immutable180second acceptance ceiling. Stop atomically records the paused intent
+and zero claim without needing a free request-receipt slot, and retries transient storage failures. A replaced
+unfinished test becomes an interrupted pause and never resumes itself. Tests finish paused; Return to app/schedule
+remains a separate explicit action. A cloud-test arming request issues no Start; the actual app Start must be proved
+by its consumed vendor grant, exact confirmed mutation and known native transaction. The cloud safety deadline has
+15seconds grace for the app's planned two-minute Stop, within the same immutable acceptance ceiling. Current,
+duration, tag and arbitrary RPC are never supplied by management callers. Generic Start remains unavailable.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh native6/closed/all-phase-zero evidence, the current actual Boot/binding, confirmed owned station0 and an empty,

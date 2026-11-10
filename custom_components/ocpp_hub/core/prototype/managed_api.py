@@ -119,6 +119,7 @@ class ManagementServer:
                 result["api_version"] = 1
                 result = health_snapshot(result)
                 result["can_pause"] = not self.controller.stopping
+                result["can_start_test"] = result["healthy"] and result.get("test_start_ready") is True
                 result["can_return"] = (
                     intent.mode == "paused"
                     and result["healthy"]
@@ -132,7 +133,11 @@ class ManagementServer:
             if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
                 raise SecurityError("management receipt identifier is invalid")
             return {"id": value["id"], "ok": True, "result": self.controller.requests.receipt(identifier)}
-        if command in ("pause", "app_control") and set(value) == {"id", "command", "revision"}:
+        if command in ("pause", "app_control", "start_test", "arm_cloud_test") and set(value) == {
+            "id",
+            "command",
+            "revision",
+        }:
             result = self.controller.command(value["id"], command, value["revision"])
             return {"id": value["id"], "ok": True, "result": result}
         raise SecurityError("management command is not supported")

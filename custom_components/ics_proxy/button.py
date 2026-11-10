@@ -1,4 +1,4 @@
-"""Intentional local Stop and explicit return to app/schedule; no Start control is exposed."""
+"""Explicit local controls and one bounded test charge; setup never initiates charging."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry, add_entities
         [
             ProxyButton(entry.runtime_data, "pause", "Pause charger"),
             ProxyButton(entry.runtime_data, "app_control", "Return to app / schedule"),
+            ProxyButton(entry.runtime_data, "start_test", "Test charge (2 minutes)"),
         ]
     )
 
@@ -30,12 +31,16 @@ class ProxyButton(ProxyEntity, ButtonEntity):
     def __init__(self, coordinator: ProxyCoordinator, action: str, name: str) -> None:
         super().__init__(coordinator, "button", action, name)
         self.action = action
-        self._attr_icon = "mdi:pause-circle" if action == "pause" else "mdi:calendar-clock"
+        self._attr_icon = {
+            "pause": "mdi:pause-circle",
+            "app_control": "mdi:calendar-clock",
+            "start_test": "mdi:play-circle-outline",
+        }[action]
 
     # Returning requires the latest confirmed hold/revision; Stop remains available for an ordinary cloud outage.
     @property
     def available(self) -> bool:
-        key = "can_pause" if self.action == "pause" else "can_return"
+        key = {"pause": "can_pause", "app_control": "can_return", "start_test": "can_start_test"}[self.action]
         return (
             super().available
             and self.coordinator.data.get(key) is True
