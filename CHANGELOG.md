@@ -6,8 +6,11 @@
   acknowledging them; retain strict lifecycle, mutation, Boot, native configuration, history and exact zero-receipt
   checks. A proven failed cloud attempt for the current introduction converts app intent to a durable Pause before
   recovery; slow registration and older failures do not. Reconnection retains Pause until explicit Return. No Start
-  or positive ceiling is sent by recovery. Validation: 1288 full-suite and 67 actual-HA cases pass; connected idle
-  acceptance is pending.
+  or positive ceiling is sent by recovery. Validation: 1288 full-suite and 67 actual-HA cases pass. Verify a real
+  cloud-blocked process replacement at zero: fresh Boot, forced Pause and local readiness, retained observation with
+  real later acknowledgement, and no automatic Return after reconnect. Explicit HA Return restores app/schedule 32 A.
+  All 43 native samples remain at zero, with no new session/id, unchanged configuration/plans/admission/history and
+  the lead connected. Correct the dashboard's verified-pause explanation while current selection awaits backfill.
 - Add an explicit, zero-protected native32 capability and an idle-only 6–32 A HA current selector. Preserve original
   admission/history bindings, separate selected current from the paused zero hold, bind request amperage and revision,
   verify actual owned profile/composite state, and retain Pause priority and interrupted-update recovery.

@@ -775,8 +775,17 @@ For a saved app intent, a real failed cloud attempt belonging to this exact char
 higher-revision Pause before recovery I/O. Slow initial cloud registration alone does not trigger that conversion,
 and a failure from an older introduction cannot authorize it. A saved Pause remains paused. Cloud reconnection never
 implicitly returns this locally recovered pause to app/schedule authority; explicit Return is still required. This
-path sends no Start or positive ceiling. Validation passes 1288 full-suite and 67 actual-HA cases; connected idle
-restart acceptance is pending.
+path sends no Start or positive ceiling. Validation passes 1288 full-suite and 67 actual-HA cases.
+
+The connected idle check on 2026-11-10 stopped the old proxy at independently verified zero while preserving its
+saved app intent, blocked the cloud endpoint, and started a different proxy process. Fresh actual Boot/introduction
+and a failed cloud attempt produced the expected higher-revision Pause and active local readiness at zero. One queued
+observation survived recovery and received its real acknowledgement after reconnect. Cloud reconnection retained
+Pause and its revision until a separate explicit HA Return restored app/schedule control at 32 A. All 43 independent
+native samples reported zero power and a closed session; transaction count stayed at six and no transaction id was
+allocated. Full configuration, saved schedules, original admission/allocation/history bindings and archived bodies
+were unchanged. The lead stayed connected. No charging test or Start was issued. The dashboard's offline paused
+explanation also remains accurate when queued observations temporarily disable current selection.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,
