@@ -9,7 +9,7 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .managed_current import ManagedCurrentLimits, managed_current_ceiling
 from .managed_intent import ControlIntent, ManagedRequests
-from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule
+from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule, require_continuing_session
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .native_http import NativeTransportUnavailableError
@@ -195,15 +195,21 @@ class ManagedController:
             return  # Attention remains latched; an unconfirmed safety cap is never reported as measured zero.
 
     # The present owned zero, live introduction and actual reconciled events are prerequisites to any release.
-    def require_zero(self, native: HandoverEvidence, *, allow_offline: bool = False) -> None:
+    def require_zero(
+        self, native: HandoverEvidence, *, allow_offline: bool = False, continuing_local: int | None = None
+    ) -> None:
         s, g, j = self.session, self.session.gateway, self.session.journal
-        self.native.require(native, closed=True)
+        self.native.require(native, closed=continuing_local is None)
+        if continuing_local is not None:
+            require_continuing_session(j, native, continuing_local)
+            if any(v != 0 for v in native.currents_a + native.powers_w):
+                raise RecoveryRequiredError("the identified original session awaits a verified zero hold")
         self.native.require_known_session(native)
         present = s.book.owned_present(native.physical)
         row = j.db.execute(
             "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
-        require_lifecycle_idle(g)
+        require_lifecycle_idle(g, continuing_local=continuing_local)
         if (
             j.get("trial_phase") not in ("active", "recovering")
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
@@ -232,12 +238,18 @@ class ManagedController:
             raise RecoveryRequiredError("shared control awaits fresh zero and actual history/cloud reconciliation")
 
     # Verify again after recovery acknowledgement; release raises only the ceiling and never sends RemoteStart.
-    async def restore_owner_control(self, expected_intent: ControlIntent | None = None) -> None:
+    async def restore_owner_control(
+        self, expected_intent: ControlIntent | None = None, *, continuing_local: int | None = None
+    ) -> None:
         g, j = self.session.gateway, self.session.journal
         expected_intent = expected_intent or self.requests.intent()
 
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> None:
+            if continuing_local is not None and (
+                j.active() != continuing_local or j.get(KEY, {}).get("unidentified_local") != continuing_local
+            ):
+                raise ReleaseDeferredError("source-specific continuation was superseded")
             if self.stopping or self.requests.intent() != expected_intent:
                 raise UnavailableError("a newer requested hold superseded managed release")
 
@@ -248,18 +260,22 @@ class ManagedController:
         native = await self.native.read()
         await self.schedule.await_closure_agreement(native)
         self.native.require_known_session(native)
-        if native.physical.transaction_open:
+        if native.physical.transaction_open and continuing_local is None:
             raise RecoveryRequiredError("owner release awaits actual transaction closure")
-        self.require_zero(native)
+        self.require_zero(native, continuing_local=continuing_local)
         if j.get("trial_phase") == "recovering":
-            await self.native.resume()
+            await self.native.resume(continuing_local=continuing_local)
         ticket = j.get("control", {}).get("ticket")
-        native = await self.native.read(closed=True)
-        self.require_zero(native)
-        if j.get("managed_temporary_schedule", {}).get("state") in ("installing", "armed", "clearing"):
+        native = await self.native.read(closed=continuing_local is None)
+        self.require_zero(native, continuing_local=continuing_local)
+        if continuing_local is None and j.get("managed_temporary_schedule", {}).get("state") in (
+            "installing",
+            "armed",
+            "clearing",
+        ):
             await self.schedule.before_release(native)
-            native = await self.native.read(closed=True)
-            self.require_zero(native)
+            native = await self.native.read(closed=continuing_local is None)
+            self.require_zero(native, continuing_local=continuing_local)
         if (
             self.stopping
             or epoch != g._charger_epoch
@@ -269,8 +285,9 @@ class ManagedController:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
-        self.schedule.check_release()
-        self.session.book.before_positive_release = self.schedule.check_release
+        release_guard = self.schedule.check_release if continuing_local is None else guard
+        release_guard()
+        self.session.book.before_positive_release = release_guard
         try:
             await g.controls.release(guard=guard)
             guard()
@@ -424,7 +441,8 @@ class ManagedController:
                         self.require_paused(native)
                         await self.schedule.before_release(native)
                     return {**base, "state": "waiting_for_cloud", "owner_control_enabled": False}
-                await self.restore_owner_control()
+                if self.released_epoch != g._charger_epoch:
+                    await self.restore_owner_control()
             native = await self.settled_native()
             await self.schedule.observe(native)
             if self.requests.intent().mode == "app" and self.released_epoch != g._charger_epoch:

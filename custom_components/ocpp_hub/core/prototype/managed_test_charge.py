@@ -88,6 +88,7 @@ class ManagedChargeTests:
             and (normal or c.current.selected() == 6)
             and not c.current.pending()
             and not g.policy.allow_local_start
+            and (g.remote_start_guard is None or g.remote_start_guard())
             and (not local or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags))
             and not j.get("control", {}).get("uncertain")
             and not j.get("control", {}).get("start_pending")

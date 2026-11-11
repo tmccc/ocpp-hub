@@ -825,6 +825,11 @@ At 06:00, if the identified temporary session is still open, the service holds t
 requests closure of that transaction over OCPP. A separate deadline task runs while telemetry is slow or
 unavailable and while an owner Pause is pending. It waits for
 both the charger’s Stop event and independent readings showing a closed session and zero output.
+If the source of an open session is unknown at cutoff, the proxy holds the station at 0 A. A fresh
+native plan ID or a distinct accepted transaction tag can identify an independent session and let it
+continue. Only the identified temporary session receives the timer’s Stop. New local or cloud
+RemoteStart commands are unavailable while a one-off timer is outstanding. The original native daily
+plan remains enabled, and the proxy preserves a separate Start already acknowledged by an older release.
 Once actual closure and zero output are verified, it removes its timer, verifies the complete original
 timetable and restores the owner's selected ceiling in app mode. If no matching session appears within
 ten minutes of the start, or by 06:00 if sooner, cleanup runs at idle. The station stays at zero while

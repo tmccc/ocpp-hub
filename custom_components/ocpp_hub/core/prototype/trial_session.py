@@ -14,13 +14,15 @@ from typing import Any
 
 from .gateway import Gateway
 from .managed_current import managed_current_ceiling
+from .managed_schedule import recorded_timer_hold
 from .native_bounded import NativeBoundedSpec
 from .native_bounded_handover import NativeBoundedHandover
+from .native_http import NativeTransportUnavailableError
 from .policy import Policy
 from .rpc import UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
 from .seat_pause import SeatPauseVerifier
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
@@ -327,12 +329,19 @@ class TrialSession:
             if phase == "prepared":
                 await self.native_bounded.admit()
             elif phase in ("active", "recovering", "blocked"):
-                native = await self.native_bounded.read()
-                if self.journal.get("trial_binding") is None:
-                    self.native_bounded.require_known_session(native)
+                try:
+                    native = await self.native_bounded.read()
+                except NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError:
+                    spec = self.native_bounded.spec
+                    if not recorded_timer_hold(self.journal, spec.digest, spec.boot_digest):
+                        raise
+                    # The listener starts inhibited. Fresh Boot and independent telemetry still gate a positive release.
                 else:
-                    self.native_bounded.require_recovery_session(native)
-                self.book.owned_present(native.physical)
+                    if self.journal.get("trial_binding") is None:
+                        self.native_bounded.require_known_session(native)
+                    else:
+                        self.native_bounded.require_recovery_session(native)
+                    self.book.owned_present(native.physical)
                 control = self.journal.get("control", {})
                 self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
                 if self.journal.get("trial_binding") is None:

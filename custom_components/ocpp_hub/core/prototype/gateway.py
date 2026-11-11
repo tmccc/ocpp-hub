@@ -80,6 +80,8 @@ class Gateway:
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
         self.status_observer: Callable[[dict[str, Any]], None] | None = None
+        self.held_start_report: Callable[[str], bool] | None = None
+        self.remote_start_guard: Callable[[], bool] | None = None
         self.tag_guard: Callable[[str], bool] | None = None
         self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
         if self.policy.strict_cloud_authorization:
@@ -336,7 +338,7 @@ class Gateway:
             number(payload.get("meterStart"), 1e12)
             timestamp(payload.get("timestamp"))
             known = self.journal.known_start(payload)
-            if not known and not self._tag_allowed(payload.get("idTag")):
+            if not known and not self._tag_allowed(payload.get("idTag"), lifecycle=True):
                 raise DeniedError("tag is not approved for local authorization")
 
             # Permission binding and the pending flag belong to the very same commit as the new Start fact.
@@ -393,13 +395,16 @@ class Gateway:
         raise DeniedError("unsupported charger request")
 
     # Local stop overrides both the static allowlist and an app-generated trusted vendor start grant.
-    def _tag_allowed(self, tag: Any) -> bool:
+    def _tag_allowed(self, tag: Any, *, lifecycle: bool = False) -> bool:
+        if not isinstance(tag, str):
+            return False
+        inhibited = (
+            self.journal.get("control", {}).get("inhibit") or self.tag_guard is not None and not self.tag_guard(tag)
+        )
         if (
-            not isinstance(tag, str)
-            or self.tag_guard is not None
-            and not self.tag_guard(tag)
+            inhibited
+            and not (lifecycle and self.held_start_report is not None and self.held_start_report(tag))
             or self.journal.get("trial_starting")
-            or self.journal.get("control", {}).get("inhibit")
             or self.journal.get("trial_phase") not in (None, "active")
         ):
             return False
@@ -422,6 +427,10 @@ class Gateway:
     def _local_start_allowed(self, tag: str) -> bool:
         if (
             not self._local_tag(tag)
+            or self.remote_start_guard is not None
+            and not self.remote_start_guard()
+            or self.tag_guard is not None
+            and not self.tag_guard(tag)
             or self.journal.get("trial_phase") not in (None, "active")
             or self.journal.get("trial_starting")
         ):
@@ -638,6 +647,8 @@ class Gateway:
             and (control.get("owner") == "local" or control.get("inhibit"))
         ):
             raise DeniedError("explicit local control has priority")
+        if action == "RemoteStartTransaction" and self.remote_start_guard is not None and not self.remote_start_guard():
+            raise DeniedError("an outstanding native timer must finish before a separate remote Start")
         if action == "RemoteStartTransaction" and (
             self.journal.active() is not None or self.journal.get("control", {}).get("start_pending")
         ):

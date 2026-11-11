@@ -63,6 +63,7 @@ def require_native(
     *,
     allow_unplugged: bool = False,
     allow_full_current: bool = False,
+    closing_local: int | None = None,
 ) -> None:
     try:
         physical = native.physical
@@ -123,6 +124,7 @@ def require_native(
             physical.cp != "B"
             and not unplugged
             or physical.transaction_open
+            and (closed or physical.native_transaction_id != closing_local)
             or native.output_limit_a != 0
             or any(value != 0 for value in native.currents_a + native.powers_w)
         ):
@@ -244,6 +246,7 @@ class NativeBoundedSpec:
         closed: bool = False,
         allow_unplugged: bool = False,
         temporary_schedule_digest: str | None = None,
+        closing_local: int | None = None,
     ) -> None:
         expected = self.original_configuration | self.trial_route | {"AmpLmt": "32"}
         if identity != expected["Id"]:
@@ -256,6 +259,7 @@ class NativeBoundedSpec:
             closed,
             allow_unplugged=allow_unplugged,
             allow_full_current=True,
+            closing_local=closing_local,
         )
         if native.configuration != expected or native.saved_schedule_digest != (
             temporary_schedule_digest or self.saved_schedule_digest

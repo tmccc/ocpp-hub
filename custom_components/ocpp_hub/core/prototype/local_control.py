@@ -203,7 +203,9 @@ class LocalControl:
         raise UnavailableError("composite schedule remains outside present coverage")
 
     # Establish or restore the desired ceiling before a start, native plan or new authenticated connection is used.
-    async def ensure_ceiling(self) -> None:
+    async def ensure_ceiling(self, *, guard: Callable[[], None] | None = None) -> None:
+        if guard is not None:
+            guard()
         phase = self.journal.get("trial_phase")
         recovery_hold = phase in ("blocked", "recovering") and self.journal.get("control", {}).get("inhibit")
         if phase not in (None, "active") and not recovery_hold:
@@ -216,6 +218,8 @@ class LocalControl:
         # Capability reads may await a peer; a newer Stop or lower desired limit must win before the eventual write.
         def check() -> None:
             self._check(epoch)
+            if guard is not None:
+                guard()
             if self.desired() != limit:
                 raise DeniedError("desired ceiling changed during preparation")
 
@@ -255,7 +259,9 @@ class LocalControl:
         return answer
 
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
-    async def stop(self, *, expected_local: int | None = None) -> Frame:
+    async def stop(self, *, expected_local: int | None = None, guard: Callable[[], None] | None = None) -> Frame:
+        if guard is not None:
+            guard()
         if expected_local is not None and self.journal.active() not in (None, expected_local):
             raise RecoveryRequiredError("scheduled Stop no longer owns the active transaction")
         previous = self.journal.get("control", {})
@@ -263,14 +269,27 @@ class LocalControl:
             epoch, ticket = self._claim(True, stopping=True)
             self._stop_ticket = ticket
             self._stopping = self._launch(
-                self._stop(epoch, ticket, previous.get("start_pending", False), expected_local)
+                self._stop(epoch, ticket, previous.get("start_pending", False), expected_local, guard)
             )
         return await asyncio.shield(self._stopping)
 
     # Finish the zero-current hold and known-session stop even if the initiating client disconnects.
-    async def _stop(self, epoch: int, ticket: str, pending_start: bool, expected_local: int | None = None) -> Frame:
+    async def _stop(
+        self,
+        epoch: int,
+        ticket: str,
+        pending_start: bool,
+        expected_local: int | None = None,
+        guard: Callable[[], None] | None = None,
+    ) -> Frame:
+        # Recheck generation and optional scoped authority at each physical RPC.
+        def check() -> None:
+            self._check(epoch, ticket)
+            if guard is not None:
+                guard()
+
         cap_error: UnavailableError | None = None
-        async with self.peer.sequence(0, lambda: self._check(epoch, ticket)) as call:
+        async with self.peer.sequence(0, check) as call:
             try:
                 answer = await self._cap(call, 0, epoch)
             except (UnavailableError, DeniedError, RecoveryRequiredError) as error:

@@ -7,7 +7,9 @@
   time. The proxy supervises closure of the identified session, retires the timer on an observed
   unplug, preserves it across idle current changes and reports unconfirmed cleanup to Home Assistant.
   Enforce the cutoff during interrupted telemetry or a pending Pause, and retry the read-only
-  charger introduction after a temporary observation failure on reconnect.
+  charger introduction after a temporary observation failure on reconnect. Hold unidentified open sessions
+  at zero until source verification, including across a proxy restart. Preserve independently acknowledged
+  starts while retiring the timer and recover unplugged sessions that still await their final Stop.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

@@ -20,6 +20,7 @@ from .managed_schedule import (
     installed_variant,
     known_timer_closure_gap,
     remember_disconnect,
+    require_continuing_session,
 )
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
@@ -151,11 +152,14 @@ class NativeBoundedHandover:
         if managed_current_ceiling(j, self.spec) == 32:
             if route != "trial":
                 raise SecurityError("managed current capability must be retired before backend restoration")
+            lease = j.get("managed_temporary_schedule", {})
+            closing_local = j.active() if lease.get("state") in OBSERVABLE else None
             self.spec.require_managed(
                 native,
                 j.identity,
                 closed=closed,
                 allow_unplugged=self.allow_unplugged,
+                closing_local=closing_local,
                 temporary_schedule_digest=installed_variant(
                     j, self.spec.saved_schedule_digest, native.saved_schedule_digest
                 ),
@@ -253,7 +257,25 @@ class NativeBoundedHandover:
         self.introduced_epoch = epoch
         journal.put("trial_starting", False)
         if binding is not None and native.physical.transaction_open:
-            await gateway.stop()
+            lease = journal.get("managed_temporary_schedule", {})
+            if lease.get("state") not in OBSERVABLE:
+                await gateway.stop()
+            elif (
+                lease.get("native_plan_confirmed")
+                and journal.active() == lease.get("bound_local")
+                and native.session_plan_id == lease["body"]["planId"]
+            ):
+                await gateway.controls.stop(expected_local=lease["bound_local"])
+            elif journal.active() is not None:
+                # Preserve any other open transaction under the recovery zero until its provenance is verified.
+                journal.put(
+                    "managed_temporary_schedule",
+                    {
+                        **lease,
+                        "unidentified_local": journal.active(),
+                        "hold_since": lease.get("hold_since", time.time()),
+                    },
+                )
         self.introduced_revision = gateway.controls._revision
         return native
 
@@ -275,7 +297,7 @@ class NativeBoundedHandover:
             raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")
 
     # Default recovery requires an empty queue; managed local recovery retains queued observations and the zero hold.
-    async def resume(self, *, local_only: bool = False) -> dict[str, Any]:
+    async def resume(self, *, local_only: bool = False, continuing_local: int | None = None) -> dict[str, Any]:
         if type(local_only) is not bool:
             raise SecurityError("local recovery permission must be explicit")
         async with self.lock:
@@ -292,7 +314,11 @@ class NativeBoundedHandover:
                 or self.introduced_revision != revision
             ):
                 raise RecoveryRequiredError("bounded resume requires the current restricted recovery introduction")
-            native = await self.read(closed=True)
+            native = await self.read(closed=continuing_local is None)
+            if continuing_local is not None:
+                require_continuing_session(journal, native, continuing_local)
+                if local_only or any(v != 0 for v in native.currents_a + native.powers_w):
+                    raise RecoveryRequiredError("original session continuation requires online verified zero")
             gateway._require_epoch("charger", epoch)
             self.spec.require_boot(journal.get("boot"))
             if journal.get("trial_binding") != {
@@ -307,7 +333,7 @@ class NativeBoundedHandover:
             ).fetchone()
             station = [r for r in present if r.identifier == HUB_PROFILE_ID]
             control = journal.get("control", {})
-            require_lifecycle_idle(gateway)
+            require_lifecycle_idle(gateway, continuing_local=continuing_local)
             if (
                 journal.get("trial_phase") != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
@@ -358,6 +384,10 @@ class NativeBoundedHandover:
             closed=timer or action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
         )
         self.require_selected(native)
+        lease = self.gateway.journal.get("managed_temporary_schedule", {})
+        continuing = lease.get("unidentified_local")
+        if action == "SetChargingProfile" and lease.get("state") in OBSERVABLE and continuing is not None:
+            require_continuing_session(self.gateway.journal, native, continuing)
         if timer:
             if payload["messageId"] == "setPlan" and native.physical.connection != "Plug":
                 raise TimerVehicleDisconnectedError("temporary timer installation requires the connected vehicle")

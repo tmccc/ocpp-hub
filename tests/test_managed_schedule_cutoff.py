@@ -1042,6 +1042,7 @@ async def test_cutoff_during_slow_complete_audit(
         entered = asyncio.Event()
 
         # Stretch a sequence of real successful loopback reads beyond the whole-snapshot timeout.
+        # Delay each real response while preserving its exact content.
         async def slow_read(action, data=None):
             value = await read(action, data)
             entered.set()
@@ -1133,6 +1134,7 @@ async def test_stale_complete_snapshots_recover_under_hold(tmp_path, tls, unused
         observer = b.session.prepared.observer
         read = observer._read
 
+        # Delay each real response while preserving its exact content.
         async def slow_read(action, data=None):
             value = await read(action, data)
             await asyncio.sleep(0.55)
@@ -1165,6 +1167,7 @@ async def test_telemetry_loss_begins_before_deadline(tmp_path, tls, unused_tcp_p
         observer = b.session.prepared.observer
         original_port = observer.port
 
+        # Close cleanly before the first HTTP status line.
         async def interrupted(reader, writer):
             await reader.readuntil(b"\r\n\r\n")
             writer.close()
@@ -1184,3 +1187,242 @@ async def test_telemetry_loss_begins_before_deadline(tmp_path, tls, unused_tcp_p
                 observer.port = original_port
         await b.close_transaction(local)
         assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+
+
+# Intent: a missing source read at cutoff immediately holds zero without guessing which open transaction to stop.
+# Why: the one-off and original timer have the same tag, and only the native plan ID can distinguish them.
+@pytest.mark.parametrize("plan", ["temporary", "daily", "unidentified", "changed_at_release"])
+@pytest.mark.parametrize("demand", [False, True])
+async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypatch, plan, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.start_plan(b.timer if plan == "temporary" else 9, demand=demand)
+        if plan == "unidentified":
+            b.rig.peer.plan_session = (local, 987654)
+        observer = b.session.prepared.observer
+        original_port = observer.port
+
+        # The station keeps serving the real OCPP control socket, but only HTTP exposes its native plan ID.
+        async def interrupted(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(interrupted, "127.0.0.1", 0) as server:
+            observer.port = server.sockets[0].getsockname()[1]
+            try:
+                b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+                for _ in range(4):
+                    await b.c.tick()
+                    assert b.device.effective_limit() == 0 and b.device.current == 0 and not b.stops()
+                    b.clock.now += 16
+                assert b.session.journal.active() == local and not b.session.journal.get("managed_control_fault")
+                assert (await b.c.tick())["fault"] == "temporary_schedule_stop_unconfirmed"
+            finally:
+                observer.port = original_port
+        if plan == "changed_at_release":
+            peer = b.session.gateway.charger
+            validate = peer.validate_send
+            checked = asyncio.Event()
+
+            # Change the observed plan before the final native read in the real outgoing positive profile gate.
+            async def reassigned(action, payload):
+                if (
+                    action == "SetChargingProfile"
+                    and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
+                ):
+                    b.rig.peer.plan_session = (local, b.timer)
+                    checked.set()
+                if validate is not None:
+                    await validate(action, payload)
+
+            peer.validate_send = reassigned
+            try:
+                for _ in range(5):
+                    await b.c.tick()
+                assert checked.is_set() and b.device.effective_limit() == 0
+                assert set(b.stops()) == {local} and not starts(b.rig)
+            finally:
+                peer.validate_send = validate
+        elif plan == "temporary":
+            for _ in range(2):
+                await b.c.tick()
+            assert set(b.stops()) == {local} and b.device.effective_limit() == 0
+        elif plan == "daily":
+            resumed = await healthy(b.c)
+            assert resumed["station_ceiling_a"] == 6 and resumed["charging_session_open"]
+            assert b.session.journal.active() == local and not b.stops() and not starts(b.rig)
+        else:
+            for _ in range(4):
+                await b.c.tick()
+            assert not b.stops() and b.device.effective_limit() == 0
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+        assert not starts(b.rig)
+
+
+# Intent: a current authenticated Boot and durable ownership allow restrictive control while reintroduction has no HTTP.
+# Why: the last physically installed station profile can still be positive when the replacement process first connects.
+@pytest.mark.parametrize("demand", [False, True])
+@pytest.mark.parametrize("cold", [False, True])
+async def test_interrupted_reintroduction_holds_open_timer_at_deadline(
+    tmp_path, tls, unused_tcp_port, monkeypatch, demand, cold
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=demand)
+        await healthy(b.c)
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        if not cold:
+            await b.session.start()
+        observer = b.session.prepared.observer
+        original_port = observer.port
+
+        # Interrupt every introduction read until the independent deadline task has delivered zero and scoped Stop.
+        async def interrupted(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(interrupted, "127.0.0.1", 0) as server:
+            observer.port = server.sockets[0].getsockname()[1]
+            if cold:
+                await b.session.start()
+            b.c = ManagedController(b.session)
+            async with b.rig.charger(b.session) as b.sock:
+                deadline = None
+                try:
+                    b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+                    await b.c.tick()
+                    assert not b.stops() and b.device.effective_limit() == 6
+                    assert (await b.rig.bench.call(b.sock, "interrupted-open-boot", "BootNotification", BOOT))[0] == 3
+                    deadline = asyncio.create_task(b.c.schedule.watch_deadline())
+                    async with asyncio.timeout(4):
+                        while not b.stops():
+                            await asyncio.sleep(0.01)
+                    assert b.c.native.introduced_epoch != b.session.gateway._charger_epoch
+                    assert b.device.effective_limit() == 0 and set(b.stops()) == {local}
+                    assert b.session.journal.active() == local and b.timer in b.device.plans
+                finally:
+                    observer.port = original_port
+                    if deadline is not None:
+                        deadline.cancel()
+                        await asyncio.gather(deadline, return_exceptions=True)
+                await b.close_transaction(local)
+                assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+                assert not starts(b.rig)
+
+
+# Intent: cable removal at zero is a revocation even when the charger still reports the same open session.
+# Why: a delayed Stop must remain reconcilable without adopting a replacement car or claiming zero proves closure.
+@pytest.mark.parametrize("demand", [False, True])
+async def test_unplugged_open_timer_retirement(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=demand)
+        await healthy(b.c)
+        b.device.requested_current = 0
+        b.rig.peer.permission_enabled = False
+        b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
+        await b.rig.bench.call(
+            b.sock,
+            "cable-left",
+            "StatusNotification",
+            {"connectorId": 1, "status": "Available", "errorCode": "NoError"},
+        )
+        for _ in range(4):
+            await b.c.tick()
+        assert set(b.stops()) == {local} and b.device.effective_limit() == 0
+        assert b.session.journal.active() == local and b.timer in b.device.plans
+        assert not b.session.journal.get("managed_control_fault")
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily is not None and daily != local and (await healthy(b.c))["power_w"] > 0
+
+
+# Intent: a new independent Start cannot collide with the one-off while its native permission is still installed.
+# Why: a positive Start acknowledgement before timer retirement creates a lifecycle that cleanup must never orphan.
+@pytest.mark.parametrize("source", ["local", "cloud"])
+async def test_remote_start_serialized_with_timer(tmp_path, tls, unused_tcp_port, monkeypatch, source):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        if source == "local":
+            with pytest.raises(RecoveryRequiredError):
+                b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+        else:
+            reply = await b.rig.bench.cloud_call(
+                "unrelated-owner-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+            )
+            assert reply[0] == 4 or reply[2]["status"] == "Rejected"
+        assert not starts(b.rig) and b.timer in b.device.plans and b.device.effective_limit() == 6
+        b.clock.now = b.start + 601
+        await healthy(b.c)
+        assert set(b.device.plans) == {9}
+        if source == "local":
+            b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+            await b.c.tests.settle()
+        else:
+            reply = await b.rig.bench.cloud_call(
+                "owner-start-after-cleanup", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+            )
+            assert reply[0] == 3 and reply[2]["status"] == "Accepted"
+        assert len(starts(b.rig)) == 1
+        await b.c.tests.close()
+
+
+# Intent: honor an independently accepted Start from an older release while actual transaction reporting is delayed.
+# Why: zero before that event cannot end the pending lifecycle or clear its grant.
+@pytest.mark.parametrize("source", ["local", "cloud"])
+@pytest.mark.parametrize("at_deadline", [False, True])
+async def test_previously_accepted_start_before_timer_retirement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, source, at_deadline
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start + 601
+        gate = b.session.gateway.remote_start_guard
+        b.session.gateway.remote_start_guard = None
+        try:
+            if source == "local":
+                b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+                await b.c.tests.settle()
+            else:
+                reply = await b.rig.bench.cloud_call(
+                    "prior-owner-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+                )
+                assert reply[0] == 3 and reply[2]["status"] == "Accepted"
+        finally:
+            b.session.gateway.remote_start_guard = gate
+        assert len(starts(b.rig)) == 1
+        tag = starts(b.rig)[0][3]["idTag"]
+        for _ in range(2):
+            await b.c.tick()
+        assert b.c.schedule.awaiting_start() and b.device.effective_limit() == 6 and b.timer in b.device.plans
+        if at_deadline:
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops()
+            unknown = await b.rig.bench.call(
+                b.sock, "wrong-pending-tag", "StartTransaction", START | {"idTag": "UNKNOWN"}
+            )
+            assert unknown[0] == 4 and b.session.journal.active() is None
+        reply = await b.rig.bench.call(
+            b.sock,
+            "delayed-owner-lifecycle",
+            "StartTransaction",
+            START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.clock.now, ZONE).isoformat()},
+        )
+        assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+        local = reply[2]["transactionId"]
+        b.rig.peer.plan_session = (local, 9)
+        await healthy(b.c)
+        assert not b.stops() and b.session.journal.active() == local
+        await b.close_transaction(local)
+        await healthy(b.c)
+        assert set(b.device.plans) == {9} and not b.stops()
+        await b.c.tests.close()
