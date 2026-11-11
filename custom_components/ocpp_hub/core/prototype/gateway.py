@@ -401,14 +401,22 @@ class Gateway:
         inhibited = (
             self.journal.get("control", {}).get("inhibit") or self.tag_guard is not None and not self.tag_guard(tag)
         )
+        phase = self.journal.get("trial_phase")
+        held_report = lifecycle and inhibited and self.held_start_report is not None and self.held_start_report(tag)
         if (
             inhibited
-            and not (lifecycle and self.held_start_report is not None and self.held_start_report(tag))
+            and not held_report
             or self.journal.get("trial_starting")
-            or self.journal.get("trial_phase") not in (None, "active")
+            or phase not in (None, "active")
+            and not (phase == "recovering" and held_report)
         ):
             return False
-        selected = self._local_tag(tag) or (self.policy.trust_vendor_start_tags and self.authorisation.allows(tag))
+        # A confirmed held report consumes its original receipt without reviving a tag for new Starts.
+        selected = (
+            self._local_tag(tag)
+            or self.policy.trust_vendor_start_tags
+            and (held_report or self.authorisation.allows(tag))
+        )
         if not selected or not self.policy.strict_cloud_authorization:
             return bool(selected)
         info = self.auth_info.get(tag)

@@ -28,7 +28,12 @@ async def framing_line(reader: asyncio.StreamReader) -> bytes:
 # Keep the framing type so a truncated connection-close body can be distinguished from a complete invalid document.
 async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
     status = await framing_line(reader)
-    if len(status) > 8192 or len(status.split()) < 2 or status.split()[1] != b"200":
+    fields = status.split()
+    if len(status) <= 8192 and len(fields) >= 2 and fields[0] in (b"HTTP/1.0", b"HTTP/1.1"):
+        code = fields[1]
+        if code in (b"408", b"429") or len(code) == 3 and code.startswith(b"5") and code.isdigit():
+            raise ConnectionError("native HTTP temporarily unavailable")
+    if len(status) > 8192 or len(fields) < 2 or fields[1] != b"200":
         raise SecurityError("native reader received a non-success HTTP response")
     headers: dict[bytes, bytes] = {}
     total = 0

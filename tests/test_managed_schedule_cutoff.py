@@ -756,6 +756,7 @@ async def test_full_session_needs_both_closures(
     [
         "truncated",
         "no_status",
+        "busy",
         "partial_status",
         "partial_header",
         "close_delimited",
@@ -788,6 +789,7 @@ async def test_deadline_without_native_http(
                     responses = {
                         "truncated": b"HTTP/1.0 200 OK\r\nContent-Length: 40\r\n\r\n{",
                         "no_status": b"",
+                        "busy": b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
                         "partial_status": b"HTTP/1.0 20",
                         "partial_header": b"HTTP/1.0 200 OK\r\nContent-Length:",
                         "close_delimited": b'HTTP/1.0 200 OK\r\n\r\n{"code":200,"data":',
@@ -906,26 +908,38 @@ async def test_cutoff_reintroduction_recovers_on_same_socket(tmp_path, tls, unus
 # Why: the actual Stop can precede the meter and native SESSION by several ticks or even a process replacement.
 @pytest.mark.parametrize("first", ["native", "ledger"])
 @pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize(("unplugged", "demand"), [(False, True), (True, True), (True, False)])
 async def test_deadline_closure_gap(
-    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, first: str, restart: bool
+    tmp_path: Path,
+    tls: Any,
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    first: str,
+    restart: bool,
+    unplugged: bool,
+    demand: bool,
 ) -> None:
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await b.arm()
         b.clock.now = b.start
-        local = await b.fire(b.timer)
+        local = await b.fire(b.timer, demand=demand)
         await healthy(b.c)
         b.clock.now = int(datetime(2026, 11, 11, 5, 59, 59, tzinfo=ZONE).timestamp())
         if first == "ledger":
             await b.close_transaction(local)
             b.device.active = local
             b.device.fire_plan(b.timer)
-            b.rig.peer.permission_enabled = True
-            b.rig.bench.cp, b.rig.bench.connection = "C", "Charging"
+            b.rig.peer.permission_enabled = demand
+            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
         else:
             b.device.active = None
             b.device.requested_current = 0
             b.rig.peer.permission_enabled = False
             b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        if unplugged:
+            b.device.requested_current = 0
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
         b.clock.now += 1
 
         # Verify the hold across independent polls and a delayed second closure report.
@@ -944,8 +958,13 @@ async def test_deadline_closure_gap(
                 b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
             else:
                 await b.close_transaction(local)
+            if unplugged:
+                b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
             assert (await healthy(b.c))["station_ceiling_a"] == 6
             assert set(b.device.plans) == {9} and not starts(b.rig)
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily is not None and daily != local and (await healthy(b.c))["power_w"] > 0
 
         if restart:
             # This case isolates the two closure indications from ambiguous cloud delivery.
@@ -1274,6 +1293,10 @@ async def test_interrupted_reintroduction_holds_open_timer_at_deadline(
         b.clock.now = b.start
         local = await b.fire(b.timer, demand=demand)
         await healthy(b.c)
+        # This scenario starts with the original Start acknowledged by the vendor before the simulated crash.
+        async with asyncio.timeout(3):
+            while b.session.journal.next_delivery() is not None:
+                await asyncio.sleep(0.01)
         await crash(b.session)
         b.session = managed_session(b.rig)
         if not cold:
@@ -1426,3 +1449,134 @@ async def test_previously_accepted_start_before_timer_retirement(
         await healthy(b.c)
         assert set(b.device.plans) == {9} and not b.stops()
         await b.c.tests.close()
+
+
+# Intent: a rejected recovery Stop retains the validated Boot and retries only the identified transaction.
+# Why: a command acknowledgement is separate from the authority of the native read that preceded it.
+@pytest.mark.parametrize("demand", [True, False])
+async def test_reconnect_stop_rejection_recovers(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=demand)
+        await healthy(b.c)
+        async with asyncio.timeout(3):
+            while b.session.journal.next_delivery() is not None:
+                await asyncio.sleep(0.01)
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        answer = b.device.answer
+        rejected = asyncio.Event()
+
+        # Return a real OCPP rejection once, keeping physical closure separate from subsequent acknowledgements.
+        def reject_once(action, payload):
+            if action == "RemoteStopTransaction" and not rejected.is_set():
+                rejected.set()
+                return {"status": "Rejected"}
+            return answer(action, payload)
+
+        b.device.answer = reject_once
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "rejected-timer-stop-boot")
+            assert rejected.is_set() and b.stops() == [local] and b.device.effective_limit() == 0
+            await b.c.tick()
+            assert b.stops() == [local]
+            b.clock.now += 16
+            await b.c.tick()
+            assert b.stops() == [local, local] and b.session.journal.active() == local
+            await b.close_transaction(local)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily != local and (await healthy(b.c))["power_w"] > 0 and daily not in b.stops()
+
+
+# Intent: fresh original-plan evidence supersedes the earlier temporary binding for the same transaction.
+# Why: an old receipt cannot stop an independent session after the charger positively identifies its actual plan.
+@pytest.mark.parametrize("demand", [False, True])
+async def test_fresh_original_source_supersedes_temporary(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=demand)
+        await healthy(b.c)
+        assert b.session.journal.get(managed_schedule.KEY)["bound_local"] == local
+        b.rig.peer.plan_session = (local, 9)
+        await healthy(b.c)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        for _ in range(3):
+            await healthy(b.c)
+        assert not b.stops() and b.device.effective_limit() == 6
+        assert b.session.journal.active() == local
+        await b.close_transaction(local)
+        await healthy(b.c)
+        assert set(b.device.plans) == {9} and not starts(b.rig)
+
+
+# Intent: a previous cloud Start can report its lifecycle under verified zero after a restart or grant expiry.
+# Why: blocking a delayed, specifically acknowledged report can permanently strand the original midnight window.
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
+async def test_confirmed_owner_report_under_recovery_zero(
+    tmp_path, tls, unused_tcp_port, monkeypatch, restart, expired
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        tag = "CLOUD_OWNER"
+        gateway = b.session.gateway
+        gate = gateway.remote_start_guard
+        gateway.remote_start_guard = None
+        try:
+            reply = await b.rig.bench.cloud_call(
+                "accepted-before-upgrade", "RemoteStartTransaction", {"connectorId": 1, "idTag": tag}
+            )
+            assert reply[0] == 3 and reply[2]["status"] == "Accepted"
+        finally:
+            gateway.remote_start_guard = gate
+        if restart:
+            await crash(b.session)
+            b.session = managed_session(b.rig)
+            await b.session.start()
+            b.c = ManagedController(b.session)
+
+        # Check the physical ceiling, precise authorization and real event chain on the active peer socket.
+        async def report(sock):
+            j, g = b.session.journal, b.session.gateway
+            original_grant = j.get("vendor_start_grant")
+            if expired:
+                j.put("vendor_start_grant", {**original_grant, "expires": 0})
+            expiry = j.get("vendor_start_grant")["expires"]
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and not g._tag_allowed(tag)
+            b.clock.now += 61
+            assert (await b.c.tick())["fault"] == "temporary_schedule_awaiting_start_report"
+            assert len(starts(b.rig)) == 1 and not b.stops()
+            rejected = await b.rig.bench.call(sock, "different-tag", "StartTransaction", START | {"idTag": "UNRELATED"})
+            assert rejected[0] == 4 and j.active() is None
+            accepted = await b.rig.bench.call(
+                sock,
+                "delayed-owner-start",
+                "StartTransaction",
+                START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.clock.now, ZONE).isoformat()},
+            )
+            assert accepted[0] == 3 and accepted[2]["idTagInfo"]["status"] == "Accepted"
+            local = accepted[2]["transactionId"]
+            assert j.get("vendor_start_grant")["local"] == local and j.get("vendor_start_grant")["expires"] == expiry
+            assert b.device.effective_limit() == 0
+            b.rig.peer.plan_session = (local, 9)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and not b.stops()
+            await b.close_transaction(local)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+            assert not j.get("vendor_start_grant") and not g._tag_allowed(tag)
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily is not None and daily != local and (await healthy(b.c))["power_w"] > 0
+
+        if restart:
+            async with b.rig.charger(b.session) as b.sock:
+                await introduced(b.rig, b.session, b.sock, "recovering-prior-start")
+                await report(b.sock)
+        else:
+            await report(b.sock)

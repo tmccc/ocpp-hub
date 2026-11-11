@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,6 +19,7 @@ from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, encoded
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
+    from .gateway import Gateway
     from .managed import ManagedController
 
 KEY = "managed_temporary_schedule"
@@ -92,6 +94,30 @@ def require_continuing_session(j: Journal, n: HandoverEvidence, local: int) -> N
         or j.get("managed_control_intent", {"mode": "app"})["mode"] != "app"
     ):
         raise ReleaseDeferredError("the held transaction awaits positive identification of its original plan")
+
+
+# Share a durable retry interval and the final source check across Boot recovery and ordinary deadline supervision.
+async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Callable[[], bool]) -> None:
+    j = g.journal
+    now = time.time()
+    if now < lease.get("next_stop", 0):
+        return
+    j.put(KEY, {**lease, "hold_since": lease.get("hold_since", now), "next_stop": now + 15})
+
+    # A replacement Boot or newer independent source can supersede the Stop during physical zero verification.
+    def guard() -> None:
+        current = j.get(KEY, {})
+        if (
+            not authorized()
+            or current.get("id") != lease["id"]
+            or not current.get("native_plan_confirmed")
+            or current.get("bound_local") != lease["bound_local"]
+            or current.get("other_local") == lease["bound_local"]
+            or j.active() not in (None, lease["bound_local"])
+        ):
+            raise RecoveryRequiredError("the identified cutoff Stop was superseded")
+
+    await g.controls.stop(expected_local=lease["bound_local"], guard=guard)
 
 
 # The two independent closure indicators may arrive in either order for a previously identified one-off.
@@ -169,7 +195,6 @@ class ManagedSchedule:
             lease.get("state") not in OBSERVABLE
             or "hold_since" not in lease
             or j.active() is not None
-            or c.requests.intent().mode != "app"
             or c.stopping
             or j.get("managed_control_fault")
             or not g.controls.ready
@@ -187,7 +212,7 @@ class ManagedSchedule:
         grant = j.get("vendor_start_grant", {})
         return bool(
             grant.get("local") is None
-            and g.authorisation.allows(tag)
+            and grant.get("digest") == fingerprint(tag.casefold())
             and j.db.execute(
                 "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
                 "AND action='RemoteStartTransaction' AND state='confirmed'",
@@ -480,6 +505,13 @@ class ManagedSchedule:
         if (
             "hold_since" in lease
             and now - lease["hold_since"] >= 60
+            and self.j.active() is None
+            and self.awaiting_start()
+        ):
+            return "temporary_schedule_awaiting_start_report"
+        if (
+            "hold_since" in lease
+            and now - lease["hold_since"] >= 60
             and (
                 lease.get("closure_gap")
                 or self.j.active() is not None
@@ -591,26 +623,7 @@ class ManagedSchedule:
             await self.protect_station(lease)
             return
         self.begin_hold(lease)
-        await self.request_stop_if_due(j.get(KEY))
-
-    # Re-check ownership inside LocalControl after the zero ceiling has been attempted, before sending any Stop.
-    async def request_stop_if_due(self, lease: dict[str, Any]) -> None:
-        now = time.time()
-        if now >= lease.get("next_stop", 0):
-            self.j.put(KEY, {**lease, "next_stop": now + 15})
-
-            # The charger can deliver a new Boot or transaction while the physical zero is being verified.
-            def guard() -> None:
-                current = self.j.get(KEY, {})
-                if (
-                    not self.hold_authorized()
-                    or current.get("id") != lease["id"]
-                    or current.get("bound_local") != lease["bound_local"]
-                    or self.j.active() not in (None, lease["bound_local"])
-                ):
-                    raise RecoveryRequiredError("the identified cutoff Stop was superseded")
-
-            await self.c.session.gateway.controls.stop(expected_local=lease["bound_local"], guard=guard)
+        await request_timer_stop(self.c.session.gateway, j.get(KEY), self.hold_authorized)
 
     # A known closing transaction needs zero, with no guessed Stop, until native and ledger closure agree.
     async def await_closure_agreement(self, native: HandoverEvidence) -> None:
@@ -661,7 +674,7 @@ class ManagedSchedule:
             c.require_paused(n)
             return
         if bound is not None:
-            await self.request_stop_if_due(lease)
+            await request_timer_stop(g, lease, self.hold_authorized)
         else:
             await self.protect_station(lease)
         if active is None and j.active() is None and g.controls.ready and g.controls.desired() == 0:
@@ -695,6 +708,13 @@ class ManagedSchedule:
         if actual_id == j.active() and actual_id is not None and independent_session(j, lease, n, actual_id):
             if lease.get("other_local") != actual_id:
                 changes["other_local"] = actual_id
+            if actual_id == previous:
+                # A fresh conflicting native plan invalidates the old Stop authority for this transaction ID.
+                changes.update(bound_local=None, native_plan_confirmed=False)
+                if "hold_since" in lease:
+                    changes["unidentified_local"] = actual_id
+        elif native_local is not None and native_local == lease.get("other_local") and native_local in candidates:
+            changes["other_local"] = None
         if changes:
             lease = {**lease, **changes}
             j.put(KEY, lease)

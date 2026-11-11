@@ -20,11 +20,13 @@ from .managed_schedule import (
     installed_variant,
     known_timer_closure_gap,
     remember_disconnect,
+    request_timer_stop,
     require_continuing_session,
 )
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .native_http import NativeTransportUnavailableError
+from .policy import DeniedError
 from .rpc import IntroductionDeferredError, UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice
@@ -37,6 +39,10 @@ from .trial_resources import ResourceBook
 from .trial_rollback import require_lifecycle_idle
 
 NativePatch = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class AuditSupersededError(UnavailableError):
+    """The independently read snapshot straddled a change to the journal's control or lifecycle authority."""
 
 
 class NativeBoundedHandover:
@@ -124,7 +130,7 @@ class NativeBoundedHandover:
         try:
             native = await self.observe()
             if before != self.authority():
-                raise UnavailableError("native bounded audit was superseded by local authority")
+                raise AuditSupersededError("native bounded audit was superseded by local authority")
             self.require(native, route=route, closed=closed)
             audit_history(
                 self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
@@ -154,6 +160,8 @@ class NativeBoundedHandover:
                 raise SecurityError("managed current capability must be retired before backend restoration")
             lease = j.get("managed_temporary_schedule", {})
             closing_local = j.active() if lease.get("state") in OBSERVABLE else None
+            if closing_local is None and known_timer_closure_gap(j, native):
+                closing_local = native.physical.native_transaction_id
             self.spec.require_managed(
                 native,
                 j.identity,
@@ -255,6 +263,7 @@ class NativeBoundedHandover:
                 gateway._require_epoch("charger", epoch)
             journal.put("trial_phase", "recovering")
         self.introduced_epoch = epoch
+        verified_revision = gateway.controls._revision
         journal.put("trial_starting", False)
         if binding is not None and native.physical.transaction_open:
             lease = journal.get("managed_temporary_schedule", {})
@@ -265,7 +274,18 @@ class NativeBoundedHandover:
                 and journal.active() == lease.get("bound_local")
                 and native.session_plan_id == lease["body"]["planId"]
             ):
-                await gateway.controls.stop(expected_local=lease["bound_local"])
+                # Introduction remains verified if this restrictive RPC fails. Its durable hold supervises retries.
+                def same_boot() -> bool:
+                    return (
+                        gateway.current_boot_seen(epoch)
+                        and verified_revision == gateway.controls._revision
+                        and fingerprint(journal.get("boot")) == self.spec.boot_digest
+                    )
+
+                try:
+                    await request_timer_stop(gateway, lease, same_boot)
+                except UnavailableError, RecoveryRequiredError, DeniedError:
+                    pass
             elif journal.active() is not None:
                 # Preserve any other open transaction under the recovery zero until its provenance is verified.
                 journal.put(
@@ -276,7 +296,10 @@ class NativeBoundedHandover:
                         "hold_since": lease.get("hold_since", time.time()),
                     },
                 )
-        self.introduced_revision = gateway.controls._revision
+        gateway._require_epoch("charger", epoch)
+        if verified_revision != gateway.controls._revision:
+            raise UnavailableError("the verified charger introduction was superseded")
+        self.introduced_revision = verified_revision
         return native
 
     # An unknown native transaction is external activity, never a proxy-created Start or inferred Stop.
@@ -433,7 +456,11 @@ class NativeBoundedHandover:
                     await gateway.stop()
                 async with asyncio.timeout(30):
                     while True:
-                        native = await self.read()
+                        try:
+                            native = await self.read()
+                        except AuditSupersededError:
+                            await asyncio.sleep(0.1)
+                            continue  # Retry a snapshot crossed by Stop within the same recovery deadline.
                         self.require_known_session(native)
                         if not native.physical.transaction_open:
                             try:
