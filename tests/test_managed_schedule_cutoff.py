@@ -26,7 +26,7 @@ from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
 from tests.test_managed_schedule import SchedulePeer
-from tests.test_prototype import START
+from tests.test_prototype import BOOT, START
 from tests.test_prototype_tls import tls as tls
 
 ZONE = ZoneInfo("Europe/London")
@@ -751,7 +751,20 @@ async def test_full_session_needs_both_closures(
 
 # Intent: losing physical telemetry cannot delay the independent OCPP hold and Stop for the identified transaction.
 # Why: an open, identified timer must remain inhibited while a timeout, truncated read or interrupted poll recovers.
-@pytest.mark.parametrize("failure", ["truncated", "timeout", "cancelled"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "truncated",
+        "no_status",
+        "partial_status",
+        "partial_header",
+        "close_delimited",
+        "chunk_eof",
+        "trailer_eof",
+        "timeout",
+        "cancelled",
+    ],
+)
 async def test_deadline_without_native_http(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -769,11 +782,20 @@ async def test_deadline_without_native_http(
             try:
                 await reader.readuntil(b"\r\n\r\n")
                 reached.set()
-                if failure == "truncated":
-                    writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 40\r\n\r\n{")
-                    await writer.drain()
-                else:
+                if failure in ("timeout", "cancelled"):
                     await release.wait()
+                else:
+                    responses = {
+                        "truncated": b"HTTP/1.0 200 OK\r\nContent-Length: 40\r\n\r\n{",
+                        "no_status": b"",
+                        "partial_status": b"HTTP/1.0 20",
+                        "partial_header": b"HTTP/1.0 200 OK\r\nContent-Length:",
+                        "close_delimited": b'HTTP/1.0 200 OK\r\n\r\n{"code":200,"data":',
+                        "chunk_eof": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1",
+                        "trailer_eof": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+                    }
+                    writer.write(responses[failure])
+                    await writer.drain()
             finally:
                 writer.close()
                 await writer.wait_closed()
@@ -792,7 +814,7 @@ async def test_deadline_without_native_http(
                         await tick
                 else:
                     assert (await tick)["state"] == "degraded"
-                if failure == "truncated":
+                if failure not in ("timeout", "cancelled"):
                     b.clock.now += 61
                     for _ in range(4):
                         assert (await b.c.tick())["fault"] == "temporary_schedule_stop_unconfirmed"
@@ -806,6 +828,78 @@ async def test_deadline_without_native_http(
         assert b.stops() and set(b.stops()) == {local}
         await b.close_transaction(local)
         assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily is not None and daily != local and (await healthy(b.c))["power_w"] > 0
+        assert not starts(b.rig) and daily not in b.stops()
+
+
+# Intent: genuine conflicting native authority under a held timer remains a permanent failure.
+# Why: an authenticated complete configuration change must not acquire the privilege of a transport retry.
+async def test_conflicting_configuration_during_timer_hold(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        await healthy(b.c)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        b.rig.peer.configuration["untouched"] = "external-change"
+        for _ in range(4):
+            await b.c.tick()
+        assert (
+            b.session.journal.get("managed_control_fault")["classification"]
+            == "native_authority_or_preservation_failed"
+        )
+        assert b.device.effective_limit() == 0 and set(b.stops()) == {local}
+        assert b.timer in b.device.plans and not starts(b.rig)
+
+
+# Intent: native telemetry recovers on the same charger socket after a replacement's first Boot audit is interrupted.
+# Why: one lost read must not strand a genuine closed zero or prevent the following normal midnight session.
+async def test_cutoff_reintroduction_recovers_on_same_socket(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=False)
+        await healthy(b.c)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        await b.close_transaction(local)
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        observer = b.session.prepared.observer
+        original_port = observer.port
+        reads = asyncio.Queue()
+
+        # Accept the HTTP query but close before the status so multiple attempts demonstrably come from one Boot.
+        async def broken(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.close()
+            await writer.wait_closed()
+            reads.put_nowait(True)
+
+        async with await asyncio.start_server(broken, "127.0.0.1", 0) as server:
+            observer.port = server.sockets[0].getsockname()[1]
+            async with b.rig.charger(b.session) as b.sock:
+                try:
+                    assert (await b.rig.bench.call(b.sock, "interrupted-cutoff-boot", "BootNotification", BOOT))[0] == 3
+                    async with asyncio.timeout(4):
+                        for _ in range(3):
+                            await reads.get()
+                    epoch = b.session.gateway._charger_epoch
+                    assert b.device.effective_limit() == 0 and b.timer in b.device.plans
+                    assert b.c.native.introduced_epoch != epoch
+                finally:
+                    observer.port = original_port
+                assert (await healthy(b.c))["station_ceiling_a"] == 6
+                assert b.c.native.introduced_epoch == epoch and b.session.gateway._charger_epoch == epoch
+                assert set(b.device.plans) == {9} and not b.session.journal.get("managed_control_fault")
+                daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+                assert daily is not None and daily != local and (await healthy(b.c))["power_w"] > 0
+                assert not starts(b.rig) and set(b.stops()) == {local}
 
 
 # Intent: at cutoff neither order of physical/ledger closure adopts or stops a different transaction.
@@ -968,5 +1062,125 @@ async def test_cutoff_during_slow_complete_audit(
                 tick.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await tick
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+
+
+# Intent: the service deadline task can lower the physical ceiling while a health read that began before 06:00 stalls.
+# Why: the native charger may keep delivering power after its timer expires, including when a Pause is pending.
+@pytest.mark.parametrize("paused", [False, True])
+@pytest.mark.parametrize("demand", [False, True])
+async def test_deadline_during_inflight_poll(tmp_path, tls, unused_tcp_port, monkeypatch, paused, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=demand)
+        await healthy(b.c)
+        observer = b.session.prepared.observer
+        read = observer._read
+        entered, release = asyncio.Event(), asyncio.Event()
+        end = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        loop = asyncio.get_running_loop()
+        boundary = loop.time() + 0.3
+        monkeypatch.setattr(managed_schedule, "time", SimpleNamespace(time=lambda: end + loop.time() - boundary))
+
+        # Block only the independent native reader. The OCPP peer continues serving its actual control socket.
+        async def stalled(action, data=None):
+            entered.set()
+            await release.wait()
+            return await read(action, data)
+
+        observer._read = stalled
+        if paused:
+            request = uuid.uuid4().hex
+            b.c.command(request, "pause", b.c.requests.intent().revision)
+        deadlines = asyncio.create_task(b.c.schedule.watch_deadline())
+        tick = asyncio.create_task(b.c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert loop.time() < boundary and not b.stops()
+            async with asyncio.timeout(2):
+                while not b.stops():
+                    await asyncio.sleep(0.01)
+            assert b.device.current == 0 and b.device.effective_limit() == 0
+            assert not tick.done() and b.stops() == [local]
+            assert b.session.journal.active() == local and b.timer in b.device.plans
+        finally:
+            observer._read = read
+            release.set()
+            await asyncio.wait_for(tick, 4)
+            deadlines.cancel()
+            await asyncio.gather(deadlines, return_exceptions=True)
+        await b.close_transaction(local)
+        state = await healthy(b.c)
+        if paused:
+            assert state["local_hold_verified"] and state["station_ceiling_a"] == 0
+            assert b.c.requests.receipt(request)["state"] == "completed"
+            b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+            state = await healthy(b.c)
+        assert state["station_ceiling_a"] == 6 and set(b.device.plans) == {9} and not starts(b.rig)
+
+
+# Intent: complete, matching snapshots that took longer than five seconds remain unusable and recoverable.
+# Why: a slow telemetry response under zero cannot by itself establish closure or permanently suppress the next window.
+async def test_stale_complete_snapshots_recover_under_hold(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=False)
+        await healthy(b.c)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        observer = b.session.prepared.observer
+        read = observer._read
+
+        async def slow_read(action, data=None):
+            value = await read(action, data)
+            await asyncio.sleep(0.55)
+            return value
+
+        observer._read = slow_read
+        try:
+            for _ in range(3):
+                assert (await b.c.tick())["state"] == "degraded"
+                assert b.device.effective_limit() == 0 and set(b.stops()) == {local}
+            assert not b.session.journal.get("managed_control_fault") and b.timer in b.device.plans
+        finally:
+            observer._read = read
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily is not None and daily != local and (await healthy(b.c))["power_w"] > 0
+
+
+# Intent: an outage starting before 06:00 keeps a recoverable zero without permanently freezing the next day's plan.
+# Why: repeated reads can already have failed before the independent deadline task fires.
+async def test_telemetry_loss_begins_before_deadline(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        await healthy(b.c)
+        end = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        b.clock.now = end - 45
+        observer = b.session.prepared.observer
+        original_port = observer.port
+
+        async def interrupted(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(interrupted, "127.0.0.1", 0) as server:
+            observer.port = server.sockets[0].getsockname()[1]
+            try:
+                for _ in range(3):
+                    await b.c.tick()
+                    b.clock.now += 10
+                assert b.device.effective_limit() == 0 and not b.session.journal.get("managed_control_fault")
+                b.clock.now = end
+                await b.c.tick()
+                assert set(b.stops()) == {local} and b.session.journal.active() == local
+            finally:
+                observer.port = original_port
         await b.close_transaction(local)
         assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}

@@ -127,15 +127,19 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     started = time.time()
     last_state: tuple[Any, ...] | None = None
     published: dict[str, Any] = {"running": True, "state": "starting"}
+    deadline: asyncio.Task[None] | None = None
     api: ManagementServer | None = None
     try:
         await session.start()
         controller = ManagedController(session)
+        deadline = asyncio.create_task(controller.schedule.watch_deadline())
         if management is not None:
             api = ManagementServer(management, controller, lambda: dict(published))
             await api.start()
         notify("READY=1\nSTATUS=Waiting for verified charger and owner control")
         while not stopped.is_set():
+            if deadline.done():
+                deadline.result()
             status = await controller.tick()
             remaining = expires - time.time()
             status.update(pid=os.getpid(), started_at=started, certificate_remaining_seconds=remaining, running=True)
@@ -156,6 +160,9 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     finally:
         request_stop()
         task.cancel()
+        if deadline is not None:
+            deadline.cancel()
+            await asyncio.gather(deadline, return_exceptions=True)
         await asyncio.gather(task, return_exceptions=True)
         notify("STOPPING=1\nSTATUS=Retaining charger hold and persistent records")
         if api is not None:

@@ -822,7 +822,8 @@ A connector-1 Available event also retires it if the car reconnects between poll
 tag cannot authorize another Start before cleanup. Changing the selected current while the timer is armed
 preserves it. A current change overtaken by a disconnect is cancelled and the previous selection is restored.
 At 06:00, if the identified temporary session is still open, the service holds the station at zero and
-requests closure of that transaction over OCPP, even while native telemetry is unavailable. It waits for
+requests closure of that transaction over OCPP. A separate deadline task runs while telemetry is slow or
+unavailable and while an owner Pause is pending. It waits for
 both the charger’s Stop event and independent readings showing a closed session and zero output.
 Once actual closure and zero output are verified, it removes its timer, verifies the complete original
 timetable and restores the owner's selected ceiling in app mode. If no matching session appears within

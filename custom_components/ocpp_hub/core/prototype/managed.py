@@ -12,9 +12,10 @@ from .managed_intent import ControlIntent, ManagedRequests
 from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
+from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
 from .rpc import UnavailableError
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .store import RecoveryRequiredError, ReleaseDeferredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import require_lifecycle_idle
@@ -404,7 +405,7 @@ class ManagedController:
         verified_pause = False
         try:
             self.prepare_offline_pause()
-            if self.requests.intent().mode == "app" and pending_timer:
+            if pending_timer:
                 await self.schedule.protect_deadline(timer)
                 cutoff_hold = "hold_since" in j.get(KEY, {})
             pending_return = self.requests.pending_return()
@@ -450,6 +451,21 @@ class ManagedController:
             )
             self.failures += 1
             if self.failures >= 3:
+                lease = j.get(KEY, {})
+                if lease.get("state") in OBSERVABLE and isinstance(
+                    error, (NativeTransportUnavailableError, StaleEvidenceError)
+                ):
+                    # Telemetry can fail before the deadline. Hold at zero while waiting for a fresh read.
+                    if not lease.get("retire_reason"):
+                        lease = {**lease, "retire_reason": "native_observation_unavailable"}
+                        j.put(KEY, lease)
+                    await self.schedule.protect_station(lease)
+                    return {
+                        **base,
+                        "state": "degraded",
+                        "owner_control_enabled": False,
+                        "fault": "native_observation_unavailable",
+                    }
                 self.fault("native_authority_or_preservation_failed")
             return {**base, "state": "degraded", "fault": "native_authority_or_preservation_failed"}
         self.failures = 0

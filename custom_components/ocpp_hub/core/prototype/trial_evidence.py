@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from .native_http import read_native
 from .policy import DeniedError, integer, number
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .station import anchor_epoch
 from .store import fingerprint
 from .trial_allocation import HistoryObservation, observe_history
@@ -164,8 +164,10 @@ class Evidence:
     # Validate identity, freshness and inventory uniqueness independently of whether a supervised session is active.
     def require_fresh(self, identity: str, max_age: float = 30) -> None:
         age = time.time() - self.observed_at
-        if self.identity_digest != fingerprint(identity) or not math.isfinite(age) or not 0 <= age <= max_age:
+        if self.identity_digest != fingerprint(identity) or not math.isfinite(age) or age < 0:
             raise SecurityError("trial requires fresh matching physical evidence")
+        if age > max_age:
+            raise StaleEvidenceError("native observation exceeded its freshness limit")
         keys = [resource.key for resource in self.resources]
         if len(keys) != len(set(keys)):
             raise SecurityError("native inventory contains duplicate resource identifiers")

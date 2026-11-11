@@ -6,6 +6,8 @@
   and automatic selective cleanup after charging or a missed start. Delayed starts end at 06:00 local
   time. The proxy supervises closure of the identified session, retires the timer on an observed
   unplug, preserves it across idle current changes and reports unconfirmed cleanup to Home Assistant.
+  Enforce the cutoff during interrupted telemetry or a pending Pause, and retry the read-only
+  charger introduction after a temporary observation failure on reconnect.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

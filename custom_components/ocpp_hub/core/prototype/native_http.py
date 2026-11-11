@@ -17,17 +17,25 @@ class NativeTransportUnavailableError(SecurityError):
     """A missing or interrupted HTTP response provides no new native evidence."""
 
 
-# Read only a bounded successful body, supporting ordinary length, chunked and connection-close framing.
-async def response_body(reader: asyncio.StreamReader) -> bytes:
-    status = await reader.readline()
+# A stream ending partway through any framing line supplies no complete HTTP response.
+async def framing_line(reader: asyncio.StreamReader) -> bytes:
+    line = await reader.readline()
+    if not line.endswith(b"\n"):
+        raise asyncio.IncompleteReadError(line, None)
+    return line
+
+
+# Keep the framing type so a truncated connection-close body can be distinguished from a complete invalid document.
+async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
+    status = await framing_line(reader)
     if len(status) > 8192 or len(status.split()) < 2 or status.split()[1] != b"200":
         raise SecurityError("native reader received a non-success HTTP response")
     headers: dict[bytes, bytes] = {}
     total = 0
     for _ in range(64):
-        line = await reader.readline()
+        line = await framing_line(reader)
         total += len(line)
-        if total > 65536 or not line:
+        if total > 65536:
             raise ValueError("native headers are incomplete or oversized")
         if line == b"\r\n":
             break
@@ -45,7 +53,7 @@ async def response_body(reader: asyncio.StreamReader) -> bytes:
             raise ValueError("ambiguous native body framing")
         body = bytearray()
         while True:
-            line = await reader.readline()
+            line = await framing_line(reader)
             if len(line) > 128:
                 raise ValueError("native chunk header is oversized")
             size = int(line.split(b";", 1)[0].strip(), 16)
@@ -53,10 +61,10 @@ async def response_body(reader: asyncio.StreamReader) -> bytes:
                 raise ValueError("native body is oversized")
             if size == 0:
                 for _ in range(32):
-                    trailer = await reader.readline()
+                    trailer = await framing_line(reader)
                     if trailer == b"\r\n":
-                        return bytes(body)
-                    if not trailer or len(trailer) > 8192:
+                        return bytes(body), False
+                    if len(trailer) > 8192:
                         raise ValueError("invalid native trailer")
                 raise ValueError("too many native trailers")
             body.extend(await reader.readexactly(size))
@@ -65,13 +73,19 @@ async def response_body(reader: asyncio.StreamReader) -> bytes:
     if length is not None:
         if not length.isdigit() or not 0 <= int(length) <= MAXIMUM:
             raise ValueError("native body length is invalid")
-        return await reader.readexactly(int(length))
+        return await reader.readexactly(int(length)), False
     body = bytearray()
     while chunk := await reader.read(min(8192, MAXIMUM + 1 - len(body))):
         body.extend(chunk)
         if len(body) > MAXIMUM:
             raise ValueError("native body is oversized")
-    return bytes(body)
+    return bytes(body), True
+
+
+# Return the bounded payload to callers that perform their own application decoding.
+async def response_body(reader: asyncio.StreamReader) -> bytes:
+    body, _ = await framed_body(reader)
+    return body
 
 
 # The whole request has one deadline; closing the stream on cancellation does not leave a background reader running.
@@ -92,8 +106,13 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
             ).encode("ascii") + body
             writer.write(request)
             await writer.drain()
-            raw = await response_body(reader)
-            value = json.loads(raw, object_pairs_hook=unique_object)
+            raw, close_delimited = await framed_body(reader)
+            try:
+                value = json.loads(raw, object_pairs_hook=unique_object)
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                if close_delimited:
+                    raise asyncio.IncompleteReadError(raw, None) from error
+                raise
             encoded(value)
             if (
                 action == "statistics"

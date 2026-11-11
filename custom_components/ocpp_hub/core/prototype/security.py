@@ -25,6 +25,10 @@ class SecurityError(ValueError):
     """A transport would weaken identity, authentication or certificate checks."""
 
 
+class StaleEvidenceError(SecurityError):
+    """An observation aged out before it could establish current authority."""
+
+
 # The prototype never lets a synthetic credential reach a LAN or public endpoint.
 def loopback(host: str | None) -> bool:
     try:

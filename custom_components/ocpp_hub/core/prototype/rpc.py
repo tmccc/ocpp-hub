@@ -20,6 +20,10 @@ class UnavailableError(RuntimeError):
     """The peer did not give a confirmed outcome."""
 
 
+class IntroductionDeferredError(UnavailableError):
+    """The read-only introduction lacks fresh evidence. No recovery command has been sent."""
+
+
 class RegistrationDeferredError(UnavailableError):
     """The backend requires a bounded wait before the next registration attempt."""
 

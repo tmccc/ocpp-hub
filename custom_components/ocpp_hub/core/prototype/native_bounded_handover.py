@@ -15,6 +15,7 @@ from .ics import is_safe_transaction_query
 from .managed_current import managed_current_ceiling
 from .managed_recovery import local_recovery_binding
 from .managed_schedule import (
+    OBSERVABLE,
     TimerVehicleDisconnectedError,
     installed_variant,
     known_timer_closure_gap,
@@ -23,8 +24,8 @@ from .managed_schedule import (
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .native_http import NativeTransportUnavailableError
-from .rpc import UnavailableError
-from .security import SecurityError
+from .rpc import IntroductionDeferredError, UnavailableError
+from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice
 from .store import RecoveryRequiredError, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
@@ -128,11 +129,13 @@ class NativeBoundedHandover:
                 self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
             )
             self.book.check_originals(native.physical)
-        except NativeTransportUnavailableError as error:
+        except (NativeTransportUnavailableError, StaleEvidenceError) as error:
             self.last_verified_at = 0
             timer = self.gateway.journal.get("managed_temporary_schedule", {})
-            if timer.get("state") in ("installing", "armed", "clearing") and "hold_since" in timer:
-                raise UnavailableError("timer hold awaits fresh native HTTP evidence") from error
+            if timer.get("state") in OBSERVABLE and (
+                "hold_since" in timer or self.gateway.journal.get("managed_control_intent", {}).get("mode") == "paused"
+            ):
+                raise UnavailableError("timer hold awaits fresh native evidence") from error
             raise
         except SecurityError, UnavailableError, TimeoutError:
             self.last_verified_at = 0
@@ -203,7 +206,13 @@ class NativeBoundedHandover:
         if not gateway.current_boot_seen(epoch) or fingerprint(journal.get("boot")) != self.spec.boot_digest:
             raise SecurityError("native bounded introduction requires the commissioned actual Boot")
         binding = journal.get("trial_binding")
-        native = await self.read(closed=binding is None)
+        try:
+            native = await self.read(closed=binding is None)
+        except (NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError) as error:
+            if journal.get("managed_temporary_schedule", {}).get("state") not in OBSERVABLE:
+                raise
+            # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
+            raise IntroductionDeferredError("timer recovery awaits fresh introduction evidence") from error
         gateway._require_epoch("charger", epoch)
         if binding is None:
             if (

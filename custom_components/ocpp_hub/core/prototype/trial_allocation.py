@@ -9,7 +9,7 @@ from typing import Any
 
 from .native_start_attempts import split_attempts
 from .policy import integer
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .store import Journal, RecoveryRequiredError, fingerprint
 
 
@@ -33,9 +33,11 @@ class HistoryObservation:
             self.identity_digest != fingerprint(identity)
             or self.hardware_digest != fingerprint(hardware)
             or not math.isfinite(age)
-            or not 0 <= age <= max_age
+            or age < 0
         ):
             raise SecurityError("fresh matching complete native history is required")
+        if age > max_age:
+            raise StaleEvidenceError("native observation exceeded its freshness limit")
         integer(self.count, 0, 10000)
         integer(self.floor, 1000, 2**31 - 1025)
 

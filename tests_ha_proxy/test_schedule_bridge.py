@@ -81,3 +81,57 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             with suppress(asyncio.CancelledError):
                 await supervisor
             await server.close()
+
+
+# Intent: the HA client can observe a scheduled full car reach the cutoff and recover its normal daily window.
+# Why: zero watts and an accepted Stop do not complete the schedule receipt or establish closure.
+async def test_full_vehicle_unattended_deadline(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        published = await healthy(b.c)
+        port = unused_tcp_port_factory()
+        server = ManagementServer(
+            ManagementSettings(port, tmp_path / "unused", TOKEN),
+            b.c,
+            lambda: dict(published, running=True, certificate_remaining_seconds=86400),
+        )
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                client = ProxyClient(session, port, TOKEN)
+                initial = await client.request("status")
+                receipt = await client.request(
+                    "temporary_schedule", revision=initial["control_revision"], start_epoch=b.start
+                )
+                b.timer = b.session.journal.get("managed_temporary_schedule")["body"]["planId"]
+                for _ in range(2):
+                    published = await healthy(b.c)
+                assert (await client.request("status"))["temporary_schedule"]["state"] == "armed"
+                local = await b.advance_idle_to(b.start)
+                assert local is not None
+                b.device.requested_current = 0
+                b.rig.peer.permission_enabled = False
+                b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+                published = await healthy(b.c)
+                assert (await client.request("status"))["power_w"] == 0
+                b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+                published = await b.c.tick()
+                assert b.stops() == [local] and b.device.effective_limit() == 0
+                b.clock.now += 61
+                published = await b.c.tick()
+                alarm = await client.request("status")
+                assert alarm["fault"] == "temporary_schedule_stop_unconfirmed" and not alarm["healthy"]
+                assert (await client.request("receipt", request_id=receipt["id"]))["state"] == "accepted"
+                await b.close_transaction(local)
+                published = await healthy(b.c)
+                restored = await client.request("status")
+                assert restored["healthy"] and restored["desired_control"] == "app"
+                assert restored["station_ceiling_a"] == 6 and restored["temporary_schedule"]["state"] == "complete"
+                assert (await client.request("receipt", request_id=receipt["id"]))["state"] == "completed"
+                assert set(b.device.plans) == {9} and not starts(b.rig)
+                daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+                published = await healthy(b.c)
+                assert daily is not None and daily != local and (await client.request("status"))["power_w"] > 0
+                await b.advance_running_plan(9, daily, b.clock.now + 21600)
+                assert (await healthy(b.c))["power_w"] == 0 and daily not in b.stops()
+        finally:
+            await server.close()

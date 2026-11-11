@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Self
 
 from .policy import integer, number
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .store import encoded, fingerprint
 from .trial_allocation import observe_history
 from .trial_handover_evidence import HandoverEvidence, require_digest
@@ -135,6 +135,8 @@ def require_native(
         observed = observe_history(list(native.history), identity, hardware, physical.observed_at)
         if physical.history != observed:
             raise ValueError
+    except StaleEvidenceError:
+        raise
     except ValueError, TypeError, KeyError, IndexError, OverflowError:
         raise SecurityError("fresh complete independent native current-limit evidence is required") from None
 

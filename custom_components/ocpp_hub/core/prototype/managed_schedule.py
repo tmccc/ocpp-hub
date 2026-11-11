@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import UTC, datetime
@@ -76,6 +77,7 @@ class ManagedSchedule:
     # Receipt arguments outlive the active timer so old command IDs cannot arm a new time.
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
+        self.changed = asyncio.Event()
         self.j = controller.session.journal
         self.j.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_schedule_requests(id TEXT PRIMARY KEY, start_epoch INTEGER NOT NULL)"
@@ -223,6 +225,7 @@ class ManagedSchedule:
             )
             j.db.execute("INSERT INTO managed_schedule_requests VALUES(?,?)", (identifier, start_epoch))
             j.put(KEY, lease)
+        self.changed.set()
         return c.requests.receipt(identifier)
 
     # Reuse current-selection readiness, including idle native evidence, connected peers, debt, Boot and ownership.
@@ -431,6 +434,32 @@ class ManagedSchedule:
         except DeniedError, UnavailableError, RecoveryRequiredError:
             # A separate scoped Stop can still succeed when a station write fails. Never release on this evidence.
             return
+
+    # The service owns this independent deadline wait so a slow health poll or a concurrent Pause cannot defer zero.
+    async def watch_deadline(self) -> None:
+        while not self.c.stopping:
+            self.changed.clear()
+            lease = self.j.get(KEY, {})
+            delay = None
+            if lease.get("state") in {"requested", *OBSERVABLE}:
+                end = lease.get("end_epoch")
+                if end is None:
+                    # A pre-upgrade lease keeps its physical payload while gaining the admitted local deadline.
+                    zone = ZoneInfo(self.c.native.spec.original_configuration["timeZone"])
+                    end = cutoff_epoch(lease["start_epoch"], zone)
+                    lease = {**lease, "end_epoch": end}
+                    self.j.put(KEY, lease)
+                remaining = end - time.time()
+                if remaining <= 0 and not self.j.get("managed_control_fault"):
+                    try:
+                        await self.protect_deadline(lease)
+                    except DeniedError, UnavailableError, RecoveryRequiredError:
+                        pass  # Durable attempt times bound retries. Only actual closure can release the hold.
+                delay = min(remaining, 30) if remaining > 0 else 1
+            try:
+                await asyncio.wait_for(self.changed.wait(), delay)
+            except TimeoutError:
+                pass
 
     # Stop a previously identified, still-open OCPP transaction by its own ID, even while HTTP reads are unavailable.
     async def protect_deadline(self, lease: dict[str, Any]) -> None:

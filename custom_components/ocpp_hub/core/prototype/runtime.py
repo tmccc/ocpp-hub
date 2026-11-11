@@ -18,7 +18,7 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake
 from .diagnostics import FaultDiagnostics
 from .gateway import Gateway
 from .policy import DeniedError
-from .rpc import RegistrationDeferredError, Sender, UnavailableError
+from .rpc import IntroductionDeferredError, RegistrationDeferredError, Sender, UnavailableError
 from .security import Admission, SecurityError, offline_server, offline_vendor, validate_offline_vendor
 from .store import ConflictError, RecoveryRequiredError
 
@@ -180,7 +180,19 @@ class ConnectionRuntime:
             self.status.boot_observed = self.gateway.current_boot_seen(epoch)
             self.gateway._require_epoch("charger", epoch)
             if self.before_ceiling is not None:
-                await self.before_ceiling()
+                delay = self.settings.retry_min
+                while True:
+                    try:
+                        await self.before_ceiling()
+                        break
+                    except IntroductionDeferredError as error:
+                        self.status.last_failure = "BootOrCeilingUnavailable"
+                        self.status.charger_fault.record(
+                            error, "boot_or_ceiling", self.gateway.charger.diagnostics.action
+                        )
+                        await asyncio.sleep(delay)
+                        self.gateway._require_epoch("charger", epoch)
+                        delay = min(2 * delay, self.settings.retry_max)
             self.gateway._require_epoch("charger", epoch)
             if self.ceiling_enabled():
                 await self.gateway.controls.ensure_ceiling()
