@@ -60,9 +60,25 @@ class ManagedChargeTests:
         if saved.get("state") in ACTIVE:
             with self.journal.atomic():
                 intent = controller.requests.intent()
-                self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                preserve = (
+                    saved.get("kind") == "normal"
+                    and intent.mode == "app"
+                    and self.journal.get("control", {}).get("start_pending") is True
+                    and local_start_receipt(self.journal).get("local") is None
+                    and local_start_receipt(self.journal).get("stage") in ("issued", "accepted")
+                )
+                if not preserve:
+                    self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 controller.session.gateway.controls._claim(True, stopping=True)
-                self.journal.put("managed_test_charge", {**saved, "state": "interrupted", "charging": False})
+                self.journal.put(
+                    "managed_test_charge",
+                    {
+                        **saved,
+                        "state": "expired" if preserve else "interrupted",
+                        "expired_normal": bool(preserve),
+                        "charging": False,
+                    },
+                )
         controller.session.gateway.start_observer = self.started
         controller.native.observation_listener = self.record_source
         controller.native.positive_guard = self.check_positive

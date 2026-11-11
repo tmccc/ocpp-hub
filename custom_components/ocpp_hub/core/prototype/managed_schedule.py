@@ -42,7 +42,13 @@ OBSERVABLE = {"installing", "armed", "clearing"}
 
 # A completed inventory cleanup does not end the independent idle cutoff obligation.
 def supervised_timer(lease: dict[str, Any]) -> bool:
-    return lease.get("state") in OBSERVABLE or lease.get("idle_cutoff_hold") is True
+    return (
+        lease.get("state") in OBSERVABLE
+        or lease.get("recovery_session") is True
+        or lease.get("idle_cutoff_hold") is True
+        or lease.get("closure_gap") is True
+        or idle_cutoff_pending(lease)
+    )
 
 
 # A timer that was installed without a confirmed closure must still reach its local deadline after early cleanup.
@@ -51,7 +57,8 @@ def idle_cutoff_pending(lease: dict[str, Any]) -> bool:
         lease.get("state") in {*OBSERVABLE, "complete"}
         and lease.get("result") not in ("cancelled_before_install", "session_closed")
         and lease.get("retire_reason") != "session_closed"
-        and not lease.get("idle_cutoff_released")
+        and lease.get("idle_cutoff_released")
+        not in ("verified_session", "owner_return", "session_closed", "observed_closure")
         and not lease.get("native_plan_confirmed")
     )
 
@@ -228,7 +235,7 @@ def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str
             "next_stop": 0,
         }
         j.put(KEY, lease)
-    if not supervised_timer(lease):
+    if not supervised_timer(lease) and not (lease.get("state") == "complete" and local is not None):
         return
     if "end_epoch" not in lease:
         lease = {**lease, "end_epoch": cutoff_epoch(lease["start_epoch"], ZoneInfo(n.configuration["timeZone"]))}
@@ -272,6 +279,18 @@ def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str
         lease = {**lease, "pending_native_reports": False}
         j.put(KEY, lease)
     gap = known_timer_closure_gap(j, n)
+    closing_local = lease.get("unidentified_local") or lease.get("other_local")
+    if (
+        active is None
+        and not n.physical.transaction_open
+        and closing_local is not None
+        and j.db.execute("SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (closing_local,)).fetchone()
+    ):
+        # The two closure indicators discharge this transaction's source hold, keeping the timer deadline separate.
+        lease = {**lease, "unidentified_local": None, "recovery_session": False}
+        if lease.get("idle_cutoff_hold"):
+            lease = {**lease, "idle_cutoff_hold": False, "idle_cutoff_released": "observed_closure"}
+        j.put(KEY, lease)
     unreported = local is not None and active != local and not gap
     evidence = lease.get("unreported_source", {})
     if unreported and (evidence.get("native_id"), evidence.get("plan_id")) != (local, n.session_plan_id):
@@ -422,7 +441,7 @@ async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Call
 def known_timer_closure_gap(journal: Journal, native: HandoverEvidence) -> bool:
     lease = journal.get(KEY, {})
     local, physical = journal.active(), native.physical.native_transaction_id
-    if not supervised_timer(lease) or (local is None) == (physical is None):
+    if not lease or (local is None) == (physical is None):
         return False
     closing = local if local is not None else physical
     return closing in (lease.get("unidentified_local"), lease.get("other_local")) or (
@@ -490,28 +509,13 @@ class ManagedSchedule:
             lease = {**lease, "end_epoch": cutoff_epoch(lease["start_epoch"], zone)}
             self.j.put(KEY, lease)
         if time.time() >= lease["end_epoch"] and not lease.get("idle_cutoff_hold"):
-            # An already-observed lifecycle stays with its own cutoff, exact Stop and closure reconciliation.
+            active = self.j.active()
             if (
-                self.j.active() is not None
-                or self.awaiting_start()
-                or self.c.requests.intent().mode == "paused"
-                or any(
-                    lease.get(key)
-                    for key in (
-                        "unreported_native",
-                        "closure_gap",
-                        "vehicle_disconnected",
-                        "temporary_start_reported",
-                        "pending_native_reports",
-                        "unidentified_local",
-                        "bound_local",
-                        "other_local",
-                    )
-                )
-                or lease.get("retire_reason") in ("vehicle_disconnected", "owner_superseded")
+                active is not None
+                and lease.get("other_local") == active
+                and current_source(self.c.session.gateway, lease)
+                and not self.needs_source(lease)
             ):
-                lease = {**lease, "idle_cutoff_released": "existing_lifecycle"}
-                self.j.put(KEY, lease)
                 return lease
             lease = {**lease, "idle_cutoff_hold": True, "hold_since": time.time(), "next_cap": 0}
             self.j.put(KEY, lease)
@@ -521,7 +525,7 @@ class ManagedSchedule:
     # Clear only after a successful positive restoration; the reason prevents the same retired lease rearming.
     def clear_idle_cutoff(self, reason: str) -> None:
         lease = self.j.get(KEY, {})
-        if lease.get("idle_cutoff_hold"):
+        if lease.get("idle_cutoff_hold") or idle_cutoff_pending(lease):
             self.j.put(KEY, {**lease, "idle_cutoff_hold": False, "idle_cutoff_released": reason})
             self.changed.set()
 
@@ -558,7 +562,7 @@ class ManagedSchedule:
     # Revocation takes effect before asynchronous physical cleanup, including across a clock correction or restart.
     def revoked(self, lease: dict[str, Any]) -> bool:
         # Inherited station zero does not cancel the newly authorized occurrence's own start window.
-        return supervised_timer(lease) and (
+        return bool(lease.get("state") in OBSERVABLE or lease.get("idle_cutoff_hold")) and (
             bool(lease.get("retire_reason"))
             or "hold_since" in lease
             and not (lease.get("idle_cutoff_hold") and lease.get("idle_cutoff_replacement"))
@@ -1380,6 +1384,15 @@ class ManagedSchedule:
     async def protect_deadline(self, lease: dict[str, Any]) -> None:
         j = self.j
         lease = self.arm_idle_cutoff()
+        if (
+            lease.get("state") == "complete"
+            and (time.time() < lease.get("end_epoch", float("inf")) or not idle_cutoff_pending(lease))
+            and not lease.get("idle_cutoff_hold")
+            and not lease.get("closure_gap")
+            and not lease.get("unreported_native")
+            and j.active() is None
+        ):
+            return
         needs_source = self.needs_source(lease)
         before_end = time.time() < lease.get("end_epoch", float("inf"))
         if (
@@ -1463,7 +1476,8 @@ class ManagedSchedule:
                         {
                             k: v
                             for k, v in current.items()
-                            if k not in ("unidentified_local", "hold_since", "next_cap", "next_stop")
+                            if k
+                            not in ("unidentified_local", "hold_since", "next_cap", "next_stop", "recovery_session")
                         },
                     )
                 self.clear_idle_cutoff("verified_session")

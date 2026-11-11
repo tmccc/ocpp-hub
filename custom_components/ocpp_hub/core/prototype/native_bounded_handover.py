@@ -320,8 +320,23 @@ class NativeBoundedHandover:
             if journal.get("managed_current_change", {}).get("state") == "recovering":
                 pass  # This operation owns only zero; fresh supervision must identify the independent session.
             elif not supervised_timer(lease):
-                if self.recovery_zero_only is not None and self.recovery_zero_only():
+                if (
+                    journal.get("managed_mode")
+                    and journal.get("managed_control_intent", {}).get("mode") == "app"
+                    or self.recovery_zero_only is not None
+                    and self.recovery_zero_only()
+                ):
                     await gateway.controls.ensure_ceiling()
+                    if lease and journal.active() is not None:
+                        journal.put(
+                            "managed_temporary_schedule",
+                            {
+                                **lease,
+                                "recovery_session": True,
+                                "unidentified_local": journal.active(),
+                                "hold_since": time.time(),
+                            },
+                        )
                 elif journal.active() is not None:
                     await gateway.stop()
             elif (
