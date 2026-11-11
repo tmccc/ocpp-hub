@@ -60,6 +60,16 @@ async def management_client(b, directory, port):
         await server.close()
 
 
+# Wait for the independently published service observation instead of assuming a client request advances it.
+async def confirmed_status(client, ceiling):
+    async with asyncio.timeout(5):
+        while True:
+            state = await client.request("status")
+            if state.get("station_ceiling_a") == ceiling:
+                return state
+            await asyncio.sleep(0.25)
+
+
 # Admit a one-off using its real client command and verify independent native inventory.
 async def arm_from_client(b, client):
     state = await client.request("status")
@@ -175,7 +185,7 @@ async def test_n09_management_scheduling_trace(tmp_path, tls, unused_tcp_port_fa
             elif trace in ("unplug", "replacement"):
                 b.clock.now = END
                 await settle(b)
-                assert (await client.request("status"))["station_ceiling_a"] == 0
+                await confirmed_status(client, 0)
                 await next_date_idle(b)
                 await b.wait_for_admission()
                 receipt = await arm_from_client(b, client)
@@ -187,8 +197,8 @@ async def test_n09_management_scheduling_trace(tmp_path, tls, unused_tcp_port_fa
 
             if trace not in ("daily-reconnect", "owner-restart"):
                 await next_daily(b, 32, saved, stops)
-                state = await client.request("status")
-                assert state["station_ceiling_a"] == 32 and not state["charging_session_open"]
+                state = await confirmed_status(client, 32)
+                assert not state["charging_session_open"]
                 return
 
         # Service replacement retires the old management endpoint and its publication task too.
@@ -210,5 +220,5 @@ async def test_n09_management_scheduling_trace(tmp_path, tls, unused_tcp_port_fa
                     await close_in_order(b, owner, "ledger", stops)
                 await healthy(b.c)
                 await next_daily(b, 32, saved, stops, starts_count)
-                state = await client.request("status")
-                assert state["station_ceiling_a"] == 32 and not state["charging_session_open"]
+                state = await confirmed_status(client, 32)
+                assert not state["charging_session_open"]
