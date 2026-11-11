@@ -15,7 +15,7 @@ from .managed_view import charger_history
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError
-from .store import RecoveryRequiredError, fingerprint
+from .store import RecoveryRequiredError, ReleaseDeferredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import require_lifecycle_idle
 from .trial_session import TrialSession
@@ -261,9 +261,13 @@ class ManagedController:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
+        self.schedule.check_release()
+        self.session.book.before_positive_release = self.schedule.check_release
         try:
             await g.controls.release(guard=guard)
             guard()
+        except ReleaseDeferredError:
+            raise
         except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError) as error:
             if not self.stopping and self.requests.intent() == expected_intent:
                 # Detailed peer/guard errors stay in the private journal; public status exposes classification only.
@@ -278,6 +282,8 @@ class ManagedController:
                 )
                 self.fault("owner_release_unconfirmed")
             raise
+        finally:
+            self.session.book.before_positive_release = None
         self.released_epoch = epoch
         j.put("managed_owner_epoch", epoch)
 
@@ -292,6 +298,11 @@ class ManagedController:
         )
         try:
             await self.restore_owner_control(expected)
+        except ReleaseDeferredError:
+            self.session.journal.db.execute(
+                "UPDATE managed_requests SET state='accepted' WHERE id=? AND state='running'", (identifier,)
+            )
+            return
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
             self.requests.finish(identifier, "uncertain", {"classification": "return_not_confirmed"})
             return

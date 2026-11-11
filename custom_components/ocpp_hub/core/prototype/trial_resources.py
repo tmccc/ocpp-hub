@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,6 +91,7 @@ class ResourceBook:
     # A fresh trial cannot silently claim an older unowned journal or replace its original baseline.
     def __init__(self, journal: Journal, baseline: Baseline) -> None:
         self.journal, self.baseline = journal, baseline
+        self.before_positive_release: Callable[[], None] | None = None
         self.temporary_plan_write: dict[str, Any] | None = None
         if baseline.identity_digest != fingerprint(journal.identity):
             raise SecurityError("baseline belongs to another charger")
@@ -257,6 +259,8 @@ class ResourceBook:
 
                 spec = NativeBoundedSpec.parse(self.journal.get("native_bounded_handover", {}).get("spec", {}))
                 ceiling = managed_current_ceiling(self.journal, spec)
+            if canonical["id"] == HUB_PROFILE_ID and canonical["limit"] > 0 and self.before_positive_release:
+                self.before_positive_release()
             if canonical["limit"] > ceiling:
                 raise DeniedError("trial resource exceeds its approved current ceiling")
             key = "profile:" + str(canonical["id"])

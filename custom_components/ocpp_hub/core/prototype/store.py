@@ -21,6 +21,10 @@ class RecoveryRequiredError(RuntimeError):
     """An uncertain remote outcome needs reconciliation instead of automatic replay."""
 
 
+class ReleaseDeferredError(RecoveryRequiredError):
+    """An owner release was withheld before the positive profile reached the transport."""
+
+
 class ConflictError(ValueError):
     """A retry contradicts an already accepted fact."""
 

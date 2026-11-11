@@ -15,7 +15,7 @@ from .composite import FutureScheduleError, verify_composite
 from .policy import DeniedError, Policy, number
 from .rpc import Peer, UnavailableError
 from .station import StationChoice
-from .store import Journal, RecoveryRequiredError
+from .store import Journal, RecoveryRequiredError, ReleaseDeferredError
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
 
@@ -368,9 +368,11 @@ class LocalControl:
                     number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a),
                     epoch,
                 )
-            except UnavailableError, DeniedError, RecoveryRequiredError:
+            except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)
                 await self._cap(call, 0, epoch)
+                if isinstance(error, ReleaseDeferredError):
+                    self._complete(ticket, uncertain=False)
                 raise
             self._complete(ticket, owner="shared", inhibit=False, uncertain=False, start_pending=False)

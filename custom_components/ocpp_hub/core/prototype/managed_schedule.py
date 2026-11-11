@@ -12,7 +12,7 @@ from .ics_writes import validate_write
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
@@ -267,19 +267,26 @@ class ManagedSchedule:
                 candidates[int(row["local"])] = row["stop"] is not None
         return candidates
 
-    # Retire a missed or superseded timer while still under verified zero, before Return or restart raises the ceiling.
-    async def before_release(self, n: HandoverEvidence) -> None:
-        lease = self.j.get(KEY, {})
-        if lease.get("state") not in OBSERVABLE:
-            return
+    # Re-evaluate the persisted timer and owner intent at the last positive station write, after all awaited reads.
+    def release_needs_cleanup(self, lease: dict[str, Any]) -> bool:
         intent = self.c.requests.intent()
-        if (
-            lease.get("retire_reason")
+        return lease.get("state") in OBSERVABLE and (
+            bool(lease.get("retire_reason"))
             or lease["state"] == "clearing"
             or time.time() >= lease["start_epoch"]
             or intent.revision != lease["revision"]
             or intent.mode == "paused"
-        ):
+        )
+
+    # A withheld positive write can be retried after a verified zero and independent native removal.
+    def check_release(self) -> None:
+        if self.release_needs_cleanup(self.j.get(KEY, {})):
+            raise ReleaseDeferredError("positive release awaits verified native timer removal")
+
+    # Retire a missed or superseded timer while still under verified zero, before Return or restart raises the ceiling.
+    async def before_release(self, n: HandoverEvidence) -> None:
+        lease = self.j.get(KEY, {})
+        if self.release_needs_cleanup(lease):
             if not lease.get("retire_reason"):
                 self.j.put(
                     KEY,
@@ -294,7 +301,7 @@ class ManagedSchedule:
             if self.j.get(KEY)["state"] != "complete":
                 await self.observe(await self.c.native.read(closed=True))
             if self.j.get(KEY)["state"] != "complete":
-                raise RecoveryRequiredError("positive release awaits verified native timer removal")
+                raise ReleaseDeferredError("positive release awaits verified native timer removal")
 
     # The daily plan stays enabled. Only a fresh verified closed session or missed/cancelled timer permits cleanup.
     async def observe(self, n: HandoverEvidence) -> None:

@@ -84,6 +84,7 @@ class SchedulePeer(NativeVehiclePeer):
         "pause",
         "unexpected",
         "replacement",
+        "release-deadline",
         "lost-ack",
         "clear-lost",
         "preempt",
@@ -213,7 +214,7 @@ async def test_temporary_native_schedule(
                 )
             elif outcome == "pause":
                 c.command(uuid.uuid4().hex, "pause", 0)
-            elif outcome != "replacement":
+            elif outcome not in ("replacement", "release-deadline"):
                 logical = target + 601
             if outcome == "other-plan":
                 await healthy(c)
@@ -229,7 +230,7 @@ async def test_temporary_native_schedule(
                     await old(raw)
 
                 s.gateway.charger.sender = lose_clear
-            if outcome != "replacement":
+            if outcome not in ("replacement", "release-deadline"):
                 for _ in range(4):
                     await healthy(c)
                 last = c.schedule.summary()
@@ -247,11 +248,23 @@ async def test_temporary_native_schedule(
         await s.close()
         replacement = managed_session(rig)
         await replacement.start()
-        logical = target + 601
+        logical = target - 2 if outcome == "release-deadline" else target + 601
         c = ManagedController(replacement)
+        wire_offset = len(rig.bench.device_calls)
+        validate = replacement.gateway.charger.validate_send
+        assert validate is not None
+
+        # Move the clock inside the final asynchronous validation of the positive write, after the release claim.
+        async def cross_deadline(action: str, body: dict[str, Any]) -> None:
+            nonlocal logical
+            await validate(action, body)
+            if outcome == "release-deadline" and action == "SetChargingProfile":
+                if body["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0:
+                    logical = target + 1
+
+        replacement.gateway.charger.validate_send = cross_deadline
         async with rig.charger(replacement) as sock:
             await introduced(rig, replacement, sock, "replacement-boot")
-            logical = target + 601
             for _ in range(4):
                 await healthy(c)
             assert c.schedule.summary()["state"] == "complete" and set(rig.bench.firmware.plans) == {9}
@@ -260,3 +273,12 @@ async def test_temporary_native_schedule(
                 f for f in rig.bench.device_calls if f[2] == "DataTransfer" and f[3].get("messageId") == "setPlan"
             ]
             assert len(writes) == 1 and not starts(rig)
+            wire = rig.bench.device_calls[wire_offset:]
+            clear = next(i for i, f in enumerate(wire) if f[2] == "DataTransfer" and f[3]["messageId"] == "clearPlans")
+            positive = next(
+                i
+                for i, f in enumerate(wire)
+                if f[2] == "SetChargingProfile"
+                and f[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
+            )
+            assert clear < positive
