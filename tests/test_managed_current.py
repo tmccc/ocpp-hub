@@ -452,6 +452,7 @@ async def test_offline_local_start_and_stop_then_real_cloud_backfill(
         )
         local = reply[2]["transactionId"]
         assert reply[2]["idTagInfo"]["status"] == "Accepted"
+        test.rig.peer.plan_session = (local, 987654)
         test.rig.peer.paused, test.rig.peer.permission_enabled = False, True
         test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
         test.rig.bench.firmware.fire_plan(9)

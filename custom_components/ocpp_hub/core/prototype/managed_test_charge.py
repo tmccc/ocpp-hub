@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
-from .managed_schedule import KEY, OBSERVABLE
+from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, fingerprint
+from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
@@ -55,6 +55,7 @@ class ManagedChargeTests:
         self.worker: asyncio.Task[None] | None = None
         self.timer: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
+        self.source: tuple[HandoverEvidence, str | None, int] | None = None
         saved = self.state()
         if saved.get("state") in ACTIVE:
             with self.journal.atomic():
@@ -63,6 +64,12 @@ class ManagedChargeTests:
                 controller.session.gateway.controls._claim(True, stopping=True)
                 self.journal.put("managed_test_charge", {**saved, "state": "interrupted", "charging": False})
         controller.session.gateway.start_observer = self.started
+        controller.native.observation_listener = self.record_source
+        controller.native.positive_guard = self.check_positive
+        self.prepare_report_hold = controller.session.gateway.prepare_report_hold
+        self.held_start_report = controller.session.gateway.held_start_report
+        controller.session.gateway.prepare_report_hold = self.prepare_owner_report
+        controller.session.gateway.held_start_report = self.can_record_owner
 
     # Keep one journal owner and the same durable management receipt table as Pause/Return.
     @property
@@ -211,7 +218,7 @@ class ManagedChargeTests:
         ):
             raise DeniedError("managed test Start permission expired or was superseded")
 
-    # The service owns the worker after client disappearance; all failures request a normal durable Pause.
+    # The service owns the worker after client disappearance; failures revoke only this Start's authority.
     async def _start(self, lease: TestLease) -> None:
         c, j = self.controller, self.journal
         effects = False
@@ -319,6 +326,218 @@ class ManagedChargeTests:
         self.changed.set()
         return True
 
+    # Keep verified source evidence on its actual Boot; an ACK never identifies an unrelated native transaction.
+    def record_source(self, native: HandoverEvidence) -> None:
+        g = self.controller.session.gateway
+        self.source = (native, g.boot_observation, g.controls._revision)
+        local, state = self.journal.active(), self.state()
+        if local is not None and self.independent_daily(native, local) and not state.get("independent_seen"):
+            self.journal.put("managed_test_charge", {**state, "independent_seen": True})
+
+    # The verified original plan and matching ledger identify the daily even when the owner uses its tag.
+    def independent_daily(self, native: HandoverEvidence, local: int) -> bool:
+        state, j = self.state(), self.journal
+        if (
+            state.get("kind") != "normal"
+            or not isinstance(state.get("tag_digest"), str)
+            or not native.physical.transaction_open
+            or native.physical.native_transaction_id != local
+            or j.active() != local
+            or native.physical.connection == "Unplug"
+            or native.saved_schedule is None
+            or local_start_receipt(j).get("local") == local
+        ):
+            return False
+        row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
+        if row is None:
+            return False
+        tag = json.loads(row["start"])["idTag"].casefold()
+        timer = j.get(KEY, {})
+        return bool(
+            any(
+                plan["planId"] == native.session_plan_id
+                and isinstance(plan.get("idTag"), str)
+                and plan["idTag"].casefold() == tag
+                and plan.get("kindType") == "Recurring"
+                and plan["planId"] != timer.get("body", {}).get("planId")
+                for plan in native.saved_schedule["planList"]
+            )
+        )
+
+    # Cached evidence authorizes only this same transaction on the same fresh, authenticated introduction.
+    def current_daily(self, local: int) -> bool:
+        c, g = self.controller, self.controller.session.gateway
+        if self.source is None:
+            return False
+        native, boot, revision = self.source
+        return bool(
+            boot is not None
+            and boot == g.boot_observation
+            and revision == g.controls._revision
+            and c.native.last_verified_at == native.physical.observed_at
+            and 0 <= c.native.observation_age() <= 5
+            and self.independent_daily(native, local)
+        )
+
+    # A newer explicit Pause owns unrestricted Stop; an expired normal Start owns only its exact receipt.
+    def scoped_normal_stop(self) -> bool:
+        c, state = self.controller, self.state()
+        return bool(
+            state.get("expired_normal")
+            and state.get("state") != "completed"
+            and self.journal.get("managed_owner_pause", {}).get("revision") != c.requests.intent().revision
+        )
+
+    # Positive writes under expired Start authority need a verified daily or the genuine owner's closed lifecycle.
+    def check_positive(self, native: HandoverEvidence) -> None:
+        if not self.scoped_normal_stop():
+            return
+        j, c = self.journal, self.controller
+        owner = local_start_receipt(j)
+        local = j.active()
+        if c.requests.intent().mode == "app" and local is not None:
+            if self.independent_daily(native, local):
+                return
+            raise ReleaseDeferredError("expired Start cannot release an unidentified or owner transaction")
+        if j.get("control", {}).get("start_pending") or native.physical.transaction_open:
+            raise ReleaseDeferredError("expired Start awaits its real owner lifecycle")
+        if (
+            owner.get("local") is not None
+            and not j.db.execute(
+                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner["local"],)
+            ).fetchone()
+        ):
+            raise ReleaseDeferredError("expired Start awaits actual owner closure")
+
+    # Zero authority does not borrow Stop authority from whichever daily transaction happens to be open.
+    async def hold_expired(self) -> None:
+        c, j = self.controller, self.journal
+        g, expected = c.session.gateway, c.requests.intent()
+        epoch, identifier = g._charger_epoch, self.state().get("id")
+
+        # Restrictive writes remain bound to this request, current intent, commissioned device and actual Boot.
+        def guard() -> None:
+            if (
+                c.stopping
+                or self.state().get("id") != identifier
+                or not self.scoped_normal_stop()
+                or c.requests.intent() != expected
+                or g._charger_epoch != epoch
+                or not g.current_boot_seen(epoch)
+                or fingerprint(j.get("boot")) != c.native.spec.boot_digest
+                or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
+            ):
+                raise RecoveryRequiredError("expired Start zero authority was superseded")
+
+        guard()
+        if not j.get("control", {}).get("inhibit"):
+            g.controls._claim(True, stopping=True)
+        ticket = j.get("control", {}).get("ticket")
+        await g.controls.ensure_ceiling(guard=guard)
+        guard()
+        # Confirm only the station zero. The separate Start receipt and real lifecycle remain outstanding.
+        g.controls._complete(ticket, uncertain=False)
+
+    # Admit the genuine delayed owner report only after zero, even while unrelated daily authority remains enabled.
+    async def prepare_owner_report(self, payload: dict[str, Any]) -> None:
+        tag = payload.get("idTag")
+        if (
+            self.scoped_normal_stop()
+            and self.controller.requests.intent().mode == "app"
+            and isinstance(tag, str)
+            and self.controller.schedule.matches_pending_start(tag)
+            and self.journal.active() is None
+        ):
+            await self.hold_expired()
+        if self.prepare_report_hold is not None:
+            await self.prepare_report_hold(payload)
+
+    # The held listener consumes only the pending owner receipt and cannot authorize a new Start or guess an ID.
+    def can_record_owner(self, tag: str) -> bool:
+        c, g = self.controller, self.controller.session.gateway
+        return bool(
+            self.scoped_normal_stop()
+            and c.requests.intent().mode == "app"
+            and c.schedule.matches_pending_start(tag)
+            and self.journal.active() is None
+            and not c.stopping
+            and not self.journal.get("managed_control_fault")
+            and g.controls.ready
+            and g.controls.desired() == 0
+            and c.schedule.hold_authorized()
+            or self.held_start_report is not None
+            and self.held_start_report(tag)
+        )
+
+    # Reconcile expired authority independently of the short lease and retain the original Start reporting debt.
+    async def reconcile_expired(self) -> bool:
+        if not self.scoped_normal_stop():
+            return False
+        c, j, state = self.controller, self.journal, self.state()
+        g, expected = c.session.gateway, c.requests.intent()
+        try:
+            active = j.active()
+            if expected.mode == "paused" or active is not None and not self.current_daily(active):
+                await self.hold_expired()
+            native = await c.native.read()
+            local, owner = j.active(), local_start_receipt(j)
+            if expected.mode == "app" and local is not None and self.independent_daily(native, local):
+                if g.controls.ready and g.controls.desired() == state["current_a"]:
+                    return False
+                await self.hold_expired()
+                # Reuse the ordinary guarded release; this raises the ceiling and never sends RemoteStart.
+                await c.restore_owner_control(expected, continuing_local=local)
+                return False
+            owner_closed = (
+                not j.get("control", {}).get("start_pending")
+                and local is None
+                and not native.physical.transaction_open
+                and (
+                    owner.get("stage") in ("unsent", "rejected")
+                    or owner.get("local") is not None
+                    and j.db.execute(
+                        "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner["local"],)
+                    ).fetchone()
+                )
+            )
+            if owner_closed:
+                if expected.mode == "app" and (not g.controls.ready or g.controls.desired() == 0):
+                    await c.restore_owner_control(expected)
+                j.put("managed_test_charge", {**self.state(), "state": "completed", "charging": False})
+                return False
+            if (
+                expected.mode == "app"
+                and local is None
+                and not native.physical.transaction_open
+                and g.controls.ready
+                and g.controls.desired() == state["current_a"]
+            ):
+                return False  # A preserved daily may close before the separate owner command reports.
+            await self.hold_expired()
+            c.native.require_known_session(native)
+            if local is not None and owner.get("local") == local and owner.get("digest") == state.get("tag_digest"):
+                epoch, boot = g._charger_epoch, g.boot_observation
+
+                # Recheck receipt, lifecycle and intent after every awaited native or profile verification.
+                def guard() -> None:
+                    if (
+                        c.requests.intent() != expected
+                        or not self.scoped_normal_stop()
+                        or g._charger_epoch != epoch
+                        or g.boot_observation != boot
+                        or local_start_receipt(j).get("local") != local
+                        or j.active() not in (None, local)
+                    ):
+                        raise RecoveryRequiredError("expired owner Stop was superseded")
+
+                await g.controls.stop(expected_local=local, guard=guard)
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+            try:
+                await self.hold_expired()
+            except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+                pass  # Keep the debt and retry zero; no unknown transaction receives a guessed Stop.
+        return True
+
     # Polling waits for the short native/start sequence; its independent Stop timer continues to run meanwhile.
     async def settle(self) -> None:
         if self.worker is not None and not self.worker.done():
@@ -341,6 +560,22 @@ class ManagedChargeTests:
                 self.journal.put("managed_test_charge", {**state, "charging": native.physical.power_w > 10})
             return
         if lease is None:
+            owner = local_start_receipt(self.journal)
+            if (
+                state.get("expired_normal")
+                and state.get("state") != "completed"
+                and not native.physical.transaction_open
+                and self.journal.active() is None
+                and not self.journal.get("control", {}).get("start_pending")
+                and (
+                    owner.get("stage") in ("unsent", "rejected")
+                    or self.journal.db.execute(
+                        "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner.get("local"),)
+                    ).fetchone()
+                )
+            ):
+                # An explicit Pause can finish this expired debt too, without reviving it on the next Return.
+                self.journal.put("managed_test_charge", {**state, "state": "completed", "charging": False})
             return
         if state.get("state") == "stopping":
             if (
@@ -431,7 +666,7 @@ class ManagedChargeTests:
             )
             self.changed.set()
 
-    # Stopping records a normal higher-revision Pause before its physical effects; it never automatically returns.
+    # Normal expiry retains separate reporting debt; only an explicit Pause can Stop an independent daily.
     def stop(self, lease: TestLease, reason: str) -> None:
         if self.lease is not lease or self.state().get("state") == "stopping":
             return
@@ -440,7 +675,13 @@ class ManagedChargeTests:
             return
         with j.atomic():
             intent = c.requests.intent()
-            if intent.mode != "paused":
+            preserve = (
+                lease.normal
+                and intent.mode == "app"
+                and intent.revision == lease.revision
+                and self.state().get("independent_seen") is True
+            )
+            if intent.mode != "paused" and not preserve:
                 j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 c.session.gateway.controls._claim(True, stopping=True)
                 j.db.execute(
@@ -448,8 +689,18 @@ class ManagedChargeTests:
                     "AND state IN ('accepted','running')",
                     (json.dumps({"classification": "superseded_by_test_stop"}),),
                 )
-            j.put("managed_test_charge", {**self.state(), "state": "stopping", "stop_reason": reason})
+            j.put(
+                "managed_test_charge",
+                {
+                    **self.state(),
+                    "state": "expired" if preserve else "stopping",
+                    "stop_reason": reason,
+                    "expired_normal": lease.normal,
+                },
+            )
             c.requests.finish(lease.identifier, "uncertain", {"classification": reason})
+        if lease.normal:
+            self.lease = None
         if c.pause_task is None or c.pause_task.done():
             c.pause_task = asyncio.create_task(c._stop_requested())
         self.changed.set()

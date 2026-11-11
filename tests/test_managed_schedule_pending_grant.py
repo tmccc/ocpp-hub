@@ -314,6 +314,9 @@ async def test_ack_after_owner_pause(tmp_path, tls, unused_tcp_port, monkeypatch
             actual = await b.rig.bench.call(b.sock, "paused-owner", "StartTransaction", body)
             assert actual[0] == 3 and b.device.effective_limit() == 0
             local = actual[2]["transactionId"]
+            assert j.get("control")["start_pending"]
+            b.rig.peer.plan_session = (local, 987655)
+            await b.c.native.read()
             assert j.get("local_start_receipt")["local"] == local and not j.get("control")["start_pending"]
             if not close_between_ticks:
                 for _ in range(3):
@@ -337,9 +340,23 @@ async def test_ack_after_owner_pause(tmp_path, tls, unused_tcp_port, monkeypatch
 async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypatch, ambiguous):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         j = b.session.journal
+
+        # The actual owner uses the same tag as the daily timer; its independently numbered source distinguishes it.
+        async def report_owner():
+            body = START | {
+                "idTag": starts(b.rig)[-1][3]["idTag"],
+                "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+            }
+            reply = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+            assert reply[0] == 3
+            owner = reply[2]["transactionId"]
+            b.rig.peer.plan_session = (owner, 987655)
+            await b.c.native.read()
+            return owner
+
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.tests.settle()
-        local = await b.start_plan(9)
+        local = await report_owner()
         await healthy(b.c)
         b.clock.now += 20
         await b.close_transaction(local)
@@ -366,7 +383,7 @@ async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypat
             b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
             await b.c.tests.settle()
             b.clock.now += 20
-            later = await b.start_plan(9)
+            later = await report_owner()
             assert later != local and j.get("local_start_receipt")["local"] == later
             await b.close_transaction(later)
             await healthy(b.c)
@@ -428,6 +445,9 @@ async def test_late_or_rejected_local_start(tmp_path, tls, unused_tcp_port, monk
             if outcome == "late":
                 assert result[0] == 3 and j.get("local_start_receipt")["stage"] == "issued"
                 local = result[2]["transactionId"]
+                assert j.get("control")["start_pending"]
+                b.rig.peer.plan_session = (local, 987659)
+                await b.c.native.read()
                 assert j.get("local_start_receipt")["local"] == local
                 for _ in range(3):
                     await b.c.tick()
@@ -485,3 +505,61 @@ async def test_replacement_after_prepared_local_start(tmp_path, tls, unused_tcp_
             assert (await healthy(b.c))["station_ceiling_a"] == 6 and not starts(b.rig)
             daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
             assert daily is not None and (await healthy(b.c))["power_w"] > 0
+
+
+# Intent: finish the original Return after a timed-out owner command eventually starts and closes.
+# Why: native and protocol closure can arrive in either order while the requested Return is waiting.
+@pytest.mark.parametrize("first", ["native", "ledger"])
+async def test_return_after_automatic_start_timeout_waits_for_real_owner_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, first
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+        await b.c.tests.settle()
+        b.c.tests.lease.deadline = asyncio.get_running_loop().time() - 1
+        b.c.tests.changed.set()
+        async with asyncio.timeout(3):
+            while b.c.requests.intent().mode != "paused":
+                await asyncio.sleep(0.01)
+        await b.c.pause_task
+        returning = uuid.uuid4().hex
+        b.c.command(returning, "app_control", b.c.requests.intent().revision)
+        await b.c.tick()
+        assert b.c.requests.receipt(returning)["state"] == "accepted"
+        b.clock.now += 60
+        actual = await b.rig.bench.call(
+            b.sock,
+            "late-owner-without-explicit-pause",
+            "StartTransaction",
+            START
+            | {
+                "idTag": starts(b.rig)[0][3]["idTag"],
+                "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+            },
+        )
+        assert actual[0] == 3
+        owner = actual[2]["transactionId"]
+        b.rig.peer.plan_session = (owner, 987654)
+        for _ in range(3):
+            await b.c.tick()
+        assert owner in b.stops()
+        during = b.c.requests.receipt(returning)
+        if first == "native":
+            b.device.active = None
+        else:
+            await b.close_transaction(owner)
+            b.device.active = owner
+        await b.c.tick()
+        assert b.device.effective_limit() == 0 and b.c.requests.intent().mode == "paused"
+        if first == "native":
+            await b.close_transaction(owner)
+        else:
+            b.device.active = None
+        assert during["state"] == "accepted"
+        for _ in range(6):
+            await b.c.tick()
+        assert b.c.requests.receipt(returning)["state"] == "completed"
+        assert b.c.requests.intent().mode == "app" and b.device.effective_limit() == 6
+        following = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert following not in (None, owner) and (await healthy(b.c))["current_a"] == 6
+        assert set(b.stops()) == {owner}

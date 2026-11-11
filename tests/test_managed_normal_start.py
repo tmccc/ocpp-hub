@@ -6,6 +6,7 @@ import asyncio
 import copy
 import ssl
 import uuid
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,9 @@ from tests.test_native_bounded_recovery import crash
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
+
+# A distinct command tag identifies even an owner lifecycle that closes entirely between native observations.
+owner_rig = partial(ready, owner_tag="APP_OWNER")
 
 
 # A known real transaction may wait at zero watts while the vehicle decides whether to accept its six-ampere offer.
@@ -57,7 +61,7 @@ async def test_regular_start_continues_until_explicit_pause(
     monkeypatch: pytest.MonkeyPatch,
     initial: str,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
         controller = test.controller
         if initial == "paused":
             controller.command(uuid.uuid4().hex, "pause", 0)
@@ -94,7 +98,7 @@ async def test_regular_start_confirms_known_zero_power_session_without_invented_
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
@@ -117,7 +121,7 @@ async def test_no_session_startup_timeout_holds_zero_without_guessed_stop(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.4) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.4) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
@@ -140,7 +144,7 @@ async def test_regular_start_duplicate_and_stale_revision_do_not_repeat_rpc(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
         accepted = test.controller.command(identifier, "start", 0)
         assert test.controller.command(identifier, "start", 0) == accepted
@@ -169,7 +173,7 @@ async def test_newer_pause_preempts_regular_start(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         await healthy(test.controller)
         revision = test.controller.requests.intent().revision
@@ -233,7 +237,7 @@ async def test_natural_session_stop_keeps_app_control_without_forced_pause(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         test.controller.command(uuid.uuid4().hex, "start", 0)
         await test.controller.tests.settle()
         local = await positive_flow(test)
@@ -258,7 +262,7 @@ async def test_between_poll_app_session_is_not_attributed_to_completed_local_sta
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         test.controller.command(uuid.uuid4().hex, "start", 0)
         await test.controller.tests.settle()
         previous = await positive_flow(test)
@@ -305,7 +309,7 @@ async def test_complete_local_lifecycle_before_first_poll_retires_startup_withou
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
@@ -332,7 +336,7 @@ async def test_complete_local_lifecycle_before_first_poll_retires_startup_withou
 
 # Intent: a complete local lifecycle followed by a legitimate app or same-tag timer session never rebinds the old Start.
 # Why: source changes and tag reuse between polls cannot make an expired local request own or stop a later session.
-@pytest.mark.parametrize("source", ["cloud", "same-tag-timer"])
+@pytest.mark.parametrize("source", ["cloud", "native-timer"])
 async def test_complete_lifecycle_then_external_start_before_first_poll_keeps_new_session(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
@@ -340,7 +344,7 @@ async def test_complete_lifecycle_then_external_start_before_first_poll_keeps_ne
     monkeypatch: pytest.MonkeyPatch,
     source: str,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
@@ -399,7 +403,7 @@ async def test_closed_lifecycle_retired_by_timer_without_any_poll_or_pause(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.8) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.8) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
@@ -428,7 +432,7 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
@@ -467,7 +471,7 @@ async def test_normal_start_reserves_future_explicit_pause_capacity(
     monkeypatch: pytest.MonkeyPatch,
     count: int,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         journal = test.session.journal
         with journal.atomic():
             journal.db.executemany(
@@ -501,7 +505,7 @@ async def test_normal_start_api_rejects_arbitrary_parameters_without_effects(
     monkeypatch: pytest.MonkeyPatch,
     extra: dict[str, Any],
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as test:
         port = unused_tcp_port_factory()
         published = {**await healthy(test.controller), "running": True, "certificate_remaining_seconds": 86400}
         api = ManagementServer(
@@ -531,7 +535,7 @@ async def test_return_requires_verified_paused_mode(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         before = copy.deepcopy(test.rig.bench.device_calls)
         with pytest.raises(RecoveryRequiredError):
             test.controller.command(uuid.uuid4().hex, "app_control", 0)

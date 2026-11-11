@@ -11,6 +11,7 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .ics import is_safe_transaction_query
+from .managed_occurrences import occurrences
 from .policy import DeniedError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
@@ -347,12 +348,12 @@ class ResourceBook:
         if self.journal.get("trial_inventory_fault"):
             raise SecurityError("native inventory reconciliation is still required")
         temporary: set[str] = set()
-        lease = self.journal.get("managed_temporary_schedule", {})
-        if lease.get("state") in ("installing", "armed", "clearing"):
-            expected = lease["body"]
-            key = "plan:" + str(expected["planId"])
-            if key in current and current[key].digest == fingerprint(expected) and key not in originals:
-                temporary.add(key)
+        for lease in occurrences(self.journal).values():
+            if lease.get("state") in ("installing", "armed", "clearing"):
+                expected = lease["body"]
+                key = "plan:" + str(expected["planId"])
+                if key in current and current[key].digest == fingerprint(expected) and key not in originals:
+                    temporary.add(key)
         if set(current) - originals - {row["key"] for row in rows} - temporary:
             self._inventory_failure("unexpected_resources")
         result = []

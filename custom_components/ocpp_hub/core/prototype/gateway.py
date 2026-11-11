@@ -70,10 +70,10 @@ def timestamp(value: Any) -> datetime:
 
 @dataclass(frozen=True)
 class NativeStartReport:
-    """A verified physical occurrence and its receipt to commit with the ordinary local transaction."""
+    """A held lifecycle report, with an optional verified native source, committed with the actual transaction."""
 
     native_id: int | None
-    plan_id: int
+    plan_id: int | None
     attempt: tuple[str, int] | None
     record: Callable[[int], None] = field(compare=False)
 
@@ -98,6 +98,7 @@ class Gateway:
         self.native_start_report: Callable[[dict[str, Any]], Awaitable[NativeStartReport | None]] | None = None
         self.remote_start_guard: Callable[[], bool] | None = None
         self.tag_guard: Callable[[str], bool] | None = None
+        self.defer_command_binding: Callable[[int, str], bool] | None = None
         self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
@@ -411,8 +412,8 @@ class Gateway:
             def accepted(local: int) -> None:
                 if native_report is not None:
                     native_report.record(local)
-                self.authorisation.consume(payload["idTag"], local)
-                if native_report is None:
+                elif self.defer_command_binding is None or not self.defer_command_binding(local, payload["idTag"]):
+                    self.authorisation.consume(payload["idTag"], local)
                     self.controls.bind_start(payload["idTag"], local)
                 if self.start_observer is not None:
                     self.start_observer(local, payload)

@@ -50,11 +50,16 @@ async def ready(
     *,
     duration: float = 0.15,
     startup: float = 3,
+    owner_tag: str | None = None,
 ) -> AsyncIterator[ChargeRig]:
     monkeypatch.setattr(charge_tests, "DURATION", duration)
     monkeypatch.setattr(charge_tests, "STARTUP_BUDGET", startup)
     async with managed_bench(directory, contexts, port, monkeypatch) as rig:
         session = managed_session(rig)
+        if owner_tag is not None:
+            gateway = session.gateway
+            gateway.policy = replace(gateway.policy, allowed_tags=frozenset({owner_tag, *gateway.policy.allowed_tags}))
+            gateway.controls.policy = gateway.policy
         await session.start()
         controller = ManagedController(session)
         rig.route_to_trial()
@@ -81,10 +86,16 @@ async def owner_start(test: ChargeRig) -> None:
 
 # Send a real charger lifecycle and let the independent native peer report genuine bounded power.
 async def positive_flow(test: ChargeRig, source: str = "local") -> int:
-    tag = "NATIVE_TIMER" if source == "local" else "CLOUD_OWNER"
+    if source == "daily":
+        tag = "NATIVE_TIMER"
+    elif source == "local":
+        tag = starts(test.rig)[-1][3]["idTag"]
+    else:
+        tag = "CLOUD_OWNER"
     answer = await test.rig.bench.call(test.charger, "actual-test-start", "StartTransaction", START | {"idTag": tag})
     assert answer[2]["idTagInfo"]["status"] == "Accepted"
     local = answer[2]["transactionId"]
+    test.rig.peer.plan_session = (local, 9 if source == "daily" else 987654)
     await until(
         lambda: test.session.journal.vendor_id(local) is not None and test.session.journal.next_delivery() is None
     )
@@ -412,7 +423,7 @@ async def test_unrelated_timer_flow_cannot_prove_cloud_start(
             test.charger, "independent-timer-authorize", "Authorize", {"idTag": "NATIVE_TIMER"}
         )
         assert authorize[2]["idTagInfo"]["status"] == "Accepted"
-        local = await positive_flow(test)
+        local = await positive_flow(test, "daily")
         assert (await healthy(test.controller))["power_w"] == 1440
         assert test.controller.tests.state()["state"] == "armed"
         assert not test.controller.tests.state().get("start_source_verified")

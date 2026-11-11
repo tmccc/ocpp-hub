@@ -23,11 +23,19 @@ from tests.test_prototype_tls import tls as tls
 # Intent: HA Pause closes an otherwise open, full scheduled session; Return restores ordinary app/schedule operation.
 # Why: a simulated management receipt cannot show that the real client waits for measured closure or original readback.
 @pytest.mark.parametrize(
-    ("delayed_owner", "early"), [(None, False), ("CLOUD_OWNER", False), ("APP_OWNER", False), ("APP_OWNER", True)]
+    ("delayed_owner", "early"),
+    [
+        (None, False),
+        ("CLOUD_OWNER", False),
+        ("APP_OWNER", False),
+        ("APP_OWNER", True),
+        ("NATIVE_TIMER", False),
+        ("NATIVE_TIMER", True),
+    ],
 )
 async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory, monkeypatch, delayed_owner, early):
     async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
-        if delayed_owner == "APP_OWNER":
+        if delayed_owner in ("APP_OWNER", "NATIVE_TIMER"):
             gateway = b.session.gateway
             gateway.policy = replace(
                 gateway.policy, allowed_tags=frozenset({delayed_owner, *gateway.policy.allowed_tags})
@@ -37,7 +45,9 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             await b.c.tests.settle()
             assert starts(b.rig)[0][3]["idTag"] == delayed_owner
             unrelated = await b.start_plan(9, demand=False)
+            await healthy(b.c)
             await b.close_transaction(unrelated)
+            b.clock.now += 60
             published = await b.c.tick()
         else:
             await b.arm()

@@ -8,16 +8,23 @@ from typing import Any
 
 from ..control import HUB_PROFILE_ID
 from .local_control import local_start_receipt
-from .managed_current import ManagedCurrentLimits, managed_current_ceiling
+from .managed_current import (
+    ManagedCurrentLimits,
+    managed_current_ceiling,
+    require_current_session,
+    require_current_source,
+)
 from .managed_intent import ControlIntent, ManagedRequests
 from .managed_schedule import (
     KEY,
-    OBSERVABLE,
     ManagedSchedule,
     current_source,
     recorded_station_profile,
     require_continuing_session,
+    supervised_timer,
+    temporary_continuation,
 )
+from .managed_start_binding import ManagedStartBinding
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .native_http import NativeTransportUnavailableError
@@ -55,6 +62,11 @@ class ManagedController:
         self.schedule = ManagedSchedule(self)
         self.current = ManagedCurrentLimits(self)
         self.tests = ManagedChargeTests(self)
+        self.native.continuation_guard = self.require_continuation
+        self.native.recovery_zero_only = self.tests.scoped_normal_stop
+        binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest)
+        session.gateway.defer_command_binding = binding.defer
+        self.native.command_source_observer = binding.observe
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
@@ -80,7 +92,10 @@ class ManagedController:
 
         # This claim shares the intent transaction, so no accepted Pause can leave old shared authority committed.
         def claim() -> None:
-            self.session.gateway.controls._claim(True, stopping=True)
+            _, ticket = self.session.gateway.controls._claim(True, stopping=True)
+            self.session.journal.put(
+                "managed_owner_pause", {"ticket": ticket, "revision": self.requests.intent().revision}
+            )
 
         receipt = self.requests.accept(identifier, action, revision, claim)
         if action == "pause":
@@ -120,6 +135,9 @@ class ManagedController:
 
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
+        if self.tests.scoped_normal_stop():
+            await self.tests.reconcile_expired()
+            return
         await self.ensure_pause_zero()
         try:
             native = await self.native.read()
@@ -131,7 +149,7 @@ class ManagedController:
                 controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
                 return
             await self.session.gateway.stop()
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
@@ -191,15 +209,20 @@ class ManagedController:
         control = j.get("control", {})
         receipt = local_start_receipt(j)
         if control.get("uncertain") and (
-            receipt.get("stage") == "unsent"
+            j.get("managed_owner_pause")
+            == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
+            or receipt.get("stage") == "unsent"
             and receipt.get("settled_ticket") == control.get("ticket")
             or receipt.get("bound_ticket") == control.get("ticket")
             and j.db.execute(
                 "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (receipt.get("local"),)
             ).fetchone()
         ):
-            # Verified physical Pause reconciles this ticket's proven unsent Start or its real lifecycle closure.
+            # This ticket's explicit Pause is now verified, including any previous lifecycle obligation.
             g.controls._complete(control["ticket"], uncertain=False)
+        pause_revision = self.requests.intent().revision
+        if receipt.get("pause_revision") == pause_revision and receipt.get("verified_pause_revision") != pause_revision:
+            j.put("local_start_receipt", {**receipt, "verified_pause_revision": pause_revision})
         self.requests.confirm_pauses()
         return native
 
@@ -256,6 +279,14 @@ class ManagedController:
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
             return  # Attention remains latched; an unconfirmed safety cap is never reported as measured zero.
 
+    # Require the actual source under whichever operation is currently holding this particular open transaction.
+    def require_continuation(self, native: HandoverEvidence, local: int) -> None:
+        j = self.session.journal
+        if j.get("managed_current_change", {}).get("state") == "recovering":
+            require_current_session(self.session.gateway, native, local)
+        elif not (self.tests.scoped_normal_stop() and self.tests.independent_daily(native, local)):
+            require_continuing_session(j, native, local)
+
     # The present owned zero, live introduction and actual reconciled events are prerequisites to any release.
     def require_zero(
         self, native: HandoverEvidence, *, allow_offline: bool = False, continuing_local: int | None = None
@@ -263,7 +294,7 @@ class ManagedController:
         s, g, j = self.session, self.session.gateway, self.session.journal
         self.native.require(native, closed=continuing_local is None)
         if continuing_local is not None:
-            require_continuing_session(j, native, continuing_local)
+            self.require_continuation(native, continuing_local)
             if any(v != 0 for v in native.currents_a + native.powers_w):
                 raise RecoveryRequiredError("the identified original session awaits a verified zero hold")
         self.native.require_known_session(native)
@@ -309,13 +340,24 @@ class ManagedController:
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> None:
             timer = j.get(KEY, {})
-            if continuing_local is not None and (
-                not current_source(g, timer)
-                or self.schedule.needs_source(timer)
-                or j.active() != continuing_local
-                or timer.get("unidentified_local") != continuing_local
-                or timer.get("other_local") != continuing_local
-                or timer.get("unreported_native")
+            current_recovery = j.get("managed_current_change", {}).get("state") == "recovering"
+            if current_recovery:
+                require_current_source(g, continuing_local)
+            if (
+                continuing_local is not None
+                and not current_recovery
+                and not (self.tests.scoped_normal_stop() and self.tests.current_daily(continuing_local))
+                and (
+                    not current_source(g, timer)
+                    or self.schedule.needs_source(timer)
+                    or j.active() != continuing_local
+                    or timer.get("unidentified_local") != continuing_local
+                    or (
+                        timer.get("other_local") != continuing_local
+                        and not temporary_continuation(j, timer, continuing_local)
+                    )
+                    or timer.get("unreported_native")
+                )
             ):
                 raise ReleaseDeferredError("source-specific continuation was superseded")
             if self.stopping or self.requests.intent() != expected_intent:
@@ -383,6 +425,19 @@ class ManagedController:
             self.session.book.before_positive_release = None
         self.released_epoch = epoch
         j.put("managed_owner_epoch", epoch)
+        if continuing_local is not None:
+            self.schedule.clear_idle_cutoff("verified_session")
+        elif expected_intent.mode == "paused" and self.schedule.owner_returning():
+            self.schedule.clear_idle_cutoff("owner_return")
+        timer = j.get(KEY, {})
+        if (
+            timer.get("state") == "requested"
+            and timer.get("idle_cutoff_replacement")
+            and timer["revision"] == expected_intent.revision
+            and timer["epoch"] == epoch
+        ):
+            # This newly authorized one-off was accepted under zero; bind its installation to this verified release.
+            j.put(KEY, {**timer, "ticket": j.get("control", {}).get("ticket"), "idle_cutoff_replacement": False})
 
     # One accepted return receives one guarded attempt; uncertainty never changes persisted paused intent to app.
     async def return_requested(self, identifier: str, revision: int) -> None:
@@ -392,13 +447,25 @@ class ManagedController:
             return
         j = self.session.journal
         control = j.get("control", {})
-        if control.get("start_pending") or (
-            local_start_receipt(j).get("pause_revision") == expected.revision
+        receipt = local_start_receipt(j)
+        if (
+            control.get("start_pending")
+            or receipt.get("pause_revision") == expected.revision
+            and receipt.get("local") is not None
+            and (
+                j.active() == receipt.get("local")
+                or j.db.execute(
+                    "SELECT 1 FROM transactions WHERE local=? AND stop IS NULL", (receipt.get("local"),)
+                ).fetchone()
+            )
+            or receipt.get("pause_revision") == expected.revision
+            and receipt.get("verified_pause_revision") != expected.revision
+            or j.get("managed_owner_pause") == {"ticket": control.get("ticket"), "revision": expected.revision}
             and j.db.execute(
                 "SELECT 1 FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') LIMIT 1"
             ).fetchone()
         ):
-            return  # The existing Pause must verify the delayed local lifecycle before this Return can run.
+            return  # The same Return survives the real Start and both closure reports under its Pause.
         j.db.execute("UPDATE managed_requests SET state='running' WHERE id=? AND state='accepted'", (identifier,))
         try:
             await self.restore_owner_control(expected)
@@ -431,7 +498,7 @@ class ManagedController:
                 and native.physical.native_transaction_id != self.session.journal.active()
             ):
                 lease = self.session.journal.get(KEY, {})
-                if lease.get("state") in OBSERVABLE and lease.get("unreported_native"):
+                if supervised_timer(lease) and lease.get("unreported_native"):
                     await self.schedule.protect_station(lease)
                     raise RecoveryRequiredError("timer holds zero awaiting the genuine transaction or native closure")
                 raise SecurityError("managed native transaction has no exact accepted local counterpart")
@@ -490,17 +557,19 @@ class ManagedController:
         if j.get("managed_control_fault"):
             await self.hold_fault()
             return {**base, "state": "attention", "fault": j.get("managed_control_fault")["classification"]}
-        timer = j.get(KEY, {})
-        pending_timer = timer.get("state") in OBSERVABLE
+        timer = self.schedule.arm_idle_cutoff()
+        pending_timer = supervised_timer(timer)
         cutoff_hold = pending_timer and "hold_since" in timer
         if not base["charger_connected"] or not base["boot_verified"]:
             return {**base, "state": "starting", "owner_control_enabled": False}
         if self.requests.intent().mode == "paused" and (self.pause_task is None or self.pause_task.done()):
             await self.ensure_pause_zero()
+        current_hold = j.get("managed_current_change", {}).get("state") == "recovering"
         if (
             not g.controls.ready
             and self.released_epoch != g._charger_epoch
             and not cutoff_hold
+            and not current_hold
             and not (pending_timer and j.active() is not None)
         ):
             if pending_timer:
@@ -510,8 +579,12 @@ class ManagedController:
                     pass
             return {**base, "state": "starting", "owner_control_enabled": False}
         verified_pause = False
+        verified_idle_hold = False
         try:
             self.prepare_offline_pause()
+            await self.current.recover_overlap()
+            if await self.tests.reconcile_expired() and self.requests.intent().mode == "app":
+                return {**base, "state": "reconciling", "owner_control_enabled": False}
             if pending_timer:
                 await self.schedule.protect_deadline(timer)
                 cutoff_hold = "hold_since" in j.get(KEY, {})
@@ -535,11 +608,26 @@ class ManagedController:
                         self.require_paused(native)
                         await self.schedule.before_release(native)
                     return {**base, "state": "waiting_for_cloud", "owner_control_enabled": False}
-                if self.released_epoch != g._charger_epoch:
+                if j.get(KEY, {}).get("idle_cutoff_hold"):
+                    if j.get("trial_phase") == "recovering":
+                        await self.native.resume()
+                elif self.released_epoch != g._charger_epoch:
                     await self.restore_owner_control()
             native = await self.settled_native()
             await self.schedule.observe(native)
-            if self.requests.intent().mode == "app" and self.released_epoch != g._charger_epoch:
+            if j.get(KEY, {}).get("idle_cutoff_hold"):
+                self.require_paused(native, timer_cleanup=True)
+                timer = j.get(KEY, {})
+                verified_idle_hold = timer.get("state") == "complete" or (
+                    timer.get("state") == "armed"
+                    and timer.get("idle_cutoff_replacement") is True
+                    and not self.schedule.revoked(timer)
+                )
+            if (
+                self.requests.intent().mode == "app"
+                and self.released_epoch != g._charger_epoch
+                and not verified_idle_hold
+            ):
                 raise RecoveryRequiredError("timer retirement awaits fresh app-control restoration")
             if self.requests.intent().mode == "paused":
                 self.require_paused(native)
@@ -564,9 +652,7 @@ class ManagedController:
             self.failures += 1
             if self.failures >= 3:
                 lease = j.get(KEY, {})
-                if lease.get("state") in OBSERVABLE and isinstance(
-                    error, (NativeTransportUnavailableError, StaleEvidenceError)
-                ):
+                if supervised_timer(lease) and isinstance(error, (NativeTransportUnavailableError, StaleEvidenceError)):
                     # Telemetry can fail before the deadline. Hold at zero while waiting for a fresh read.
                     if not lease.get("retire_reason"):
                         lease = {**lease, "retire_reason": "native_observation_unavailable"}
@@ -595,15 +681,24 @@ class ManagedController:
         control = j.get("control", {})
         shared = control.get("owner") == "shared" and not control.get("inhibit") and not control.get("uncertain")
         paused = self.requests.intent().mode == "paused"
-        if not (shared or verified_pause) or s.runtime.status.delivery_blocked or j.get("uncertain_vendor_command"):
+        if (
+            not (shared or verified_pause or verified_idle_hold)
+            or s.runtime.status.delivery_blocked
+            or j.get("uncertain_vendor_command")
+        ):
             if not self.stopping:
                 self.fault("owner_control_or_delivery_uncertain")
         shared = shared and not j.get("managed_control_fault") and not self.stopping
         verified_pause = verified_pause and not j.get("managed_control_fault") and not self.stopping
+        verified_idle_hold = verified_idle_hold and not j.get("managed_control_fault") and not self.stopping
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )
-        local_healthy = (shared or verified_pause) and j.get("trial_phase") == "active" and not control.get("uncertain")
+        local_healthy = (
+            (shared or verified_pause or verified_idle_hold)
+            and j.get("trial_phase") == "active"
+            and not control.get("uncertain")
+        )
         healthy = local_healthy and cloud
         if healthy and not paused:
             pending_return = self.requests.pending_return()
@@ -627,7 +722,7 @@ class ManagedController:
             "owner_control_enabled": shared,
             "desired_control": self.requests.intent().mode,
             "control_revision": self.requests.intent().revision,
-            "local_hold_verified": verified_pause,
+            "local_hold_verified": verified_pause or verified_idle_hold,
             "native_observed_at": native.physical.observed_at,
             "native_limit_a": native.runtime_user_a,
             "requested_current_a": self.current.selected(),

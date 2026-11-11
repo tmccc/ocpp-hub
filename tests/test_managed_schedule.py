@@ -55,7 +55,6 @@ class SchedulePeer(NativeVehiclePeer):
         wire.update(connectorId=wire.pop("ConnectorId"), limitCurrent=wire["limitCurrent"] / 10)
         del wire["maxEnergy"]
         bench.firmware.plans[9] = wire
-        self.plan_session: tuple[int, int | float] | None = None
 
     # Simulate the complete native envelope and its independent representation, including fields never sent on OCPP.
     def native(self, key: str) -> Any:
@@ -72,8 +71,6 @@ class SchedulePeer(NativeVehiclePeer):
                 )
                 plans.append(plan)
             return {"planList": plans, "defaultEco": {"mode": "Fast"}}
-        if key == "SESSION" and self.plan_session is not None and self.bench.firmware.active == self.plan_session[0]:
-            value["saveData"]["sessionList"][0]["_setPlanId"] = self.plan_session[1]
         return value
 
 
@@ -226,11 +223,14 @@ async def test_temporary_native_schedule(
                     rig.peer.permission_enabled = True
                     rig.bench.cp, rig.bench.connection = "C", "Charging"
                     rig.bench.firmware.fire_plan(timer)
-                status = await healthy(c)
-                assert bool(status["temporary_schedule"].get("native_plan_confirmed")) == (
-                    outcome in ("full", "charge")
-                )
-                assert (status["power_w"] > 0) == (outcome == "charge")
+                if outcome == "untyped-plan":
+                    for _ in range(3):
+                        status = await c.tick()
+                    assert rig.bench.firmware.effective_limit() == 0 and status["state"] == "reconciling"
+                else:
+                    status = await healthy(c)
+                assert bool(c.schedule.summary().get("native_plan_confirmed")) == (outcome in ("full", "charge"))
+                assert (rig.bench.firmware.current > 0) == (outcome == "charge")
                 assert timer in rig.bench.firmware.plans
                 rig.peer.permission_enabled = False
                 rig.bench.cp, rig.bench.connection = "B", "Plug"
@@ -256,7 +256,11 @@ async def test_temporary_native_schedule(
             elif outcome not in ("replacement", "release-deadline", "offline-replacement"):
                 logical = target + 601
             if outcome in ("other-plan", "untyped-plan"):
-                await healthy(c)
+                if outcome == "untyped-plan":
+                    await c.tick()
+                    assert rig.bench.firmware.effective_limit() == 0
+                else:
+                    await healthy(c)
                 assert c.schedule.summary()["state"] == "armed" and timer in rig.bench.firmware.plans
                 logical = target + 601
             if outcome == "clear-lost":

@@ -651,6 +651,10 @@ async def test_previous_release_open_timer(
         old["install"]["data"] = json.dumps(native_plan)
         native = await b.rig.prepared.observer.observe_handover()
         old["augmented_digest"] = native.saved_schedule_digest
+        # A genuine older journal predates the immutable occurrence archive as well as the deadline fields.
+        j.db.execute(
+            "DELETE FROM meta WHERE key IN ('managed_temporary_occurrences','managed_temporary_schedule_head')"
+        )
         j.put(managed_schedule.KEY, old)
         b.clock.now = b.start
         local = await b.fire(b.timer)
@@ -747,7 +751,7 @@ async def test_retired_timer_cannot_supply_power(
         b.clock.now += 61
         b.device.answer = answer
         await healthy(b.c)
-        assert b.device.effective_limit() == 6 and set(b.device.plans) == {9}
+        assert b.device.effective_limit() == (0 if why == "05:59" else 6) and set(b.device.plans) == {9}
 
 
 # Intent: full at zero is still open; Pause waits for the native sensor and OCPP ledger to agree in either order.
@@ -950,7 +954,8 @@ async def test_cutoff_reintroduction_recovers_on_same_socket(tmp_path, tls, unus
 # Why: the actual Stop can precede the meter and native SESSION by several ticks or even a process replacement.
 @pytest.mark.parametrize("first", ["native", "ledger"])
 @pytest.mark.parametrize("restart", [False, True])
-@pytest.mark.parametrize(("unplugged", "demand"), [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("unplugged", [False, True])
+@pytest.mark.parametrize("demand", [False, True])
 async def test_deadline_closure_gap(
     tmp_path: Path,
     tls: Any,
@@ -1491,7 +1496,8 @@ async def test_previously_accepted_start_before_timer_retirement(
         )
         assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
         local = reply[2]["transactionId"]
-        b.rig.peer.plan_session = (local, 9)
+        # The native peer identifies the owner command independently of its shared tag.
+        b.rig.peer.plan_session = (local, 987654)
         await healthy(b.c)
         assert not b.stops() and b.session.journal.active() == local
         await b.close_transaction(local)
@@ -1701,7 +1707,11 @@ async def test_unplugged_closing_original_or_unidentified(tmp_path, tls, unused_
         local = await b.start_plan(9)
         if source == "unknown":
             b.rig.peer.plan_session = (local, 987654)
-        await healthy(b.c)
+            for _ in range(3):
+                await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops()
+        else:
+            await healthy(b.c)
         b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
         await b.c.tick()
         assert b.device.effective_limit() == (0 if source == "unknown" else 6) and not b.stops()
@@ -2651,7 +2661,12 @@ async def test_source_read_completion_order(
         b.clock.now = b.start
         local = await b.start_plan(9, demand=demand)
         b.rig.peer.plan_session = (local, newest_plan)
-        await healthy(b.c)
+        if newest_plan == 9:
+            await healthy(b.c)
+        else:
+            for _ in range(3):
+                await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops()
         j = b.session.journal
         assert j.get(managed_schedule.KEY).get("other_local") == (local if newest_plan == 9 else None)
         observer = b.session.prepared.observer
@@ -2949,3 +2964,87 @@ async def test_replace_during_current_overlap(tmp_path, tls, unused_tcp_port, mo
             assert set(b.device.plans) == {9}
             daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
             assert daily != local and (await healthy(b.c))["current_a"] == 16 and not b.stops()
+
+
+# Intent: an idle Pause recovers its exact ticket if telemetry fails after the charger has applied 0 A.
+# Why: Return may be queued during the interruption, and neither a receipt nor zero draw alone proves a safe release.
+@pytest.mark.parametrize("armed", [False, True])
+@pytest.mark.parametrize("early_return", [False, True])
+async def test_owner_pause_recovers_interrupted_zero_verification(
+    tmp_path, tls, unused_tcp_port, monkeypatch, armed, early_return
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        if armed:
+            await b.arm()
+        read = b.c.native.observe
+
+        # Interrupt the initial independent check after the station has applied the owner's physical hold.
+        async def unavailable():
+            raise TimeoutError("initial Pause observation interrupted")
+
+        monkeypatch.setattr(b.c.native, "observe", unavailable)
+        pause = uuid.uuid4().hex
+        b.c.command(pause, "pause", b.c.requests.intent().revision)
+        await b.c.pause_task
+        assert b.c.requests.receipt(pause)["state"] == "accepted" and b.device.effective_limit() == 0
+        returning = uuid.uuid4().hex
+        if early_return:
+            b.c.command(returning, "app_control", b.c.requests.intent().revision)
+            await b.c.tick()
+            assert b.c.requests.receipt(returning)["state"] == "accepted" and b.device.effective_limit() == 0
+        monkeypatch.setattr(b.c.native, "observe", read)
+        if not early_return:
+            assert (await healthy(b.c))["local_hold_verified"]
+            b.c.command(returning, "app_control", b.c.requests.intent().revision)
+        for _ in range(6):
+            await b.c.tick()
+        assert b.c.requests.receipt(pause)["state"] == b.c.requests.receipt(returning)["state"] == "completed"
+        assert b.device.effective_limit() == 6 and set(b.device.plans) == {9} and not b.stops()
+        following = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert following is not None and (await healthy(b.c))["power_w"] > 0
+        await b.close_transaction(following)
+
+
+# Intent: a temporary transaction may draw its authorized current after its two source reports agree in either order.
+# Why: a provisional zero while the station waits for its number must not retire the timer before its local deadline.
+@pytest.mark.parametrize("demand", [False, True])
+@pytest.mark.parametrize("native_first", [False, True])
+@pytest.mark.parametrize("start_lag", [0, 300])
+async def test_temporary_native_start_order_before_cutoff(
+    tmp_path, tls, unused_tcp_port, monkeypatch, demand, native_first, start_lag
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start + start_lag
+        if native_first:
+            b.device.active = 987654
+            b.device.fire_plan(b.timer)
+            b.rig.peer.plan_session = (987654, b.timer)
+            b.rig.peer.paused = False
+            b.rig.peer.permission_enabled = demand
+            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
+            if not demand:
+                b.device.requested_current = 0
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops()
+            body = START | {
+                "idTag": b.device.plans[b.timer]["idTag"],
+                "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+            }
+            result = await b.rig.bench.call(b.sock, "delayed-pre-cutoff-temporary", "StartTransaction", body)
+            assert result[0] == 3
+            local = result[2]["transactionId"]
+            b.rig.peer.plan_session = (local, b.timer)
+        else:
+            local = await b.start_plan(b.timer, demand=demand)
+        for _ in range(3):
+            await b.c.tick()
+        assert not b.stops() and b.device.effective_limit() == 6 and b.device.current == (6 if demand else 0)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        assert b.device.effective_limit() == 0 and b.stops() == [local]
+        await b.close_transaction(local)
+        await healthy(b.c)
+        assert set(b.device.plans) == {9}
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily != local and (await healthy(b.c))["power_w"] > 0

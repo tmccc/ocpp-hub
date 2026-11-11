@@ -73,6 +73,7 @@ class NativeVehiclePeer:
         self.phase_fault = False
         self.permission_enabled = False
         self.resource_on_restore: str | None = None
+        self.plan_session: tuple[int, int | float] | None = None
 
     # Produce the known device-native representation from the fake firmware's own stored profiles and real effects.
     def native(self, key: str) -> Any:
@@ -106,6 +107,8 @@ class NativeVehiclePeer:
             "TRANSACTIONS": bench.history,
             "STATE": [{"currLimit": {"USER": self.runtime_user, "HWCFG": self.hardware}}],
         }
+        if key == "SESSION" and self.plan_session is not None and bench.firmware.active == self.plan_session[0]:
+            values["SESSION"]["saveData"]["sessionList"][0]["_setPlanId"] = self.plan_session[1]
         return copy.deepcopy(values[key])
 
     # Generate a live test witness with a new nonce; its format is synthetic and is not a SEAT API.

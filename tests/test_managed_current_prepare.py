@@ -262,7 +262,7 @@ async def test_active_session_blocks_preparation_until_real_stop_is_observed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
-        local = await positive_flow(test)
+        local = await positive_flow(test, "daily")
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         await until(lambda: test.rig.bench.remote_stop.is_set())
         writes: list[dict[str, str]] = []

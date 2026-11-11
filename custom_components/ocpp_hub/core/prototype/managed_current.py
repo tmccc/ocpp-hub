@@ -8,7 +8,8 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
-from .managed_schedule import KEY, OBSERVABLE
+from .gateway import NativeStartReport
+from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -17,6 +18,7 @@ from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerp
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
+    from .gateway import Gateway
     from .managed import ManagedController
 
 
@@ -46,10 +48,65 @@ def managed_current_ceiling(journal: Journal, spec: NativeBoundedSpec) -> int:
     return 32
 
 
+# Publish only validated native evidence; a later read must revoke an earlier independent-session identification.
+def record_current_source(j: Journal, n: HandoverEvidence, boot: str | None) -> None:
+    change = j.get("managed_current_change", {})
+    if change.get("state") not in ("pending", "recovering"):
+        return
+    local = n.physical.native_transaction_id
+    plan = next((p for p in (n.saved_schedule or {}).get("planList", []) if p["planId"] == n.session_plan_id), None)
+    row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
+    original = j.get("native_bounded_handover", {}).get("spec", {}).get("saved_schedule_digest")
+    independent = bool(
+        n.physical.transaction_open
+        and local == j.active()
+        and n.physical.connection != "Unplug"
+        and plan is not None
+        and n.saved_schedule_digest == original
+        and row is not None
+        and json.loads(row["start"])["idTag"].casefold() == plan["idTag"].casefold()
+    )
+    j.put(
+        "managed_current_change",
+        {
+            **change,
+            "observed_open": change.get("observed_open", False) or n.physical.transaction_open,
+            "native_open": n.physical.transaction_open,
+            "source_boot": boot,
+            "continuing_local": local if independent else None,
+        },
+    )
+
+
+# Current recovery has no Stop authority and can continue only its freshly identified independent original session.
+def require_current_source(g: Gateway, local: int | None) -> None:
+    j = g.journal
+    change = j.get("managed_current_change", {})
+    intent = j.get("managed_control_intent", {})
+    if (
+        change.get("state") != "recovering"
+        or intent != {"mode": "app", "revision": change.get("recovery_revision")}
+        or g.boot_observation is None
+        or change.get("source_boot") != g.boot_observation
+        or change.get("continuing_local") != local
+        or local is None
+        and change.get("native_open") is not False
+        or j.active() != local
+    ):
+        raise ReleaseDeferredError("current recovery awaits the independent original session on this Boot")
+
+
+# Every recovery read must still describe the same open original transaction before its positive ceiling is sent.
+def require_current_session(g: Gateway, n: HandoverEvidence, local: int) -> None:
+    require_current_source(g, local)
+    if not n.physical.transaction_open or n.physical.native_transaction_id != local:
+        raise ReleaseDeferredError("current recovery awaits matching native and OCPP lifecycle evidence")
+
+
 class ManagedCurrentLimits:
     """A current request persists its generation before a guarded profile write; Pause always takes precedence."""
 
-    # Interrupted updates recover paused and cannot resume a partially applied positive operation.
+    # Interrupted app updates retain their previous selection; no partially applied increase becomes permission.
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
@@ -59,7 +116,17 @@ class ManagedCurrentLimits:
         change = self.journal.get("managed_current_change", {})
         if change.get("state") == "pending":
             timer = self.journal.get(KEY, {})
-            if controller.requests.intent().mode == "app" and timer.get("state") in OBSERVABLE:
+            if (
+                change.get("mode") == "app"
+                and controller.requests.intent().mode == "paused"
+                and (self.journal.active() is not None or change.get("observed_open"))
+            ):
+                # A durable explicit Pause already owns its ticket; the interrupted increase cannot replace it.
+                with self.journal.atomic():
+                    self.journal.put("control", {**self.journal.get("control"), "resume_limit": change["previous_a"]})
+                    self.journal.put("managed_current_change", {**change, "state": "cancelled"})
+                return
+            if controller.requests.intent().mode == "app":
                 previous = change.get("previous_a")
                 if previous is None:
                     # Earlier pending receipts stored the target only. Recover the most recent completed selection.
@@ -68,7 +135,12 @@ class ManagedCurrentLimits:
                         "WHERE r.state='completed' ORDER BY r.rowid DESC LIMIT 1"
                     ).fetchone()
                     previous = row["current_a"] if row else 6
-                self.cancel_under_timer(change["id"], change["current_a"], integer(previous, 6, 32), "process_replaced")
+                if timer.get("state") in OBSERVABLE:
+                    self.cancel_under_timer(
+                        change["id"], change["current_a"], integer(previous, 6, 32), "process_replaced"
+                    )
+                else:
+                    self.cancel_overlap(change["id"], integer(previous, 6, 32), "process_replaced")
                 return
             with self.journal.atomic():
                 intent = controller.requests.intent()
@@ -98,7 +170,7 @@ class ManagedCurrentLimits:
 
     # A pending update blocks Start, Return and another update until its physical outcome has been established.
     def pending(self) -> bool:
-        return bool(self.journal.get("managed_current_change", {}).get("state") == "pending")
+        return bool(self.journal.get("managed_current_change", {}).get("state") in ("pending", "recovering"))
 
     # The first version changes current only while closed and idle; an open car session cannot be silently resumed.
     def available(self, native: HandoverEvidence | None, *, for_schedule: bool = False) -> bool:
@@ -129,6 +201,12 @@ class ManagedCurrentLimits:
                 c.requests.intent().mode == "app"
                 and j.get("control", {}).get("owner") == "shared"
                 and not j.get("control", {}).get("inhibit")
+                or for_schedule
+                and c.requests.intent().mode == "app"
+                and timer.get("idle_cutoff_hold") is True
+                and g.controls.desired() == 0
+                and j.get("control", {}).get("owner") == "local"
+                and j.get("control", {}).get("inhibit") is True
                 or c.requests.intent().mode == "paused"
                 and j.get("control", {}).get("owner") == "local"
                 and j.get("control", {}).get("inhibit") is True
@@ -173,7 +251,14 @@ class ManagedCurrentLimits:
                 j.put(KEY, {**timer, "control_revision": revision + 1})
             j.put(
                 "managed_current_change",
-                {"id": identifier, "current_a": value, "previous_a": previous_value, "state": "pending"},
+                {
+                    "id": identifier,
+                    "current_a": value,
+                    "previous_a": previous_value,
+                    "mode": intent.mode,
+                    "floor": j.get("next_transaction"),
+                    "state": "pending",
+                },
             )
             j.db.execute("INSERT INTO managed_current_requests VALUES(?,?)", (identifier, value))
             j.db.execute(
@@ -248,6 +333,7 @@ class ManagedCurrentLimits:
             timer = j.get(KEY, {})
             active = j.active()
             retired = c.schedule.revoked(timer)
+            overlap = active is not None or j.get("managed_current_change", {}).get("observed_open")
             if not superseded and mode == "app" and timer.get("state") in OBSERVABLE:
                 reason = "current_unconfirmed"
                 if retired:
@@ -257,19 +343,143 @@ class ManagedCurrentLimits:
                 self.cancel_under_timer(identifier, value, previous_value, reason)
                 await c.schedule.protect_station(j.get(KEY))
                 return
+            if not superseded and mode == "app" and overlap:
+                self.cancel_overlap(identifier, previous_value, "session_opened")
+                try:
+                    await self.protect_overlap()
+                except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
+                    pass  # Durable operation recovery retries zero; a lost acknowledgement never grants Stop.
+                return
             with j.atomic():
                 if not superseded:
                     j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                     g.controls._claim(True, stopping=True)
                 control = j.get("control", {})
                 if control.get("inhibit") is True:
-                    j.put("control", {**control, "resume_limit": value})
+                    j.put(
+                        "control", {**control, "resume_limit": previous_value if mode == "app" and overlap else value}
+                    )
                 j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "uncertain"})
                 c.requests.finish(
                     identifier, "failed" if superseded else "uncertain", {"classification": "current_unconfirmed"}
                 )
             if c.pause_task is None or c.pause_task.done():
                 c.pause_task = asyncio.create_task(c._stop_requested())
+
+    # Persist the failed operation's zero hold without manufacturing durable owner Pause intent or Stop authority.
+    def cancel_overlap(self, identifier: str, previous: int, reason: str) -> None:
+        c, j = self.controller, self.journal
+        with j.atomic():
+            change = j.get("managed_current_change")
+            j.put(
+                "managed_current_change",
+                {
+                    **change,
+                    "state": "recovering",
+                    "previous_a": previous,
+                    "recovery_revision": c.requests.intent().revision,
+                    "recovery_reason": reason,
+                },
+            )
+            j.put("control", {**j.get("control", {}), "resume_limit": previous})
+            c.session.gateway.controls._claim(True, stopping=True)
+            c.released_epoch = None
+            c.requests.finish(identifier, "failed", {"classification": reason})
+
+    # Apply only the already owned station zero, including before native source identification or reintroduction.
+    async def protect_overlap(self) -> None:
+        c, j = self.controller, self.journal
+        g = c.session.gateway
+        change = j.get("managed_current_change", {})
+        epoch = g._charger_epoch
+
+        # A newer owner Pause or another Boot revokes this operation's restrictive ticket too.
+        def guard() -> None:
+            if (
+                c.stopping
+                or change.get("state") != "recovering"
+                or j.get("managed_current_change", {}).get("id") != change["id"]
+                or c.requests.intent().mode != "app"
+                or c.requests.intent().revision != change["recovery_revision"]
+                or g._charger_epoch != epoch
+                or not g.current_boot_seen(epoch)
+                or fingerprint(j.get("boot")) != c.native.spec.boot_digest
+                or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
+                or g.controls.desired() != 0
+            ):
+                raise RecoveryRequiredError("current recovery zero was superseded")
+
+        guard()
+        await g.controls.ensure_ceiling(guard=guard)
+        guard()
+        if j.get("trial_phase") == "active":
+            g.controls._complete(j.get("control")["ticket"], uncertain=False)
+
+    # Reconcile the failed selection under zero, then restore only the previous verified current without any Start.
+    async def recover_overlap(self) -> None:
+        c, j = self.controller, self.journal
+        change = j.get("managed_current_change", {})
+        if change.get("state") != "recovering":
+            return
+        if c.requests.intent().mode != "app" or c.requests.intent().revision != change["recovery_revision"]:
+            j.put("managed_current_change", {**change, "state": "cancelled"})
+            return
+        await self.protect_overlap()
+        native = await c.native.read()
+        c.native.require_known_session(native)
+        if change.get("recovery_reason") == "process_replaced" and not j.get("managed_current_change")["observed_open"]:
+            # Preserve the existing fail-closed policy when replacement confirms there was no overlapping session.
+            with j.atomic():
+                intent = c.requests.intent()
+                j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                c.session.gateway.controls._claim(True, stopping=True)
+                j.put("control", {**j.get("control"), "resume_limit": change["current_a"]})
+                j.put("managed_current_change", {**j.get("managed_current_change"), "state": "interrupted"})
+            return
+        local = j.active()
+        if local is not None:
+            require_current_session(c.session.gateway, native, local)
+        await c.restore_owner_control(continuing_local=local)
+        j.put("managed_current_change", {**j.get("managed_current_change"), "state": "cancelled"})
+
+    # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
+    async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
+        c, j = self.controller, self.journal
+        change = j.get("managed_current_change", {})
+        g = c.session.gateway
+        if (
+            change.get("state") != "recovering"
+            or c.requests.intent().mode != "app"
+            or c.requests.intent().revision != change["recovery_revision"]
+            or j.active() is not None
+            or not g.controls.ready
+            or g.controls.desired() != 0
+        ):
+            return None
+        native = await c.native.read()
+        local = native.physical.native_transaction_id
+        plan = next(
+            (p for p in (native.saved_schedule or {}).get("planList", []) if p["planId"] == native.session_plan_id),
+            None,
+        )
+        if (
+            not native.physical.transaction_open
+            or native.physical.connection == "Unplug"
+            or native.saved_schedule_digest != c.native.spec.saved_schedule_digest
+            or plan is None
+            or plan["idTag"].casefold() != str(payload.get("idTag")).casefold()
+            or local is None
+            or local <= change.get("floor", 0)
+            or j.db.execute("SELECT 1 FROM transactions WHERE local=?", (local,)).fetchone()
+            or any(v != 0 for v in native.currents_a + native.powers_w)
+        ):
+            return None
+
+        # The ordinary gateway commits the supplied Start; only a later read may identify its local transaction.
+        def accepted(local: int) -> None:
+            j.put("managed_current_change", {**j.get("managed_current_change"), "reported_local": local})
+
+        return NativeStartReport(local, plan["planId"], None, accepted)
 
     # Restrict an interrupted selection without giving it owner Pause authority over a concurrent transaction.
     def cancel_under_timer(self, identifier: str, value: int, previous: int, reason: str) -> None:
