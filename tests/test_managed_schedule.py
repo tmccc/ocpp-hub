@@ -63,6 +63,9 @@ class SchedulePeer(NativeVehiclePeer):
                     )
                     plans.append(plan)
             return {"planList": plans, "defaultEco": {"mode": "Fast"}}
+        if key == "SESSION" and getattr(self, "other_plan", False):
+            value["saveData"]["sessionList"][0]["_setPlanId"] = 9
+            return value
         if key == "SESSION" and self.bench.firmware.active is not None:
             value["saveData"]["sessionList"][0]["_setPlanId"] = next(
                 (i for i in self.bench.firmware.plans if i != 9), 0
@@ -73,7 +76,20 @@ class SchedulePeer(NativeVehiclePeer):
 # Intent: prove add/readback, actual scheduled Start/Stop, missed starts, superseding Pause, and selective cleanup.
 # Why: a timed RemoteStart or an ACK without independent complete native readback cannot establish a native schedule.
 @pytest.mark.parametrize(
-    "outcome", ["charge", "full", "missed", "pause", "unexpected", "replacement", "lost-ack", "clear-lost", "preempt"]
+    "outcome",
+    [
+        "charge",
+        "full",
+        "missed",
+        "pause",
+        "unexpected",
+        "replacement",
+        "lost-ack",
+        "clear-lost",
+        "preempt",
+        "other-plan",
+        "disappeared",
+    ],
 )
 async def test_temporary_native_schedule(
     tmp_path: Path, tls: Any, unused_tcp_port_factory: Any, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -149,7 +165,13 @@ async def test_temporary_native_schedule(
                 with pytest.raises(SecurityError):
                     await c.native.read()
                 return
-            if outcome in ("charge", "full"):
+            if outcome == "disappeared":
+                del rig.bench.firmware.plans[timer]
+                await healthy(c)
+                assert c.schedule.summary()["result"] == "disappeared_before_start"
+                return
+            if outcome in ("charge", "full", "other-plan"):
+                rig.peer.other_plan = outcome == "other-plan"
                 logical = target
                 start = START | {"idTag": "NATIVE_TIMER", "timestamp": datetime.fromtimestamp(logical, UTC).isoformat()}
                 answer = await rig.bench.call(sock, "actual-timer", "StartTransaction", start)
@@ -160,7 +182,7 @@ async def test_temporary_native_schedule(
                     rig.bench.cp, rig.bench.connection = "C", "Charging"
                     rig.bench.firmware.fire_plan(timer)
                 status = await healthy(c)
-                assert status["temporary_schedule"]["native_plan_confirmed"]
+                assert bool(status["temporary_schedule"].get("native_plan_confirmed")) == (outcome != "other-plan")
                 assert (status["power_w"] > 0) == (outcome == "charge")
                 assert timer in rig.bench.firmware.plans
                 rig.peer.permission_enabled = False
@@ -180,8 +202,12 @@ async def test_temporary_native_schedule(
                 c.command(uuid.uuid4().hex, "pause", 0)
             elif outcome != "replacement":
                 logical = target + 601
+            if outcome == "other-plan":
+                await healthy(c)
+                assert c.schedule.summary()["state"] == "armed" and timer in rig.bench.firmware.plans
+                logical = target + 601
             if outcome == "clear-lost":
-
+                # The device removes the named plan and loses only its confirmation.
                 async def lose_clear(raw: str) -> None:
                     f = json.loads(raw)
                     if f[0] == 2 and f[2] == "DataTransfer" and f[3]["messageId"] == "clearPlans":
@@ -199,6 +225,7 @@ async def test_temporary_native_schedule(
                     "pause": "owner_superseded",
                     "charge": "session_closed",
                     "full": "session_closed",
+                    "other-plan": "session_source_unverified",
                 }.get(outcome, "no_scheduled_session")
                 assert (
                     await rig.prepared.observer.observe_handover()
@@ -207,6 +234,7 @@ async def test_temporary_native_schedule(
         await s.close()
         replacement = managed_session(rig)
         await replacement.start()
+        logical = target + 601
         c = ManagedController(replacement)
         async with rig.charger(replacement) as sock:
             await introduced(rig, replacement, sock, "replacement-boot")
@@ -214,6 +242,7 @@ async def test_temporary_native_schedule(
             for _ in range(4):
                 await healthy(c)
             assert c.schedule.summary()["state"] == "complete" and set(rig.bench.firmware.plans) == {9}
+            assert c.schedule.summary()["result"] == "missed_while_held"
             writes = [
                 f for f in rig.bench.device_calls if f[2] == "DataTransfer" and f[3].get("messageId") == "setPlan"
             ]

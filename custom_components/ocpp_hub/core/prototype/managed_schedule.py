@@ -6,7 +6,7 @@ import json
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .ics_writes import validate_write
 from .policy import DeniedError, integer
@@ -59,6 +59,7 @@ class ManagedSchedule:
                 "result",
                 "verified_at",
                 "session_seen",
+                "timer_present",
                 "native_plan_confirmed",
                 "last_response",
             )
@@ -85,13 +86,16 @@ class ManagedSchedule:
             or n.saved_schedule is None
         ):
             raise RecoveryRequiredError("temporary schedule needs fresh idle app control")
-        zone = ZoneInfo(n.configuration["timeZone"])
+        try:
+            zone = ZoneInfo(n.configuration["timeZone"])
+        except KeyError, TypeError, ValueError, ZoneInfoNotFoundError:
+            raise SecurityError("a configured charger time zone is required") from None
         start = datetime.fromtimestamp(start_epoch, zone)
         if (
             start_epoch % 60
             or not 30 <= start_epoch - now <= 24 * 3600
             or start.date() != datetime.fromtimestamp(now, zone).date()
-            or start.fold
+            or start.replace(fold=0).utcoffset() != start.replace(fold=1).utcoffset()
         ):
             raise SecurityError("temporary timer requires a future whole minute on the current local date")
         plans = n.saved_schedule["planList"]
@@ -112,7 +116,9 @@ class ManagedSchedule:
         duration = integer(original["stopValue"], 1, 1440)
         amp = integer(original["limitCurrent"], 60, 320)
         amp = min(amp, c.current.selected() * 10)
-        plan_id = 10000 + int(identifier[:8], 16) % 55000
+        # Use a higher free 16-bit ID, as in the captured two-plan native ordering.
+        lower = max(10000, integer(original["planId"], 1, 65534) + 1)
+        plan_id = lower + int(identifier[:8], 16) % (65536 - lower)
         if (
             any(r.kind == "plan" and r.identifier == plan_id for r in n.physical.resources)
             or j.db.execute("SELECT 1 FROM plans WHERE local=? OR vendor=?", (plan_id, plan_id)).fetchone()
@@ -185,6 +191,7 @@ class ManagedSchedule:
             else {"vendorId": "IoCharger", "messageId": "clearPlans", "data": encoded([lease["body"]["planId"]])}
         )
 
+        # Check again inside the write gate after waiting for the independent native reads.
         def check() -> None:
             current = j.get(KEY, {})
             if (
@@ -214,6 +221,7 @@ class ManagedSchedule:
             ):
                 raise UnavailableError("scheduled start authority changed")
 
+        # Persist this exact send before the protocol can deliver it to the charger.
         def mark() -> None:
             j.put(KEY, {**lease, "state": "installing" if adding else "clearing", "sent_at": time.time()})
             c.session.book.temporary_plan_write = payload
@@ -233,8 +241,9 @@ class ManagedSchedule:
         ):
             j.put(KEY, {**current, "last_response": result})
 
-    # Find genuine lifecycle evidence newer than installation, with the schedule tag and a plausible device timestamp.
-    def session(self, lease: dict[str, Any]) -> tuple[int | None, bool]:
+    # Filter new ledger facts by timestamp and tag; only an independent active native plan ID can prove provenance.
+    def sessions(self, lease: dict[str, Any]) -> dict[int, bool]:
+        candidates = {}
         for row in self.j.db.execute(
             "SELECT local,start,stop FROM transactions WHERE local>? ORDER BY local", (lease["floor"],)
         ):
@@ -244,8 +253,37 @@ class ManagedSchedule:
                 start["idTag"].casefold() == lease["body"]["idTag"].casefold()
                 and lease["start_epoch"] - 5 <= when <= lease["start_epoch"] + 600
             ):
-                return int(row["local"]), row["stop"] is not None
-        return None, False
+                candidates[int(row["local"])] = row["stop"] is not None
+        return candidates
+
+    # Retire a missed or superseded timer while still under verified zero, before Return or restart raises the ceiling.
+    async def before_release(self, n: HandoverEvidence) -> None:
+        lease = self.j.get(KEY, {})
+        if lease.get("state") not in OBSERVABLE:
+            return
+        intent = self.c.requests.intent()
+        if (
+            lease.get("retire_reason")
+            or lease["state"] == "clearing"
+            or time.time() >= lease["start_epoch"]
+            or intent.revision != lease["revision"]
+            or intent.mode == "paused"
+        ):
+            if not lease.get("retire_reason"):
+                self.j.put(
+                    KEY,
+                    {
+                        **lease,
+                        "retire_reason": "missed_while_held"
+                        if time.time() >= lease["start_epoch"]
+                        else "owner_superseded",
+                    },
+                )
+            await self.observe(n)
+            if self.j.get(KEY)["state"] != "complete":
+                await self.observe(await self.c.native.read(closed=True))
+            if self.j.get(KEY)["state"] != "complete":
+                raise RecoveryRequiredError("positive release awaits verified native timer removal")
 
     # The daily plan stays enabled. Only a fresh verified closed session or missed/cancelled timer permits cleanup.
     async def observe(self, n: HandoverEvidence) -> None:
@@ -267,30 +305,54 @@ class ManagedSchedule:
             else:
                 await self.send(lease, True)
             return
-        seen, closed = self.session(lease)
+        candidates = self.sessions(lease)
+        actual_id = n.physical.native_transaction_id
+        changes: dict[str, Any] = {}
         if present and state == "installing":
-            lease = {**lease, "state": "armed", "verified_at": now}
-            j.put(KEY, lease)
+            changes.update(state="armed", verified_at=now)
         if (
-            seen is not None
-            and seen == n.physical.native_transaction_id
+            lease.get("bound_local") is None
+            and actual_id in candidates
+            and n.physical.transaction_open
             and n.session_plan_id == lease["body"]["planId"]
-            and not lease.get("native_plan_confirmed")
         ):
-            lease = {**lease, "native_plan_confirmed": True}
+            changes.update(native_plan_confirmed=True, bound_local=actual_id)
+        if candidates and not lease.get("session_seen"):
+            changes["session_seen"] = True
+        if lease.get("timer_present") is not present:
+            changes["timer_present"] = present
+        if changes:
+            lease = {**lease, **changes}
             j.put(KEY, lease)
-        if seen and not lease.get("session_seen"):
-            lease = {**lease, "session_seen": True}
-            j.put(KEY, lease)
+        closed = candidates.get(lease.get("bound_local")) is True
         idle = not n.physical.transaction_open and j.active() is None and all(v == 0 for v in n.currents_a + n.powers_w)
         cancelled = c.requests.intent().mode == "paused" or c.requests.intent().revision != lease["revision"]
-        reason = "session_closed" if closed else "owner_superseded" if cancelled else "no_scheduled_session"
-        should_remove = closed or cancelled or state == "clearing" or now >= lease["start_epoch"] + 600
+        reason = lease.get("retire_reason")
+        if closed:
+            reason = "session_closed"
+        elif not reason and cancelled:
+            reason = "owner_superseded"
+        elif not reason and state == "armed" and not present and now < lease["start_epoch"] - 5:
+            reason = "disappeared_before_start"
+        elif not reason and now >= lease["start_epoch"] + 600:
+            reason = "session_source_unverified" if any(candidates.values()) else "no_scheduled_session"
+        should_remove = bool(reason)
         if not idle or not should_remove:
             return
         if not present:
+            # A timed-out install can still arrive late. Retain its ownership through the start grace period.
+            if state == "installing" and lease.get("last_response") != "accepted":
+                if now < lease["start_epoch"] + 600:
+                    return
+                if not lease.get("absence_verified_at"):
+                    j.put(KEY, {**lease, "absence_verified_at": now})
+                    return
+                if now - lease["absence_verified_at"] < 2:
+                    return
             if n.saved_schedule_digest != lease["original_digest"]:
                 raise SecurityError("original native timer is not confirmed")
-            self.finish(lease, reason)
+            self.finish(lease, str(reason))
         elif state != "clearing" or now - lease["sent_at"] >= 30:
+            lease = {**lease, "retire_reason": reason}
+            j.put(KEY, lease)
             await self.send(lease, False)

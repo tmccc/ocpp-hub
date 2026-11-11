@@ -248,6 +248,10 @@ class ManagedController:
         ticket = j.get("control", {}).get("ticket")
         native = await self.native.read(closed=True)
         self.require_zero(native)
+        if j.get("managed_temporary_schedule", {}).get("state") in ("installing", "armed", "clearing"):
+            await self.schedule.before_release(native)
+            native = await self.native.read(closed=True)
+            self.require_zero(native)
         if (
             self.stopping
             or epoch != g._charger_epoch
