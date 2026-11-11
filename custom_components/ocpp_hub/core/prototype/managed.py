@@ -134,6 +134,8 @@ class ManagedController:
                 await self.native.resume(local_only=True)
             elif not j.next_delivery():
                 await self.native.resume()
+        if j.get("managed_temporary_schedule", {}).get("state") in ("installing", "armed", "clearing"):
+            await self.schedule.before_release(native)
         self.requests.confirm_pauses()
         return native
 

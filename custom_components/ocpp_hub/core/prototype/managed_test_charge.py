@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .managed_schedule import KEY, OBSERVABLE
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError
@@ -79,6 +80,7 @@ class ManagedChargeTests:
         return bool(
             not c.stopping
             and (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused")
+            and not (c.requests.intent().mode == "paused" and j.get(KEY, {}).get("state") in OBSERVABLE)
             and not j.get("managed_control_fault")
             and j.get("trial_phase") == "active"
             and g.controls.ready

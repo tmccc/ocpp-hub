@@ -223,6 +223,7 @@ def handover_evidence(config: Any, values: dict[str, Any], observed_at: float) -
         history = values["TRANSACTIONS"]
         if physical.history is None or not isinstance(history, list):
             raise ValueError
+        plan_id = values["SESSION"]["saveData"]["sessionList"][0].get("_setPlanId")
         return HandoverEvidence(
             physical,
             fingerprint(config["bPSN"]),
@@ -237,7 +238,7 @@ def handover_evidence(config: Any, values: dict[str, Any], observed_at: float) -
             number(values["CONNECTOR"][0].get("offerCur", 0), 320) / 10,
             fingerprint(values["SETPLAN"]),
             values["SETPLAN"],
-            values["SESSION"]["saveData"]["sessionList"][0].get("_setPlanId"),
+            plan_id if type(plan_id) is int else None,
         )
     except KeyError, TypeError, ValueError, IndexError:
         raise SecurityError("complete connected-handover native evidence is required") from None

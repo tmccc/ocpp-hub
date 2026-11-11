@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import replace
@@ -9,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from ocpp_hub_core.prototype import managed_schedule
@@ -16,13 +18,14 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
 
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import NativeVehiclePeer
 from tests.test_managed_api import TOKEN, call
 from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype import START
+from tests.test_prototype import BOOT, START
 from tests.test_prototype_tls import tls as tls
 
 ORIGINAL_PLAN = {
@@ -67,8 +70,9 @@ class SchedulePeer(NativeVehiclePeer):
             value["saveData"]["sessionList"][0]["_setPlanId"] = 9
             return value
         if key == "SESSION" and self.bench.firmware.active is not None:
-            value["saveData"]["sessionList"][0]["_setPlanId"] = next(
-                (i for i in self.bench.firmware.plans if i != 9), 0
+            plan_id = next((i for i in self.bench.firmware.plans if i != 9), 0)
+            value["saveData"]["sessionList"][0]["_setPlanId"] = (
+                float(plan_id) if getattr(self, "untyped_plan", False) else plan_id
             )
         return value
 
@@ -85,10 +89,12 @@ class SchedulePeer(NativeVehiclePeer):
         "unexpected",
         "replacement",
         "release-deadline",
+        "offline-replacement",
         "lost-ack",
         "clear-lost",
         "preempt",
         "other-plan",
+        "untyped-plan",
         "disappeared",
     ],
 )
@@ -184,8 +190,9 @@ async def test_temporary_native_schedule(
                 await healthy(c)
                 assert c.schedule.summary()["result"] == "disappeared_before_start"
                 return
-            if outcome in ("charge", "full", "other-plan"):
+            if outcome in ("charge", "full", "other-plan", "untyped-plan"):
                 rig.peer.other_plan = outcome == "other-plan"
+                rig.peer.untyped_plan = outcome == "untyped-plan"
                 logical = target
                 start = START | {"idTag": "NATIVE_TIMER", "timestamp": datetime.fromtimestamp(logical, UTC).isoformat()}
                 answer = await rig.bench.call(sock, "actual-timer", "StartTransaction", start)
@@ -196,7 +203,9 @@ async def test_temporary_native_schedule(
                     rig.bench.cp, rig.bench.connection = "C", "Charging"
                     rig.bench.firmware.fire_plan(timer)
                 status = await healthy(c)
-                assert bool(status["temporary_schedule"].get("native_plan_confirmed")) == (outcome != "other-plan")
+                assert bool(status["temporary_schedule"].get("native_plan_confirmed")) == (
+                    outcome in ("full", "charge")
+                )
                 assert (status["power_w"] > 0) == (outcome == "charge")
                 assert timer in rig.bench.firmware.plans
                 rig.peer.permission_enabled = False
@@ -214,9 +223,15 @@ async def test_temporary_native_schedule(
                 )
             elif outcome == "pause":
                 c.command(uuid.uuid4().hex, "pause", 0)
-            elif outcome not in ("replacement", "release-deadline"):
+                assert c.pause_task is not None
+                await c.pause_task
+                logical = target + 1
+                with pytest.raises(RecoveryRequiredError):
+                    c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+                assert timer in rig.bench.firmware.plans and rig.bench.firmware.effective_limit() == 0
+            elif outcome not in ("replacement", "release-deadline", "offline-replacement"):
                 logical = target + 601
-            if outcome == "other-plan":
+            if outcome in ("other-plan", "untyped-plan"):
                 await healthy(c)
                 assert c.schedule.summary()["state"] == "armed" and timer in rig.bench.firmware.plans
                 logical = target + 601
@@ -230,16 +245,17 @@ async def test_temporary_native_schedule(
                     await old(raw)
 
                 s.gateway.charger.sender = lose_clear
-            if outcome not in ("replacement", "release-deadline"):
+            if outcome not in ("replacement", "release-deadline", "offline-replacement"):
                 for _ in range(4):
                     await healthy(c)
                 last = c.schedule.summary()
                 assert last["state"] == "complete" and set(rig.bench.firmware.plans) == {9} and not starts(rig)
                 assert last["result"] == {
-                    "pause": "owner_superseded",
+                    "pause": "missed_while_held",
                     "charge": "session_closed",
                     "full": "session_closed",
                     "other-plan": "session_source_unverified",
+                    "untyped-plan": "session_source_unverified",
                 }.get(outcome, "no_scheduled_session")
                 assert (
                     await rig.prepared.observer.observe_handover()
@@ -247,6 +263,13 @@ async def test_temporary_native_schedule(
                 return
         await s.close()
         replacement = managed_session(rig)
+        if outcome == "offline-replacement":
+            transport = replacement.runtime.transport
+            url = urlsplit(transport.config.vendor_url)
+            transport.config = replace(
+                transport.config,
+                vendor_url=urlunsplit(url._replace(netloc=f"127.0.0.1:{unused_tcp_port_factory()}")),
+            )
         await replacement.start()
         logical = target - 2 if outcome == "release-deadline" else target + 601
         c = ManagedController(replacement)
@@ -264,6 +287,17 @@ async def test_temporary_native_schedule(
 
         replacement.gateway.charger.validate_send = cross_deadline
         async with rig.charger(replacement) as sock:
+            if outcome == "offline-replacement":
+                assert (await rig.bench.call(sock, "offline-replacement-boot", "BootNotification", BOOT))[0] == 3
+                async with asyncio.timeout(6):
+                    while True:
+                        status = await c.tick()
+                        if status["state"] == "local_only" and c.schedule.summary()["state"] == "complete":
+                            break
+                        await asyncio.sleep(0.02)
+                assert status["local_hold_verified"] and status["station_ceiling_a"] == 0
+                assert set(rig.bench.firmware.plans) == {9} and not starts(rig)
+                return
             await introduced(rig, replacement, sock, "replacement-boot")
             for _ in range(4):
                 await healthy(c)
