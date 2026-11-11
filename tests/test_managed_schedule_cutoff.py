@@ -1951,3 +1951,41 @@ async def test_future_idle_timer_retries_reconnect_zero(tmp_path, tls, unused_tc
             assert set(b.stops()) == {local} and b.device.effective_limit() == 0
             await b.close_transaction(local)
             assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+
+
+# Intent: an unidentified daily session recovers when its zero profile took effect but its reply timed out.
+# Why: the ledger must repair the uncertain station confirmation before resuming the independently identified car.
+@pytest.mark.parametrize("demand", [False, True])
+async def test_lost_provisional_zero_ack_then_daily_source(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.start_plan(9, demand=demand)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        # Delay the actual OCPP reply past the transport deadline after the station has applied zero.
+        async def late_reply(action, payload):
+            if (
+                action == "SetChargingProfile"
+                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+            ):
+                entered.set()
+                await release.wait()
+
+        b.rig.bench.before_reply = late_reply
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        poll = asyncio.create_task(b.c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert b.device.effective_limit() == 0 and not b.stops()
+            await asyncio.wait_for(poll, 8)
+            assert b.session.journal.get(managed_schedule.KEY)["other_local"] == local
+        finally:
+            release.set()
+            b.rig.bench.before_reply = None
+        b.clock.now += 16
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and b.session.journal.active() == local
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily != local and (await healthy(b.c))["power_w"] > 0 and not b.stops() and not starts(b.rig)
