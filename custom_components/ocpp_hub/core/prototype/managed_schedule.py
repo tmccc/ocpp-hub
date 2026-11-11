@@ -34,6 +34,10 @@ def installed_variant(journal: Journal, original: str, actual: str) -> str:
     return original
 
 
+class TimerVehicleDisconnectedError(UnavailableError):
+    """The final native read saw the cable removed before the timer could be sent."""
+
+
 class ManagedSchedule:
     """The supervised tick owns both timer installation and exact removal, including after replacement."""
 
@@ -240,6 +244,10 @@ class ManagedSchedule:
         try:
             reply = await g.charger.call("DataTransfer", payload, check=check, before_send=mark)
             result = "accepted" if reply[0] == 3 and reply[2] == {"status": "Accepted", "data": ""} else "unconfirmed"
+        except TimerVehicleDisconnectedError:
+            if adding and j.get(KEY) == lease and lease["state"] == "requested":
+                self.finish(lease, "cancelled_before_install")
+            return
         except UnavailableError, DeniedError, RecoveryRequiredError:
             result = "unconfirmed"
         finally:

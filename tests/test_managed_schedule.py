@@ -174,6 +174,9 @@ async def test_temporary_native_schedule(
 
                 s.gateway.charger.validate_send = disconnect_vehicle
                 await healthy(c)
+                assert c.schedule.summary()["state"] == "complete"
+                rig.bench.cp, rig.bench.connection = "B", "Plug"
+                s.gateway.charger.validate_send = original_validate
                 await healthy(c)
                 assert c.schedule.summary()["result"] == "cancelled_before_install"
                 assert all(f[2] != "DataTransfer" or f[3].get("messageId") != "setPlan" for f in rig.bench.device_calls)

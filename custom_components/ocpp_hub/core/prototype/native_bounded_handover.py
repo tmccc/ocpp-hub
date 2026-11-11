@@ -14,7 +14,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .managed_current import managed_current_ceiling
 from .managed_recovery import local_recovery_binding
-from .managed_schedule import installed_variant
+from .managed_schedule import TimerVehicleDisconnectedError, installed_variant
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .rpc import UnavailableError
@@ -336,7 +336,7 @@ class NativeBoundedHandover:
         self.require_selected(native)
         if timer:
             if payload["messageId"] == "setPlan" and native.physical.connection != "Plug":
-                raise UnavailableError("temporary timer installation requires the connected vehicle")
+                raise TimerVehicleDisconnectedError("temporary timer installation requires the connected vehicle")
             lease = self.gateway.journal.get("managed_temporary_schedule", {})
             expected = (
                 lease.get("original_digest") if payload["messageId"] == "setPlan" else lease.get("augmented_digest")
