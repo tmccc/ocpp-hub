@@ -239,6 +239,7 @@ class ConnectionRuntime:
             fault_count = self.status.vendor_fault.count
             attempted_charger_epoch = self.gateway._charger_epoch
             attempted_boot = self.gateway.journal.get("boot")
+            attempted_boot_revision = self.gateway.boot_metadata_revision
             stage = "opening"
             self.status.vendor_attempts += 1
             try:
@@ -247,6 +248,7 @@ class ConnectionRuntime:
                         not self.vendor_enabled()
                         or not self.gateway.current_boot_seen(attempted_charger_epoch)
                         or self.gateway.journal.get("boot") != attempted_boot
+                        or self.gateway.boot_metadata_revision != attempted_boot_revision
                     ):
                         raise UnavailableError("vendor introduction changed while its connection was opening")
                     self.status.vendor_connected = True
@@ -274,6 +276,7 @@ class ConnectionRuntime:
     async def _vendor_session(self, connection: ClientConnection, epoch: int) -> None:
         charger_epoch = self.gateway._charger_epoch
         boot = self.gateway.journal.get("boot")
+        boot_revision = self.gateway.boot_metadata_revision
         fault_count = self.status.vendor_fault.count
 
         # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
@@ -293,6 +296,7 @@ class ConnectionRuntime:
                 self.vendor_session_enabled()
                 and self.gateway.current_boot_seen(charger_epoch)
                 and self.gateway.journal.get("boot") == boot
+                and self.gateway.boot_metadata_revision == boot_revision
             ):
                 await asyncio.sleep(self.settings.pump_interval)
 

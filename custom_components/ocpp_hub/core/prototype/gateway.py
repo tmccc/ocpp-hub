@@ -112,6 +112,7 @@ class Gateway:
         self._boot_retry_at = 0.0
         self._charger_epoch = 0
         self._boot_charger_epoch = -1
+        self.boot_metadata_revision = 0
         self.boot_observation: str | None = None
         self._boot_seen = asyncio.Event()
         self._vendor_epoch = 0
@@ -368,6 +369,9 @@ class Gateway:
     ) -> dict[str, Any]:
         if action == "BootNotification":
             previous_boot = self.journal.get("boot")
+            if previous_boot != payload:
+                # A later return to the same body cannot erase an intervening introduction revocation.
+                self.boot_metadata_revision += 1
             if previous_boot is not None and previous_boot != payload:
                 self._restrict_trial_introduction()
                 self.controls.invalidate()

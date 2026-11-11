@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -15,6 +16,41 @@ from tests.test_prototype import BOOT, START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
 from tests.test_trial_session import Bench
+
+
+# Intent: an intervening Boot change revokes the old registration even if the original body returns before polling.
+# Why: comparing only the current body can erase a real A-to-B-to-A introduction revocation.
+async def test_intervening_boot_change_revokes_cloud(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        gateway, runtime = b.session.gateway, b.session.runtime
+        epoch = gateway._vendor_epoch
+        settings, permitted = runtime.settings, runtime.vendor_session_enabled
+        runtime.settings = replace(settings, pump_interval=0.25)
+        observed = asyncio.Event()
+        polls = 0
+
+        # Observe the real policy check without changing its decision, then use its configured sleeping interval.
+        def observe_presence():
+            nonlocal polls
+            polls += 1
+            observed.set()
+            return permitted()
+
+        runtime.vendor_session_enabled = observe_presence
+        try:
+            await asyncio.wait_for(observed.wait(), 1)
+            before = polls
+            changed = await b.rig.bench.call(
+                b.sock, "intervening-boot", "BootNotification", BOOT | {"chargePointModel": "Unapproved replacement"}
+            )
+            restored = await b.rig.bench.call(b.sock, "restored-boot", "BootNotification", BOOT)
+            assert polls == before, "the two genuine reports must fall between presence polls"
+            assert changed[0] == restored[0] == 3 and b.session.journal.get("boot") == BOOT
+            await until(lambda: not runtime.status.vendor_connected, timeout=1)
+            assert gateway._vendor_epoch != epoch and gateway.vendor_registration != "Accepted"
+            assert b.session.journal.get("trial_phase") == "recovering" and not gateway.controls.ready
+        finally:
+            runtime.settings, runtime.vendor_session_enabled = settings, permitted
 
 
 # Intent: changed Boot metadata revokes the accepted cloud introduction, while an identical retry retains it.
