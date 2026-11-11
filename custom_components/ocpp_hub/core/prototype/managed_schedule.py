@@ -35,11 +35,14 @@ def installed_variant(journal: Journal, original: str, actual: str) -> str:
 
 
 # Remember a verified cable removal even if the next supervisor tick sees a newly connected vehicle.
-def remember_disconnect(journal: Journal, native: HandoverEvidence) -> None:
-    if native.physical.connection == "Unplug":
-        lease = journal.get(KEY, {})
-        if lease.get("state") in OBSERVABLE and not lease.get("retire_reason"):
-            journal.put(KEY, {**lease, "retire_reason": "vehicle_disconnected"})
+def remember_disconnect(journal: Journal, observed_at: float | None = None) -> None:
+    lease = journal.get(KEY, {})
+    if (
+        lease.get("state") in {"requested", *OBSERVABLE}
+        and not lease.get("retire_reason")
+        and (observed_at is None or lease.get("accepted_epoch", 0) <= observed_at <= time.time() + 5)
+    ):
+        journal.put(KEY, {**lease, "retire_reason": "vehicle_disconnected"})
 
 
 # Resolve the owner's wall-clock end on the date of the actual occurrence, including offset changes before 06:00.
@@ -62,9 +65,30 @@ class ManagedSchedule:
         self.j.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_schedule_requests(id TEXT PRIMARY KEY, start_epoch INTEGER NOT NULL)"
         )
+        controller.session.gateway.status_observer = self.observe_status
+        controller.session.gateway.tag_guard = self.permits_tag
         lease = self.j.get(KEY, {})
         if lease.get("state") == "requested":
             self.finish(lease, "cancelled_before_install")
+
+    # Keep a connector-1 Available transition even when the next status or native poll sees its replacement.
+    def observe_status(self, payload: dict[str, Any]) -> None:
+        if payload["connectorId"] == 1 and payload["status"] == "Available":
+            when = datetime.fromisoformat(payload["timestamp"]).timestamp() if "timestamp" in payload else None
+            remember_disconnect(self.j, when)
+
+    # Revocation takes effect before asynchronous physical cleanup, including across a clock correction or restart.
+    def revoked(self, lease: dict[str, Any]) -> bool:
+        return lease.get("state") in OBSERVABLE and (
+            bool(lease.get("retire_reason"))
+            or "hold_since" in lease
+            or time.time() >= lease.get("end_epoch", float("inf"))
+        )
+
+    # Never grant a new Start to the retired timer's tag while its physical removal remains unverified.
+    def permits_tag(self, tag: str) -> bool:
+        lease = self.j.get(KEY, {})
+        return not (self.revoked(lease) and tag.casefold() == lease["body"]["idTag"].casefold())
 
     # Expose only timing and progress, without private native resources or tag data.
     def summary(self) -> dict[str, Any]:
@@ -166,6 +190,7 @@ class ManagedSchedule:
             "id": identifier,
             "revision": revision,
             "state": "requested",
+            "accepted_epoch": now,
             "start_epoch": start_epoch,
             "end_epoch": end_epoch,
             "floor": j.get("next_transaction"),
@@ -263,8 +288,9 @@ class ManagedSchedule:
             reply = await g.charger.call("DataTransfer", payload, check=check, before_send=mark)
             result = "accepted" if reply[0] == 3 and reply[2] == {"status": "Accepted", "data": ""} else "rejected"
         except TimerVehicleDisconnectedError:
-            if adding and j.get(KEY) == lease and lease["state"] == "requested":
-                self.finish(lease, "cancelled_before_install")
+            current = j.get(KEY, {})
+            if adding and current.get("id") == lease["id"] and current.get("state") == "requested":
+                self.finish(current, "cancelled_before_install")
             return
         except UnavailableError, DeniedError, RecoveryRequiredError:
             result = "unconfirmed"
@@ -278,19 +304,20 @@ class ManagedSchedule:
         ):
             j.put(KEY, {**current, "last_response": result})
 
-    # Filter new ledger facts by timestamp and tag; only an independent active native plan ID can prove provenance.
-    def sessions(self, lease: dict[str, Any]) -> dict[int, bool]:
+    # A matching live native plan and a new ledger transaction can identify a delayed Start outside the grace window.
+    def sessions(self, lease: dict[str, Any], native_local: int | None) -> dict[int, bool]:
         candidates = {}
         for row in self.j.db.execute(
             "SELECT local,start,stop FROM transactions WHERE local>? ORDER BY local", (lease["floor"],)
         ):
+            local = int(row["local"])
             start = json.loads(row["start"])
             when = datetime.fromisoformat(start["timestamp"]).timestamp()
-            if (
-                start["idTag"].casefold() == lease["body"]["idTag"].casefold()
-                and lease["start_epoch"] - 5 <= when <= lease["start_epoch"] + 600
+            if start["idTag"].casefold() == lease["body"]["idTag"].casefold() and (
+                local in (native_local, lease.get("bound_local"))
+                or lease["start_epoch"] - 5 <= when <= lease["start_epoch"] + 600
             ):
-                candidates[int(row["local"])] = row["stop"] is not None
+                candidates[local] = row["stop"] is not None
         return candidates
 
     # Re-evaluate the persisted timer and owner intent at the last positive station write, after all awaited reads.
@@ -365,8 +392,9 @@ class ManagedSchedule:
             active is None
             and g.controls.ready
             and g.controls.desired() == 0
-            and not j.get("control", {}).get("uncertain")
+            and (j.get("trial_phase") == "recovering" or not j.get("control", {}).get("uncertain"))
         ):
+            c.require_paused(n)
             return
         now = time.time()
         if now >= lease.get("next_stop", 0):
@@ -393,7 +421,8 @@ class ManagedSchedule:
         present = n.saved_schedule_digest == lease["augmented_digest"]
         if state == "requested":
             if (
-                not self.can_install(n)
+                lease.get("retire_reason")
+                or not self.can_install(n)
                 or c.requests.intent().revision != lease["revision"]
                 or lease["epoch"] != c.session.gateway._charger_epoch
                 or now >= lease["start_epoch"] - 10
@@ -406,18 +435,20 @@ class ManagedSchedule:
             # An older armed lease has the original six-hour payload. Preserve its digest and enforce its local cutoff.
             lease = {**lease, "end_epoch": cutoff_epoch(lease["start_epoch"], ZoneInfo(n.configuration["timeZone"]))}
             j.put(KEY, lease)
-        candidates = self.sessions(lease)
         actual_id = n.physical.native_transaction_id
+        native_local = (
+            actual_id if n.session_plan_id == lease["body"]["planId"] and n.physical.transaction_open else None
+        )
+        candidates = self.sessions(lease, native_local)
         changes: dict[str, Any] = {}
         if present and state == "installing":
             changes.update(state="armed", verified_at=now)
-        if (
-            lease.get("bound_local") is None
-            and actual_id in candidates
-            and n.physical.transaction_open
-            and n.session_plan_id == lease["body"]["planId"]
-        ):
-            changes.update(native_plan_confirmed=True, bound_local=actual_id)
+        previous = lease.get("bound_local")
+        if native_local is not None and native_local in candidates and native_local != previous:
+            if previous is None or candidates.get(previous) is True:
+                changes.update(native_plan_confirmed=True, bound_local=native_local)
+                if previous is not None:
+                    changes["retire_reason"] = "session_closed"
         if candidates and not lease.get("session_seen"):
             changes["session_seen"] = True
         if lease.get("timer_present") is not present:
@@ -431,7 +462,7 @@ class ManagedSchedule:
         cancelled = intent.mode == "paused" or intent.revision != lease.get("control_revision", lease["revision"])
         if (
             not cancelled
-            and now >= lease["end_epoch"]
+            and self.revoked(lease)
             and actual_id is not None
             and actual_id == lease.get("bound_local") == j.active()
             and n.physical.transaction_open

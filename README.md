@@ -818,7 +818,9 @@ authority, the proxy installs a one-off plan using the daily timer's tag and at 
 The start must be before 06:00. The duration is the elapsed time to 06:00 on that local date, including
 clock changes. For example, a 03:45 start lasts 135 minutes. The original daily plan stays in place.
 The service verifies the complete two-plan readback. An observed unplug retires the temporary timer.
-Changing the selected current while the timer is armed preserves it and the station ceiling still applies.
+A connector-1 Available event also retires it if the car reconnects between polls. A retired timer's
+tag cannot authorize another Start before cleanup. Changing the selected current while the timer is armed
+preserves it. A current change overtaken by a disconnect is cancelled and the previous selection is restored.
 At 06:00, if the identified temporary session is still open, the service holds the station at zero and
 requests closure of that transaction. Zero draw and an accepted Stop reply alone cannot confirm closure.
 Once actual closure and zero output are verified, it removes its timer, verifies the complete original

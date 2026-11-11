@@ -8,12 +8,12 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
-from .managed_schedule import KEY
+from .managed_schedule import KEY, OBSERVABLE
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, fingerprint
+from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
@@ -142,6 +142,7 @@ class ManagedCurrentLimits:
         intent = c.requests.intent()
         if intent.revision != revision or not self.available(c.latest_native):
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
+        previous_value = self.selected()
         with j.atomic():
             j.put("managed_control_intent", {"mode": intent.mode, "revision": revision + 1})
             timer = j.get(KEY, {})
@@ -167,11 +168,13 @@ class ManagedCurrentLimits:
                 },
             )
         expected = c.requests.intent()
-        self.worker = asyncio.create_task(self._apply(identifier, value, expected.mode, expected.revision))
+        self.worker = asyncio.create_task(
+            self._apply(identifier, value, previous_value, expected.mode, expected.revision)
+        )
         return c.requests.receipt(identifier)
 
     # One service-owned worker survives a disappearing HA client and confirms native profile bytes after the ACK.
-    async def _apply(self, identifier: str, value: int, mode: str, revision: int) -> None:
+    async def _apply(self, identifier: str, value: int, previous_value: int, mode: str, revision: int) -> None:
         c, g, j = self.controller, self.controller.session.gateway, self.journal
         epoch, control_revision = g._charger_epoch, g.controls._revision
 
@@ -194,6 +197,8 @@ class ManagedCurrentLimits:
                 or j.get("managed_current_change", {}).get("id") != identifier
             ):
                 raise UnavailableError("current update was superseded by another control operation")
+            if mode == "app" and c.schedule.revoked(j.get(KEY, {})):
+                raise ReleaseDeferredError("selected current awaits retirement of the native timer")
 
         try:
             guard()
@@ -214,6 +219,16 @@ class ManagedCurrentLimits:
                 guard()
                 j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "completed"})
                 c.requests.finish(identifier, "completed", {"current_a": value, "charging_started": False})
+        except ReleaseDeferredError:
+            # Keep the previous selection while the timer supervisor closes the gate and verifies exact removal.
+            with j.atomic():
+                timer = j.get(KEY, {})
+                if timer.get("state") in OBSERVABLE:
+                    j.put(KEY, {**timer, "hold_since": timer.get("hold_since", time.time())})
+                c.released_epoch = None
+                j.put("control", {**j.get("control", {}), "resume_limit": previous_value})
+                j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
+                c.requests.finish(identifier, "failed", {"classification": "timer_retired"})
         except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
             j.put("managed_current_failure", {"type": type(error).__name__, "detail": str(error)[:1024]})
             with j.atomic():

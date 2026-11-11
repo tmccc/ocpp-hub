@@ -125,7 +125,8 @@ class NativeBoundedHandover:
         except SecurityError, UnavailableError, TimeoutError:
             self.last_verified_at = 0
             raise
-        remember_disconnect(self.gateway.journal, native)
+        if native.physical.connection == "Unplug":
+            remember_disconnect(self.gateway.journal)
         self.last_verified_at = native.physical.observed_at
         return native
 

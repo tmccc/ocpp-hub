@@ -387,13 +387,15 @@ class ManagedController:
             await self.hold_fault()
             return {**base, "state": "attention", "fault": j.get("managed_control_fault")["classification"]}
         timer = j.get(KEY, {})
-        cutoff_hold = timer.get("state") in OBSERVABLE and "hold_since" in timer
+        pending_timer = timer.get("state") in OBSERVABLE
+        cutoff_hold = pending_timer and "hold_since" in timer
         if (
             not base["charger_connected"]
             or not base["boot_verified"]
             or not g.controls.ready
             and self.released_epoch != g._charger_epoch
             and not cutoff_hold
+            and not (pending_timer and j.active() is not None)
         ):
             return {**base, "state": "starting", "owner_control_enabled": False}
         verified_pause = False
@@ -407,6 +409,8 @@ class ManagedController:
             elif self.released_epoch != g._charger_epoch:
                 if cutoff_hold:
                     await self.schedule.hold_until_closed()
+                elif pending_timer and j.active() is not None and self.native.introduced_epoch == g._charger_epoch:
+                    await self.schedule.observe(await self.native.read())
                 if not base["cloud_connected"]:
                     if cutoff_hold and j.get("trial_phase") == "active":
                         native = await self.native.read(closed=True)

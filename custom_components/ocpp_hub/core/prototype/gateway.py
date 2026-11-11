@@ -79,6 +79,8 @@ class Gateway:
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
+        self.status_observer: Callable[[dict[str, Any]], None] | None = None
+        self.tag_guard: Callable[[str], bool] | None = None
         self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
@@ -376,6 +378,8 @@ class Gateway:
                 self.journal.enqueue(action, payload, payload.get("transactionId"))
                 if action == "StatusNotification":
                     self.journal.put("last_status", payload)
+                    if self.status_observer is not None:
+                        self.status_observer(payload)
                 elif action == "MeterValues" and type(payload.get("transactionId")) is int:
                     rows = payload.get("meterValue", [])
                     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
@@ -392,6 +396,8 @@ class Gateway:
     def _tag_allowed(self, tag: Any) -> bool:
         if (
             not isinstance(tag, str)
+            or self.tag_guard is not None
+            and not self.tag_guard(tag)
             or self.journal.get("trial_starting")
             or self.journal.get("control", {}).get("inhibit")
             or self.journal.get("trial_phase") not in (None, "active")

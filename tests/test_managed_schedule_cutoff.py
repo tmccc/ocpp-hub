@@ -24,7 +24,7 @@ from ocpp_hub_core.prototype.security import SecurityError
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_managed_schedule import ORIGINAL_PLAN, SchedulePeer
+from tests.test_managed_schedule import SchedulePeer
 from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
 
@@ -69,23 +69,50 @@ class TimerBench:
 
     # Drive a new transaction only when the wire plan is scheduled on this exact local minute.
     async def fire(self, plan_id: int, *, demand: bool = True) -> int:
-        plan = ORIGINAL_PLAN if plan_id == 9 else self.device.plans[plan_id]
+        plan = self.device.plans[plan_id]
         current = datetime.fromtimestamp(self.clock.now, ZONE)
         bounds = window(plan, current)
         assert plan_id in self.device.plans and bounds and self.clock.now == bounds[0]
+        return await self.start_plan(plan_id, demand=demand)
+
+    # The firmware also can deliver a late Start. Its actual plan identifier follows that transaction only.
+    async def start_plan(self, plan_id: int, *, demand: bool = True) -> int:
+        plan = self.device.plans[plan_id]
+        current = datetime.fromtimestamp(self.clock.now, ZONE)
         payload = START | {"idTag": plan["idTag"], "timestamp": current.astimezone(UTC).isoformat()}
         response = await self.rig.bench.call(self.sock, uuid.uuid4().hex, "StartTransaction", payload)
         assert response[2]["idTagInfo"]["status"] == "Accepted"
-        self.rig.peer.other_plan = plan_id == 9
+        self.rig.peer.plan_session = (response[2]["transactionId"], plan_id)
         self.rig.peer.paused = False
         self.rig.peer.permission_enabled = demand
         self.rig.bench.cp, self.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
         self.device.fire_plan(plan_id)
         return response[2]["transactionId"]
 
+    # Advance an idle peer through the next trigger, selecting the plan from its own complete saved timetable.
+    async def advance_idle_to(self, instant: int) -> int | None:
+        assert self.device.active is None
+        day = datetime.fromtimestamp(self.clock.now, ZONE)
+        final = datetime.fromtimestamp(instant, ZONE)
+        due = []
+        while day.date() <= final.date():
+            for plan_id, plan in self.device.plans.items():
+                bounds = window(plan, day)
+                if bounds and self.clock.now < bounds[0] <= instant:
+                    due.append((bounds[0], plan_id))
+            day += timedelta(days=1)
+        if not due:
+            self.clock.now = instant
+            return None
+        assert len(due) == 1
+        self.clock.now, plan_id = due[0]
+        local = await self.fire(plan_id)
+        await self.advance_running_plan(plan_id, local, instant)
+        return local
+
     # Let the native clock deliver its autonomous end when the installed duration runs out.
     async def advance_running_plan(self, plan_id: int, local: int, instant: int) -> None:
-        plan = ORIGINAL_PLAN if plan_id == 9 else self.device.plans[plan_id]
+        plan = self.device.plans[plan_id]
         bounds = window(plan, datetime.fromtimestamp(self.clock.now, ZONE))
         self.clock.now = instant
         if bounds and instant >= bounds[1]:
@@ -143,9 +170,11 @@ async def test_deadline_and_next_daily(
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await b.arm()
         original = dict(b.device.plans[9])
-        b.clock.now = b.start
-        local = await b.fire(b.timer)
-        b.rig.peer.other_plan = outcome == "other-plan"
+        assert await b.advance_idle_to(b.start - 1) is None
+        local = await b.advance_idle_to(b.start)
+        assert local is not None
+        if outcome == "other-plan":
+            b.rig.peer.plan_session = (local, 9)
         assert (await healthy(b.c))["power_w"] > 0
         if outcome == "full-open":
             b.rig.peer.permission_enabled = False
@@ -166,7 +195,9 @@ async def test_deadline_and_next_daily(
                 await introduced(b.rig, replacement, b.sock, "deadline-restart")
                 for _ in range(4):
                     await b.c.tick()
-                assert b.stops() and set(b.stops()) == {local}
+                b.clock.now += 61
+                assert (await b.c.tick()).get("fault") == "temporary_schedule_stop_unconfirmed"
+                assert len(b.stops()) >= 2 and set(b.stops()) == {local}
                 assert b.device.effective_limit() == 0 and b.session.journal.active() == local
                 assert not b.session.journal.get("managed_control_fault")
                 await b.close_transaction(local)
@@ -197,9 +228,9 @@ async def test_deadline_and_next_daily(
         )
         assert b.device.effective_limit() == 6 and not starts(b.rig)
         next_day = datetime(2026, 11, 12, 0, tzinfo=ZONE)
-        assert window(ORIGINAL_PLAN, next_day) == (int(next_day.timestamp()), int(next_day.timestamp()) + 21600)
-        b.clock.now = int(next_day.timestamp())
-        daily = await b.fire(9)
+        assert window(b.device.plans[9], next_day) == (int(next_day.timestamp()), int(next_day.timestamp()) + 21600)
+        daily = await b.advance_idle_to(int(next_day.timestamp()))
+        assert daily is not None
         assert (await healthy(b.c))["power_w"] > 0 and daily != local
         await b.advance_running_plan(9, daily, b.clock.now + 21600)
         assert (await healthy(b.c))["power_w"] == 0 and daily not in b.stops()
@@ -228,19 +259,47 @@ async def test_clock_change(
 
 # Intent: a disconnected vehicle cannot leave a reusable timer, even if another cable arrives before the next tick.
 # Why: the native read which observes removal may be a release/current check outside normal timer supervision.
-@pytest.mark.parametrize("phase", ["installing", "armed", "replacement"])
+@pytest.mark.parametrize(
+    "phase", ["requested", "installing", "armed", "wire-events", "selecting", "replacement", "held-replacement"]
+)
 async def test_disconnect_retires_timer(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         b.request()
-        await b.c.tick()
-        if phase != "installing":
-            await healthy(b.c)
+        if phase != "requested":
+            await b.c.tick()
+            if phase != "installing":
+                await healthy(b.c)
+        if phase == "selecting":
+            b.c.current.accept(uuid.uuid4().hex, 0, 16)
+        notification = {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
         b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
-        await b.c.native.read()
+        if phase == "wire-events":
+            for payload in (
+                notification | {"connectorId": 0},
+                notification | {"timestamp": datetime.fromtimestamp(MORNING - 3600, UTC).isoformat()},
+            ):
+                await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StatusNotification", payload)
+            assert not b.session.journal.get(managed_schedule.KEY).get("retire_reason")
+            await b.rig.bench.call(b.sock, "departed", "StatusNotification", notification)
+        elif phase == "selecting":
+            await b.c.current.settle()
+            assert b.device.effective_limit() <= 6 and b.c.current.selected() == 6
+        elif phase == "held-replacement":
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and b.timer in b.device.plans
+        else:
+            await b.c.native.read()
         b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
-        if phase == "replacement":
+        if phase == "wire-events":
+            await b.rig.bench.call(b.sock, "new-cable", "StatusNotification", notification | {"status": "Preparing"})
+        if phase in ("armed", "wire-events", "selecting"):
+            b.clock.now = b.start
+            start = START | {"idTag": "NATIVE_TIMER", "timestamp": datetime.fromtimestamp(b.start, UTC).isoformat()}
+            reply = await b.rig.bench.call(b.sock, "retired-timer", "StartTransaction", start)
+            assert reply[0] == 4 and b.session.journal.active() is None
+        if phase in ("replacement", "held-replacement"):
             await crash(b.session)
             replacement = managed_session(b.rig)
             await replacement.start()
@@ -251,7 +310,8 @@ async def test_disconnect_retires_timer(
         else:
             for _ in range(2):
                 await healthy(b.c)
-        assert b.c.schedule.summary()["result"] == "vehicle_disconnected"
+        expected = "cancelled_before_install" if phase == "requested" else "vehicle_disconnected"
+        assert b.c.schedule.summary()["result"] == expected
         assert set(b.device.plans) == {9} and not starts(b.rig)
 
 
@@ -460,4 +520,114 @@ async def test_replug_during_cleanup_refusal(
         b.device.requested_current = 0
         b.device.answer = answer
         await healthy(b.c)
+        assert set(b.device.plans) == {9} and b.device.effective_limit() == 6 and not starts(b.rig)
+
+
+# Intent: a Start already committed before a disconnect report can be held only when its native plan ID matches.
+# Why: recording a retirement reason closes new admissions but cannot undo an already acknowledged Start.
+@pytest.mark.parametrize("other_plan", [True, False])
+async def test_departure_after_an_acknowledged_start(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, other_plan: bool
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        if other_plan:
+            b.rig.peer.plan_session = (local, 9)
+        await b.rig.bench.call(
+            b.sock, "departure", "StatusNotification", {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
+        )
+        await b.c.tick()
+        assert b.stops() == ([] if other_plan else [local])
+        assert b.device.effective_limit() == (6 if other_plan else 0)
+        await b.close_transaction(local)
+        for _ in range(3):
+            await healthy(b.c)
+        assert set(b.device.plans) == {9} and not starts(b.rig)
+
+
+# Intent: exact native identity and the post-admission ledger identify late triggers across the missed-start boundary.
+# Why: a timer firing one second outside the grace interval must still stop at 06:00 without adopting another plan.
+@pytest.mark.parametrize("delay", [600, 601])
+async def test_late_identified_start(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, delay: int
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start + delay
+        local = await b.start_plan(b.timer)
+        assert (await healthy(b.c))["temporary_schedule"]["native_plan_confirmed"]
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        assert b.stops() == [local] and b.device.effective_limit() == 0
+        await b.close_transaction(local)
+        await healthy(b.c)
+        assert set(b.device.plans) == {9} and b.c.schedule.summary()["result"] == "session_closed"
+
+
+# Intent: an altered original daily plan changes both its real readback and its next simulated occurrence.
+# Why: a canonical constant substituted by the fake for plan 9 would silently mask a damaged timetable.
+async def test_next_daily_reads_device_storage(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        b.device.plans[9].update(startTime=720, stopValue=1, recurring=0)
+        with pytest.raises(SecurityError):
+            await b.c.native.read()
+        assert await b.advance_idle_to(int(datetime(2026, 11, 12, 6, tzinfo=ZONE).timestamp())) is None
+        assert b.session.journal.active() is None and not starts(b.rig)
+
+
+# Intent: an armed lease written by the previous release keeps its physical digest but gains the 06:00 deadline.
+# Why: restarting with an old six-hour payload must never extend a late session to 09:45 or replay installation.
+async def test_previous_release_open_timer(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        j = b.session.journal
+        old = j.get(managed_schedule.KEY)
+        del old["end_epoch"], old["accepted_epoch"]
+        old["body"]["stopValue"] = 360
+        native_plan = b.device.plans[b.timer]
+        native_plan["stopValue"] = 360.0
+        old["install"]["data"] = json.dumps(native_plan)
+        native = await b.rig.prepared.observer.observe_handover()
+        old["augmented_digest"] = native.saved_schedule_digest
+        j.put(managed_schedule.KEY, old)
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        deadline = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        assert (await healthy(b.c))["temporary_schedule"]["end_epoch"] == deadline
+        b.clock.now = deadline
+        await b.c.tick()
+        assert b.stops() == [local] and b.device.effective_limit() == 0
+        await b.close_transaction(local)
+        await healthy(b.c)
+        assert set(b.device.plans) == {9} and not starts(b.rig)
+
+
+# Intent: a second session between polls cannot inherit the first one's authority to keep charging or to receive Stop.
+# Why: only independent confirmation that the same one-off fired again permits stopping the new transaction.
+@pytest.mark.parametrize("source", ["temporary", "daily"])
+async def test_session_turnover_between_polls(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        first = await b.fire(b.timer)
+        await healthy(b.c)
+        await b.close_transaction(first)
+        b.clock.now += 1200
+        second = await b.start_plan(b.timer if source == "temporary" else 9)
+        assert second != first
+        await b.c.tick()
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        assert set(b.stops()) == ({second} if source == "temporary" else set())
+        await b.close_transaction(second)
+        for _ in range(2):
+            await healthy(b.c)
         assert set(b.device.plans) == {9} and b.device.effective_limit() == 6 and not starts(b.rig)

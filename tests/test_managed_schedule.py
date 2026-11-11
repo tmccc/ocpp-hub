@@ -48,32 +48,32 @@ ORIGINAL_PLAN = {
 class SchedulePeer(NativeVehiclePeer):
     """The physical getter uses tenths of amps and different connector casing from its OCPP request."""
 
+    # Seed the device with actual mutable wire-format daily settings before the baseline is read.
+    def __init__(self, bench: Any) -> None:
+        super().__init__(bench)
+        wire = dict(ORIGINAL_PLAN)
+        wire.update(connectorId=wire.pop("ConnectorId"), limitCurrent=wire["limitCurrent"] / 10)
+        del wire["maxEnergy"]
+        bench.firmware.plans[9] = wire
+        self.plan_session: tuple[int, int | float] | None = None
+
     # Simulate the complete native envelope and its independent representation, including fields never sent on OCPP.
     def native(self, key: str) -> Any:
         value = super().native(key)
         if key == "SETPLAN":
             plans = []
             for raw in value["planList"]:
-                if raw["planId"] == 9:
-                    plans.append(dict(ORIGINAL_PLAN))
-                else:
-                    plan = dict(raw)
-                    plan.update(
-                        ConnectorId=plan.pop("connectorId"),
-                        limitCurrent=int(plan["limitCurrent"] * 10),
-                        stopValue=int(plan["stopValue"]),
-                        maxEnergy=0,
-                    )
-                    plans.append(plan)
+                plan = dict(raw)
+                plan.update(
+                    ConnectorId=plan.pop("connectorId"),
+                    limitCurrent=int(plan["limitCurrent"] * 10),
+                    stopValue=int(plan["stopValue"]),
+                    maxEnergy=0,
+                )
+                plans.append(plan)
             return {"planList": plans, "defaultEco": {"mode": "Fast"}}
-        if key == "SESSION" and getattr(self, "other_plan", False):
-            value["saveData"]["sessionList"][0]["_setPlanId"] = 9
-            return value
-        if key == "SESSION" and self.bench.firmware.active is not None:
-            plan_id = next((i for i in self.bench.firmware.plans if i != 9), 0)
-            value["saveData"]["sessionList"][0]["_setPlanId"] = (
-                float(plan_id) if getattr(self, "untyped_plan", False) else plan_id
-            )
+        if key == "SESSION" and self.plan_session is not None and self.bench.firmware.active == self.plan_session[0]:
+            value["saveData"]["sessionList"][0]["_setPlanId"] = self.plan_session[1]
         return value
 
 
@@ -213,12 +213,14 @@ async def test_temporary_native_schedule(
                 assert c.schedule.summary()["result"] == "disappeared_before_start"
                 return
             if outcome in ("charge", "full", "other-plan", "untyped-plan"):
-                rig.peer.other_plan = outcome == "other-plan"
-                rig.peer.untyped_plan = outcome == "untyped-plan"
                 logical = target
                 start = START | {"idTag": "NATIVE_TIMER", "timestamp": datetime.fromtimestamp(logical, UTC).isoformat()}
                 answer = await rig.bench.call(sock, "actual-timer", "StartTransaction", start)
                 local = answer[2]["transactionId"]
+                rig.peer.plan_session = (
+                    local,
+                    9 if outcome == "other-plan" else float(timer) if outcome == "untyped-plan" else timer,
+                )
                 if outcome == "charge":
                     rig.peer.paused = False
                     rig.peer.permission_enabled = True
