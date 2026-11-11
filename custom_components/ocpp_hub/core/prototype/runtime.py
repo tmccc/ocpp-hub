@@ -238,10 +238,17 @@ class ConnectionRuntime:
                 continue
             fault_count = self.status.vendor_fault.count
             attempted_charger_epoch = self.gateway._charger_epoch
+            attempted_boot = self.gateway.journal.get("boot")
             stage = "opening"
             self.status.vendor_attempts += 1
             try:
                 async with self.transport.connect() as connection:
+                    if (
+                        not self.vendor_enabled()
+                        or not self.gateway.current_boot_seen(attempted_charger_epoch)
+                        or self.gateway.journal.get("boot") != attempted_boot
+                    ):
+                        raise UnavailableError("vendor introduction changed while its connection was opening")
                     self.status.vendor_connected = True
                     self.status.reconnects += 1
                     epoch = self.gateway.attach_vendor(self._sender(connection))
@@ -266,6 +273,7 @@ class ConnectionRuntime:
     # Stop all session children when any transport/heartbeat child ends; quarantine leaves the pump alive.
     async def _vendor_session(self, connection: ClientConnection, epoch: int) -> None:
         charger_epoch = self.gateway._charger_epoch
+        boot = self.gateway.journal.get("boot")
         fault_count = self.status.vendor_fault.count
 
         # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
@@ -281,7 +289,11 @@ class ConnectionRuntime:
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
-            while self.vendor_session_enabled() and self.gateway.current_boot_seen(charger_epoch):
+            while (
+                self.vendor_session_enabled()
+                and self.gateway.current_boot_seen(charger_epoch)
+                and self.gateway.journal.get("boot") == boot
+            ):
                 await asyncio.sleep(self.settings.pump_interval)
 
         tasks = [

@@ -20,6 +20,7 @@
   Recover a verified daily that shares an expired manual Start's tag without consuming that command's
   reporting debt. Keep an established cloud lifecycle channel open during temporary zero-profile
   verification so a genuine Start acknowledgement can finish.
+  Revoke that cloud introduction if the charger reports changed Boot metadata, including on the same socket.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

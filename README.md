@@ -840,7 +840,8 @@ An expired manual Start retains its own reporting obligation while ordinary dail
 That includes a daily session using the same tag: fresh evidence must identify the exact recurring plan
 and transaction before restoring its selected current after an outage or restart. A newer explicit Pause
 still takes priority. Temporary zero-profile verification does not disconnect an established cloud
-lifecycle channel or discard an acknowledgement already in flight.
+lifecycle channel or discard an acknowledgement already in flight. Changed Boot metadata revokes that
+cloud introduction even when the charger's socket stays connected.
 Its delayed report is held at zero before the proxy binds it to that command. A report with one matching
 unnumbered native history record can be recorded under verified zero when its plan ID is missing;
 recording it does not identify its charging source or authorize positive current. A contradictory plan ID

@@ -17,6 +17,30 @@ from tests.test_prototype_tls import tls as tls
 from tests.test_trial_session import Bench
 
 
+# Intent: changed Boot metadata revokes the accepted cloud introduction, while an identical retry retains it.
+# Why: temporary zero verification may retain a session only while its actual admitted Boot binding agrees.
+@pytest.mark.parametrize("changed", [False, True])
+async def test_cloud_registration_remains_bound_to_boot(tmp_path, tls, unused_tcp_port, monkeypatch, changed):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        gateway, runtime = b.session.gateway, b.session.runtime
+        epoch = gateway._vendor_epoch
+        cloud_boots = [frame for frame in b.rig.bench.calls if frame[0] == 2 and frame[2] == "BootNotification"]
+        assert runtime.status.vendor_connected and gateway.vendor_registration == "Accepted"
+        payload = BOOT | {"chargePointModel": "Unapproved replacement"} if changed else BOOT
+        result = await b.rig.bench.call(b.sock, "later-real-boot", "BootNotification", payload)
+        assert result[0] == 3
+        await b.c.tick()
+        if changed:
+            await until(lambda: not runtime.status.vendor_connected, timeout=1)
+            assert gateway._vendor_epoch != epoch and gateway.vendor_registration != "Accepted"
+            assert b.session.journal.get("trial_phase") == "recovering" and not gateway.controls.ready
+        else:
+            await asyncio.sleep(10 * runtime.settings.pump_interval)
+            assert runtime.status.vendor_connected and gateway._vendor_epoch == epoch
+            assert gateway.vendor_registration == "Accepted"
+        assert [f for f in b.rig.bench.calls if f[0] == 2 and f[2] == "BootNotification"] == cloud_boots
+
+
 # Intent: a cloud Start acknowledgement commits while a local zero re-confirmation is independently pending.
 # Why: readiness is allowed to suspend new cloud openings, but must not cancel an admitted lifecycle RPC.
 @pytest.mark.parametrize("demand", [False, True])
