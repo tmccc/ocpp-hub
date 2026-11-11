@@ -13,6 +13,10 @@ from .store import encoded
 MAXIMUM = 2 * 1024 * 1024
 
 
+class NativeTransportUnavailableError(SecurityError):
+    """A missing or interrupted HTTP response provides no new native evidence."""
+
+
 # Read only a bounded successful body, supporting ordinary length, chunked and connection-close framing.
 async def response_body(reader: asyncio.StreamReader) -> bytes:
     status = await reader.readline()
@@ -107,7 +111,9 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
                 result = json.loads(result, object_pairs_hook=unique_object)
             encoded(result)
             return result
-    except OSError, ValueError, KeyError, TypeError, RecursionError, asyncio.IncompleteReadError:
+    except OSError, asyncio.IncompleteReadError:
+        raise NativeTransportUnavailableError("native HTTP observation was interrupted") from None
+    except ValueError, KeyError, TypeError, RecursionError:
         raise SecurityError("native trial observation was unavailable or malformed") from None
     finally:
         if writer is not None:

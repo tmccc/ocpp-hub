@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
-from .managed_schedule import KEY, OBSERVABLE
+from .managed_schedule import KEY
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -219,21 +219,23 @@ class ManagedCurrentLimits:
                 guard()
                 j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "completed"})
                 c.requests.finish(identifier, "completed", {"current_a": value, "charging_started": False})
-        except ReleaseDeferredError:
-            # Keep the previous selection while the timer supervisor closes the gate and verifies exact removal.
-            with j.atomic():
-                timer = j.get(KEY, {})
-                if timer.get("state") in OBSERVABLE:
-                    j.put(KEY, {**timer, "hold_since": timer.get("hold_since", time.time())})
-                c.released_epoch = None
-                j.put("control", {**j.get("control", {}), "resume_limit": previous_value})
-                j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
-                c.requests.finish(identifier, "failed", {"classification": "timer_retired"})
         except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
             j.put("managed_current_failure", {"type": type(error).__name__, "detail": str(error)[:1024]})
+            intent = c.requests.intent()
+            superseded = intent.mode != mode or intent.revision != revision
+            timer = j.get(KEY, {})
+            if not superseded and mode == "app" and c.schedule.revoked(timer):
+                # A concurrent departure may interrupt the read before the positive-write guard runs.
+                with j.atomic():
+                    c.schedule.begin_hold(timer)
+                    j.put("control", {**j.get("control", {}), "resume_limit": previous_value})
+                    if j.active() in (None, timer.get("bound_local")):
+                        g.controls._claim(True, stopping=True)
+                    j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
+                    c.requests.finish(identifier, "failed", {"classification": "timer_retired"})
+                await c.schedule.protect_station(j.get(KEY))
+                return
             with j.atomic():
-                intent = c.requests.intent()
-                superseded = intent.mode != mode or intent.revision != revision
                 if not superseded:
                     j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                     g.controls._claim(True, stopping=True)

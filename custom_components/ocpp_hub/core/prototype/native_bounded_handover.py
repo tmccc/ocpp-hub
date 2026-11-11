@@ -14,9 +14,15 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .managed_current import managed_current_ceiling
 from .managed_recovery import local_recovery_binding
-from .managed_schedule import TimerVehicleDisconnectedError, installed_variant, remember_disconnect
+from .managed_schedule import (
+    TimerVehicleDisconnectedError,
+    installed_variant,
+    known_timer_closure_gap,
+    remember_disconnect,
+)
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
+from .native_http import NativeTransportUnavailableError
 from .rpc import UnavailableError
 from .security import SecurityError
 from .station import StationChoice
@@ -122,6 +128,12 @@ class NativeBoundedHandover:
                 self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
             )
             self.book.check_originals(native.physical)
+        except NativeTransportUnavailableError as error:
+            self.last_verified_at = 0
+            timer = self.gateway.journal.get("managed_temporary_schedule", {})
+            if timer.get("state") in ("installing", "armed", "clearing") and "hold_since" in timer:
+                raise UnavailableError("timer hold awaits fresh native HTTP evidence") from error
+            raise
         except SecurityError, UnavailableError, TimeoutError:
             self.last_verified_at = 0
             raise
@@ -248,7 +260,8 @@ class NativeBoundedHandover:
     # A genuine Stop may have occurred while the process was absent; retain the ledger debt until its real replay.
     def require_recovery_session(self, native: HandoverEvidence) -> None:
         if native.physical.transaction_open:
-            self.require_known_session(native)
+            if not known_timer_closure_gap(self.gateway.journal, native):
+                self.require_known_session(native)
         elif native.physical.native_transaction_id is not None:
             raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")
 

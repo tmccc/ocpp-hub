@@ -747,3 +747,226 @@ async def test_full_session_needs_both_closures(
         await b.close_transaction(new)
         await healthy(b.c)
         assert set(b.device.plans) == {9} and not starts(b.rig)
+
+
+# Intent: losing physical telemetry cannot delay the independent OCPP hold and Stop for the identified transaction.
+# Why: an open, identified timer must remain inhibited while a timeout, truncated read or interrupted poll recovers.
+@pytest.mark.parametrize("failure", ["truncated", "timeout", "cancelled"])
+async def test_deadline_without_native_http(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        assert (await healthy(b.c))["temporary_schedule"]["native_plan_confirmed"]
+        observer = b.session.prepared.observer
+        original_port = observer.port
+        reached, release = asyncio.Event(), asyncio.Event()
+
+        # The station's real management socket remains available while its separate native HTTP response fails.
+        async def broken_http(reader, writer):
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                reached.set()
+                if failure == "truncated":
+                    writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 40\r\n\r\n{")
+                    await writer.drain()
+                else:
+                    await release.wait()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        async with await asyncio.start_server(broken_http, "127.0.0.1", 0) as server:
+            observer.port = server.sockets[0].getsockname()[1]
+            try:
+                b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+                tick = asyncio.create_task(b.c.tick())
+                async with asyncio.timeout(3):
+                    await reached.wait()
+                assert b.device.effective_limit() == 0 and b.device.current == 0
+                if failure == "cancelled":
+                    tick.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await tick
+                else:
+                    assert (await tick)["state"] == "degraded"
+                if failure == "truncated":
+                    b.clock.now += 61
+                    for _ in range(4):
+                        assert (await b.c.tick())["fault"] == "temporary_schedule_stop_unconfirmed"
+                assert not b.session.journal.get("managed_control_fault")
+                assert b.timer in b.device.plans and b.session.journal.active() == local
+                assert b.stops() and set(b.stops()) == {local}
+            finally:
+                observer.port = original_port
+                release.set()
+        await b.c.tick()
+        assert b.stops() and set(b.stops()) == {local}
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+
+
+# Intent: at cutoff neither order of physical/ledger closure adopts or stops a different transaction.
+# Why: the actual Stop can precede the meter and native SESSION by several ticks or even a process replacement.
+@pytest.mark.parametrize("first", ["native", "ledger"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_deadline_closure_gap(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, first: str, restart: bool
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        await healthy(b.c)
+        b.clock.now = int(datetime(2026, 11, 11, 5, 59, 59, tzinfo=ZONE).timestamp())
+        if first == "ledger":
+            await b.close_transaction(local)
+            b.device.active = local
+            b.device.fire_plan(b.timer)
+            b.rig.peer.permission_enabled = True
+            b.rig.bench.cp, b.rig.bench.connection = "C", "Charging"
+        else:
+            b.device.active = None
+            b.device.requested_current = 0
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        b.clock.now += 1
+
+        # Verify the hold across independent polls and a delayed second closure report.
+        async def reconcile():
+            for _ in range(4):
+                await b.c.tick()
+            assert b.device.effective_limit() == 0 and b.timer in b.device.plans
+            assert set(b.stops()) <= ({local} if first == "native" else set())
+            assert not b.session.journal.get("managed_control_fault")
+            b.clock.now += 61
+            assert (await b.c.tick())["fault"] == "temporary_schedule_stop_unconfirmed"
+            if first == "ledger":
+                b.device.active = None
+                b.device.requested_current = 0
+                b.rig.peer.permission_enabled = False
+                b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+            else:
+                await b.close_transaction(local)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6
+            assert set(b.device.plans) == {9} and not starts(b.rig)
+
+        if restart:
+            # This case isolates the two closure indications from ambiguous cloud delivery.
+            async with asyncio.timeout(3):
+                while b.session.journal.next_delivery() is not None:
+                    await asyncio.sleep(0.01)
+            await crash(b.session)
+            b.session = managed_session(b.rig)
+            await b.session.start()
+            b.c = ManagedController(b.session)
+            async with b.rig.charger(b.session) as b.sock:
+                await introduced(b.rig, b.session, b.sock, "restart-between-closures")
+                await reconcile()
+        else:
+            await reconcile()
+
+
+# Intent: a departure event concurrent with native current verification cancels the new selection consistently.
+# Why: an interrupted audit and an explicit revocation guard are different observations of the same vehicle change.
+async def test_departure_interrupts_current_audit(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        observe = b.c.native.observe
+
+        # Deliver the real wire event after the native sample and before its authority generation is checked.
+        async def interrupt():
+            snapshot = await observe()
+            b.c.native.observe = observe
+            await b.rig.bench.call(
+                b.sock, "left", "StatusNotification", {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
+            )
+            return snapshot
+
+        b.c.native.observe = interrupt
+        identifier = uuid.uuid4().hex
+        b.c.current.accept(identifier, b.c.requests.intent().revision, 16)
+        await b.c.current.settle()
+        assert b.c.requests.receipt(identifier)["state"] == "failed" and b.c.current.selected() == 6
+        assert b.c.requests.intent().mode == "app"
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+
+
+# Intent: a new current already applied by the station is physically inhibited before a cancelled selector settles.
+# Why: reverting the saved number alone leaves a retained autonomous plan able to draw the higher current.
+async def test_departure_after_positive_current_write(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        b.c.current.accept(uuid.uuid4().hex, 0, 32)
+        await b.c.current.settle()
+        await healthy(b.c)
+        await b.arm()
+        b.c.current.accept(uuid.uuid4().hex, b.c.requests.intent().revision, 6)
+        await b.c.current.settle()
+        await healthy(b.c)
+
+        # The station applies the higher profile just before reporting that the original car has gone.
+        async def depart(action, body):
+            if (
+                action == "SetChargingProfile"
+                and body["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 16
+            ):
+                b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
+
+        b.rig.bench.before_reply = depart
+        b.clock.now = b.start - 2
+        identifier = uuid.uuid4().hex
+        b.c.current.accept(identifier, b.c.requests.intent().revision, 16)
+        await b.c.current.settle()
+        assert b.c.requests.receipt(identifier)["state"] == "failed" and b.c.current.selected() == 6
+        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        b.clock.now = b.start
+        b.device.fire_plan(b.timer)
+        assert b.device.current == 0 and b.device.effective_limit() == 0
+        b.device.requested_current = 0
+        await healthy(b.c)
+        assert set(b.device.plans) == {9} and b.device.effective_limit() == 6 and not starts(b.rig)
+
+
+# Intent: the entire 15-second native audit can time out even when every getter individually succeeds.
+# Why: the backup hold and scoped Stop must reach the device before waiting for this independent telemetry path.
+async def test_cutoff_during_slow_complete_audit(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer)
+        await healthy(b.c)
+        observer = b.session.prepared.observer
+        read = observer._read
+        entered = asyncio.Event()
+
+        # Stretch a sequence of real successful loopback reads beyond the whole-snapshot timeout.
+        async def slow_read(action, data=None):
+            value = await read(action, data)
+            entered.set()
+            await asyncio.sleep(2)
+            return value
+
+        observer._read = slow_read
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        tick = asyncio.create_task(b.c.tick())
+        try:
+            async with asyncio.timeout(3):
+                await entered.wait()
+            assert b.device.effective_limit() == 0 and b.stops() == [local] and not tick.done()
+            assert (await tick)["state"] == "degraded" and b.session.journal.active() == local
+        finally:
+            observer._read = read
+            if not tick.done():
+                tick.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await tick
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}

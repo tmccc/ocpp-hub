@@ -116,6 +116,7 @@ class ManagedController:
         if self.pause_task is not None and not self.pause_task.done():
             await asyncio.shield(self.pause_task)
         native = await self.native.read()
+        await self.schedule.await_closure_agreement(native)
         self.native.require_known_session(native)
         if (
             native.physical.transaction_open
@@ -244,6 +245,7 @@ class ManagedController:
             raise UnavailableError("managed shutdown retains its hold")
         epoch, revision = g._charger_epoch, g.controls._revision
         native = await self.native.read()
+        await self.schedule.await_closure_agreement(native)
         self.native.require_known_session(native)
         if native.physical.transaction_open:
             raise RecoveryRequiredError("owner release awaits actual transaction closure")
@@ -326,6 +328,7 @@ class ManagedController:
             native = await self.native.read()
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
+            await self.schedule.await_closure_agreement(native)
             if (
                 native.physical.transaction_open
                 and native.physical.native_transaction_id != self.session.journal.active()
@@ -401,6 +404,9 @@ class ManagedController:
         verified_pause = False
         try:
             self.prepare_offline_pause()
+            if self.requests.intent().mode == "app" and pending_timer:
+                await self.schedule.protect_deadline(timer)
+                cutoff_hold = "hold_since" in j.get(KEY, {})
             pending_return = self.requests.pending_return()
             if self.requests.intent().mode == "paused" and pending_return is not None:
                 await self.return_requested(*pending_return)

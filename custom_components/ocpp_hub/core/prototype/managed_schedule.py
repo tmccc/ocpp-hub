@@ -46,6 +46,20 @@ def remember_disconnect(journal: Journal, observed_at: float | None = None) -> N
         journal.put(KEY, {**lease, "retire_reason": "vehicle_disconnected"})
 
 
+# The two independent closure indicators may arrive in either order for a previously identified one-off.
+def known_timer_closure_gap(journal: Journal, native: HandoverEvidence) -> bool:
+    lease = journal.get(KEY, {})
+    local, physical = journal.active(), native.physical.native_transaction_id
+    bound = lease.get("bound_local")
+    return (
+        lease.get("state") in OBSERVABLE
+        and lease.get("native_plan_confirmed") is True
+        and bound is not None
+        and local != physical
+        and {local, physical} == {None, bound}
+    )
+
+
 # Resolve the owner's wall-clock end on the date of the actual occurrence, including offset changes before 06:00.
 def cutoff_epoch(start_epoch: int, zone: ZoneInfo) -> int:
     start = datetime.fromtimestamp(start_epoch, zone)
@@ -325,7 +339,7 @@ class ManagedSchedule:
     def release_needs_cleanup(self, lease: dict[str, Any]) -> bool:
         intent = self.c.requests.intent()
         return lease.get("state") in OBSERVABLE and (
-            bool(lease.get("retire_reason"))
+            self.revoked(lease)
             or lease["state"] == "clearing"
             or time.time() >= lease["start_epoch"]
             or intent.revision != lease.get("control_revision", lease["revision"])
@@ -341,7 +355,7 @@ class ManagedSchedule:
     async def before_release(self, n: HandoverEvidence) -> None:
         lease = self.j.get(KEY, {})
         if self.release_needs_cleanup(lease):
-            if not lease.get("retire_reason"):
+            if not lease.get("retire_reason") and "hold_since" not in lease:
                 self.j.put(
                     KEY,
                     {
@@ -370,20 +384,101 @@ class ManagedSchedule:
         if (
             "hold_since" in lease
             and now - lease["hold_since"] >= 60
-            and self.j.active() is not None
-            and self.j.active() == lease.get("bound_local")
+            and (
+                lease.get("closure_gap") or self.j.active() is not None and self.j.active() == lease.get("bound_local")
+            )
         ):
             return "temporary_schedule_stop_unconfirmed"
         return None
 
+    # Journal the hold before any I/O. Recovery owns the next positive write until original-plan verification.
+    def begin_hold(self, lease: dict[str, Any]) -> None:
+        self.c.released_epoch = None
+        if "hold_since" not in lease:
+            self.j.put(KEY, {**lease, "hold_since": time.time()})
+
+    # Lower only the station ceiling, even if native HTTP is unavailable. A foreign ledger transaction has priority.
+    async def protect_station(self, lease: dict[str, Any]) -> None:
+        c, j = self.c, self.j
+        g = c.session.gateway
+        if c.native.introduced_epoch != g._charger_epoch or not g.current_boot_seen(g._charger_epoch):
+            return
+        if j.active() not in (None, lease.get("bound_local")):
+            return
+        self.begin_hold(lease)
+        if g.controls.ready and g.controls.desired() == 0:
+            return
+        lease = j.get(KEY)
+        now = time.time()
+        if now < lease.get("next_cap", 0):
+            return
+        j.put(KEY, {**lease, "next_cap": now + 15})
+
+        # Recheck the actual receipt and generation before every outgoing write; this path never requests a Stop.
+        def guard() -> None:
+            if (
+                c.stopping
+                or j.get(KEY, {}).get("id") != lease["id"]
+                or j.active() not in (None, lease.get("bound_local"))
+            ):
+                raise RecoveryRequiredError("timer station hold was superseded")
+
+        try:
+            if j.get("trial_phase") == "recovering" and g.controls.desired() == 0:
+                await g.controls.ensure_ceiling()
+            else:
+                await g.controls.set_limit(0, guard=guard)
+        except DeniedError, UnavailableError, RecoveryRequiredError:
+            # A separate scoped Stop can still succeed when a station write fails. Never release on this evidence.
+            return
+
+    # Stop a previously identified, still-open OCPP transaction by its own ID, even while HTTP reads are unavailable.
+    async def protect_deadline(self, lease: dict[str, Any]) -> None:
+        c, j = self.c, self.j
+        g = c.session.gateway
+        if (
+            lease.get("state") not in OBSERVABLE
+            or time.time() < lease.get("end_epoch", float("inf"))
+            or c.native.introduced_epoch != g._charger_epoch
+            or c.native.introduced_revision != g.controls._revision
+            or not g.current_boot_seen(g._charger_epoch)
+        ):
+            return
+        bound = lease.get("bound_local")
+        if bound is None or not lease.get("native_plan_confirmed") or j.active() != bound or lease.get("closure_gap"):
+            await self.protect_station(lease)
+            return
+        self.begin_hold(lease)
+        await self.request_stop_if_due(j.get(KEY))
+
+    # Re-check ownership inside LocalControl after the zero ceiling has been attempted, before sending any Stop.
+    async def request_stop_if_due(self, lease: dict[str, Any]) -> None:
+        now = time.time()
+        if now >= lease.get("next_stop", 0):
+            self.j.put(KEY, {**lease, "next_stop": now + 15})
+            await self.c.session.gateway.controls.stop(expected_local=lease["bound_local"])
+
+    # A known closing transaction needs zero, with no guessed Stop, until native and ledger closure agree.
+    async def await_closure_agreement(self, native: HandoverEvidence) -> None:
+        lease = self.j.get(KEY, {})
+        if known_timer_closure_gap(self.j, native):
+            if not lease.get("closure_gap"):
+                lease = {**lease, "closure_gap": True}
+                self.j.put(KEY, lease)
+            await self.protect_station(lease)
+            raise RecoveryRequiredError("identified timer awaits both closure indicators")
+        if lease.get("closure_gap"):
+            self.j.put(KEY, {**lease, "closure_gap": False})
+
     # While a cutoff hold is active, allow only the known scheduled session to receive a Stop.
     async def hold_until_closed(self, n: HandoverEvidence | None = None) -> None:
         c, j = self.c, self.j
-        lease = j.get(KEY)
         g = c.session.gateway
         if c.native.introduced_epoch != g._charger_epoch or not g.current_boot_seen(g._charger_epoch):
             raise RecoveryRequiredError("deadline hold awaits the current charger introduction")
         n = n or await c.native.read()
+        await self.await_closure_agreement(n)
+        lease = j.get(KEY)
         c.native.require_known_session(n)
         active = j.active()
         bound = lease.get("bound_local")
@@ -397,21 +492,13 @@ class ManagedSchedule:
         ):
             c.require_paused(n)
             return
-        now = time.time()
-        if now >= lease.get("next_stop", 0):
-            j.put(KEY, {**lease, "next_stop": now + 15})
-            if bound is not None:
-                await g.controls.stop(expected_local=bound)
-            else:
-                # An unplugged vehicle has no transaction to Stop. Inhibit the timer until exact removal is verified.
-                def still_idle() -> None:
-                    if j.active() is not None or c.requests.intent().mode != "app":
-                        raise RecoveryRequiredError("timer hold was superseded")
-
-                await g.controls.set_limit(0, guard=still_idle)
-            if active is None and j.active() is None:
-                c.require_paused(await c.native.read(closed=True))
-                return
+        if bound is not None:
+            await self.request_stop_if_due(lease)
+        else:
+            await self.protect_station(lease)
+        if active is None and j.active() is None and g.controls.ready and g.controls.desired() == 0:
+            c.require_paused(await c.native.read(closed=True))
+            return
         raise RecoveryRequiredError("deadline hold awaits verified closure")
 
     # The daily plan stays enabled. Only a fresh verified closed session or missed/cancelled timer permits cleanup.
