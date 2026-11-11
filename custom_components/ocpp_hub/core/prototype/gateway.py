@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -90,6 +91,7 @@ class Gateway:
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
+        self.boot_observer: Callable[[], None] | None = None
         self.status_observer: Callable[[str, dict[str, Any]], None] | None = None
         self.prepare_report_hold: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self.held_start_report: Callable[[str], bool] | None = None
@@ -109,6 +111,7 @@ class Gateway:
         self._boot_retry_at = 0.0
         self._charger_epoch = 0
         self._boot_charger_epoch = -1
+        self.boot_observation: str | None = None
         self._boot_seen = asyncio.Event()
         self._vendor_epoch = 0
         self._inbound = InboundCache()
@@ -129,6 +132,7 @@ class Gateway:
         self.charger.detach()
         self._charger_epoch = epoch
         self._boot_seen.clear()
+        self.boot_observation = None
         self._inbound.retire("charger", epoch)
         self.charger.sender = sender
         return epoch
@@ -147,6 +151,7 @@ class Gateway:
     def detach_charger(self, epoch: int) -> None:
         if epoch == self._charger_epoch:
             self.charger.detach()
+            self.boot_observation = None
             self._charger_epoch = self.journal.connection_epoch()
 
     # A vendor outage never closes the local charger or cancels its handlers.
@@ -367,7 +372,10 @@ class Gateway:
                 self.controls.invalidate()
             self.journal.put("boot", payload)
             self._boot_charger_epoch = self._charger_epoch
+            self.boot_observation = uuid.uuid4().hex
             self._boot_seen.set()
+            if self.boot_observer is not None:
+                self.boot_observer()
             return {
                 "status": "Accepted",
                 "interval": 60,
@@ -405,8 +413,7 @@ class Gateway:
                     native_report.record(local)
                 self.authorisation.consume(payload["idTag"], local)
                 if native_report is None:
-                    control = self.journal.get("control", {})
-                    self.journal.put("control", {**control, "start_pending": False})
+                    self.controls.bind_start(payload["idTag"], local)
                 if self.start_observer is not None:
                     self.start_observer(local, payload)
 

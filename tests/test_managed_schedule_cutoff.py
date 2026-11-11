@@ -1346,7 +1346,7 @@ async def test_interrupted_reintroduction_holds_open_timer_at_deadline(
         observer = b.session.prepared.observer
         original_port = observer.port
 
-        # Interrupt every introduction read until the independent deadline task has delivered zero and scoped Stop.
+        # Interrupt every introduction read until the new socket independently enforces station zero.
         async def interrupted(reader, writer):
             await reader.readuntil(b"\r\n\r\n")
             writer.close()
@@ -1366,9 +1366,16 @@ async def test_interrupted_reintroduction_holds_open_timer_at_deadline(
                     assert (await b.rig.bench.call(b.sock, "interrupted-open-boot", "BootNotification", BOOT))[0] == 3
                     deadline = asyncio.create_task(b.c.schedule.watch_deadline())
                     async with asyncio.timeout(4):
-                        while not b.stops():
+                        while b.device.effective_limit() != 0:
                             await asyncio.sleep(0.01)
                     assert b.c.native.introduced_epoch != b.session.gateway._charger_epoch
+                    assert not b.stops()
+                    # The same ID is now seen on this connection as the temporary occurrence, permitting its own Stop.
+                    observer.port = original_port
+                    async with asyncio.timeout(4):
+                        while not b.stops():
+                            await b.c.tick()
+                            await asyncio.sleep(0.01)
                     assert b.device.effective_limit() == 0 and set(b.stops()) == {local}
                     assert b.session.journal.active() == local and b.timer in b.device.plans
                 finally:

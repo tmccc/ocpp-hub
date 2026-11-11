@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ..control import HUB_PROFILE_ID
 from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
+from .local_control import local_start_receipt
 from .native_start_attempts import matching_unassigned_start, start_millisecond_range
 from .policy import DeniedError, integer, number
 from .rpc import UnavailableError
@@ -94,11 +95,11 @@ def confirmed_vendor_start(j: Journal, tag_digest: str, local: int | None) -> bo
 def awaiting_owner_start(j: Journal, tag: str | None = None) -> bool:
     digest = fingerprint(tag.casefold()) if tag is not None else None
     if j.get("control", {}).get("start_pending"):
-        owner = j.get("managed_test_charge", {})
-        owner_digest = owner.get("tag_digest")
+        owner = local_start_receipt(j)
+        owner_digest = owner.get("digest")
         if (
             digest is None
-            or owner.get("start_rpc_accepted") is not True
+            or owner.get("stage") != "accepted"
             or not isinstance(owner_digest, str)
             or len(owner_digest) != 64
             or owner_digest == digest
@@ -141,16 +142,14 @@ def independent_session(j: Journal, lease: dict[str, Any], n: HandoverEvidence, 
     if not temporary:
         return True
     digest = fingerprint(tag)
-    owner = j.get("managed_test_charge", {})
+    owner = local_start_receipt(j)
     return confirmed_vendor_start(j, digest, local) or (
-        owner.get("start_rpc_accepted") is True
-        and owner.get("local_transaction") == local
-        and owner.get("tag_digest") == digest
+        owner.get("stage") == "accepted" and owner.get("local") == local and owner.get("digest") == digest
     )
 
 
 # Publish the source of each fully verified, open native observation before any cutoff or recovery task can act.
-def record_session_source(j: Journal, n: HandoverEvidence) -> None:
+def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str | None) -> None:
     lease = j.get(KEY, {})
     local = n.physical.native_transaction_id
     if lease.get("state") not in OBSERVABLE:
@@ -200,6 +199,8 @@ def record_session_source(j: Journal, n: HandoverEvidence) -> None:
     row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
     if row is None:
         return
+    if lease.get("source_boot") != boot_observation:
+        changes["source_boot"] = boot_observation
     timer_source = (
         n.session_plan_id == lease["body"]["planId"]
         and json.loads(row["start"])["idTag"].casefold() == lease["body"]["idTag"].casefold()
@@ -243,11 +244,16 @@ def require_continuing_session(j: Journal, n: HandoverEvidence, local: int) -> N
         raise ReleaseDeferredError("the held transaction awaits positive identification of its original plan")
 
 
+# Only evidence from this actual Boot may exempt the current transaction from zero or authorize a timer Stop.
+def current_source(gateway: Gateway, lease: dict[str, Any]) -> bool:
+    return gateway.boot_observation is not None and lease.get("source_boot") == gateway.boot_observation
+
+
 # Share a durable retry interval and the final source check across Boot recovery and ordinary deadline supervision.
 async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Callable[[], bool]) -> None:
     j = g.journal
     now = time.time()
-    if now < lease.get("next_stop", 0):
+    if not current_source(g, lease) or now < lease.get("next_stop", 0):
         return
     j.put(KEY, {**lease, "hold_since": lease.get("hold_since", now), "next_stop": now + 15})
 
@@ -256,6 +262,8 @@ async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Call
         current = j.get(KEY, {})
         if (
             not authorized()
+            or not current_source(g, lease)
+            or not current_source(g, current)
             or current.get("id") != lease["id"]
             or not current.get("native_plan_confirmed")
             or current.get("closure_gap")
@@ -298,6 +306,7 @@ class ManagedSchedule:
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
         self.changed = asyncio.Event()
+        self.cutoff_checked: str | None = None
         self.prior_departure: tuple[int, str, str] | None = None
         self.j = controller.session.journal
         self.j.db.execute(
@@ -313,6 +322,7 @@ class ManagedSchedule:
             "local INTEGER NOT NULL UNIQUE REFERENCES transactions(local),"
             "PRIMARY KEY(attempt,started_ms))"
         )
+        controller.session.gateway.boot_observer = self.changed.set
         controller.session.gateway.status_observer = self.observe_status
         controller.session.gateway.tag_guard = self.permits_tag
         controller.session.gateway.prepare_report_hold = self.prepare_report_hold
@@ -380,11 +390,12 @@ class ManagedSchedule:
     def matches_pending_start(self, tag: str) -> bool:
         j = self.j
         digest = fingerprint(tag.casefold())
-        prior = self.c.tests.state()
+        prior = local_start_receipt(j)
         return bool(
             j.get("control", {}).get("start_pending")
-            and prior.get("start_rpc_accepted")
-            and prior.get("tag_digest") == digest
+            and prior.get("local") is None
+            and prior.get("stage") in ("issued", "accepted")
+            and prior.get("digest") == digest
             or confirmed_vendor_start(j, digest, None)
         )
 
@@ -392,11 +403,21 @@ class ManagedSchedule:
     async def prepare_report_hold(self, payload: dict[str, Any]) -> None:
         j, g = self.j, self.c.session.gateway
         lease, tag = j.get(KEY, {}), payload.get("idTag")
+        if j.active() is not None or not isinstance(tag, str):
+            return
+        if self.c.requests.intent().mode == "paused" and self.matches_pending_start(tag):
+            if not g.controls.ready or g.controls.desired() != 0:
+                operations = set(g.controls._operations)
+                if self.c.pause_task is not None and not self.c.pause_task.done():
+                    operations.add(self.c.pause_task)
+                if operations:
+                    await asyncio.wait(operations, timeout=min(1.0, g.charger.timeout))
+                if not self.held_report_ready(owner_command=True) or not self.matches_pending_start(tag):
+                    raise UnavailableError("the acknowledged owner report awaits verified Pause zero")
+            return
         if (
             not self.revoked(lease)
-            or j.active() is not None
             or not lease.get("other_local")
-            or not isinstance(tag, str)
             or not (tag.casefold() == lease["body"]["idTag"].casefold() or self.matches_pending_start(tag))
         ):
             return
@@ -941,8 +962,50 @@ class ManagedSchedule:
             # A separate scoped Stop can still succeed when a station write fails. Never release on this evidence.
             return
 
+    # After a new Boot, a previously observed or recovering transaction must be held until its origin is re-established.
+    def needs_source(self, lease: dict[str, Any]) -> bool:
+        g, j = self.c.session.gateway, self.j
+        active = j.active()
+        if active is None:
+            return False
+        if not current_source(g, lease):
+            return j.get("trial_phase") == "recovering" or active in (
+                lease.get("other_local"),
+                lease.get("bound_local"),
+                lease.get("unidentified_local"),
+            )
+        if active != lease.get("other_local"):
+            return False
+        native = self.c.native
+        cutoff = time.time() >= lease.get("end_epoch", float("inf"))
+        return (
+            native.last_verified_at == 0
+            or cutoff
+            and (
+                not 0 <= native.observation_age() <= 5
+                or self.cutoff_checked != lease["id"]
+                and native.read_sequence > native.last_resolved_read
+            )
+        )
+
+    # Renew a continuing independent source without delaying the watchdog's ability to hold the station at zero.
+    async def refresh_independent_source(self) -> None:
+        try:
+            async with asyncio.timeout(5):
+                await self.c.native.read()
+        except SecurityError, UnavailableError, TimeoutError:
+            pass  # An expired or failed observation leaves the next watchdog pass responsible for physical zero.
+        finally:
+            self.changed.set()
+
     # The service owns this independent deadline wait so a slow health poll or a concurrent Pause cannot defer zero.
     async def watch_deadline(self) -> None:
+        async with asyncio.TaskGroup() as tasks:
+            await self.supervise_deadline(tasks)
+
+    # At most one bounded source refresh supplements the five-second foreground poll near and after cutoff.
+    async def supervise_deadline(self, tasks: asyncio.TaskGroup) -> None:
+        refresh: asyncio.Task[None] | None = None
         while not self.c.stopping:
             self.changed.clear()
             lease = self.j.get(KEY, {})
@@ -958,6 +1021,7 @@ class ManagedSchedule:
                 remaining = end - time.time()
                 due = (
                     remaining <= 0
+                    or self.needs_source(lease)
                     or lease.get("retire_reason") == "vehicle_disconnected"
                     or lease.get("vehicle_disconnected")
                     or lease.get("unreported_native")
@@ -968,7 +1032,23 @@ class ManagedSchedule:
                         await self.protect_deadline(lease)
                     except DeniedError, UnavailableError, RecoveryRequiredError:
                         pass  # Durable attempt times bound retries. Only actual closure can release the hold.
-                delay = 1 if due else min(remaining, 30)
+                daily = self.j.active() is not None and self.j.active() == lease.get("other_local")
+                native = self.c.native
+                if (
+                    remaining <= 5
+                    and daily
+                    and self.c.session.gateway.controls.desired() > 0
+                    and native.observation_age() >= 2
+                    and native.read_sequence == native.last_resolved_read
+                    and (refresh is None or refresh.done())
+                ):
+                    refresh = tasks.create_task(self.refresh_independent_source())
+                if due:
+                    delay = 1
+                elif daily:
+                    delay = min(remaining, 1) if remaining <= 5 else min(remaining - 5, 30)
+                else:
+                    delay = min(remaining, 30)
             try:
                 await asyncio.wait_for(self.changed.wait(), delay)
             except TimeoutError:
@@ -977,17 +1057,29 @@ class ManagedSchedule:
     # Stop a previously identified, still-open OCPP transaction by its own ID, even while HTTP reads are unavailable.
     async def protect_deadline(self, lease: dict[str, Any]) -> None:
         j = self.j
+        needs_source = self.needs_source(lease)
+        before_end = time.time() < lease.get("end_epoch", float("inf"))
         if (
             lease.get("state") not in OBSERVABLE
-            or time.time() < lease.get("end_epoch", float("inf"))
+            or before_end
             and lease.get("retire_reason") != "vehicle_disconnected"
             and not lease.get("vehicle_disconnected")
             and not lease.get("unreported_native")
             and not lease.get("closure_gap")
+            and not needs_source
             or not self.hold_authorized()
         ):
             return
+        if not before_end:
+            self.cutoff_checked = lease["id"]
         bound, active = lease.get("bound_local"), j.active()
+        if active is not None and (needs_source or not current_source(self.c.session.gateway, lease)):
+            # Historical IDs remain available for closure. They cannot exempt an unverified physical session.
+            if lease.get("unidentified_local") != active:
+                lease = {**lease, "unidentified_local": active}
+                j.put(KEY, lease)
+            await self.protect_station(lease)
+            return
         if active is not None and active != bound:
             if (
                 active == lease.get("other_local")
@@ -1020,7 +1112,12 @@ class ManagedSchedule:
     async def hold_until_closed(self, n: HandoverEvidence | None = None) -> None:
         c, j = self.c, self.j
         g = c.session.gateway
-        if c.native.introduced_epoch != g._charger_epoch or not g.current_boot_seen(g._charger_epoch):
+        if not g.current_boot_seen(g._charger_epoch):
+            raise RecoveryRequiredError("deadline hold awaits the current charger Boot")
+        if c.native.introduced_epoch != g._charger_epoch:
+            if not current_source(g, j.get(KEY, {})):
+                # A blocked introduction read must not prevent newer source evidence reaching the deadline task.
+                await c.native.read()
             raise RecoveryRequiredError("deadline hold awaits the current charger introduction")
         n = n or await c.native.read()
         await self.await_closure_agreement(n)

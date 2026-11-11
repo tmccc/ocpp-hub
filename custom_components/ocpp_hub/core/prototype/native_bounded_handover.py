@@ -12,6 +12,7 @@ from .. import commands
 from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
+from .local_control import local_start_receipt
 from .managed_current import managed_current_ceiling
 from .managed_recovery import local_recovery_binding
 from .managed_schedule import (
@@ -20,6 +21,7 @@ from .managed_schedule import (
     installed_variant,
     known_timer_closure_gap,
     record_session_source,
+    recorded_station_profile,
     recorded_timer_hold,
     remember_disconnect,
     request_timer_stop,
@@ -79,6 +81,10 @@ class NativeBoundedHandover:
         if not saved and gateway.journal.get("trial_phase") != "prepared":
             raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
 
+    # The last verified native snapshot expires on the same clock and within the same limit as its admission audit.
+    def observation_age(self) -> float:
+        return time.time() - self.last_verified_at
+
     # Report an observation's age honestly rather than treating a persisted desired limit as a live guarantee.
     def status(self) -> dict[str, Any]:
         state = self.gateway.journal.get("native_bounded_handover", {})
@@ -86,7 +92,7 @@ class NativeBoundedHandover:
             "configured": True,
             "stage": state.get("stage", "not_admitted"),
             "target_native_limit_a": managed_current_ceiling(self.gateway.journal, self.spec),
-            "native_limit_freshly_verified": 0 <= time.time() - self.last_verified_at <= 5,
+            "native_limit_freshly_verified": 0 <= self.observation_age() <= 5,
             "vehicle_pause_asserted": False,
             "restoration_pending": state.get("stage") != "complete",
             "complete": state.get("stage") == "complete",
@@ -114,6 +120,7 @@ class NativeBoundedHandover:
         return fingerprint(
             {
                 "epoch": gateway._charger_epoch,
+                "boot_observation": gateway.boot_observation,
                 "revision": gateway.controls._revision,
                 "phase": journal.get("trial_phase"),
                 "control": journal.get("control"),
@@ -152,10 +159,7 @@ class NativeBoundedHandover:
             self.book.check_originals(native.physical)
             if native.physical.connection == "Unplug":
                 remember_disconnect(self.gateway.journal)
-            record_session_source(self.gateway.journal, native)
-            # A verified open session remains evidence even when this particular caller needs the station idle.
-            if closed:
-                self.require(native, route=route, closed=True)
+            record_session_source(self.gateway.journal, native, self.gateway.boot_observation)
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
             resolve()
             self.last_verified_at = 0
@@ -170,6 +174,9 @@ class NativeBoundedHandover:
             self.last_verified_at = 0
             raise
         self.last_verified_at = native.physical.observed_at
+        # A verified open source stays fresh even if this particular operation needs the station idle.
+        if closed:
+            self.require(native, route=route, closed=True)
         return native
 
     # The explicit managed capability broadens only its native ceiling; selected-current enforcement stays independent.
@@ -296,7 +303,8 @@ class NativeBoundedHandover:
         if binding is not None and native.physical.transaction_open:
             lease = journal.get("managed_temporary_schedule", {})
             if lease.get("state") not in OBSERVABLE:
-                await gateway.stop()
+                if journal.active() is not None:
+                    await gateway.stop()
             elif (
                 lease.get("native_plan_confirmed")
                 and native.physical.native_transaction_id == journal.active() == lease.get("bound_local")
@@ -343,6 +351,22 @@ class NativeBoundedHandover:
     def require_recovery_session(self, native: HandoverEvidence) -> None:
         if native.physical.transaction_open:
             j = self.gateway.journal
+            control = j.get("control", {})
+            if (
+                j.active() is None
+                and j.get("managed_control_intent", {}).get("mode") == "paused"
+                and control.get("start_pending")
+                and control.get("inhibit")
+                and control.get("owner") == "local"
+                and local_start_receipt(j).get("stage") in ("issued", "accepted")
+                and recorded_station_profile(j, self.spec.digest, self.spec.boot_digest)
+                and all(v == 0 for v in native.currents_a + native.powers_w)
+                and any(
+                    r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0
+                    for r in self.book.owned_present(native.physical)
+                )
+            ):
+                return  # The verified zero listener can receive the real lifecycle without adopting this native ID.
             if j.get("managed_temporary_schedule", {}).get("unreported_native"):
                 if recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest):
                     return  # Only the restricted listener/Boot can proceed. No local transaction is adopted.

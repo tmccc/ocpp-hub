@@ -250,19 +250,23 @@ async def test_pause_preempts_queued_start_before_actual_send(
                 if test.controller.pause_task is not None:
                     await test.controller.pause_task
                 control = test.session.journal.get("control")
-                assert control["start_pending"] and control["uncertain"]
+                assert (
+                    not control["start_pending"]
+                    and test.session.journal.get("local_start_receipt")["stage"] == "unsent"
+                )
                 assert test.controller.requests.intent().mode == "paused"
                 assert not starts(test.rig)
                 native = await test.controller.native.read()
                 assert native.physical.power_w == 0 and not native.physical.transaction_open
                 assert all(limit == 0 for limit in test.rig.bench.received_limits[count:])
-                # The uncertain Start remains fenced: a new Return cannot release its zero hold.
+                # The newer Pause remains in force until the owner Returns after fresh physical verification.
                 request = uuid.uuid4().hex
                 test.controller.command(request, "app_control", test.controller.requests.intent().revision)
-                await test.controller.tick()
-                assert test.controller.requests.intent().mode == "paused"
-                assert test.controller.requests.receipt(request)["state"] != "completed"
-                assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+                await healthy(test.controller)
+                await healthy(test.controller)
+                assert test.controller.requests.intent().mode == "app"
+                assert test.controller.requests.receipt(request)["state"] == "completed"
+                assert test.rig.bench.firmware.effective_limit() == 6 and not starts(test.rig)
                 return
             status = await healthy(test.controller)
             assert status["desired_control"] == "paused" and status["local_hold_verified"]

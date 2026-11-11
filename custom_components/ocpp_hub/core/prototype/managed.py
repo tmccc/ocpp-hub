@@ -7,9 +7,17 @@ import time
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
+from .local_control import local_start_receipt
 from .managed_current import ManagedCurrentLimits, managed_current_ceiling
 from .managed_intent import ControlIntent, ManagedRequests
-from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule, recorded_station_profile, require_continuing_session
+from .managed_schedule import (
+    KEY,
+    OBSERVABLE,
+    ManagedSchedule,
+    current_source,
+    recorded_station_profile,
+    require_continuing_session,
+)
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .native_http import NativeTransportUnavailableError
@@ -180,6 +188,18 @@ class ManagedController:
             await self.schedule.before_release(native)
         if self.schedule.awaiting_start():
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
+        control = j.get("control", {})
+        receipt = local_start_receipt(j)
+        if control.get("uncertain") and (
+            receipt.get("stage") == "unsent"
+            and receipt.get("settled_ticket") == control.get("ticket")
+            or receipt.get("bound_ticket") == control.get("ticket")
+            and j.db.execute(
+                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (receipt.get("local"),)
+            ).fetchone()
+        ):
+            # Verified physical Pause reconciles this ticket's proven unsent Start or its real lifecycle closure.
+            g.controls._complete(control["ticket"], uncertain=False)
         self.requests.confirm_pauses()
         return native
 
@@ -290,7 +310,9 @@ class ManagedController:
         def guard() -> None:
             timer = j.get(KEY, {})
             if continuing_local is not None and (
-                j.active() != continuing_local
+                not current_source(g, timer)
+                or self.schedule.needs_source(timer)
+                or j.active() != continuing_local
                 or timer.get("unidentified_local") != continuing_local
                 or timer.get("other_local") != continuing_local
                 or timer.get("unreported_native")
@@ -368,9 +390,16 @@ class ManagedController:
         if expected.revision != revision:
             self.requests.finish(identifier, "failed", {"classification": "stale_revision"})
             return
-        self.session.journal.db.execute(
-            "UPDATE managed_requests SET state='running' WHERE id=? AND state='accepted'", (identifier,)
-        )
+        j = self.session.journal
+        control = j.get("control", {})
+        if control.get("start_pending") or (
+            local_start_receipt(j).get("pause_revision") == expected.revision
+            and j.db.execute(
+                "SELECT 1 FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') LIMIT 1"
+            ).fetchone()
+        ):
+            return  # The existing Pause must verify the delayed local lifecycle before this Return can run.
+        j.db.execute("UPDATE managed_requests SET state='running' WHERE id=? AND state='accepted'", (identifier,))
         try:
             await self.restore_owner_control(expected)
         except ReleaseDeferredError:

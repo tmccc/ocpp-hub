@@ -213,8 +213,14 @@ async def test_newer_pause_preempts_regular_start(
             assert not starts(test.rig)
             assert all(value == 0 for value in test.rig.bench.received_limits[limits:])
             if boundary == "native_send":
-                assert test.session.journal.get("control")["start_pending"]
-                assert test.session.journal.get("control")["uncertain"]
+                assert not test.session.journal.get("control")["start_pending"]
+                assert test.session.journal.get("local_start_receipt")["stage"] == "unsent"
+                assert test.controller.requests.intent().mode == "paused"
+                assert (await healthy(test.controller))["local_hold_verified"]
+                returning = uuid.uuid4().hex
+                test.controller.command(returning, "app_control", test.controller.requests.intent().revision)
+                assert (await healthy(test.controller))["owner_control_enabled"]
+                assert test.controller.requests.receipt(returning)["state"] == "completed" and not starts(test.rig)
         finally:
             proceed.set()
 

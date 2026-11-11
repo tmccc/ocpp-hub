@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
@@ -15,9 +16,73 @@ from .composite import FutureScheduleError, verify_composite
 from .policy import DeniedError, Policy, number
 from .rpc import Peer, UnavailableError
 from .station import StationChoice
-from .store import Journal, RecoveryRequiredError, ReleaseDeferredError
+from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
+
+
+# Older managed normal Starts saved their tag with the owner's request before dispatching the physical command.
+def local_start_receipt(j: Journal) -> dict[str, Any]:
+    receipt = j.get("local_start_receipt", {})
+    if receipt:
+        return dict(receipt)
+    old = j.get("managed_test_charge", {})
+    if old.get("tag_digest") and old.get("source") == "local":
+        return {
+            "digest": old["tag_digest"],
+            "stage": "accepted" if old.get("start_rpc_accepted") else "prepared",
+            "local": old.get("local_transaction"),
+        }
+    return {}
+
+
+# A crash or revoked validation before final dispatch cannot leave a real transaction for this command to report.
+def retire_unsent_local_start(j: Journal, ticket: str | None) -> None:
+    receipt = j.get("local_start_receipt", {})
+    if not ticket or receipt.get("ticket") != ticket or receipt.get("stage") != "prepared":
+        return
+    control = j.get("control", {})
+    with j.atomic():
+        intent = j.get("managed_control_intent", {})
+        j.put(
+            "local_start_receipt",
+            {
+                **receipt,
+                "stage": "unsent",
+                "settled_ticket": control.get("ticket"),
+                "pause_revision": intent.get("revision") if intent.get("mode") == "paused" else None,
+            },
+        )
+        j.put("control", {**control, "start_pending": False})
+
+
+# A pre-upgrade ordinary Start can lose its pending flag when a different tag is accepted first.
+def recover_unreported_local_start(j: Journal) -> None:
+    existing = j.get("local_start_receipt", {})
+    if existing:
+        retire_unsent_local_start(j, existing.get("ticket"))
+        return
+    owner = j.get("managed_test_charge", {})
+    if (
+        owner.get("source") != "local"
+        or owner.get("kind") != "normal"
+        or owner.get("start_rpc_accepted") is not True
+        or owner.get("local_transaction") is not None
+        or owner.get("state") not in ("awaiting_power", "stopping", "interrupted")
+        or not isinstance(owner.get("tag_digest"), str)
+        or len(owner["tag_digest"]) != 64
+    ):
+        return
+    control = j.get("control", {})
+    # The old ledger never recorded a Start-command floor. A matching historical tag alone has no ordering proof.
+    if not control.get("start_pending") and any(
+        fingerprint(json.loads(row["start"])["idTag"].casefold()) == owner["tag_digest"]
+        for row in j.db.execute("SELECT start FROM transactions")
+    ):
+        return
+    with j.atomic():
+        j.put("local_start_receipt", {"digest": owner["tag_digest"], "stage": "accepted", "local": None})
+        j.put("control", {**control, "start_pending": True})
 
 
 class LocalControl:
@@ -131,6 +196,29 @@ class LocalControl:
         state = self.journal.get("control", {})
         if state.get("ticket") == ticket:
             self.journal.put("control", {**state, **changes})
+
+    # Bind only the issued local command with this tag, inside the actual transaction's durable commit.
+    def bind_start(self, tag: str, local: int) -> None:
+        control = self.journal.get("control", {})
+        if not control.get("start_pending"):
+            return
+        receipt = local_start_receipt(self.journal)
+        if (
+            receipt.get("local") is None
+            and receipt.get("digest") == fingerprint(tag.casefold())
+            and receipt.get("stage") in ("issued", "accepted")
+        ):
+            intent = self.journal.get("managed_control_intent", {})
+            self.journal.put(
+                "local_start_receipt",
+                {
+                    **receipt,
+                    "local": local,
+                    "bound_ticket": control.get("ticket"),
+                    "pause_revision": intent.get("revision") if intent.get("mode") == "paused" else None,
+                },
+            )
+            self.journal.put("control", {**control, "start_pending": False})
 
     # Install the reserved station profile; Accepted confirms receipt, not yet real-device execution or persistence.
     async def _cap(self, call: Call, limit: float, epoch: int) -> Frame:
@@ -343,17 +431,48 @@ class LocalControl:
             if guard is not None:
                 guard()
 
-        async with self.peer.sequence(1, check) as call:
+        # Write dispatch and ACK independently of the control ticket a later Pause can supersede.
+        def record_stage(stage: str) -> None:
+            receipt = self.journal.get("local_start_receipt", {})
+            if receipt.get("ticket") == ticket:
+                with self.journal.atomic():
+                    self.journal.put("local_start_receipt", {**receipt, "stage": stage})
+                    if stage == "rejected" and receipt.get("local") is None:
+                        control = self.journal.get("control", {})
+                        self.journal.put("control", {**control, "start_pending": False})
+
+        # The native and resource gates both run before the transport can send this command.
+        def dispatch(action: str) -> None:
+            if action == "RemoteStartTransaction":
+                if self.journal.active() is not None:
+                    raise DeniedError("an actual transaction superseded the pending Start before dispatch")
+                record_stage("issued")
+
+        async with self.peer.sequence(1, check, on_dispatch=dispatch) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
                 if self.authorize is not None and not self.authorize(tag):
                     raise DeniedError("authorization changed before forwarding a local start")
-                self._complete(ticket, inhibit=False, start_pending=True)
+                with self.journal.atomic():
+                    self.journal.put(
+                        "local_start_receipt",
+                        {
+                            "ticket": ticket,
+                            "digest": fingerprint(tag.casefold()),
+                            "stage": "prepared",
+                            "local": None,
+                        },
+                    )
+                    self._complete(ticket, inhibit=False, start_pending=True)
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":
+                    if answer[0] == 3 and answer[2].get("status") == "Rejected":
+                        record_stage("rejected")
                     raise UnavailableError("transaction start was not confirmed")
+                record_stage("accepted")
             except UnavailableError, DeniedError, RecoveryRequiredError:
+                retire_unsent_local_start(self.journal, ticket)
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)
                 await self._cap(call, 0, epoch)
@@ -402,6 +521,5 @@ class LocalControl:
                 if isinstance(error, ReleaseDeferredError):
                     self._complete(ticket, uncertain=False)
                 raise
-            # Resuming an open independent session cannot consume a separate pending Start.
-            pending = self.journal.active() is not None and self.journal.get("control", {}).get("start_pending", False)
-            self._complete(ticket, owner="shared", inhibit=False, uncertain=False, start_pending=pending)
+            # Changing the station ceiling cannot bind a pending command to a transaction.
+            self._complete(ticket, owner="shared", inhibit=False, uncertain=False)

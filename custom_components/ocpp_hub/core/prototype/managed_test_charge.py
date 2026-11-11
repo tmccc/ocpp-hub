@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .local_control import local_start_receipt
 from .managed_schedule import KEY, OBSERVABLE
 from .policy import DeniedError
 from .rpc import UnavailableError
@@ -288,7 +289,7 @@ class ManagedChargeTests:
         lease, state = self.lease, self.state()
         if lease is None or not lease.normal or state.get("kind") != "normal":
             return
-        if state.get("local_transaction") is not None:
+        if state.get("local_transaction") is not None or local_start_receipt(self.journal).get("local") != local:
             return
         tag = payload.get("idTag")
         if not isinstance(tag, str) or state.get("tag_digest") != fingerprint(tag.casefold()):
@@ -405,9 +406,11 @@ class ManagedChargeTests:
                     (lease.first_mutation, grant.get("mutation")),
                 ).fetchone()
             )
-            if (lease.source == "local" and (cloud or not state.get("start_rpc_accepted"))) or (
-                lease.source == "cloud" and not cloud
-            ):
+            local = local_start_receipt(self.journal)
+            if (
+                lease.source == "local"
+                and (cloud or not state.get("start_rpc_accepted") or local.get("local") != self.journal.active())
+            ) or (lease.source == "cloud" and not cloud):
                 return
             lease.deadline = min(
                 lease.hard_deadline, time.monotonic() + DURATION + (15 if lease.source == "cloud" else 0)
@@ -440,12 +443,12 @@ class ManagedChargeTests:
             if intent.mode != "paused":
                 j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 c.session.gateway.controls._claim(True, stopping=True)
+                j.db.execute(
+                    "UPDATE managed_requests SET state='failed',result=? WHERE action='app_control' "
+                    "AND state IN ('accepted','running')",
+                    (json.dumps({"classification": "superseded_by_test_stop"}),),
+                )
             j.put("managed_test_charge", {**self.state(), "state": "stopping", "stop_reason": reason})
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? WHERE action='app_control' "
-                "AND state IN ('accepted','running')",
-                (json.dumps({"classification": "superseded_by_test_stop"}),),
-            )
             c.requests.finish(lease.identifier, "uncertain", {"classification": reason})
         if c.pause_task is None or c.pause_task.done():
             c.pause_task = asyncio.create_task(c._stop_requested())

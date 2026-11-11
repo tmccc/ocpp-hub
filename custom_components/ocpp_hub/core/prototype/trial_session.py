@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .gateway import Gateway
+from .local_control import recover_unreported_local_start
 from .managed_current import managed_current_ceiling
 from .managed_schedule import recorded_timer_hold
 from .native_bounded import NativeBoundedSpec
@@ -326,6 +327,8 @@ class TrialSession:
     async def start(self) -> None:
         phase = self.journal.get("trial_phase")
         if self.native_bounded is not None:
+            if not self.started and self.journal.get("managed_mode"):
+                recover_unreported_local_start(self.journal)
             if phase == "prepared":
                 await self.native_bounded.admit()
             elif phase in ("active", "recovering", "blocked"):

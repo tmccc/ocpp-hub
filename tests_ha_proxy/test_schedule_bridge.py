@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import aiohttp
@@ -20,15 +22,30 @@ from tests.test_prototype_tls import tls as tls
 
 # Intent: HA Pause closes an otherwise open, full scheduled session; Return restores ordinary app/schedule operation.
 # Why: a simulated management receipt cannot show that the real client waits for measured closure or original readback.
-@pytest.mark.parametrize("delayed_owner", [False, True])
-async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory, monkeypatch, delayed_owner):
+@pytest.mark.parametrize(
+    ("delayed_owner", "early"), [(None, False), ("CLOUD_OWNER", False), ("APP_OWNER", False), ("APP_OWNER", True)]
+)
+async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory, monkeypatch, delayed_owner, early):
     async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
-        await b.arm()
-        if delayed_owner:
+        if delayed_owner == "APP_OWNER":
+            gateway = b.session.gateway
+            gateway.policy = replace(
+                gateway.policy, allowed_tags=frozenset({delayed_owner, *gateway.policy.allowed_tags})
+            )
+            gateway.controls.policy = gateway.policy
+            b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+            await b.c.tests.settle()
+            assert starts(b.rig)[0][3]["idTag"] == delayed_owner
+            unrelated = await b.start_plan(9, demand=False)
+            await b.close_transaction(unrelated)
+            published = await b.c.tick()
+        else:
+            await b.arm()
+        if delayed_owner == "CLOUD_OWNER":
             await b.acknowledge_older_owner_start()
             b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
             published = await b.c.tick()
-        else:
+        elif delayed_owner is None:
             b.clock.now = b.start
             local = await b.fire(b.timer)
             assert (await healthy(b.c))["power_w"] > 0
@@ -37,6 +54,23 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             b.device.requested_current = 0
             published = await healthy(b.c)
             assert published["power_w"] == 0 and b.session.journal.active() == local
+        if early:
+            gateway = b.session.gateway
+            prepare = gateway.prepare_report_hold
+            report_arrived = asyncio.Event()
+
+            # Hold the actual zero ACK until the charger's genuine Start reaches the gateway on its other channel.
+            async def wait_for_report(action, payload):
+                if action == "SetChargingProfile" and b.device.effective_limit() == 0:
+                    await asyncio.wait_for(report_arrived.wait(), 4)
+
+            # Observe ingress without bypassing the original receipt checks or the physical zero verification.
+            async def trace_report(payload):
+                report_arrived.set()
+                await prepare(payload)
+
+            b.rig.bench.before_reply = wait_for_report
+            monkeypatch.setattr(gateway, "prepare_report_hold", trace_report)
         before_starts = list(starts(b.rig))
         port = unused_tcp_port_factory()
         server = ManagementServer(
@@ -62,15 +96,22 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                 try:
                     if delayed_owner:
                         async with asyncio.timeout(4):
-                            while b.timer in b.device.plans:
+                            while (
+                                b.timer in b.device.plans
+                                or b.c.requests.intent().mode != "paused"
+                                or b.device.effective_limit() != 0
+                                or not early
+                                and not b.session.gateway.controls.ready
+                            ):
                                 await asyncio.sleep(0.01)
                         assert not pause.done() and b.device.effective_limit() == 0
                         b.device.active = 987654
                         b.rig.peer.plan_session = (987654, 987655)
                         body = START | {
-                            "idTag": "CLOUD_OWNER",
+                            "idTag": delayed_owner,
                             "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
                         }
+                        assert b.session.gateway.controls.ready is not early
                         reply = await b.rig.bench.call(b.sock, "prior-owner-report", "StartTransaction", body)
                         assert reply[0] == 3
                         local = reply[2]["transactionId"]
@@ -101,6 +142,9 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                 b.clock.now += 21600
                 await b.close_transaction(daily)
         finally:
+            if early:
+                report_arrived.set()
+                b.rig.bench.before_reply = None
             supervisor.cancel()
             with suppress(asyncio.CancelledError):
                 await supervisor

@@ -155,12 +155,12 @@ class Peer:
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
     @asynccontextmanager
     async def sequence(
-        self, priority: int, check: Callable[[], None]
+        self, priority: int, check: Callable[[], None], *, on_dispatch: Callable[[str], None] | None = None
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
         async with self.gate.enter(priority):
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
-                return await self._call_locked(action, payload, check, None, None)
+                return await self._call_locked(action, payload, check, None, None, on_dispatch)
 
             yield call
 
@@ -172,6 +172,7 @@ class Peer:
         check: Callable[[], None] | None,
         token: str | None,
         before_send: Callable[[], None] | None,
+        on_dispatch: Callable[[str], None] | None = None,
     ) -> Frame:
         if check is not None:
             check()
@@ -196,6 +197,8 @@ class Peer:
                     before_send()
                 if self.before_send is not None:
                     self.before_send(action, actual)
+                if on_dispatch is not None:
+                    on_dispatch(action)
                 self.diagnostics.sending(action, len(unique_id))
                 await sender(build_call(unique_id, action, actual))
                 self.diagnostics.phase = "awaiting_reply"
