@@ -93,6 +93,7 @@ class SchedulePeer(NativeVehiclePeer):
         "lost-ack",
         "clear-lost",
         "preempt",
+        "unplug",
         "other-plan",
         "untyped-plan",
         "disappeared",
@@ -161,6 +162,23 @@ async def test_temporary_native_schedule(
                     await old(raw)
 
                 s.gateway.charger.sender = lose
+            if outcome == "unplug":
+                original_validate = s.gateway.charger.validate_send
+                assert original_validate is not None
+
+                # The cable is removed after request acceptance but before the final independent device read.
+                async def disconnect_vehicle(action: str, payload: dict[str, Any]) -> None:
+                    if action == "DataTransfer" and payload.get("messageId") == "setPlan":
+                        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+                    await original_validate(action, payload)
+
+                s.gateway.charger.validate_send = disconnect_vehicle
+                await healthy(c)
+                await healthy(c)
+                assert c.schedule.summary()["result"] == "cancelled_before_install"
+                assert all(f[2] != "DataTransfer" or f[3].get("messageId") != "setPlan" for f in rig.bench.device_calls)
+                assert set(rig.bench.firmware.plans) == {9}
+                return
             if outcome == "preempt":
                 c.command(uuid.uuid4().hex, "pause", 0)
                 await healthy(c)

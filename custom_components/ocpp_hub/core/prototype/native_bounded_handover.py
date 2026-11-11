@@ -335,6 +335,8 @@ class NativeBoundedHandover:
         )
         self.require_selected(native)
         if timer:
+            if payload["messageId"] == "setPlan" and native.physical.connection != "Plug":
+                raise UnavailableError("temporary timer installation requires the connected vehicle")
             lease = self.gateway.journal.get("managed_temporary_schedule", {})
             expected = (
                 lease.get("original_digest") if payload["messageId"] == "setPlan" else lease.get("augmented_digest")
