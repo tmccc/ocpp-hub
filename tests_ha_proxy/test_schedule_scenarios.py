@@ -177,7 +177,7 @@ async def next_date_idle(b, published):
 # Why: real service publication, receipts and process replacement must agree with physical peer effects and next daily.
 @pytest.mark.parametrize(
     "trace",
-    ["unknown", "unplug", "daily-reconnect", "owner-restart", "ledger-first", "replacement"],
+    ["unknown", "unplug", "daily-reconnect", "owner-restart", "ledger-first", "later-booking"],
 )
 @pytest.mark.parametrize("demand", [False, True])
 async def test_n09_management_scheduling_trace(tmp_path, tls, unused_tcp_port_factory, monkeypatch, trace, demand):
@@ -254,7 +254,7 @@ async def test_n09_management_scheduling_trace(tmp_path, tls, unused_tcp_port_fa
                     b.device.active = None
                     await published.settle()
                 await published.healthy()
-            elif trace in ("unplug", "replacement"):
+            elif trace in ("unplug", "later-booking"):
                 b.clock.now = END
                 await published.settle()
                 await confirmed_status(client, 0)

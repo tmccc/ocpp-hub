@@ -10,6 +10,9 @@
   charger introduction after a temporary observation failure on reconnect. Hold unidentified open sessions
   at zero until source verification, including across a proxy restart. Preserve independently acknowledged
   starts while retiring the timer and recover unplugged sessions that still await their final Stop.
+  Preserve archived cutoff duties when a later unsent booking is cancelled. Keep independent-session
+  continuation conditional on the current source, and recover either temporary Start report order after
+  an interrupted current selection without stopping the session before its deadline.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

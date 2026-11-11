@@ -66,7 +66,7 @@ async def test_older_occurrence_after_newer_receipt(tmp_path, tls, unused_tcp_po
                 await introduced(b.rig, b.session, b.sock, "occurrence-restart")
                 if newer_state == "requested":
                     newer_receipt = b.c.requests.receipt(newer["id"])
-                    newer = b.session.journal.get(managed_schedule.KEY)
+                    newer = occurrences(b.session.journal)[newer["id"]]
             b.rig.bench.history.append(row)
             b.device.active = 987654
             b.rig.peer.plan_session = (987654, old["body"]["planId"])

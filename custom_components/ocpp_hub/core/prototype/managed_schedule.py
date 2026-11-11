@@ -14,6 +14,10 @@ from ..control import HUB_PROFILE_ID
 from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
 from .local_control import local_start_receipt
+from .managed_cutoffs import OBSERVABLE as OBSERVABLE
+from .managed_cutoffs import idle_cutoff_pending as idle_cutoff_pending
+from .managed_cutoffs import release_idle_cutoffs, resume_cutoff
+from .managed_cutoffs import supervised_timer as supervised_timer
 from .managed_occurrences import (
     HEAD,
     activate,
@@ -38,30 +42,6 @@ if TYPE_CHECKING:
     from .managed import ManagedController
 
 KEY = "managed_temporary_schedule"
-OBSERVABLE = {"installing", "armed", "clearing"}
-
-
-# A completed inventory cleanup does not end the independent idle cutoff obligation.
-def supervised_timer(lease: dict[str, Any]) -> bool:
-    return (
-        lease.get("state") in OBSERVABLE
-        or lease.get("recovery_session") is True
-        or lease.get("idle_cutoff_hold") is True
-        or lease.get("closure_gap") is True
-        or idle_cutoff_pending(lease)
-    )
-
-
-# A timer that was installed without a confirmed closure must still reach its local deadline after early cleanup.
-def idle_cutoff_pending(lease: dict[str, Any]) -> bool:
-    return (
-        lease.get("state") in {*OBSERVABLE, "complete"}
-        and lease.get("result") not in ("cancelled_before_install", "session_closed")
-        and lease.get("retire_reason") != "session_closed"
-        and lease.get("idle_cutoff_released")
-        not in ("verified_session", "owner_return", "session_closed", "observed_closure")
-        and not lease.get("native_plan_confirmed")
-    )
 
 
 # A temporary plan is a separate, explicitly receipted native resource; the original schedule stays pinned.
@@ -194,7 +174,7 @@ def matching_retired_attempt(lease: dict[str, Any], n: HandoverEvidence) -> bool
 
 # Publish the source of each fully verified, open native observation before any cutoff or recovery task can act.
 def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str | None) -> None:
-    previous_lease = j.get(KEY, {})
+    previous_lease = resume_cutoff(j)
     local = n.physical.native_transaction_id
     if local is not None or any(
         candidate["body"]["planId"] == n.session_plan_id and matching_retired_attempt(candidate, n)
@@ -292,6 +272,8 @@ def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str
         if lease.get("idle_cutoff_hold"):
             lease = {**lease, "idle_cutoff_hold": False, "idle_cutoff_released": "observed_closure"}
         j.put(KEY, lease)
+        if lease.get("idle_cutoff_released") == "observed_closure":
+            release_idle_cutoffs(j, "observed_closure", time.time())
     unreported = local is not None and active != local and not gap
     evidence = lease.get("unreported_source", {})
     if unreported and (evidence.get("native_id"), evidence.get("plan_id")) != (local, n.session_plan_id):
@@ -309,6 +291,7 @@ def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str
         # Both interfaces now confirm the end of the previously observed native lifecycle.
         lease = {**lease, "idle_cutoff_hold": False, "idle_cutoff_released": "observed_closure"}
         j.put(KEY, lease)
+        release_idle_cutoffs(j, "observed_closure", time.time())
     if (
         gap != lease.get("closure_gap", False)
         or unreported != lease.get("unreported_native", False)
@@ -340,6 +323,9 @@ def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str
         timestamp(json.loads(row["start"])["timestamp"]).timestamp(),
     )
     if timer_source:
+        if boot_observation is not None:
+            # Either report order can establish the same exact temporary source on this actual Boot.
+            changes["continuation_boot"] = boot_observation
         if previous != local:
             changes.update(bound_local=local, native_plan_confirmed=True, temporary_attempts={})
             if previous is not None:
@@ -367,14 +353,14 @@ def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str
         j.put(KEY, {**lease, **changes})
 
 
-# A native-first temporary report may resume only the original connected occurrence inside its remaining window.
+# A reconciled temporary report may resume only the original connected occurrence inside its remaining window.
 def temporary_continuation(j: Journal, lease: dict[str, Any], local: int) -> bool:
     intent = j.get("managed_control_intent", {})
     return (
         lease.get("state") == "armed"
         and lease.get("bound_local") == local
-        and lease.get("provisional_boot") is not None
-        and lease["provisional_boot"] == lease.get("source_boot")
+        and lease.get("source_boot") is not None
+        and lease["source_boot"] in (lease.get("provisional_boot"), lease.get("continuation_boot"))
         and lease.get("native_plan_confirmed") is True
         and not lease.get("retire_reason")
         and not lease.get("vehicle_disconnected")
@@ -496,7 +482,12 @@ class ManagedSchedule:
 
     # Persist the local deadline independently of timer cleanup, including when an old complete lease is reopened.
     def arm_idle_cutoff(self) -> dict[str, Any]:
-        lease: dict[str, Any] = self.j.get(KEY, {})
+        head = occurrences(self.j).get(self.j.get(HEAD), {})
+        if head.get("state") == "requested" and time.time() >= head["start_epoch"] - 10:
+            # An unavailable native read cannot retain an expired unsent head across an older cutoff.
+            activate(self.j, head["id"])
+            self.finish(head, "cancelled_before_install")
+        lease = resume_cutoff(self.j)
         if not idle_cutoff_pending(lease):
             return lease
         if "end_epoch" not in lease:
@@ -519,10 +510,8 @@ class ManagedSchedule:
 
     # Clear only after a successful positive restoration; the reason prevents the same retired lease rearming.
     def clear_idle_cutoff(self, reason: str) -> None:
-        lease = self.j.get(KEY, {})
-        if lease.get("idle_cutoff_hold") or idle_cutoff_pending(lease):
-            self.j.put(KEY, {**lease, "idle_cutoff_hold": False, "idle_cutoff_released": reason})
-            self.changed.set()
+        release_idle_cutoffs(self.j, reason, time.time())
+        self.changed.set()
 
     # Return remains explicit owner authority while its receipt moves from accepted to running.
     def owner_returning(self) -> bool:
@@ -1012,11 +1001,17 @@ class ManagedSchedule:
                 if reason == "session_closed"
                 else {}
             )
+            if reason == "cancelled_before_install":
+                # An unsent request never owns a separate idle duty; the archived installed receipt retains any hold.
+                closure = {"idle_cutoff_hold": False}
             self.j.put(KEY, {**lease, **closure, "state": "complete", "result": reason, "verified_at": time.time()})
             self.c.requests.finish(
                 lease["id"], "completed" if reason == "session_closed" else "failed", {"classification": reason}
             )
+            if reason == "session_closed":
+                release_idle_cutoffs(self.j, reason, time.time())
             restore_head(self.j)
+            resume_cutoff(self.j)
 
     # Mark sent intent at the final transport boundary, and reconcile acknowledgements or lost replies by readback.
     async def send(self, lease: dict[str, Any], adding: bool) -> None:
@@ -1321,7 +1316,7 @@ class ManagedSchedule:
             self.changed.clear()
             lease = self.arm_idle_cutoff()
             delay: float | None = None
-            if lease.get("state") in {"requested", *OBSERVABLE} or idle_cutoff_pending(lease):
+            if lease.get("state") == "requested" or supervised_timer(lease):
                 end = lease.get("end_epoch")
                 if end is None:
                     # A pre-upgrade lease keeps its physical payload while gaining the admitted local deadline.
