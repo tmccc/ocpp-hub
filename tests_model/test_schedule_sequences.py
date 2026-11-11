@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
-import socket
 import ssl
 import subprocess
 from contextlib import AsyncExitStack
@@ -20,6 +19,7 @@ from tests.test_managed_proxy import introduced, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_native_history_archive import unassigned
 from tests.test_prototype import START
+from tests.worker_ports import listener_port_factory
 from tests_model.schedule_cases import SequenceCase, cases, smoke_cases
 
 
@@ -75,17 +75,7 @@ def tls_for_case(path, material):
 
 # Allocate only inside this worker's checked non-ephemeral pool, then start its sole scenario listener immediately.
 def listener_port():
-    worker = int(os.environ.get("MODEL_WORKER_INDEX", "0"))
-    if not 0 <= worker < 20:
-        raise ValueError("model worker index outside its allocated pool")
-    for port in range(14000 + worker * 500, 14500 + worker * 500):
-        with socket.socket() as reservation:
-            try:
-                reservation.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError("no free model listener port")
+    return listener_port_factory(int(os.environ.get("MODEL_WORKER_INDEX", "0")))()
 
 
 @dataclass
