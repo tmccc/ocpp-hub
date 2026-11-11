@@ -1561,7 +1561,7 @@ async def test_confirmed_owner_report_under_recovery_zero(
         await b.arm()
         issued = int(b.clock.now)
         if expired == "metadata":
-            monkeypatch.setattr(auth_info, "time", SimpleNamespace(time=lambda: b.clock.now))
+            monkeypatch.setattr(auth_info, "time", SimpleNamespace(time=lambda: b.clock.now + 0.75))
             standard = trial_bench.info
             original_expiry = datetime.fromtimestamp(issued + 20, UTC).isoformat()
             monkeypatch.setattr(trial_bench, "info", lambda: standard() | {"expiryDate": original_expiry})
@@ -1599,7 +1599,7 @@ async def test_confirmed_owner_report_under_recovery_zero(
             assert rejected[0] == 4 and j.active() is None
             if expired == "metadata":
                 assert g.auth_info.get(tag)["status"] == "Expired"
-                for instant in (issued - 1, issued + 20):
+                for instant in (issued - 1, issued + 0.1, issued + 20):
                     response = await b.rig.bench.call(
                         sock,
                         uuid.uuid4().hex,
@@ -1615,7 +1615,7 @@ async def test_confirmed_owner_report_under_recovery_zero(
                 | {
                     "idTag": tag,
                     "timestamp": datetime.fromtimestamp(
-                        issued + 1 if expired == "metadata" else b.clock.now, UTC
+                        issued if expired == "metadata" else b.clock.now, UTC
                     ).isoformat(),
                 },
             )
@@ -1767,3 +1767,187 @@ async def test_departure_wakes_cutoff_during_stalled_poll(tmp_path, tls, unused_
         assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
         daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
         assert daily is not None and (await healthy(b.c))["power_w"] > 0 and not starts(b.rig)
+
+
+# Intent: a corrected source during physical zero verification cancels Stop and finishes the zero-only recovery.
+# Why: a superseded Stop may leave an accepted zero profile whose composite acknowledgement still needs verification.
+@pytest.mark.parametrize("stage", ["before_zero", "zero_ack", "before_stop"])
+@pytest.mark.parametrize("source", ["daily", "unknown"])
+@pytest.mark.parametrize("demand", [False, True])
+async def test_changed_source_during_cutoff_profile_ack(
+    tmp_path, tls, unused_tcp_port, monkeypatch, source, demand, stage
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.fire(b.timer, demand=demand)
+        await healthy(b.c)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        # Delay the real station acknowledgement while the other production task reads the new source.
+        async def slow_zero(action, payload):
+            if (
+                action == "SetChargingProfile"
+                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+                and not entered.is_set()
+            ):
+                entered.set()
+                await release.wait()
+
+        validate = b.session.gateway.charger.validate_send
+
+        # Correct the source either before the first zero write or before Stop after zero has been verified.
+        async def before_command(action, payload):
+            zero = (
+                action == "SetChargingProfile"
+                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+            )
+            if not entered.is_set() and (
+                stage == "before_zero" and zero or stage == "before_stop" and action == "RemoteStopTransaction"
+            ):
+                entered.set()
+                await release.wait()
+            if validate is not None:
+                await validate(action, payload)
+
+        if stage == "zero_ack":
+            b.rig.bench.before_reply = slow_zero
+        else:
+            b.session.gateway.charger.validate_send = before_command
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        watcher = asyncio.create_task(b.c.schedule.watch_deadline())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            b.rig.peer.plan_session = (local, 9 if source == "daily" else 987655)
+            await b.c.tick()
+            release.set()
+            for _ in range(5):
+                await b.c.tick()
+                b.clock.now += 16
+            assert not b.stops() and b.session.journal.active() == local
+            if source == "unknown":
+                assert b.device.effective_limit() == 0
+                b.rig.peer.plan_session = (local, 9)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6
+            await b.close_transaction(local)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily != local and (await healthy(b.c))["power_w"] > 0 and not b.stops()
+        finally:
+            release.set()
+            b.session.gateway.charger.validate_send = validate
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+
+# Intent: only a fresh matching open occurrence may submit its delayed Start under zero, with normal ID allocation.
+# Why: cutoff cannot adopt a native-only ID, orphan the real lifecycle, or let a replacement car reuse the same tag.
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("source", ["temporary", "daily", "departed"])
+async def test_delayed_native_occurrence_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypatch, restart, source):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        plan = 9 if source == "daily" else b.timer
+        b.clock.now = b.start
+        b.device.active = 987654
+        b.device.fire_plan(plan)
+        b.rig.peer.plan_session = (987654, plan)
+        b.rig.peer.paused = False
+        b.rig.peer.permission_enabled = True
+        b.rig.bench.cp, b.rig.bench.connection = "C", "Charging"
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        if restart:
+            older = b.session.journal.get(managed_schedule.KEY)
+            del older["accepted_epoch"], older["end_epoch"]
+            b.session.journal.put(managed_schedule.KEY, older)
+            await crash(b.session)
+            b.session = managed_session(b.rig)
+            await b.session.start()
+            b.c = ManagedController(b.session)
+        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
+            if restart:
+                await introduced(b.rig, b.session, b.sock, "delayed-native-boot")
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and b.session.journal.active() is None and not b.stops()
+            tag = b.device.plans[plan]["idTag"]
+            if source == "departed":
+                await b.rig.bench.call(
+                    b.sock,
+                    "left",
+                    "StatusNotification",
+                    {"connectorId": 1, "status": "Available", "errorCode": "NoError"},
+                )
+            for wrong_tag, when in ((tag, b.clock.now), ("UNRELATED", b.start)):
+                refusal = await b.rig.bench.call(
+                    b.sock,
+                    uuid.uuid4().hex,
+                    "StartTransaction",
+                    START | {"idTag": wrong_tag, "timestamp": datetime.fromtimestamp(when, UTC).isoformat()},
+                )
+                assert refusal[0] == 4 and b.session.journal.active() is None
+            payload = START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.start, UTC).isoformat()}
+            reply = await b.rig.bench.call(b.sock, "reported-native-start", "StartTransaction", payload)
+            if source == "departed":
+                assert reply[0] == 4 and b.session.journal.active() is None
+                b.device.active = None
+                b.device.requested_current = 0
+                b.rig.peer.permission_enabled = False
+                b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+            else:
+                assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+                local = reply[2]["transactionId"]
+                assert local != 987654 and b.session.journal.active() == local and b.device.effective_limit() == 0
+                assert (await b.rig.bench.call(b.sock, "replayed-native-start", "StartTransaction", payload))[
+                    2
+                ] == reply[2]
+                b.device.active = 987654
+                for _ in range(3):
+                    await b.c.tick()
+                assert not b.stops() and b.device.effective_limit() == 0
+                b.device.active = local
+                b.rig.peer.plan_session = (local, plan)
+                if source == "daily":
+                    assert (await healthy(b.c))["station_ceiling_a"] == 6 and not b.stops()
+                else:
+                    for _ in range(3):
+                        await b.c.tick()
+                    assert set(b.stops()) == {local} and b.device.effective_limit() == 0
+                await b.close_transaction(local)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert (
+                daily is not None
+                and (await healthy(b.c))["power_w"] > 0
+                and daily not in b.stops()
+                and not starts(b.rig)
+            )
+
+
+# Intent: a failed composite check on an already introduced socket can reverify an idle recovery zero.
+# Why: a single rejected readback before a future timer must not require another Boot or the eventual 06:00 cutoff.
+async def test_future_idle_timer_retries_reconnect_zero(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        answer = b.device.answer
+        rejected = asyncio.Event()
+
+        # Reject one real zero-profile readback after the replacement has already introduced itself.
+        def reject_once(action, payload):
+            if action == "GetCompositeSchedule" and not rejected.is_set():
+                rejected.set()
+                return {"status": "Rejected"}
+            return answer(action, payload)
+
+        b.device.answer = reject_once
+        async with b.rig.charger(b.session) as b.sock:
+            assert (await b.rig.bench.call(b.sock, "zero-readback-boot", "BootNotification", BOOT))[0] == 3
+            await asyncio.wait_for(rejected.wait(), 3)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9, b.timer}
+            b.clock.now = b.start
+            local = await b.fire(b.timer)
+            await healthy(b.c)
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            await b.c.tick()
+            assert set(b.stops()) == {local} and b.device.effective_limit() == 0
+            await b.close_transaction(local)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}

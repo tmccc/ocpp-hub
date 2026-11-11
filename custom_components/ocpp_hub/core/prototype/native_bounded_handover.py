@@ -282,7 +282,7 @@ class NativeBoundedHandover:
                 await gateway.stop()
             elif (
                 lease.get("native_plan_confirmed")
-                and journal.active() == lease.get("bound_local")
+                and native.physical.native_transaction_id == journal.active() == lease.get("bound_local")
                 and native.session_plan_id == lease["body"]["planId"]
             ):
                 # Introduction remains verified if this restrictive RPC fails. Its durable hold supervises retries.
@@ -326,7 +326,7 @@ class NativeBoundedHandover:
     def require_recovery_session(self, native: HandoverEvidence) -> None:
         if native.physical.transaction_open:
             j = self.gateway.journal
-            if j.active() is None and j.get("managed_temporary_schedule", {}).get("unreported_native"):
+            if j.get("managed_temporary_schedule", {}).get("unreported_native"):
                 if recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest):
                     return  # Only the restricted listener/Boot can proceed. No local transaction is adopted.
             if not known_timer_closure_gap(j, native):

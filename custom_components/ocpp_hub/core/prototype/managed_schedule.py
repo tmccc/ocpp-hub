@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..control import HUB_PROFILE_ID
+from .gateway import timestamp
 from .ics_writes import validate_write
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -43,11 +44,18 @@ def remember_disconnect(journal: Journal, observed_at: float | None = None) -> N
     lease = journal.get(KEY, {})
     if (
         lease.get("state") in {"requested", *OBSERVABLE}
-        and not lease.get("retire_reason")
+        and not lease.get("vehicle_disconnected")
         # The station reports whole seconds. A fresh or future-dated departure cannot establish cable continuity.
         and (observed_at is None or observed_at >= int(lease.get("accepted_epoch", 0)) - 5)
     ):
-        journal.put(KEY, {**lease, "retire_reason": "vehicle_disconnected"})
+        journal.put(
+            KEY,
+            {
+                **lease,
+                "vehicle_disconnected": True,
+                "retire_reason": lease.get("retire_reason") or "vehicle_disconnected",
+            },
+        )
 
 
 # An existing commissioned timer and an owned station receipt allow a zero-only restart during a telemetry outage.
@@ -90,9 +98,17 @@ def record_session_source(j: Journal, n: HandoverEvidence) -> None:
     if lease.get("state") not in OBSERVABLE:
         return
     active = j.active()
-    unreported = local is not None and active is None and not known_timer_closure_gap(j, n)
+    unreported = local is not None and active != local and not known_timer_closure_gap(j, n)
     if unreported != lease.get("unreported_native", False):
         lease = {**lease, "unreported_native": unreported}
+        if unreported and active is not None:
+            lease = {
+                **lease,
+                "unidentified_local": active,
+                "bound_local": None,
+                "native_plan_confirmed": False,
+                "other_local": None,
+            }
         j.put(KEY, lease)
     if local is None or local != active or local <= lease["floor"]:
         return
@@ -200,6 +216,7 @@ class ManagedSchedule:
         controller.session.gateway.status_observer = self.observe_status
         controller.session.gateway.tag_guard = self.permits_tag
         controller.session.gateway.held_start_report = self.can_record_held_start
+        controller.session.gateway.native_start_report = self.prepare_native_report
         controller.session.gateway.remote_start_guard = self.permits_remote_start
         lease = self.j.get(KEY, {})
         if lease.get("state") == "requested":
@@ -229,21 +246,26 @@ class ManagedSchedule:
         grant = self.j.get("vendor_start_grant", {})
         return bool(self.j.get("control", {}).get("start_pending") or grant and grant.get("local") is None)
 
-    # Record the genuine delayed lifecycle of an already accepted owner command under verified station zero.
-    def can_record_held_start(self, tag: str) -> bool:
+    # Only an authenticated charger under an owned, verified zero profile can submit a delayed lifecycle report.
+    def held_report_ready(self) -> bool:
         c, j = self.c, self.j
         g = c.session.gateway
         lease = j.get(KEY, {})
-        if (
-            lease.get("state") not in OBSERVABLE
-            or "hold_since" not in lease
-            or j.active() is not None
-            or c.stopping
-            or j.get("managed_control_fault")
-            or not g.controls.ready
-            or g.controls.desired() != 0
-            or not self.hold_authorized()
-        ):
+        return (
+            lease.get("state") in OBSERVABLE
+            and "hold_since" in lease
+            and j.active() is None
+            and not c.stopping
+            and not j.get("managed_control_fault")
+            and g.controls.ready
+            and g.controls.desired() == 0
+            and self.hold_authorized()
+        )
+
+    # Record the genuine delayed lifecycle of an already accepted owner command under verified station zero.
+    def can_record_held_start(self, tag: str) -> bool:
+        c, j = self.c, self.j
+        if not self.held_report_ready():
             return False
         prior = c.tests.state()
         if (
@@ -262,6 +284,78 @@ class ManagedSchedule:
                 (grant.get("mutation"),),
             ).fetchone()
         )
+
+    # A delayed native report must describe an actual open occurrence on this cable, inside its authorized window.
+    async def prepare_native_report(self, payload: dict[str, Any]) -> Callable[[int], None] | None:
+        c, j = self.c, self.j
+        lease = j.get(KEY, {})
+        if (
+            not self.held_report_ready()
+            or self.awaiting_start()
+            or lease.get("vehicle_disconnected")
+            or lease.get("retire_reason") == "vehicle_disconnected"
+        ):
+            return None
+        tag = payload.get("idTag")
+        if (
+            payload.get("connectorId") != 1
+            or not isinstance(tag, str)
+            or tag.casefold() != lease["body"]["idTag"].casefold()
+        ):
+            return None
+        occurred = timestamp(payload.get("timestamp")).timestamp()
+        zone = ZoneInfo(c.native.spec.original_configuration["timeZone"])
+        end = lease.get("end_epoch") or cutoff_epoch(lease["start_epoch"], zone)
+        accepted_at = lease.get("accepted_epoch")
+        if accepted_at is None:
+            accepted_at = c.requests.receipt(lease["id"]).get("result", {}).get("accepted_at")
+        if (
+            accepted_at is None
+            or occurred < accepted_at
+            or occurred >= end
+            or occurred > min(time.time(), lease["hold_since"])
+        ):
+            return None
+        try:
+            n = await c.native.read()
+            present = c.session.book.owned_present(n.physical)
+        except (SecurityError, TimeoutError) as error:
+            raise UnavailableError("delayed timer report awaits verified native evidence") from error
+        current = j.get(KEY, {})
+        if (
+            not self.held_report_ready()
+            or self.awaiting_start()
+            or current.get("id") != lease["id"]
+            or current.get("vehicle_disconnected")
+            or current.get("retire_reason") == "vehicle_disconnected"
+            or not n.physical.transaction_open
+            or n.physical.connection == "Unplug"
+            or n.saved_schedule is None
+            or n.session_plan_id in current.get("reported_plans", [])
+            or any(v != 0 for v in n.currents_a + n.powers_w)
+            or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
+        ):
+            return None
+        plan = next((plan for plan in n.saved_schedule["planList"] if plan["planId"] == n.session_plan_id), None)
+        if plan is None or plan["idTag"].casefold() != tag.casefold():
+            return None
+        midnight = datetime.fromtimestamp(lease["start_epoch"], zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        begin = lease["start_epoch"] if plan["planId"] == lease["body"]["planId"] else midnight.timestamp()
+        if occurred < begin:
+            return None
+
+        # The normal ledger allocates its own ID. Only a later matching native ID can authorize Stop or continuation.
+        def accepted(local: int) -> None:
+            j.put(
+                KEY,
+                {
+                    **current,
+                    "unidentified_local": local,
+                    "reported_plans": [*current.get("reported_plans", []), plan["planId"]],
+                },
+            )
+
+        return accepted
 
     # Never grant a new Start to the retired timer's tag while its physical removal remains unverified.
     def permits_tag(self, tag: str) -> bool:
@@ -585,6 +679,31 @@ class ManagedSchedule:
             return True
         return recorded_timer_hold(j, c.native.spec.digest, c.native.spec.boot_digest)
 
+    # A verified introduction may retry only the existing zero profile if its physical acknowledgement was interrupted.
+    async def retry_recovery_zero(self) -> None:
+        c, j = self.c, self.j
+        g = c.session.gateway
+        epoch = g._charger_epoch
+
+        # Remain on the same authenticated, restricted Boot and never turn a readback retry into positive permission.
+        def guard() -> None:
+            if (
+                c.stopping
+                or j.get(KEY, {}).get("state") not in OBSERVABLE
+                or j.get("trial_phase") != "recovering"
+                or c.native.introduced_epoch != epoch
+                or c.native.introduced_revision != g.controls._revision
+                or not g.current_boot_seen(epoch)
+                or g.controls.desired() != 0
+                or not recorded_timer_hold(j, c.native.spec.digest, c.native.spec.boot_digest)
+            ):
+                raise RecoveryRequiredError("timer zero readback awaits the current restricted introduction")
+
+        if g.charger._pending or g.controls._operations:
+            return
+        guard()
+        await g.controls.ensure_ceiling(guard=guard)
+
     # Lower only the station ceiling, even if native HTTP is unavailable. A foreign ledger transaction has priority.
     async def protect_station(self, lease: dict[str, Any]) -> None:
         c, j = self.c, self.j
@@ -594,7 +713,11 @@ class ManagedSchedule:
         if j.active() not in (None, lease.get("bound_local"), lease.get("unidentified_local")):
             return
         self.begin_hold(lease)
-        if g.controls.ready and g.controls.desired() == 0:
+        if (
+            g.controls.ready
+            and g.controls.desired() == 0
+            and (j.get("trial_phase") == "recovering" or not j.get("control", {}).get("uncertain"))
+        ):
             return
         lease = j.get(KEY)
         now = time.time()
@@ -638,6 +761,7 @@ class ManagedSchedule:
                 due = (
                     remaining <= 0
                     or lease.get("retire_reason") == "vehicle_disconnected"
+                    or lease.get("vehicle_disconnected")
                     or lease.get("unreported_native")
                 )
                 if due and not self.j.get("managed_control_fault"):
@@ -658,6 +782,7 @@ class ManagedSchedule:
             lease.get("state") not in OBSERVABLE
             or time.time() < lease.get("end_epoch", float("inf"))
             and lease.get("retire_reason") != "vehicle_disconnected"
+            and not lease.get("vehicle_disconnected")
             and not lease.get("unreported_native")
             or not self.hold_authorized()
         ):
@@ -701,6 +826,9 @@ class ManagedSchedule:
         bound = lease.get("bound_local")
         if active is not None and active != bound:
             if lease.get("unidentified_local") == active and independent_session(j, lease, n, active):
+                if g.controls._operations or g.charger._pending:
+                    raise RecoveryRequiredError("independent session awaits the in-flight station verification")
+                await self.protect_station(lease)
                 await c.restore_owner_control(continuing_local=active)
                 current = j.get(KEY)
                 if current["id"] == lease["id"] and current.get("unidentified_local") == active:

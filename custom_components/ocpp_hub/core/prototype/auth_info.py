@@ -97,13 +97,19 @@ class InfoBook:
         return info
 
     # Return the original decision and expiry for an already acknowledged event that occurred while both were valid.
-    def accepted_for_delayed_report(self, tag: str, occurred: float) -> dict[str, Any] | None:
+    def accepted_for_delayed_report(self, tag: str, occurred: float, reported: str) -> dict[str, Any] | None:
         info = self.stored(tag)
         if info is None or info["status"] != "Accepted" or "expiryDate" not in info:
             return None
         end = expiry(info["expiryDate"])
         observed = self.journal.db.execute("SELECT observed FROM auth_info WHERE digest=?", (tag_key(tag),)).fetchone()
-        if observed is not None and observed[0] <= occurred < end <= time.time():
+        clock = re.search(r"T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.,]([0-9]+))?(?:Z|[+-][0-9]{2}:[0-9]{2})$", reported)
+        precision = 10.0 ** -min(6, len(clock[1] or "")) if clock else 0.0
+        if (
+            observed is not None
+            and (observed[0] <= occurred or observed[0] - occurred < precision)
+            and occurred < end <= time.time()
+        ):
             return info
         return None
 

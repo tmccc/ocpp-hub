@@ -414,14 +414,19 @@ class ManagedController:
         timer = j.get(KEY, {})
         pending_timer = timer.get("state") in OBSERVABLE
         cutoff_hold = pending_timer and "hold_since" in timer
+        if not base["charger_connected"] or not base["boot_verified"]:
+            return {**base, "state": "starting", "owner_control_enabled": False}
         if (
-            not base["charger_connected"]
-            or not base["boot_verified"]
-            or not g.controls.ready
+            not g.controls.ready
             and self.released_epoch != g._charger_epoch
             and not cutoff_hold
             and not (pending_timer and j.active() is not None)
         ):
+            if pending_timer:
+                try:
+                    await self.schedule.retry_recovery_zero()
+                except DeniedError, UnavailableError, RecoveryRequiredError:
+                    pass
             return {**base, "state": "starting", "owner_control_enabled": False}
         verified_pause = False
         try:

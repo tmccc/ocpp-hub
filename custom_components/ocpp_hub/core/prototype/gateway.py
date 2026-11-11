@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -81,6 +81,7 @@ class Gateway:
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
         self.status_observer: Callable[[dict[str, Any]], None] | None = None
         self.held_start_report: Callable[[str], bool] | None = None
+        self.native_start_report: Callable[[dict[str, Any]], Awaitable[Callable[[int], None] | None]] | None = None
         self.remote_start_guard: Callable[[], bool] | None = None
         self.tag_guard: Callable[[str], bool] | None = None
         self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
@@ -297,8 +298,20 @@ class Gateway:
                     and not self.journal.known_start(payload)
                 ):
                     raise DeniedError("a newer owner operation superseded the start")
+                native_report = None
+                if (
+                    action == "StartTransaction"
+                    and self.native_start_report is not None
+                    and not self.journal.known_start(payload)
+                ):
+                    native_report = await self.native_start_report(payload)
+                    self._require_epoch("charger", epoch)
+                    if self.journal.get("control", {}).get("ticket") != ticket:
+                        raise DeniedError("a newer owner operation superseded the reported start")
                 receipt = f"{epoch}:{token}"
-                text = build_call_result(token, self._local_answer(receipt, action, payload))
+                text = build_call_result(
+                    token, self._local_answer(receipt, action, payload, native_report=native_report)
+                )
         except DeniedError, ConflictError:
             text = build_call_error(
                 token, "PropertyConstraintViolation", "request conflicts with local policy or state"
@@ -313,7 +326,9 @@ class Gateway:
         return text
 
     # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
-    def _local_answer(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _local_answer(
+        self, token: str, action: str, payload: dict[str, Any], *, native_report: Callable[[int], None] | None = None
+    ) -> dict[str, Any]:
         if action == "BootNotification":
             previous_boot = self.journal.get("boot")
             if previous_boot is not None and previous_boot != payload:
@@ -345,15 +360,18 @@ class Gateway:
             if (
                 not known
                 and self.policy.strict_cloud_authorization
-                and self.held_start_report is not None
-                and self.held_start_report(tag)
+                and (native_report is not None or self.held_start_report is not None and self.held_start_report(tag))
             ):
-                historical = self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp())
-            if not known and not self._tag_allowed(tag, lifecycle=True, historical=historical is not None):
+                historical = self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp(), payload["timestamp"])
+            if not known and not self._tag_allowed(
+                tag, lifecycle=True, historical=historical is not None, native_report=native_report is not None
+            ):
                 raise DeniedError("tag is not approved for local authorization")
 
             # Permission binding and the pending flag belong to the very same commit as the new Start fact.
             def accepted(local: int) -> None:
+                if native_report is not None:
+                    native_report(local)
                 self.authorisation.consume(payload["idTag"], local)
                 control = self.journal.get("control", {})
                 self.journal.put("control", {**control, "start_pending": False})
@@ -406,14 +424,20 @@ class Gateway:
         raise DeniedError("unsupported charger request")
 
     # Local stop overrides both the static allowlist and an app-generated trusted vendor start grant.
-    def _tag_allowed(self, tag: Any, *, lifecycle: bool = False, historical: bool = False) -> bool:
+    def _tag_allowed(
+        self, tag: Any, *, lifecycle: bool = False, historical: bool = False, native_report: bool = False
+    ) -> bool:
         if not isinstance(tag, str):
             return False
         inhibited = (
             self.journal.get("control", {}).get("inhibit") or self.tag_guard is not None and not self.tag_guard(tag)
         )
         phase = self.journal.get("trial_phase")
-        held_report = lifecycle and inhibited and self.held_start_report is not None and self.held_start_report(tag)
+        held_report = (
+            lifecycle
+            and inhibited
+            and (native_report or self.held_start_report is not None and self.held_start_report(tag))
+        )
         if (
             inhibited
             and not held_report
