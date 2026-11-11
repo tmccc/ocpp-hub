@@ -56,6 +56,7 @@ class StableObserver:
             "station": journal.get("station_selection"),
             "binding": journal.get("trial_binding"),
             "resources": rows,
+            "temporary_schedule": journal.get("managed_temporary_schedule"),
             "connected_handover": journal.get("connected_handover"),
             "native_bounded_handover": journal.get("native_bounded_handover"),
         }

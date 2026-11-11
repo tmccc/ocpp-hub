@@ -248,6 +248,12 @@ class TrialSession:
 
     # Never classify native profile bytes while their actual outgoing Set/Clear response is still unresolved.
     def _resource_mutation_inflight(self) -> bool:
+        if (
+            self.gateway.charger._pending
+            and self.gateway.charger.diagnostics.action == "DataTransfer"
+            and self.journal.get("managed_temporary_schedule", {}).get("state") in ("installing", "clearing")
+        ):
+            return True
         return bool(self.gateway.charger._pending) and self.gateway.charger.diagnostics.action in (
             "SetChargingProfile",
             "ClearChargingProfile",

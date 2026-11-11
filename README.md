@@ -812,6 +812,16 @@ and native specification arguments. It checks the matching schedule attempt, nat
 zero hold and settled journal, then records a paused intent. Verify Pause after restart before using Return
 to restore the previous app/schedule permission.
 
+An authenticated `temporary_schedule` request takes a fresh control revision and a future UTC Unix
+`start_epoch` on a whole minute later on the charger's current local date. Under commissioned managed32
+authority, the proxy copies the admitted daily timer's tag and duration into a separate one-off plan,
+using at most the selected current. It keeps the midnight plan and its original integrity binding.
+The service verifies the complete two-plan readback. Once a matching new session has closed at zero, it
+removes only its own plan and verifies the complete original timetable. If no matching session appears
+within ten minutes of the start, it cleans up at idle and reports the missed start. A lost response or
+process replacement never replays installation. The status field `temporary_schedule` reports progress;
+a native session plan-ID match provides additional evidence of the trigger.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,
 the current actual Boot/binding, confirmed owned station0 and an empty, genuinely acknowledged lifecycle/outbox are

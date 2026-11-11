@@ -64,6 +64,7 @@ class ManagedRequests:
             "start_test",
             "arm_cloud_test",
             "set_current",
+            "temporary_schedule",
         ):
             raise SecurityError("management request shape is invalid")
         if type(revision) is not int or not 0 <= revision < 2**53:

@@ -9,6 +9,7 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .managed_current import ManagedCurrentLimits, managed_current_ceiling
 from .managed_intent import ControlIntent, ManagedRequests
+from .managed_schedule import ManagedSchedule
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .policy import DeniedError
@@ -44,6 +45,7 @@ class ManagedController:
         self.latest_native: HandoverEvidence | None = None
         self.current = ManagedCurrentLimits(self)
         self.tests = ManagedChargeTests(self)
+        self.schedule = ManagedSchedule(self)
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
@@ -376,6 +378,7 @@ class ManagedController:
                     return {**base, "state": "waiting_for_cloud", "owner_control_enabled": False}
                 await self.restore_owner_control()
             native = await self.settled_native()
+            await self.schedule.observe(native)
             if self.requests.intent().mode == "paused":
                 self.require_paused(native)
                 verified_pause = True
@@ -468,5 +471,6 @@ class ManagedController:
             if j.get("native_history_summary", {}).get("missing_records", 0)
             else None,
             "charger_sessions": charger_history(native.history),
+            "temporary_schedule": self.schedule.summary(),
             "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
         }

@@ -160,6 +160,8 @@ class HandoverEvidence:
     history: tuple[dict[str, Any], ...]
     offered_current_a: float = 0
     saved_schedule_digest: str = ""
+    saved_schedule: dict[str, Any] | None = None
+    session_plan_id: int | None = None
 
     # Hash the complete private view, not a public boolean or the proxy's desired profile.
     @property
@@ -234,6 +236,8 @@ def handover_evidence(config: Any, values: dict[str, Any], observed_at: float) -
             tuple(history),
             number(values["CONNECTOR"][0].get("offerCur", 0), 320) / 10,
             fingerprint(values["SETPLAN"]),
+            values["SETPLAN"],
+            values["SESSION"]["saveData"]["sessionList"][0].get("_setPlanId"),
         )
     except KeyError, TypeError, ValueError, IndexError:
         raise SecurityError("complete connected-handover native evidence is required") from None

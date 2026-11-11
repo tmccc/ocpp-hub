@@ -2,6 +2,9 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add a supervised one-off native timer alongside the original daily schedule, with verified installation
+  and automatic selective cleanup after charging or a missed start.
+
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start
   attempts and exclude them from session and transaction numbering. Add guarded offline reconciliation for

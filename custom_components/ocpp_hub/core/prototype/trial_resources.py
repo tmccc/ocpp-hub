@@ -90,6 +90,7 @@ class ResourceBook:
     # A fresh trial cannot silently claim an older unowned journal or replace its original baseline.
     def __init__(self, journal: Journal, baseline: Baseline) -> None:
         self.journal, self.baseline = journal, baseline
+        self.temporary_plan_write: dict[str, Any] | None = None
         if baseline.identity_digest != fingerprint(journal.identity):
             raise SecurityError("baseline belongs to another charger")
         for r in baseline.resources:
@@ -285,6 +286,9 @@ class ResourceBook:
             if set(payload) != {"id"} or receipt is None or receipt["state"] == "absent_verified":
                 raise DeniedError("trial clear does not name an owned resource")
         elif action == "DataTransfer":
+            if payload is self.temporary_plan_write:
+                self.temporary_plan_write = None
+                return
             if payload.get("vendorId") != "IoCharger" or payload.get("messageId") not in (
                 "getTransaction",
                 "setTransaction",
@@ -330,7 +334,14 @@ class ResourceBook:
         self.check_originals(evidence)
         if self.journal.get("trial_inventory_fault"):
             raise SecurityError("native inventory reconciliation is still required")
-        if set(current) - originals - {row["key"] for row in rows}:
+        temporary: set[str] = set()
+        lease = self.journal.get("managed_temporary_schedule", {})
+        if lease.get("state") in ("installing", "armed", "clearing"):
+            expected = lease["body"]
+            key = "plan:" + str(expected["planId"])
+            if key in current and current[key].digest == fingerprint(expected) and key not in originals:
+                temporary.add(key)
+        if set(current) - originals - {row["key"] for row in rows} - temporary:
             self._inventory_failure("unexpected_resources")
         result = []
         for row in rows:

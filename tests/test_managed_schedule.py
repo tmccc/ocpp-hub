@@ -1,0 +1,220 @@
+"""An authenticated one-off native timer on an independently observed charger and actual TLS transports."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from ocpp_hub_core.prototype import managed_schedule
+from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
+from ocpp_hub_core.prototype.managed_current import capability_value
+from ocpp_hub_core.prototype.security import SecurityError
+from websockets.asyncio.client import connect
+
+from tests import test_native_bounded_session as native_bench
+from tests.handover_helpers import NativeVehiclePeer
+from tests.test_managed_api import TOKEN, call
+from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
+from tests.test_prototype import START
+from tests.test_prototype_tls import tls as tls
+
+ORIGINAL_PLAN = {
+    "planId": 9,
+    "type": "Plan",
+    "idTag": "NATIVE_TIMER",
+    "eco": "Fast",
+    "stopModel": "Duration",
+    "stopValue": 360,
+    "limitCurrent": 320,
+    "ConnectorId": 1,
+    "validTime": "2020-01-01T00:00:00Z",
+    "startTime": 0,
+    "kindType": "Recurring",
+    "recurring": 127,
+    "maxEnergy": 0,
+}
+
+
+class SchedulePeer(NativeVehiclePeer):
+    """The physical getter uses tenths of amps and different connector casing from its OCPP request."""
+
+    # Simulate the complete native envelope and its independent representation, including fields never sent on OCPP.
+    def native(self, key: str) -> Any:
+        value = super().native(key)
+        if key == "SETPLAN":
+            plans = []
+            for raw in value["planList"]:
+                if raw["planId"] == 9:
+                    plans.append(dict(ORIGINAL_PLAN))
+                else:
+                    plan = dict(raw)
+                    plan.update(
+                        ConnectorId=plan.pop("connectorId"),
+                        limitCurrent=int(plan["limitCurrent"] * 10),
+                        stopValue=int(plan["stopValue"]),
+                        maxEnergy=0,
+                    )
+                    plans.append(plan)
+            return {"planList": plans, "defaultEco": {"mode": "Fast"}}
+        if key == "SESSION" and self.bench.firmware.active is not None:
+            value["saveData"]["sessionList"][0]["_setPlanId"] = next(
+                (i for i in self.bench.firmware.plans if i != 9), 0
+            )
+        return value
+
+
+# Intent: prove add/readback, actual scheduled Start/Stop, missed starts, superseding Pause, and selective cleanup.
+# Why: a timed RemoteStart or an ACK without independent complete native readback cannot establish a native schedule.
+@pytest.mark.parametrize(
+    "outcome", ["charge", "full", "missed", "pause", "unexpected", "replacement", "lost-ack", "clear-lost", "preempt"]
+)
+async def test_temporary_native_schedule(
+    tmp_path: Path, tls: Any, unused_tcp_port_factory: Any, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SchedulePeer)
+    monkeypatch.setitem(native_bench.ORIGINAL, "timeZone", "Europe/London")
+    logical = datetime.now(UTC).replace(hour=8, minute=0, second=0, microsecond=0).timestamp()
+    monkeypatch.setattr(managed_schedule, "time", SimpleNamespace(time=lambda: logical))
+    target = int(logical) + 180
+    async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as rig:
+        s = managed_session(rig)
+        await s.start()
+        c = ManagedController(s)
+        rig.route_to_trial()
+        async with rig.charger(s) as sock:
+            await introduced(rig, s, sock, "timer-boot")
+            await healthy(c)
+            s.journal.put("managed_current_capability", capability_value(s.journal, rig.spec))
+            rig.peer.configuration["AmpLmt"] = "32"
+            rig.peer.runtime_user = 320
+            s.gateway.policy = replace(s.gateway.policy, max_current_a=32)
+            s.gateway.controls.policy = s.gateway.policy
+            await healthy(c)
+            identifier = uuid.uuid4().hex
+            port = unused_tcp_port_factory()
+            api = ManagementServer(ManagementSettings(port, tmp_path / "no-token", TOKEN), c, lambda: {})
+            await api.start()
+            try:
+                async with connect(
+                    f"ws://127.0.0.1:{port}/management",
+                    additional_headers={"Authorization": "Bearer " + TOKEN},
+                    subprotocols=["ics-proxy.v1"],
+                ) as client:
+                    args = {"id": identifier, "command": "temporary_schedule", "revision": 0, "start_epoch": target}
+                    reply = await call(client, **args)
+                    assert reply["ok"] and reply["result"]["state"] == "accepted"
+                    assert await call(client, **args) == reply
+                    assert not (await call(client, **(args | {"start_epoch": target + 60})))["ok"]
+            finally:
+                await api.close()
+            old = s.gateway.charger.sender
+            assert old is not None
+            if outcome == "lost-ack":
+                # Apply the outgoing request to the independent firmware, then model a disconnected reply path.
+                async def lose(raw: str) -> None:
+                    f = json.loads(raw)
+                    if f[0] == 2 and f[2] == "DataTransfer" and f[3]["messageId"] == "setPlan":
+                        rig.bench.firmware.answer(f[2], f[3])
+                        raise OSError("lost response")
+                    await old(raw)
+
+                s.gateway.charger.sender = lose
+            if outcome == "preempt":
+                c.command(uuid.uuid4().hex, "pause", 0)
+                await healthy(c)
+                assert c.schedule.summary()["result"] == "cancelled_before_install" and set(
+                    rig.bench.firmware.plans
+                ) == {9}
+                return
+            await healthy(c)
+            s.gateway.charger.sender = old
+            await healthy(c)
+            lease = s.journal.get(managed_schedule.KEY)
+            assert lease["state"] == "armed" and lease["body"]["planId"] != 9
+            timer = lease["body"]["planId"]
+            assert lease["body"]["startTime"] == 8 * 60 + 3
+            assert set(rig.bench.firmware.plans) == {9, timer} and not starts(rig)
+            assert s.gateway.policy.extensions.get(("IoCharger", "setPlan")) is None
+            before = (await rig.prepared.observer.observe_handover()).saved_schedule
+            assert before["planList"] == [ORIGINAL_PLAN, lease["body"]]
+            if outcome == "unexpected":
+                rig.bench.firmware.plans[timer]["stopValue"] += 1
+                with pytest.raises(SecurityError):
+                    await c.native.read()
+                return
+            if outcome in ("charge", "full"):
+                logical = target
+                start = START | {"idTag": "NATIVE_TIMER", "timestamp": datetime.fromtimestamp(logical, UTC).isoformat()}
+                answer = await rig.bench.call(sock, "actual-timer", "StartTransaction", start)
+                local = answer[2]["transactionId"]
+                if outcome == "charge":
+                    rig.peer.paused = False
+                    rig.peer.permission_enabled = True
+                    rig.bench.cp, rig.bench.connection = "C", "Charging"
+                    rig.bench.firmware.fire_plan(timer)
+                status = await healthy(c)
+                assert status["temporary_schedule"]["native_plan_confirmed"]
+                assert (status["power_w"] > 0) == (outcome == "charge")
+                assert timer in rig.bench.firmware.plans
+                rig.peer.permission_enabled = False
+                rig.bench.cp, rig.bench.connection = "B", "Plug"
+                logical += 120
+                await rig.bench.call(
+                    sock,
+                    "finished",
+                    "StopTransaction",
+                    {
+                        "transactionId": local,
+                        "meterStop": start["meterStart"],
+                        "timestamp": datetime.fromtimestamp(logical, UTC).isoformat(),
+                    },
+                )
+            elif outcome == "pause":
+                c.command(uuid.uuid4().hex, "pause", 0)
+            elif outcome != "replacement":
+                logical = target + 601
+            if outcome == "clear-lost":
+
+                async def lose_clear(raw: str) -> None:
+                    f = json.loads(raw)
+                    if f[0] == 2 and f[2] == "DataTransfer" and f[3]["messageId"] == "clearPlans":
+                        rig.bench.firmware.answer(f[2], f[3])
+                        raise OSError("lost cleanup response")
+                    await old(raw)
+
+                s.gateway.charger.sender = lose_clear
+            if outcome != "replacement":
+                for _ in range(4):
+                    await healthy(c)
+                last = c.schedule.summary()
+                assert last["state"] == "complete" and set(rig.bench.firmware.plans) == {9} and not starts(rig)
+                assert last["result"] == {
+                    "pause": "owner_superseded",
+                    "charge": "session_closed",
+                    "full": "session_closed",
+                }.get(outcome, "no_scheduled_session")
+                assert (
+                    await rig.prepared.observer.observe_handover()
+                ).saved_schedule_digest == rig.spec.saved_schedule_digest
+                return
+        await s.close()
+        replacement = managed_session(rig)
+        await replacement.start()
+        c = ManagedController(replacement)
+        async with rig.charger(replacement) as sock:
+            await introduced(rig, replacement, sock, "replacement-boot")
+            logical = target + 601
+            for _ in range(4):
+                await healthy(c)
+            assert c.schedule.summary()["state"] == "complete" and set(rig.bench.firmware.plans) == {9}
+            writes = [
+                f for f in rig.bench.device_calls if f[2] == "DataTransfer" and f[3].get("messageId") == "setPlan"
+            ]
+            assert len(writes) == 1 and not starts(rig)

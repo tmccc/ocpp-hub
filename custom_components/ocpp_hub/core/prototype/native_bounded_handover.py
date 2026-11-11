@@ -14,6 +14,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .managed_current import managed_current_ceiling
 from .managed_recovery import local_recovery_binding
+from .managed_schedule import installed_variant
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .rpc import UnavailableError
@@ -104,6 +105,7 @@ class NativeBoundedHandover:
                 "grant": journal.get("vendor_start_grant"),
                 "state": journal.get("native_bounded_handover"),
                 "current_capability": journal.get("managed_current_capability"),
+                "temporary_schedule": journal.get("managed_temporary_schedule"),
                 "resources": [tuple(row) for row in journal.db.execute("SELECT * FROM trial_resources ORDER BY key")],
             }
         )
@@ -132,7 +134,15 @@ class NativeBoundedHandover:
         if managed_current_ceiling(j, self.spec) == 32:
             if route != "trial":
                 raise SecurityError("managed current capability must be retired before backend restoration")
-            self.spec.require_managed(native, j.identity, closed=closed, allow_unplugged=self.allow_unplugged)
+            self.spec.require_managed(
+                native,
+                j.identity,
+                closed=closed,
+                allow_unplugged=self.allow_unplugged,
+                temporary_schedule_digest=installed_variant(
+                    j, self.spec.saved_schedule_digest, native.saved_schedule_digest
+                ),
+            )
         else:
             self.spec.require(native, j.identity, route, closed=closed, allow_unplugged=self.allow_unplugged)
 
@@ -315,10 +325,23 @@ class NativeBoundedHandover:
         if zero:
             return  # Existing ledger guards still forbid recreating a station profile after verified absence.
         selecting = self.gateway.journal.get("managed_current_change", {}).get("state") == "pending"
+        timer = (
+            action == "DataTransfer"
+            and payload.get("vendorId") == "IoCharger"
+            and payload.get("messageId") in ("setPlan", "clearPlans")
+        )
         native = await self.read(
-            closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
+            closed=timer or action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
         )
         self.require_selected(native)
+        if timer:
+            lease = self.gateway.journal.get("managed_temporary_schedule", {})
+            expected = (
+                lease.get("original_digest") if payload["messageId"] == "setPlan" else lease.get("augmented_digest")
+            )
+            if native.saved_schedule_digest != expected:
+                raise SecurityError("temporary timer write requires its exact native preimage")
+            self.book.owned_present(native.physical)
         if action == "ClearChargingProfile":
             require_lifecycle_idle(self.gateway)
             present = self.book.owned_present(native.physical)

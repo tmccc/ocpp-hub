@@ -235,7 +235,13 @@ class NativeBoundedSpec:
 
     # Separately commissioned managed operation keeps the original installation ceiling and full route/config binding.
     def require_managed(
-        self, native: HandoverEvidence, identity: str, *, closed: bool = False, allow_unplugged: bool = False
+        self,
+        native: HandoverEvidence,
+        identity: str,
+        *,
+        closed: bool = False,
+        allow_unplugged: bool = False,
+        temporary_schedule_digest: str | None = None,
     ) -> None:
         expected = self.original_configuration | self.trial_route | {"AmpLmt": "32"}
         if identity != expected["Id"]:
@@ -249,7 +255,9 @@ class NativeBoundedSpec:
             allow_unplugged=allow_unplugged,
             allow_full_current=True,
         )
-        if native.configuration != expected or native.saved_schedule_digest != self.saved_schedule_digest:
+        if native.configuration != expected or native.saved_schedule_digest != (
+            temporary_schedule_digest or self.saved_schedule_digest
+        ):
             raise SecurityError("managed full configuration or saved schedule changed")
 
     # Connected admission is stricter than bounded monitoring and cannot start from another open native session.
