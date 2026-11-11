@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from ocpp_hub_core.frames import build_call, build_call_result
+from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
 from ocpp_hub_core.prototype.auth_info import InfoBook, tag_key, validate_info
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import DeniedError, Policy
@@ -39,6 +39,7 @@ class StrictRig(Rig):
         self.nested_replies: dict[str, asyncio.Future[list[Any]]] = {}
         self.authorization_seen = asyncio.Event()
         self.authorization_release: asyncio.Event | None = None
+        self.authorization_failure: str | None = None
 
     # Return correlated metadata, retaining ordinary Boot and lifecycle behavior from the independent peer.
     async def vendor_send(self, raw: str) -> None:
@@ -48,6 +49,11 @@ class StrictRig(Rig):
             self.authorization_seen.set()
             if self.authorization_release is not None:
                 await self.authorization_release.wait()
+            if self.authorization_failure == "timeout":
+                return
+            if self.authorization_failure == "callerror":
+                await self.gateway.receive("vendor", build_call_error(frame[1], "InternalError", "synthetic refusal"))
+                return
             await self.gateway.receive("vendor", build_call_result(frame[1], {"idTagInfo": self.actual_info}))
         elif frame[0] == 2 and frame[2] == "StartTransaction" and self.start_info is not None:
             self.vendor_frames.append(frame)
@@ -429,12 +435,17 @@ async def test_native_direct_start_after_expiry(tmp_path: Path, outcome: str) ->
 
 # Intent: two OCPP requests for the same expired scheduled start share renewal and one immutable transaction.
 # Why: the charger retries its timer rapidly when an initial response takes longer than its retry interval.
-async def test_overlapping_direct_starts_share_cloud_decision(tmp_path: Path) -> None:
+@pytest.mark.parametrize("outcome", ["accepted", "same_expired", "callerror", "timeout"])
+async def test_overlapping_direct_starts_share_cloud_decision(tmp_path: Path, outcome: str) -> None:
     rig = StrictRig(tmp_path / "state.db")
     try:
         await rig.boot()
         await rig.cloud()
-        rig.gateway.auth_info.put(START["idTag"], info(expiryDate="2000-01-01T00:00:00Z"))
+        expired = info(expiryDate="2000-01-01T00:00:00Z")
+        rig.gateway.auth_info.put(START["idTag"], expired)
+        if outcome == "same_expired":
+            rig.actual_info = expired
+        rig.authorization_failure = outcome
         rig.authorization_release = asyncio.Event()
         await rig.gateway.receive("charger", build_call("first", "StartTransaction", START))
         await asyncio.wait_for(rig.authorization_seen.wait(), 1)
@@ -443,8 +454,39 @@ async def test_overlapping_direct_starts_share_cloud_decision(tmp_path: Path) ->
         rig.authorization_release.set()
         await rig.gateway.drain()
         replies = [f for f in rig.charger_frames if f[1] in ("first", "retry")]
-        assert len(replies) == 2 and replies[0][0] == replies[1][0] == 3 and replies[0][2] == replies[1][2]
-        assert rig.store.active() == replies[0][2]["transactionId"]
+        assert len(replies) == 2
+        assert sum(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames) == 1
+        if outcome == "accepted":
+            assert replies[0][0] == replies[1][0] == 3 and replies[0][2] == replies[1][2]
+            assert rig.store.active() == replies[0][2]["transactionId"]
+        else:
+            assert replies[0][0] == replies[1][0] == 4 and rig.store.active() is None
+            rig.actual_info = info()
+            rig.authorization_failure = None
+            assert (await rig.charger("later", "StartTransaction", START))[0] == 3
+            assert sum(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames) == 2
+    finally:
+        await rig.close()
+
+
+# Intent: a pending ordinary Authorize can supply the fresh decision needed by a concurrent direct Start.
+# Why: the proxy may receive both messages before the initial cloud reply arrives.
+async def test_direct_start_uses_concurrent_ordinary_authorize(tmp_path: Path) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        rig.gateway.auth_info.put(START["idTag"], info(expiryDate="2000-01-01T00:00:00Z"))
+        rig.authorization_release = asyncio.Event()
+        await rig.gateway.receive("charger", build_call("tag", "Authorize", {"idTag": START["idTag"]}))
+        await asyncio.wait_for(rig.authorization_seen.wait(), 1)
+        await rig.gateway.receive("charger", build_call("direct", "StartTransaction", START))
+        await asyncio.sleep(0)
+        rig.authorization_release.set()
+        await rig.gateway.drain()
+        replies = [f for f in rig.charger_frames if f[1] in ("tag", "direct")]
+        assert len(replies) == 2 and all(f[0] == 3 and f[2]["idTagInfo"] == rig.actual_info for f in replies)
+        assert rig.store.active() is not None
         assert sum(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames) == 1
     finally:
         await rig.close()

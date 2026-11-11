@@ -380,3 +380,32 @@ def test_admitted_attempt_body_is_immutable(history_journal: Journal) -> None:
             archive.observe([original], records, allow_missing=True)
     assert archive.observe([original], [], allow_missing=True)["archived_records"] == 0
     assert history_journal.db.execute("SELECT COUNT(*) FROM native_start_attempts").fetchone()[0] == 1
+
+
+# Intent: a numbered original reappearing at its own filename as an unassigned attempt blocks reconciliation.
+# Why: retention tolerance cannot turn a changed original into a missing transaction plus a new zero-draw attempt.
+def test_numbered_original_cannot_reappear_as_unassigned(history_journal: Journal) -> None:
+    original = row(1101)
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([original], [original], allow_missing=True)
+    before = contents(history_journal)
+    with pytest.raises(SecurityError):
+        archive.observe([original], [unassigned(original["filename"])], allow_missing=True)
+    assert contents(history_journal) == before
+
+
+# Intent: ordinary strict audits also archive observed start attempts without granting missing-history tolerance.
+# Why: a failed start can subsequently roll out of the firmware's history on either retention policy.
+def test_strict_audit_retains_attempts(history_journal: Journal) -> None:
+    import json
+
+    from ocpp_hub_core.prototype.native_history import audit_history
+
+    original, attempt = row(1101), unassigned()
+    history_journal.put("native_bounded_handover", {"original_history": [original]})
+    audit_history(history_journal, "synthetic", [original, attempt], False)
+    audit_history(history_journal, "synthetic", [original], False)
+    with pytest.raises(SecurityError):
+        audit_history(history_journal, "synthetic", [attempt], False)
+    assert [json.loads(r[0]) for r in history_journal.db.execute("SELECT body FROM native_start_attempts")] == [attempt]
+    assert history_journal.get("native_history_policy") is None

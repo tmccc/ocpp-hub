@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.native_history import audit_history, history_policy
 from ocpp_hub_core.prototype.native_history_recovery import acknowledge_history_policy
 from ocpp_hub_core.prototype.security import SecurityError
@@ -437,8 +438,13 @@ async def test_managed_history_policy_allows_complete_original32_restoration(
 
 # Intent: recover only the expected unassigned attempts under proven zero and retain paused intent across restart.
 # Why: repaired parsing cannot itself clear an unrelated fault or release power at service replacement.
+@pytest.mark.parametrize("native_limit", [6, 32])
 async def test_recover_unassigned_start_to_verified_pause(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext], unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    native_limit: int,
 ) -> None:
     from ocpp_hub_core.prototype.native_history_recovery import acknowledge_start_attempts
 
@@ -448,6 +454,10 @@ async def test_recover_unassigned_start_to_verified_pause(
         rig, journal = fault.rig, fault.journal
         native = await rig.prepared.observer.observe_handover()
         acknowledge_history_policy(journal, fault.book, rig.spec, native)
+        if native_limit == 32:
+            journal.put("managed_current_capability", capability_value(journal, rig.spec))
+            rig.peer.configuration["AmpLmt"] = "32"
+            rig.peer.runtime_user = 320
         now = time.time()
         fault_record = {"at_epoch": now, "classification": "native_authority_or_preservation_failed"}
         failure = {
@@ -470,7 +480,24 @@ async def test_recover_unassigned_start_to_verified_pause(
         assert database(journal) == before
         journal.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
         initial = {"mode": "app", "revision": 5}
+        journal.put("managed_control_intent", {**initial, "unexpected": True})
+        before = database(journal)
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert database(journal) == before
         journal.put("managed_control_intent", initial)
+        audit_history(journal, rig.spec.digest, list(native.history), False)
+        before = database(journal)
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert database(journal) == before
+        journal.db.execute("DELETE FROM native_start_attempts")
+        journal.put("native_start_attempt_recovery", {"prior_fault": {"retained": True}})
+        before = database(journal)
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert database(journal) == before
+        journal.db.execute("DELETE FROM meta WHERE key='native_start_attempt_recovery'")
         uncertain_id, pause_id = uuid.uuid4().hex, uuid.uuid4().hex
         uncertain_result = json.dumps({"classification": "start_not_confirmed"})
         journal.db.execute(
@@ -532,6 +559,7 @@ async def test_recover_unassigned_start_to_verified_pause(
                 await introduced(rig, replacement, charger, "attempt-recovery-boot")
                 state = await healthy(ManagedController(replacement))
                 assert state["local_hold_verified"] and state["station_ceiling_a"] == 0 and not starts(rig)
+                assert state["native_limit_a"] == native_limit
         finally:
             await replacement.close()
             fault.journal = Journal(journal.path, journal.identity)

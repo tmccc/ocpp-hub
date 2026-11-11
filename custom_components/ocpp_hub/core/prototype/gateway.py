@@ -85,7 +85,7 @@ class Gateway:
         self._tasks: set[asyncio.Task[None]] = set()
         self._flush_lock = asyncio.Lock()
         self._boot_lock = asyncio.Lock()
-        self._start_renewal = asyncio.Lock()
+        self._start_renewals: dict[tuple[str, int, int, str | None], asyncio.Future[bool]] = {}
         self._vendor_ready = False
         self.vendor_interval = 60
         self.vendor_registration = "disconnected"
@@ -459,13 +459,35 @@ class Gateway:
             if self.journal.get("control", {}).get("ticket") != ticket or self.auth_info.stored(tag) != stored:
                 raise DeniedError("scheduled start authority changed during renewal")
 
-        # Concurrent retransmissions share the new permission, then use the normal immutable Start receipt.
-        async with self._start_renewal:
-            self._require_epoch("charger", epoch)
-            if self.journal.get("control", {}).get("ticket") != ticket:
-                raise DeniedError("a newer owner operation superseded the start")
-            if self.auth_info.stored(tag) == stored and not self.journal.known_start(payload):
+        # Share even a timeout or unchanged expired answer across this burst of retries. A later burst may retry.
+        key = (tag.casefold(), epoch, self._vendor_epoch, ticket)
+        pending = self._start_renewals.get(key)
+        if pending is not None:
+            if not await asyncio.shield(pending):
+                raise UnavailableError("scheduled start renewal was unavailable")
+            return
+        pending = asyncio.get_running_loop().create_future()
+        self._start_renewals[key] = pending
+        received = False
+        try:
+            try:
                 await self._cloud_authorize(tag, guard=guard)
+            except DeniedError:
+                # An ordinary Authorize can publish a fresh decision while this Start waits for the vendor gate.
+                self._require_epoch("charger", epoch)
+                self._require_epoch("vendor", key[2])
+                current = self.auth_info.get(tag)
+                if (
+                    self.journal.get("control", {}).get("ticket") != ticket
+                    or current is None
+                    or current["status"] != "Accepted"
+                    or not self._tag_allowed(tag)
+                ):
+                    raise
+            received = True
+        finally:
+            pending.set_result(received)
+            del self._start_renewals[key]
 
     # Preserve the actual correlated backend decision, checking generation after every await.
     async def _cloud_authorize(self, tag: str, guard: Callable[[], None] | None = None) -> dict[str, Any]:

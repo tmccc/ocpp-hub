@@ -804,8 +804,9 @@ retries share the cloud decision and the accepted transaction number.
 
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy
-and no stop. The session list and allocation counter use assigned transaction numbers. To reconcile the
-specific history fault left by an older release, stop the standalone service and run
+and no stop. The session list and allocation counter use assigned transaction numbers. On a managed
+installation with the previously acknowledged archive-missing policy, the older parser can leave a latched
+history fault. To reconcile that specific fault, stop the standalone service and run
 `tools/acknowledge_native_history.py reconcile-start-attempts` with its existing private configuration
 and native specification arguments. It checks the matching schedule attempt, native configuration, owned
 zero hold and settled journal, then records a paused intent. Verify Pause after restart before using Return

@@ -5,11 +5,26 @@ from __future__ import annotations
 import math
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from .native_start_attempts import split_attempts
 from .security import SecurityError
 from .store import Journal, encoded, fingerprint
+
+
+# Audits run both standalone and inside the operator's recovery transaction.
+@contextmanager
+def history_savepoint(journal: Journal) -> Iterator[None]:
+    journal.db.execute("SAVEPOINT native_history_observation")
+    try:
+        yield
+    except BaseException:
+        journal.db.execute("ROLLBACK TO native_history_observation")
+        raise
+    finally:
+        journal.db.execute("RELEASE native_history_observation")
 
 
 # Preserve JSON numeric types and every nested field; Python equality alone conflates integers and floats.
@@ -53,6 +68,13 @@ class NativeHistoryArchive:
             "CREATE TABLE IF NOT EXISTS native_start_attempts(digest TEXT PRIMARY KEY,body TEXT NOT NULL)"
         )
 
+    # Called inside the caller's savepoint so a failed row cannot leave part of an observation behind.
+    def retain_attempts(self, attempts: dict[str, dict[str, Any]]) -> None:
+        self.journal.db.executemany(
+            "INSERT OR IGNORE INTO native_start_attempts VALUES(?,?)",
+            ((fingerprint(body), encoded(body)) for body in attempts.values()),
+        )
+
     # A savepoint supports both standalone observations and an atomic operator recovery without partial acceptance.
     def observe(
         self, original: list[dict[str, Any]], current: list[dict[str, Any]], *, allow_missing: bool
@@ -62,8 +84,10 @@ class NativeHistoryArchive:
         original_rows, admitted_attempts = split_attempts(original)
         current_rows, attempts = split_attempts(current)
         originals, present = indexed(original_rows), indexed(current_rows)
-        if any(isinstance(row.get("filename"), str) and row["filename"] in admitted_attempts for row in current_rows):
-            raise SecurityError("an original unassigned start record acquired a transaction number")
+        if any(
+            isinstance(row.get("filename"), str) and row["filename"] in admitted_attempts for row in current_rows
+        ) or any(isinstance(row.get("filename"), str) and row["filename"] in attempts for row in original_rows):
+            raise SecurityError("an original filename changed between assigned and unassigned history")
         for name, body in admitted_attempts.items():
             if (
                 name in attempts
@@ -84,13 +108,9 @@ class NativeHistoryArchive:
             for identifier, record in originals.items()
         ):
             raise SecurityError("an original native history body changed or is required by strict policy")
-        self.journal.db.execute("SAVEPOINT native_history_observation")
-        try:
+        with history_savepoint(self.journal):
             self.journal.put("native_history_archive_binding", binding)
-            for attempt in (admitted_attempts | attempts).values():
-                self.journal.db.execute(
-                    "INSERT OR IGNORE INTO native_start_attempts VALUES(?,?)", (fingerprint(attempt), encoded(attempt))
-                )
+            self.retain_attempts(admitted_attempts | attempts)
             now = time.time()
             records = {**originals, **{key: row for key, row in present.items() if row["stopTime"] > 0}}
             for identifier, record in records.items():
@@ -104,11 +124,6 @@ class NativeHistoryArchive:
             }
             summary = {"archived_records": len(identifiers), "missing_records": len(identifiers - present.keys())}
             self.journal.put("native_history_summary", summary)
-        except BaseException:
-            self.journal.db.execute("ROLLBACK TO native_history_observation")
-            self.journal.db.execute("RELEASE native_history_observation")
-            raise
-        self.journal.db.execute("RELEASE native_history_observation")
         return summary
 
 
@@ -155,3 +170,6 @@ def audit_history(journal: Journal, spec_digest: str, current: list[dict[str, An
     present = {row["transactionId"]: row for row in current}
     if any(present.get(row["transactionId"]) != row for row in original):
         raise SecurityError("native bounded handover must preserve every original history record")
+    if attempts:
+        with history_savepoint(journal):
+            NativeHistoryArchive(journal).retain_attempts(attempts)

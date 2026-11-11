@@ -133,12 +133,18 @@ def _reconcile(
             numbered, unassigned = split_attempts(list(native.history))
             plans = {r.body.get("idTag") for r in native.physical.resources if r.kind == "plan"}
             intent = journal.get("managed_control_intent", {})
+            # The older parser could only fail on attempts it had never successfully audited.
+            NativeHistoryArchive(journal)
+            archived = {r[0] for r in journal.db.execute("SELECT digest FROM native_start_attempts")}
             if (
                 journal.get("native_history_policy") != policy
+                or journal.get("native_start_attempt_recovery") is not None
                 or journal.get("vendor_start_grant")
                 or journal.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
                 or journal.get("managed_current_change", {}).get("state") not in (None, "completed")
                 or journal.get("managed_test_charge", {}).get("state") not in (None, "completed")
+                or not isinstance(intent, dict)
+                or set(intent) != {"mode", "revision"}
                 or intent.get("mode") not in ("app", "paused")
                 or type(intent.get("revision")) is not int
                 or not 0 <= intent["revision"] < 2**53 - 1
@@ -146,13 +152,15 @@ def _reconcile(
                     "SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1"
                 ).fetchone()
                 or not any(
-                    row["idTagStart"] in plans and 0 <= failure["at_epoch"] - row["startTime"] <= 30
+                    row["idTagStart"] in plans
+                    and 0 <= failure["at_epoch"] - row["startTime"] <= 30
+                    and fingerprint(row) not in archived
                     for row in unassigned.values()
                 )
             ):
                 raise RecoveryRequiredError("the fault does not match a reconciled scheduled start attempt")
-            known = {r[0] for r in journal.db.execute("SELECT transaction_id FROM native_history_records")}
-            if any(row["transactionId"] not in known for row in numbered):
+            known = {r[0] for r in journal.db.execute("SELECT digest FROM native_history_records")}
+            if any(fingerprint(row) not in known for row in numbered):
                 raise RecoveryRequiredError("unexpected numbered history needs reconciliation")
             superseded = _superseded_tests(journal, intent["revision"], fault["at_epoch"])
             journal.require_allocation()
