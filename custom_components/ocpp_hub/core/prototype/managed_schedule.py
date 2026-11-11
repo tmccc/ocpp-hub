@@ -40,14 +40,9 @@ def installed_variant(journal: Journal, original: str, actual: str) -> str:
 
 
 # Remember a verified cable removal even if the next supervisor tick sees a newly connected vehicle.
-def remember_disconnect(journal: Journal, observed_at: float | None = None) -> None:
+def remember_disconnect(journal: Journal) -> None:
     lease = journal.get(KEY, {})
-    if (
-        lease.get("state") in {"requested", *OBSERVABLE}
-        and not lease.get("vehicle_disconnected")
-        # The station reports whole seconds. A fresh or future-dated departure cannot establish cable continuity.
-        and (observed_at is None or observed_at >= int(lease.get("accepted_epoch", 0)) - 5)
-    ):
+    if lease.get("state") in {"requested", *OBSERVABLE} and not lease.get("vehicle_disconnected"):
         journal.put(
             KEY,
             {
@@ -60,10 +55,14 @@ def remember_disconnect(journal: Journal, observed_at: float | None = None) -> N
 
 # An existing commissioned timer and an owned station receipt allow a zero-only restart during a telemetry outage.
 def recorded_timer_hold(j: Journal, spec_digest: str, boot_digest: str) -> bool:
+    return j.get(KEY, {}).get("state") in OBSERVABLE and recorded_station_profile(j, spec_digest, boot_digest)
+
+
+# Bind a restrictive write to the admitted installation and a station profile already owned by this journal.
+def recorded_station_profile(j: Journal, spec_digest: str, boot_digest: str) -> bool:
     row = j.db.execute("SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)).fetchone()
     return (
-        j.get(KEY, {}).get("state") in OBSERVABLE
-        and j.get("trial_phase") in ("active", "recovering")
+        j.get("trial_phase") in ("active", "recovering")
         and j.get("managed_mode", {}).get("spec_digest") == spec_digest
         and j.get("trial_binding", {}).get("boot_digest") == boot_digest
         and j.get("native_bounded_handover", {}).get("stage") == "admitted"
@@ -214,6 +213,7 @@ class ManagedSchedule:
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
         self.changed = asyncio.Event()
+        self.prior_departure: tuple[int, str, str] | None = None
         self.j = controller.session.journal
         self.j.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_schedule_requests(id TEXT PRIMARY KEY, start_epoch INTEGER NOT NULL)"
@@ -228,11 +228,21 @@ class ManagedSchedule:
             self.finish(lease, "cancelled_before_install")
 
     # Keep a connector-1 Available transition even when the next status or native poll sees its replacement.
-    def observe_status(self, payload: dict[str, Any]) -> None:
-        if payload["connectorId"] == 1 and payload["status"] == "Available":
-            when = datetime.fromisoformat(payload["timestamp"]).timestamp() if "timestamp" in payload else None
-            remember_disconnect(self.j, when)
-            self.changed.set()
+    def observe_status(self, token: str, payload: dict[str, Any]) -> None:
+        if payload["connectorId"] != 1 or payload["status"] != "Available":
+            return
+        # Only an exact, timed CALL witnessed on this connection before admission is a known replay.
+        # A clock behind ours can put a genuine new cable departure before the request on paper.
+        evidence = (
+            (self.c.session.gateway._charger_epoch, token, fingerprint(payload)) if "timestamp" in payload else None
+        )
+        if self.j.get(KEY, {}).get("state") not in {"requested", *OBSERVABLE}:
+            self.prior_departure = evidence
+            return
+        if evidence is not None and evidence == self.prior_departure:
+            return
+        remember_disconnect(self.j)
+        self.changed.set()
 
     # Revocation takes effect before asynchronous physical cleanup, including across a clock correction or restart.
     def revoked(self, lease: dict[str, Any]) -> bool:

@@ -89,7 +89,7 @@ class Gateway:
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
-        self.status_observer: Callable[[dict[str, Any]], None] | None = None
+        self.status_observer: Callable[[str, dict[str, Any]], None] | None = None
         self.held_start_report: Callable[[str], bool] | None = None
         self.native_start_report: Callable[[dict[str, Any]], Awaitable[NativeStartReport | None]] | None = None
         self.remote_start_guard: Callable[[], bool] | None = None
@@ -436,7 +436,7 @@ class Gateway:
                 if action == "StatusNotification":
                     self.journal.put("last_status", payload)
                     if self.status_observer is not None:
-                        self.status_observer(payload)
+                        self.status_observer(token, payload)
                 elif action == "MeterValues" and type(payload.get("transactionId")) is int:
                     rows = payload.get("meterValue", [])
                     if isinstance(rows, list) and rows and isinstance(rows[0], dict):

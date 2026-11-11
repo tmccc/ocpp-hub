@@ -69,6 +69,13 @@ class TimerBench:
             await healthy(self.c)
         assert self.c.schedule.summary()["state"] == "armed"
 
+    # Wait for earlier connector events to reach the cloud before requesting a new timer.
+    async def wait_for_admission(self) -> None:
+        async with asyncio.timeout(5):
+            while not self.c.schedule.can_install(self.c.latest_native):
+                await self.c.tick()
+                await asyncio.sleep(0.01)
+
     # Drive a new transaction only when the wire plan is scheduled on this exact local minute.
     async def fire(self, plan_id: int, *, demand: bool = True) -> int:
         plan = self.device.plans[plan_id]
@@ -270,6 +277,12 @@ async def test_disconnect_retires_timer(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        notification = {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
+        historical = notification | {"timestamp": datetime.fromtimestamp(MORNING - 3600, UTC).isoformat()}
+        if phase == "wire-events":
+            await b.rig.bench.call(b.sock, "earlier-departure", "StatusNotification", historical)
+            await b.rig.bench.call(b.sock, "initial-car", "StatusNotification", notification | {"status": "Preparing"})
+            await b.wait_for_admission()
         b.request()
         if phase != "requested":
             await b.c.tick()
@@ -277,14 +290,10 @@ async def test_disconnect_retires_timer(
                 await healthy(b.c)
         if phase == "selecting":
             b.c.current.accept(uuid.uuid4().hex, 0, 16)
-        notification = {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
         b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
         if phase == "wire-events":
-            for payload in (
-                notification | {"connectorId": 0},
-                notification | {"timestamp": datetime.fromtimestamp(MORNING - 3600, UTC).isoformat()},
-            ):
-                await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StatusNotification", payload)
+            await b.rig.bench.call(b.sock, "station-only", "StatusNotification", notification | {"connectorId": 0})
+            await b.rig.bench.call(b.sock, "earlier-departure", "StatusNotification", historical)
             assert not b.session.journal.get(managed_schedule.KEY).get("retire_reason")
             await b.rig.bench.call(b.sock, "departed", "StatusNotification", notification)
         elif phase == "selecting":
@@ -2140,3 +2149,119 @@ async def test_daily_occurrences_during_prolonged_clear_refusal(
             )
             daily = await b.advance_idle_to(int(following.timestamp()))
             assert daily is not None and (await healthy(b.c))["power_w"] > 0 and not b.stops() and not starts(b.rig)
+
+
+# Intent: preserve an independent session at cutoff while retaining a subsequent explicit owner Pause.
+# Why: preservation of unrelated work cannot override a newer deliberate Pause during telemetry loss.
+@pytest.mark.parametrize("source", ["daily", "owner"])
+@pytest.mark.parametrize("selected", [6, 32])
+async def test_owner_pause_of_independent_session_without_native_http(
+    tmp_path, tls, unused_tcp_port, monkeypatch, source, selected
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        if selected != 6:
+            b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
+            await b.c.current.settle()
+            await healthy(b.c)
+        await b.arm()
+        b.clock.now = b.start
+        if source == "daily":
+            local = await b.start_plan(9)
+        else:
+            gateway = b.session.gateway
+            guard = gateway.remote_start_guard
+            # Model a distinct Start already acknowledged by a previous release.
+            gateway.remote_start_guard = None
+            try:
+                accepted = await b.rig.bench.cloud_call(
+                    "older-owner-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+                )
+                assert accepted[0] == 3 and accepted[2]["status"] == "Accepted"
+            finally:
+                gateway.remote_start_guard = guard
+            response = await b.rig.bench.call(
+                b.sock,
+                "owner-lifecycle",
+                "StartTransaction",
+                START | {"idTag": "CLOUD_OWNER", "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
+            )
+            local = response[2]["transactionId"]
+            b.rig.peer.plan_session = (local, 987654)
+            b.rig.peer.paused = False
+            b.rig.peer.permission_enabled = True
+            b.rig.bench.cp, b.rig.bench.connection = "C", "Charging"
+            b.device.requested_current = 32
+        await healthy(b.c)
+        assert b.session.journal.get(managed_schedule.KEY)["other_local"] == local
+        observer = b.session.prepared.observer
+        original_port = observer.port
+
+        # Interrupt the native HTTP response while the independent OCPP connection stays operational.
+        async def interrupted(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(interrupted, "127.0.0.1", 0) as server:
+            observer.port = server.sockets[0].getsockname()[1]
+            # A lost first zero on the 32 A cases must be retried by ordinary supervision even with HTTP still down.
+            original_answer = b.device.answer
+            rejected = asyncio.Event()
+
+            # Reject before applying the profile so intent and physical current remain independently observable.
+            def reject_once(action, payload):
+                if selected == 32 and action == "SetChargingProfile" and not rejected.is_set():
+                    rejected.set()
+                    return {"status": "Rejected"}
+                return original_answer(action, payload)
+
+            b.device.answer = reject_once
+            pause = uuid.uuid4().hex
+            b.c.command(pause, "pause", b.c.requests.intent().revision)
+            try:
+                await b.c.pause_task
+                assert b.device.effective_limit() == (32 if selected == 32 else 0)
+                assert rejected.is_set() == (selected == 32)
+                b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+                for _ in range(3):
+                    await b.c.schedule.protect_deadline(b.session.journal.get(managed_schedule.KEY))
+                    status = await b.c.tick()
+                    b.clock.now += 16
+                    assert b.device.effective_limit() == 0 and b.device.current == 0
+                    assert b.session.journal.active() == local and b.timer in b.device.plans and not b.stops()
+                    assert b.c.requests.receipt(pause)["state"] == "accepted" and not status["local_hold_verified"]
+            finally:
+                observer.port, b.device.answer = original_port, original_answer
+        await b.c.tick()
+        assert b.stops() == [local] and b.session.journal.active() == local
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["local_hold_verified"] and set(b.device.plans) == {9}
+        assert b.c.requests.receipt(pause)["state"] == "completed"
+        b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+        assert (await healthy(b.c))["station_ceiling_a"] == selected
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily != local and (await healthy(b.c))["current_a"] == selected and b.stops() == [local]
+
+
+# Intent: slow charger clocks cannot hide a cable exchange between native observations.
+# Why: only the car connected when the owner armed the delayed timer has permission to use it.
+@pytest.mark.parametrize("skew", [0, 7, 30, 3600])
+async def test_new_departure_with_slow_charger_clock(tmp_path, tls, unused_tcp_port, monkeypatch, skew):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        stamp = datetime.fromtimestamp(b.clock.now + 1 - skew, UTC).isoformat()
+        event = {"connectorId": 1, "errorCode": "NoError", "timestamp": stamp}
+        await b.rig.bench.call(b.sock, "prior-car-left", "StatusNotification", event | {"status": "Available"})
+        await b.rig.bench.call(b.sock, "leon-plugged", "StatusNotification", event | {"status": "Preparing"})
+        await b.wait_for_admission()
+        await b.arm()
+        b.clock.now += 1
+        b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
+        await b.rig.bench.call(b.sock, "leon-left", "StatusNotification", event | {"status": "Available"})
+        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        await b.rig.bench.call(b.sock, "replacement", "StatusNotification", event | {"status": "Preparing"})
+        for _ in range(2):
+            await healthy(b.c)
+        assert b.c.schedule.summary()["result"] == "vehicle_disconnected"
+        assert set(b.device.plans) == {9} and await b.advance_idle_to(b.start) is None
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily is not None and (await healthy(b.c))["power_w"] > 0 and not b.stops()

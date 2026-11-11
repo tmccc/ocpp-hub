@@ -317,3 +317,38 @@ async def test_pause_requires_actual_closure_and_works_with_cloud_offline(
             assert status["local_hold_verified"] and not status["cloud_connected"]
             assert session.journal.next_delivery() is not None
             assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
+
+
+# Intent: an explicit Pause lowers the commissioned charger before waiting on even the first native response.
+# Why: a stalled read can outlast a deadline and zero current alone cannot complete the owner's Pause receipt.
+async def test_pause_restricts_station_while_native_observation_is_stalled(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            await introduced(rig, session, charger, "pause-telemetry-stall")
+            await healthy(controller)
+            observe = controller.native.observe
+            entered, resume = asyncio.Event(), asyncio.Event()
+
+            # Keep the socket-based station connection live while its separate observation is in progress.
+            async def delayed():
+                entered.set()
+                await resume.wait()
+                return await observe()
+
+            monkeypatch.setattr(controller.native, "observe", delayed)
+            request = identifier()
+            controller.command(request, "pause", controller.requests.intent().revision)
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                assert rig.bench.firmware.effective_limit() == 0
+                assert controller.requests.receipt(request)["state"] == "accepted"
+                assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+            finally:
+                resume.set()
+                await controller.pause_task
+            assert (await healthy(controller))["local_hold_verified"]
+            assert controller.requests.receipt(request)["state"] == "completed" and not starts(rig)

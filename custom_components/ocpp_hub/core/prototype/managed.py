@@ -9,7 +9,7 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .managed_current import ManagedCurrentLimits, managed_current_ceiling
 from .managed_intent import ControlIntent, ManagedRequests
-from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule, require_continuing_session
+from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule, recorded_station_profile, require_continuing_session
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .native_http import NativeTransportUnavailableError
@@ -80,8 +80,39 @@ class ManagedController:
                 self.pause_task = asyncio.create_task(self._stop_requested())
         return receipt
 
+    # Explicit owner Pause can restrict the commissioned station even while a native HTTP read is unavailable.
+    async def ensure_pause_zero(self) -> None:
+        g, j = self.session.gateway, self.session.journal
+        intent = self.requests.intent()
+        if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
+            return
+        epoch, ticket = g._charger_epoch, j.get("control", {}).get("ticket")
+
+        # Recheck the owner's claim and authenticated device immediately before each wire operation.
+        def guard() -> None:
+            control = j.get("control", {})
+            if (
+                self.stopping
+                or self.requests.intent() != intent
+                or not ticket
+                or control.get("ticket") != ticket
+                or control.get("owner") != "local"
+                or control.get("inhibit") is not True
+                or g._charger_epoch != epoch
+                or not g.current_boot_seen(epoch)
+                or fingerprint(j.get("boot")) != self.native.spec.boot_digest
+                or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
+            ):
+                raise RecoveryRequiredError("owner Pause awaits the current commissioned station")
+
+        try:
+            await g.controls.ensure_ceiling(guard=guard)
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
+            return  # A failed zero acknowledgement still permits Stop if independent native verification succeeds.
+
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
+        await self.ensure_pause_zero()
         try:
             native = await self.native.read()
             self.native.require_known_session(native)
@@ -420,6 +451,8 @@ class ManagedController:
         cutoff_hold = pending_timer and "hold_since" in timer
         if not base["charger_connected"] or not base["boot_verified"]:
             return {**base, "state": "starting", "owner_control_enabled": False}
+        if self.requests.intent().mode == "paused" and (self.pause_task is None or self.pause_task.done()):
+            await self.ensure_pause_zero()
         if (
             not g.controls.ready
             and self.released_epoch != g._charger_epoch
