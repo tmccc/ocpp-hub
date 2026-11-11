@@ -415,6 +415,19 @@ class ManagedChargeTests:
             and all(value == 0 for value in native.currents_a + native.powers_w)
         )
 
+    # Only fresh proof of this exact daily can preserve the separate owner's debt while its lifecycle stays open.
+    def preserve_debt(self, native: HandoverEvidence, continuing_local: int | None = None) -> bool:
+        if continuing_local is None:
+            return self.idle_debt(native)
+        return bool(
+            self.scoped_normal_stop()
+            and preserved_start_debt(self.journal, continuing_local=continuing_local)
+            and self.source is not None
+            and self.source[0] is native
+            and self.current_daily(continuing_local)
+            and all(value == 0 for value in native.currents_a + native.powers_w)
+        )
+
     # Positive writes under expired Start authority need a verified daily or the genuine owner's closed lifecycle.
     def check_positive(self, native: HandoverEvidence) -> None:
         if not self.scoped_normal_stop():

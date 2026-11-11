@@ -4,7 +4,7 @@ import pytest
 from ocpp_hub_core.prototype.gateway import Gateway
 from ocpp_hub_core.prototype.managed_intent import ManagedRequests
 from ocpp_hub_core.prototype.managed_start_debt import preserved_start_debt
-from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_rollback import require_lifecycle_idle
 
 
@@ -89,3 +89,21 @@ def test_preserved_debt_revocation(journal, key, change):
 def test_preserved_debt_requires_outstanding_owner_request(journal, action, state):
     journal.db.execute("UPDATE managed_requests SET action=?,state=?", (action, state))
     assert not preserved_start_debt(journal)
+
+
+# Intent: preserving open-session debt requires the exact ledger scope and remains unavailable to default rollback.
+# Why: a caller must not reuse another transaction's continuation permission or infer closure from the shared tag.
+def test_continuing_debt_requires_exact_ledger_scope(journal):
+    digest = fingerprint("daily")
+    journal.put("local_start_receipt", {**journal.get("local_start_receipt"), "digest": digest})
+    journal.put("managed_test_charge", {**journal.get("managed_test_charge"), "tag_digest": digest})
+    journal.db.execute(
+        "INSERT INTO transactions(local,connector,start,live) VALUES(101,1,?,1)",
+        ('{"idTag":"DAILY"}',),
+    )
+    assert not preserved_start_debt(journal)
+    assert not preserved_start_debt(journal, continuing_local=102)
+    assert preserved_start_debt(journal, continuing_local=101)
+    with pytest.raises(RecoveryRequiredError, match="unbound start"):
+        require_lifecycle_idle(Gateway(journal), continuing_local=101)
+    require_lifecycle_idle(Gateway(journal), continuing_local=101, preserve_expired_start=True)

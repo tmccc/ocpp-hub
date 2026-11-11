@@ -303,7 +303,9 @@ class ManagedController:
             "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
         require_lifecycle_idle(
-            g, continuing_local=continuing_local, preserve_expired_start=self.tests.idle_debt(native)
+            g,
+            continuing_local=continuing_local,
+            preserve_expired_start=self.tests.preserve_debt(native, continuing_local),
         )
         if (
             j.get("trial_phase") not in ("active", "recovering")
@@ -377,9 +379,7 @@ class ManagedController:
             raise RecoveryRequiredError("owner release awaits actual transaction closure")
         self.require_zero(native, continuing_local=continuing_local)
         if j.get("trial_phase") == "recovering":
-            await self.native.resume(
-                continuing_local=continuing_local, preserve_expired_start=self.tests.idle_debt(native)
-            )
+            await self.native.resume(continuing_local=continuing_local, preserve_expired_start=self.tests.preserve_debt)
         ticket = j.get("control", {}).get("ticket")
         native = await self.native.read(closed=continuing_local is None)
         self.require_zero(native, continuing_local=continuing_local)

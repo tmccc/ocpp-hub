@@ -76,7 +76,7 @@ def tls_for_case(path, material):
 # Allocate only inside this worker's checked non-ephemeral pool, then start its sole scenario listener immediately.
 def listener_port():
     worker = int(os.environ.get("MODEL_WORKER_INDEX", "0"))
-    if not 0 <= worker < 16:
+    if not 0 <= worker < 20:
         raise ValueError("model worker index outside its allocated pool")
     for port in range(14000 + worker * 500, 14500 + worker * 500):
         with socket.socket() as reservation:

@@ -417,7 +417,11 @@ class NativeBoundedHandover:
 
     # Default recovery requires an empty queue; managed local recovery retains queued observations and the zero hold.
     async def resume(
-        self, *, local_only: bool = False, continuing_local: int | None = None, preserve_expired_start: bool = False
+        self,
+        *,
+        local_only: bool = False,
+        continuing_local: int | None = None,
+        preserve_expired_start: Callable[[HandoverEvidence, int | None], bool] | None = None,
     ) -> dict[str, Any]:
         if type(local_only) is not bool:
             raise SecurityError("local recovery permission must be explicit")
@@ -457,10 +461,13 @@ class NativeBoundedHandover:
             ).fetchone()
             station = [r for r in present if r.identifier == HUB_PROFILE_ID]
             control = journal.get("control", {})
+            # Evaluate managed debt against this read, after any waits; an earlier source cannot permit recovery.
             require_lifecycle_idle(
                 gateway,
                 continuing_local=continuing_local,
-                preserve_expired_start=preserve_expired_start and not local_only,
+                preserve_expired_start=not local_only
+                and preserve_expired_start is not None
+                and preserve_expired_start(native, continuing_local),
             )
             if (
                 journal.get("trial_phase") != "recovering"

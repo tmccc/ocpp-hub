@@ -837,6 +837,10 @@ Cancelling a later timer before installation preserves
 an earlier unresolved cutoff. A current change interrupted by the temporary Start rolls back to the
 previous selected current and preserves the remaining timer window after source verification.
 An expired manual Start retains its own reporting obligation while ordinary daily charging can continue.
+That includes a daily session using the same tag: fresh evidence must identify the exact recurring plan
+and transaction before restoring its selected current after an outage or restart. A newer explicit Pause
+still takes priority. Temporary zero-profile verification does not disconnect an established cloud
+lifecycle channel or discard an acknowledgement already in flight.
 Its delayed report is held at zero before the proxy binds it to that command. A report with one matching
 unnumbered native history record can be recorded under verified zero when its plan ID is missing;
 recording it does not identify its charging source or authorize positive current. A contradictory plan ID

@@ -35,7 +35,7 @@ def require_lifecycle_idle(
         "SELECT start FROM transactions WHERE local=? AND stop IS NULL", (continuing_local,)
     ).fetchone()
     if awaiting_owner_start(journal, json.loads(row["start"])["idTag"] if row is not None else None) and not (
-        preserve_expired_start and continuing_local is None and preserved_start_debt(journal)
+        preserve_expired_start and preserved_start_debt(journal, continuing_local=continuing_local)
     ):
         raise RecoveryRequiredError("an unbound start still requires independent reconciliation")
 

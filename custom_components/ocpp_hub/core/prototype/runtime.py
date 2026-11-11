@@ -104,6 +104,7 @@ class ConnectionRuntime:
         self._charger_lock = asyncio.Lock()
         self._closing = False
         self.vendor_enabled: Callable[[], bool] = lambda: True
+        self.vendor_session_enabled: Callable[[], bool] = lambda: self.vendor_enabled()
         self.ceiling_enabled: Callable[[], bool] = lambda: True
 
     # Expose only the ephemeral test port after startup.
@@ -280,7 +281,7 @@ class ConnectionRuntime:
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
-            while self.vendor_enabled() and self.gateway.current_boot_seen(charger_epoch):
+            while self.vendor_session_enabled() and self.gateway.current_boot_seen(charger_epoch):
                 await asyncio.sleep(self.settings.pump_interval)
 
         tasks = [

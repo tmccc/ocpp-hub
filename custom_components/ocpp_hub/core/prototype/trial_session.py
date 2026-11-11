@@ -202,6 +202,15 @@ class TrialSession:
                 self.journal.get("trial_phase") == "active"
                 or (self.journal.get("trial_phase") in ("recovering", "blocked") and self.gateway.controls.ready)
             )
+            # Reconfirming zero can briefly invalidate readiness without revoking an established lifecycle channel.
+            self.runtime.vendor_session_enabled = lambda: (
+                self.journal.get("trial_phase")
+                in (
+                    "active",
+                    "recovering",
+                    "blocked",
+                )
+            )
             self.rollback = Rollback(self.gateway, self.book, self.observe)
             self.recovery = Recovery(
                 self.gateway,

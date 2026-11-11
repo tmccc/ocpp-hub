@@ -17,6 +17,9 @@
   session at zero immediately. Restore normal daily operation after an independent session closes while
   preserving an expired manual Start's outstanding report. Record a matching unnumbered native history
   report under verified zero without treating it as proof of the charging source.
+  Recover a verified daily that shares an expired manual Start's tag without consuming that command's
+  reporting debt. Keep an established cloud lifecycle channel open during temporary zero-profile
+  verification so a genuine Start acknowledgement can finish.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

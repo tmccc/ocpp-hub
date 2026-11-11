@@ -6,8 +6,8 @@ from .local_control import local_start_receipt
 from .store import Journal
 
 
-# Callers must separately prove physical and ledger closure; this exception never permits rollback or another Start.
-def preserved_start_debt(journal: Journal) -> bool:
+# Callers separately prove closed zero or the exact independent daily; debt never permits rollback or another Start.
+def preserved_start_debt(journal: Journal, *, continuing_local: int | None = None) -> bool:
     state = journal.get("managed_test_charge", {})
     intent = journal.get("managed_control_intent", {})
     owner = local_start_receipt(journal)
@@ -23,7 +23,7 @@ def preserved_start_debt(journal: Journal) -> bool:
         and intent.get("revision") == state.get("revision")
         and journal.get("managed_owner_pause", {}).get("revision") != intent.get("revision")
         and journal.get("control", {}).get("start_pending") is True
-        and journal.active() is None
+        and journal.active() == continuing_local
         and owner.get("stage") == "accepted"
         and owner.get("local") is None
         and isinstance(state.get("tag_digest"), str)
