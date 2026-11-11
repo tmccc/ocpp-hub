@@ -58,6 +58,18 @@ class ManagedCurrentLimits:
         )
         change = self.journal.get("managed_current_change", {})
         if change.get("state") == "pending":
+            timer = self.journal.get(KEY, {})
+            if controller.requests.intent().mode == "app" and timer.get("state") in OBSERVABLE:
+                previous = change.get("previous_a")
+                if previous is None:
+                    # Earlier pending receipts stored the target only. Recover the most recent completed selection.
+                    row = self.journal.db.execute(
+                        "SELECT c.current_a FROM managed_current_requests c JOIN managed_requests r ON r.id=c.id "
+                        "WHERE r.state='completed' ORDER BY r.rowid DESC LIMIT 1"
+                    ).fetchone()
+                    previous = row["current_a"] if row else 6
+                self.cancel_under_timer(change["id"], change["current_a"], integer(previous, 6, 32), "process_replaced")
+                return
             with self.journal.atomic():
                 intent = controller.requests.intent()
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
@@ -159,7 +171,10 @@ class ManagedCurrentLimits:
                 and intent.mode == "app"
             ):
                 j.put(KEY, {**timer, "control_revision": revision + 1})
-            j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "pending"})
+            j.put(
+                "managed_current_change",
+                {"id": identifier, "current_a": value, "previous_a": previous_value, "state": "pending"},
+            )
             j.db.execute("INSERT INTO managed_current_requests VALUES(?,?)", (identifier, value))
             j.db.execute(
                 "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
@@ -233,22 +248,13 @@ class ManagedCurrentLimits:
             timer = j.get(KEY, {})
             active = j.active()
             retired = c.schedule.revoked(timer)
-            if (
-                not superseded
-                and mode == "app"
-                and (retired or active is not None and timer.get("state") in OBSERVABLE)
-            ):
-                # A concurrent departure may interrupt the read before the positive-write guard runs.
-                with j.atomic():
-                    if active is not None:
-                        timer = {**timer, "unidentified_local": active}
-                        j.put(KEY, timer)
-                    c.schedule.begin_hold(timer)
-                    j.put("control", {**j.get("control", {}), "resume_limit": previous_value})
-                    g.controls._claim(True, stopping=True)
-                    j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
-                    reason = "timer_retired" if retired else "session_opened"
-                    c.requests.finish(identifier, "failed", {"classification": reason})
+            if not superseded and mode == "app" and timer.get("state") in OBSERVABLE:
+                reason = "current_unconfirmed"
+                if retired:
+                    reason = "timer_retired"
+                elif active is not None or timer.get("unreported_native"):
+                    reason = "session_opened"
+                self.cancel_under_timer(identifier, value, previous_value, reason)
                 await c.schedule.protect_station(j.get(KEY))
                 return
             with j.atomic():
@@ -264,6 +270,23 @@ class ManagedCurrentLimits:
                 )
             if c.pause_task is None or c.pause_task.done():
                 c.pause_task = asyncio.create_task(c._stop_requested())
+
+    # Restrict an interrupted selection without giving it owner Pause authority over a concurrent transaction.
+    def cancel_under_timer(self, identifier: str, value: int, previous: int, reason: str) -> None:
+        c, j = self.controller, self.journal
+        with j.atomic():
+            timer, active = j.get(KEY), j.active()
+            if reason in ("process_replaced", "current_unconfirmed") and not timer.get("retire_reason"):
+                timer = {**timer, "retire_reason": "current_update_interrupted"}
+                j.put(KEY, timer)
+            if active is not None:
+                timer = {**timer, "unidentified_local": active}
+                j.put(KEY, timer)
+            c.schedule.begin_hold(timer)
+            j.put("control", {**j.get("control", {}), "resume_limit": previous})
+            c.session.gateway.controls._claim(True, stopping=True)
+            j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
+            c.requests.finish(identifier, "failed", {"classification": reason})
 
     # Supervision observes the completed update instead of sampling through a legitimate profile replacement.
     async def settle(self) -> None:

@@ -128,6 +128,20 @@ def record_session_source(j: Journal, n: HandoverEvidence) -> None:
     if lease.get("state") not in OBSERVABLE:
         return
     active = j.active()
+    if (
+        local is None
+        and active is None
+        and lease.get("pending_native_reports")
+        and not n.physical.transaction_open
+        and all(value == 0 for value in n.currents_a + n.powers_w)
+    ):
+        # A station may reuse a provisional ID after both native and ledger closure have been witnessed.
+        j.db.execute(
+            "DELETE FROM managed_pending_native_reports WHERE local IN "
+            "(SELECT local FROM transactions WHERE stop IS NOT NULL)"
+        )
+        lease = {**lease, "pending_native_reports": False}
+        j.put(KEY, lease)
     gap = known_timer_closure_gap(j, n)
     unreported = local is not None and active != local and not gap
     evidence = lease.get("unreported_source", {})
@@ -261,6 +275,10 @@ class ManagedSchedule:
         self.j.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_schedule_requests(id TEXT PRIMARY KEY, start_epoch INTEGER NOT NULL)"
         )
+        self.j.db.execute(
+            "CREATE TABLE IF NOT EXISTS managed_pending_native_reports("
+            "native_id INTEGER PRIMARY KEY, local INTEGER NOT NULL UNIQUE REFERENCES transactions(local))"
+        )
         controller.session.gateway.status_observer = self.observe_status
         controller.session.gateway.tag_guard = self.permits_tag
         controller.session.gateway.held_start_report = self.can_record_held_start
@@ -305,13 +323,17 @@ class ManagedSchedule:
         return bool(self.j.get("control", {}).get("start_pending") or grant and grant.get("local") is None)
 
     # Only an authenticated charger under an owned, verified zero profile can submit a delayed lifecycle report.
-    def held_report_ready(self) -> bool:
+    def held_report_ready(self, *, owner_command: bool = False) -> bool:
         c, j = self.c, self.j
         g = c.session.gateway
         lease = j.get(KEY, {})
         return (
-            lease.get("state") in OBSERVABLE
-            and "hold_since" in lease
+            (
+                lease.get("state") in OBSERVABLE
+                and "hold_since" in lease
+                or owner_command
+                and c.requests.intent().mode == "paused"
+            )
             and j.active() is None
             and not c.stopping
             and not j.get("managed_control_fault")
@@ -323,7 +345,7 @@ class ManagedSchedule:
     # Record the genuine delayed lifecycle of an already accepted owner command under verified station zero.
     def can_record_held_start(self, tag: str) -> bool:
         c, j = self.c, self.j
-        if not self.held_report_ready():
+        if not self.held_report_ready(owner_command=True):
             return False
         prior = c.tests.state()
         if (
@@ -365,6 +387,7 @@ class ManagedSchedule:
             native_id is None
             or not current.get("unreported_native")
             or j.db.execute("SELECT 1 FROM transactions WHERE local=?", (native_id,)).fetchone() is not None
+            or j.db.execute("SELECT 1 FROM managed_pending_native_reports WHERE native_id=?", (native_id,)).fetchone()
             or not self.held_report_ready()
             or self.awaiting_start()
             or current.get("id") != lease["id"]
@@ -401,21 +424,19 @@ class ManagedSchedule:
             and c.requests.intent().mode != "app"
         ):
             return None
-        key = str(plan["planId"])
-        reported = current.get("reported_occurrences", {})
-        if occurrence <= reported.get(key, -1):
+        # The one-off can report once. Prior releases recorded its occurrence in the per-plan date map.
+        if temporary and (
+            current.get("temporary_start_reported") or str(plan["planId"]) in current.get("reported_occurrences", {})
+        ):
             return None
 
-        # The normal ledger allocates its own ID. Only a later matching native ID can authorize Stop or continuation.
+        # Bind the witnessed physical ID and the independently allocated ledger ID in the same Start commit.
         def accepted(local: int) -> None:
-            j.put(
-                KEY,
-                {
-                    **current,
-                    "unidentified_local": local,
-                    "reported_occurrences": {**reported, key: occurrence},
-                },
-            )
+            j.db.execute("INSERT INTO managed_pending_native_reports VALUES(?,?)", (native_id, local))
+            changes = {"unidentified_local": local, "pending_native_reports": True}
+            if temporary:
+                changes["temporary_start_reported"] = True
+            j.put(KEY, {**current, **changes})
 
         return NativeStartReport(native_id, plan["planId"], accepted)
 
@@ -697,8 +718,10 @@ class ManagedSchedule:
         if lease.get("state") not in OBSERVABLE:
             return None
         now = time.time()
-        if "cleanup_since" in lease and (
-            lease.get("last_response") == "rejected" or now - lease["cleanup_since"] >= 60
+        if (
+            lease.get("timer_present") is not False
+            and "cleanup_since" in lease
+            and (lease.get("last_response") == "rejected" or now - lease["cleanup_since"] >= 60)
         ):
             return "temporary_schedule_cleanup_unconfirmed"
         if (
@@ -1036,6 +1059,10 @@ class ManagedSchedule:
                     return
             if n.saved_schedule_digest != lease["original_digest"]:
                 raise SecurityError("original native timer is not confirmed")
+            if self.awaiting_start():
+                # Physical removal is verified. Retain the restricted listener until the accepted lifecycle reports.
+                self.begin_hold(lease)
+                return
             self.finish(lease, str(reason))
         elif now >= lease.get("next_clear", 0):
             attempts = lease.get("cleanup_attempts", 0) + 1

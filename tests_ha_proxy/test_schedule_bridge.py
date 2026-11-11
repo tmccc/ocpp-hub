@@ -4,31 +4,40 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime
 
 import aiohttp
+import pytest
 
 from custom_components.ics_proxy.api import ProxyClient
 from tests import conftest as _engine  # noqa: F401 - register the standalone engine package.
 from tests.test_managed_api import TOKEN, ManagementServer, ManagementSettings
 from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
+from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
 
 
 # Intent: HA Pause closes an otherwise open, full scheduled session; Return restores ordinary app/schedule operation.
 # Why: a simulated management receipt cannot show that the real client waits for measured closure or original readback.
-async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+@pytest.mark.parametrize("delayed_owner", [False, True])
+async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory, monkeypatch, delayed_owner):
     async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
         await b.arm()
-        b.clock.now = b.start
-        local = await b.fire(b.timer)
-        assert (await healthy(b.c))["power_w"] > 0
-        b.rig.peer.permission_enabled = False
-        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
-        b.device.requested_current = 0
-        published = await healthy(b.c)
-        assert published["power_w"] == 0 and b.session.journal.active() == local
+        if delayed_owner:
+            await b.acknowledge_older_owner_start()
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            published = await b.c.tick()
+        else:
+            b.clock.now = b.start
+            local = await b.fire(b.timer)
+            assert (await healthy(b.c))["power_w"] > 0
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+            b.device.requested_current = 0
+            published = await healthy(b.c)
+            assert published["power_w"] == 0 and b.session.journal.active() == local
+        before_starts = list(starts(b.rig))
         port = unused_tcp_port_factory()
         server = ManagementServer(
             ManagementSettings(port, tmp_path / "unused", TOKEN),
@@ -51,11 +60,26 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                 initial = await client.request("status")
                 pause = asyncio.create_task(client.command("pause", initial["control_revision"]))
                 try:
+                    if delayed_owner:
+                        async with asyncio.timeout(4):
+                            while b.timer in b.device.plans:
+                                await asyncio.sleep(0.01)
+                        assert not pause.done() and b.device.effective_limit() == 0
+                        b.device.active = 987654
+                        b.rig.peer.plan_session = (987654, 987655)
+                        body = START | {
+                            "idTag": "CLOUD_OWNER",
+                            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+                        }
+                        reply = await b.rig.bench.call(b.sock, "prior-owner-report", "StartTransaction", body)
+                        assert reply[0] == 3
+                        local = reply[2]["transactionId"]
+                        b.rig.peer.plan_session = (local, 987655)
                     async with asyncio.timeout(4):
                         while not b.stops():
                             await asyncio.sleep(0.01)
                     assert b.stops() == [local] and not pause.done()
-                    assert b.timer in b.device.plans and b.session.journal.active() == local
+                    assert (b.timer in b.device.plans) == (not delayed_owner) and b.session.journal.active() == local
                     await b.close_transaction(local)
                     await pause
                 finally:
@@ -68,7 +92,7 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                 await client.command("app_control", paused["control_revision"])
                 shared = await client.request("status")
                 assert shared["desired_control"] == "app" and shared["station_ceiling_a"] == 6
-                assert set(b.device.plans) == {9} and not starts(b.rig)
+                assert set(b.device.plans) == {9} and starts(b.rig) == before_starts
                 native = await b.c.native.read()
                 assert native.saved_schedule_digest == b.rig.spec.saved_schedule_digest
                 b.clock.now = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())

@@ -19,6 +19,7 @@ import pytest
 from ocpp_hub_core.prototype import auth_info, managed_schedule
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
+from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
@@ -2566,3 +2567,378 @@ async def test_lifecycle_turnover_at_timer_stop(tmp_path, tls, unused_tcp_port, 
         finally:
             b.rig.bench.before_reply = None
             await asyncio.gather(*jobs, return_exceptions=True)
+
+
+# Intent: a native daily occurrence may precede its OCPP lifecycle during an idle current write.
+# Why: the overlapping Start must keep app intent and the previous verified current selection.
+@pytest.mark.parametrize("demand", [False, True])
+@pytest.mark.parametrize("applied", [False, True])
+async def test_native_before_ocpp_during_current(tmp_path, tls, unused_tcp_port, monkeypatch, demand, applied):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        observe = b.c.native.observe
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        # Let the hardware report a session before the worker validates its required idle state.
+        async def delayed():
+            controls = b.session.gateway.controls
+            if not entered.is_set() and (not applied or b.device.effective_limit() == 32 and not controls._operations):
+                entered.set()
+                await release.wait()
+            return await observe()
+
+        monkeypatch.setattr(b.c.native, "observe", delayed)
+        request = uuid.uuid4().hex
+        b.c.command(request, "set_current", b.c.requests.intent().revision, current_a=32)
+        await asyncio.wait_for(entered.wait(), 2)
+        b.clock.now = b.start
+        native_id = b.session.journal.get("next_transaction") + 1
+        b.device.active = native_id
+        b.rig.peer.plan_session = (native_id, 9)
+        b.rig.peer.paused = False
+        b.rig.peer.permission_enabled = demand
+        b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
+        b.device.fire_plan(9)
+        if not demand:
+            b.device.requested_current = 0
+        release.set()
+        await b.c.current.settle()
+        if b.c.pause_task is not None:
+            await b.c.pause_task
+
+        assert b.c.requests.intent().mode == "app" and b.c.current.selected() == 6
+        assert b.c.requests.receipt(request)["state"] == "failed" and not b.stops()
+        assert b.device.effective_limit() == 0 and b.session.journal.active() is None
+        body = START | {
+            "idTag": b.device.plans[9]["idTag"],
+            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+        }
+        result = await b.rig.bench.call(b.sock, "delayed-daily-report", "StartTransaction", body)
+        assert result[0] == 3 and result[2]["transactionId"] == native_id
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and b.device.current == (6 if demand else 0)
+        await b.close_transaction(native_id)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        for _ in range(3):
+            await b.c.tick()
+        await healthy(b.c)
+        assert set(b.device.plans) == {9}
+        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+        assert daily != native_id and (await healthy(b.c))["current_a"] == 6 and not b.stops()
+
+
+# Intent: complete a fresh source read before an older in-flight snapshot of the same transaction returns.
+# Why: an unchanged newer observation must still supersede a contradictory older result.
+@pytest.mark.parametrize("demand", [False, True])
+@pytest.mark.parametrize("late_old_read", [False, True])
+@pytest.mark.parametrize("newest_plan", [9, 987654])
+@pytest.mark.parametrize("selected", [6, 32])
+async def test_source_read_completion_order(
+    tmp_path, tls, unused_tcp_port, monkeypatch, demand, late_old_read, newest_plan, selected
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        if selected != 6:
+            b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
+            await b.c.current.settle()
+            await healthy(b.c)
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.start_plan(9, demand=demand)
+        b.rig.peer.plan_session = (local, newest_plan)
+        await healthy(b.c)
+        j = b.session.journal
+        assert j.get(managed_schedule.KEY).get("other_local") == (local if newest_plan == 9 else None)
+        observer = b.session.prepared.observer
+        read = observer._read
+        entered, release = asyncio.Event(), asyncio.Event()
+        old = None
+        config_reads = 0
+
+        # Delay a read after its native session sample but before its final configuration consistency check.
+        async def older_snapshot(action, data=None):
+            nonlocal config_reads
+            if asyncio.current_task() is old and action == "getConfig":
+                config_reads += 1
+                if config_reads == 2:
+                    # SESSION/METER are already read; the ordinary final configuration HTTP await is delayed.
+                    entered.set()
+                    await release.wait()
+            return await read(action, data)
+
+        observer._read = older_snapshot
+        b.rig.peer.plan_session = (local, b.timer if newest_plan == 9 else 9)
+        old = asyncio.create_task(b.c.native.read())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            if not late_old_read:
+                release.set()
+                await old
+            b.rig.peer.plan_session = (local, newest_plan)
+            await b.c.native.read()
+            latest = j.get(managed_schedule.KEY)
+            assert latest.get("other_local") == (local if newest_plan == 9 else None)
+            assert latest.get("bound_local") is None
+            if late_old_read:
+                release.set()
+                with pytest.raises(AuditSupersededError):
+                    await old
+
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            await b.c.schedule.protect_deadline(j.get(managed_schedule.KEY))
+            assert not b.stops() and b.device.effective_limit() == (selected if newest_plan == 9 else 0)
+            if newest_plan != 9:
+                b.rig.peer.plan_session = (local, 9)
+                assert (await healthy(b.c))["station_ceiling_a"] == selected
+            await b.close_transaction(local)
+            await healthy(b.c)
+            assert set(b.device.plans) == {9}
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily != local and (await healthy(b.c))["current_a"] == selected and not b.stops()
+        finally:
+            release.set()
+            await asyncio.gather(old, return_exceptions=True)
+            observer._read = read
+
+
+# Intent: let the real Boot task and the real health supervisor overlap their source audits.
+# Why: the source ordering issue must be reachable through service tasks as well as explicit paired reads.
+@pytest.mark.parametrize("demand", [False, True])
+@pytest.mark.parametrize("selected", [6, 32])
+async def test_boot_and_health_reads_can_reorder(tmp_path, tls, unused_tcp_port, monkeypatch, demand, selected):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        if selected != 6:
+            b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
+            await b.c.current.settle()
+            await healthy(b.c)
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.start_plan(9, demand=demand)
+        await healthy(b.c)
+        async with asyncio.timeout(3):
+            while b.session.journal.next_delivery() is not None:
+                await asyncio.sleep(0.01)
+        settings = b.session.runtime.settings
+        b.session.runtime.settings = replace(settings, pump_interval=0.1)
+        await asyncio.sleep(0.03)
+        observer = b.session.prepared.observer
+        read = observer._read
+        entered, release = asyncio.Event(), asyncio.Event()
+        first_reader = None
+        config_reads = 0
+        newer_read = False
+
+        # Keep Boot recovery in a real in-flight read while the health loop confirms the newest source.
+        async def delayed_final_config(action, data=None):
+            nonlocal first_reader, config_reads, newer_read
+            task = asyncio.current_task()
+            if first_reader is None:
+                first_reader = task
+            if task is first_reader and action == "getConfig":
+                config_reads += 1
+                if config_reads == 2:
+                    entered.set()
+                    await release.wait()
+            elif task is not first_reader and action == "getConfig":
+                newer_read = True
+            return await read(action, data)
+
+        observer._read = delayed_final_config
+        b.rig.peer.plan_session = (local, b.timer)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        try:
+            async with b.rig.charger(b.session) as b.sock:
+                await b.rig.bench.call(b.sock, "real-reconnect-boot", "BootNotification", BOOT)
+                await asyncio.wait_for(entered.wait(), 2)
+                b.rig.peer.plan_session = (local, 9)
+                status = await b.c.tick()
+                assert newer_read, status
+                assert b.session.journal.get(managed_schedule.KEY)["other_local"] == local
+                release.set()
+                observer._read = read
+                assert (await healthy(b.c))["station_ceiling_a"] == selected and not b.stops()
+                await b.close_transaction(local)
+                await healthy(b.c)
+                assert set(b.device.plans) == {9}
+                daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+                assert daily != local and (await healthy(b.c))["current_a"] == selected and not b.stops()
+        finally:
+            release.set()
+            observer._read = read
+            b.session.runtime.settings = settings
+
+
+# Intent: a delayed accepted owner Start must remain reportable while explicit Pause retires the temporary timer.
+# Why: timer cleanup cannot discard the only way to name and stop the actual later native session.
+@pytest.mark.parametrize("at_deadline", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_pause_retires_timer_before_older_owner_lifecycle(
+    tmp_path, tls, unused_tcp_port, monkeypatch, at_deadline, restart
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        await b.acknowledge_older_owner_start()
+        if at_deadline:
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            await b.c.tick()
+        pause = uuid.uuid4().hex
+        b.c.command(pause, "pause", b.c.requests.intent().revision)
+        await b.c.pause_task
+        for _ in range(4):
+            await b.c.tick()
+        assert b.device.effective_limit() == 0
+        assert b.c.requests.receipt(pause)["state"] == "accepted"
+        b.device.active = 987654
+        b.rig.peer.plan_session = (987654, 987655)
+        if restart:
+            await crash(b.session)
+            b.session = managed_session(b.rig)
+            await b.session.start()
+            b.c = ManagedController(b.session)
+        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
+            if restart:
+                await introduced(b.rig, b.session, b.sock, "paused-owner-report-boot")
+            assert set(b.device.plans) == {9}
+            body = START | {"idTag": "CLOUD_OWNER", "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()}
+            wrong = await b.rig.bench.call(
+                b.sock, "wrong-held-report", "StartTransaction", body | {"idTag": "UNRELATED"}
+            )
+            assert wrong[0] == 4 and b.session.journal.active() is None and not b.stops()
+            reply = await b.rig.bench.call(b.sock, "older-held-report", "StartTransaction", body)
+            assert reply[0] == 3
+            local = reply[2]["transactionId"]
+            b.rig.peer.plan_session = (local, 987655)
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and b.stops() == [local]
+            await b.close_transaction(local)
+            assert (await healthy(b.c))["local_hold_verified"] and b.c.requests.receipt(pause)["state"] == "completed"
+            assert set(b.device.plans) == {9} and not b.session.journal.get("vendor_start_grant")
+            b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+            assert (await healthy(b.c))["station_ceiling_a"] == 6
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily != local and (await healthy(b.c))["current_a"] == 6 and b.stops() == [local]
+
+
+# Intent: two genuine transactions can use the same daily window while temporary cleanup is outstanding.
+# Why: distinct native reports, transport retries, and a reused provisional ID have different ownership evidence.
+@pytest.mark.parametrize("refused", [False, True])
+@pytest.mark.parametrize("demand", [False, True])
+async def test_multiple_reports_in_one_daily_window(tmp_path, tls, unused_tcp_port, monkeypatch, refused, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        answer = b.device.answer
+
+        # Keep an expired one-off installed, or exercise two early daily reports before the temporary start.
+        def refuse_clear(action, payload):
+            if refused and action == "DataTransfer" and payload.get("messageId") == "clearPlans":
+                return {"status": "Rejected", "data": ""}
+            return answer(action, payload)
+
+        b.device.answer = refuse_clear
+        if refused:
+            b.clock.now = b.start + 601
+            for _ in range(4):
+                await b.c.tick()
+        start = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()) if refused else b.start - 60
+        locals_seen = []
+        for index in range(2):
+            b.clock.now = start + 30 * index
+            candidate_id = 987650 + index
+            b.device.active = candidate_id
+            b.rig.peer.plan_session = (candidate_id, 9)
+            b.device.fire_plan(9)
+            b.rig.peer.paused = False
+            b.rig.peer.permission_enabled = demand
+            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
+            if not demand:
+                b.device.requested_current = 0
+            await b.c.tick()
+            body = START | {
+                "idTag": b.device.plans[9]["idTag"],
+                "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+            }
+            if index:
+                # Reusing the prior provisional ID before a native idle observation cannot create a second ledger row.
+                b.device.active = candidate_id - 1
+                b.rig.peer.plan_session = (candidate_id - 1, 9)
+                stale = await b.rig.bench.call(b.sock, "old-provisional-id", "StartTransaction", body)
+                assert stale[0] == 4 and b.session.journal.active() is None
+                b.device.active = candidate_id
+                b.rig.peer.plan_session = (candidate_id, 9)
+            reply = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+            assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+            local = reply[2]["transactionId"]
+            assert local not in locals_seen
+            locals_seen.append(local)
+            b.rig.peer.plan_session = (local, 9)
+            for _ in range(4):
+                await b.c.tick()
+            assert b.device.effective_limit() == 6 and b.device.current == (6 if demand else 0) and not b.stops()
+            retry = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+            assert retry[0] == 3 and retry[2]["transactionId"] == local
+            b.clock.now += 10
+            await b.close_transaction(local)
+        b.device.answer = answer
+        day = 12 if refused else 11
+        b.clock.now = int(datetime(2026, 11, day, 6, tzinfo=ZONE).timestamp())
+        for _ in range(4):
+            await b.c.tick()
+        await healthy(b.c)
+        assert set(b.device.plans) == {9}
+        daily = await b.advance_idle_to(int(datetime(2026, 11, day + 1, tzinfo=ZONE).timestamp()))
+        assert (
+            daily is not None and daily not in locals_seen and (await healthy(b.c))["current_a"] == 6 and not b.stops()
+        )
+
+
+# Intent: a restart during a current change cannot promote that change into an owner Stop on an independent car.
+# Why: older pending journals lack the previous selection, but the last completed receipt still proves its ceiling.
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_replace_during_current_overlap(tmp_path, tls, unused_tcp_port, monkeypatch, legacy):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=16)
+        await b.c.current.settle()
+        await healthy(b.c)
+        await b.arm()
+        started, release = asyncio.Event(), asyncio.Event()
+        observe = b.c.native.observe
+
+        # Terminate the worker after its receipt is durable and before its idle check returns.
+        async def delayed():
+            if not started.is_set():
+                started.set()
+                await release.wait()
+            return await observe()
+
+        monkeypatch.setattr(b.c.native, "observe", delayed)
+        request = uuid.uuid4().hex
+        b.c.command(request, "set_current", b.c.requests.intent().revision, current_a=32)
+        await asyncio.wait_for(started.wait(), 2)
+        b.clock.now = b.start
+        local = await b.start_plan(9)
+        await b.c.native.read()
+        async with asyncio.timeout(3):
+            while b.session.journal.next_delivery() is not None or b.session.gateway.vendor._pending:
+                await asyncio.sleep(0.01)
+        b.c.current.worker.cancel()
+        await asyncio.gather(b.c.current.worker, return_exceptions=True)
+        release.set()
+        if legacy:
+            j = b.session.journal
+            old = j.get("managed_current_change")
+            del old["previous_a"]
+            j.put("managed_current_change", old)
+            j.put("control", {**j.get("control"), "resume_limit": 32})
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "interrupted-selection")
+            assert (await healthy(b.c))["station_ceiling_a"] == b.c.current.selected() == 16
+            assert b.c.requests.intent().mode == "app" and b.device.current == 16 and not b.stops()
+            await b.close_transaction(local)
+            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+            for _ in range(4):
+                await b.c.tick()
+            assert set(b.device.plans) == {9}
+            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+            assert daily != local and (await healthy(b.c))["current_a"] == 16 and not b.stops()

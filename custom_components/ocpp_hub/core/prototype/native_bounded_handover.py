@@ -67,6 +67,8 @@ class NativeBoundedHandover:
         self.allow_unplugged = allow_unplugged
         self.lock = asyncio.Lock()
         self.last_verified_at = 0.0
+        self.read_sequence = 0
+        self.last_resolved_read = 0
         self.introduced_epoch: int | None = None
         self.introduced_revision: int | None = None
         if fingerprint(spec.original_configuration) != book.baseline.configuration_digest:
@@ -128,17 +130,34 @@ class NativeBoundedHandover:
 
     # Read current rich native evidence and preserve every original history body without adopting later sessions.
     async def read(self, route: str = "trial", closed: bool = False) -> HandoverEvidence:
+        self.read_sequence += 1
+        sequence = self.read_sequence
         before = self.authority()
+
+        # A newer observation may finish first while this read waits on the independent HTTP channel.
+        def resolve() -> None:
+            if sequence < self.last_resolved_read:
+                raise AuditSupersededError("a newer native observation superseded this read")
+            self.last_resolved_read = sequence
+
         try:
             native = await self.observe()
+            resolve()
             if before != self.authority():
                 raise AuditSupersededError("native bounded audit was superseded by local authority")
-            self.require(native, route=route, closed=closed)
+            self.require(native, route=route)
             audit_history(
                 self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
             )
             self.book.check_originals(native.physical)
+            if native.physical.connection == "Unplug":
+                remember_disconnect(self.gateway.journal)
+            record_session_source(self.gateway.journal, native)
+            # A verified open session remains evidence even when this particular caller needs the station idle.
+            if closed:
+                self.require(native, route=route, closed=True)
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
+            resolve()
             self.last_verified_at = 0
             timer = self.gateway.journal.get("managed_temporary_schedule", {})
             if timer.get("state") in OBSERVABLE and (
@@ -147,11 +166,9 @@ class NativeBoundedHandover:
                 raise UnavailableError("timer hold awaits fresh native evidence") from error
             raise
         except SecurityError, UnavailableError, TimeoutError:
+            resolve()
             self.last_verified_at = 0
             raise
-        if native.physical.connection == "Unplug":
-            remember_disconnect(self.gateway.journal)
-        record_session_source(self.gateway.journal, native)
         self.last_verified_at = native.physical.observed_at
         return native
 

@@ -44,9 +44,9 @@ class ManagedController:
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
+        self.schedule = ManagedSchedule(self)
         self.current = ManagedCurrentLimits(self)
         self.tests = ManagedChargeTests(self)
-        self.schedule = ManagedSchedule(self)
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
@@ -174,6 +174,8 @@ class ManagedController:
                 await self.native.resume()
         if j.get("managed_temporary_schedule", {}).get("state") in ("installing", "armed", "clearing"):
             await self.schedule.before_release(native)
+        if self.schedule.awaiting_start():
+            raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         self.requests.confirm_pauses()
         return native
 
