@@ -96,6 +96,17 @@ class InfoBook:
             return {**info, "status": "Expired"}
         return info
 
+    # Return the original decision and expiry for an already acknowledged event that occurred while both were valid.
+    def accepted_for_delayed_report(self, tag: str, occurred: float) -> dict[str, Any] | None:
+        info = self.stored(tag)
+        if info is None or info["status"] != "Accepted" or "expiryDate" not in info:
+            return None
+        end = expiry(info["expiryDate"])
+        observed = self.journal.db.execute("SELECT observed FROM auth_info WHERE digest=?", (tag_key(tag),)).fetchone()
+        if observed is not None and observed[0] <= occurred < end <= time.time():
+            return info
+        return None
+
     # The narrow dynamic-tag trial requires real future cloud expiry before arming a new remote start.
     def require_dynamic(self, info: dict[str, Any]) -> None:
         if info.get("status") != "Accepted" or "expiryDate" not in info or expiry(info["expiryDate"]) <= time.time():

@@ -19,6 +19,8 @@ from .managed_schedule import (
     TimerVehicleDisconnectedError,
     installed_variant,
     known_timer_closure_gap,
+    record_session_source,
+    recorded_timer_hold,
     remember_disconnect,
     request_timer_stop,
     require_continuing_session,
@@ -149,6 +151,7 @@ class NativeBoundedHandover:
             raise
         if native.physical.connection == "Unplug":
             remember_disconnect(self.gateway.journal)
+        record_session_source(self.gateway.journal, native)
         self.last_verified_at = native.physical.observed_at
         return native
 
@@ -160,7 +163,15 @@ class NativeBoundedHandover:
                 raise SecurityError("managed current capability must be retired before backend restoration")
             lease = j.get("managed_temporary_schedule", {})
             closing_local = j.active() if lease.get("state") in OBSERVABLE else None
-            if closing_local is None and known_timer_closure_gap(j, native):
+            if (
+                closing_local is None
+                and native.physical.transaction_open
+                and (
+                    known_timer_closure_gap(j, native)
+                    or recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest)
+                )
+            ):
+                # A zero-output unplugged observation can maintain the restrictive hold without adopting the native ID.
                 closing_local = native.physical.native_transaction_id
             self.spec.require_managed(
                 native,
@@ -314,7 +325,11 @@ class NativeBoundedHandover:
     # A genuine Stop may have occurred while the process was absent; retain the ledger debt until its real replay.
     def require_recovery_session(self, native: HandoverEvidence) -> None:
         if native.physical.transaction_open:
-            if not known_timer_closure_gap(self.gateway.journal, native):
+            j = self.gateway.journal
+            if j.active() is None and j.get("managed_temporary_schedule", {}).get("unreported_native"):
+                if recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest):
+                    return  # Only the restricted listener/Boot can proceed. No local transaction is adopted.
+            if not known_timer_closure_gap(j, native):
                 self.require_known_session(native)
         elif native.physical.native_transaction_id is not None:
             raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")

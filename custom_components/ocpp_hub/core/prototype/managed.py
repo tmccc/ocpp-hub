@@ -351,6 +351,10 @@ class ManagedController:
                 native.physical.transaction_open
                 and native.physical.native_transaction_id != self.session.journal.active()
             ):
+                lease = self.session.journal.get(KEY, {})
+                if lease.get("state") in OBSERVABLE and lease.get("unreported_native"):
+                    await self.schedule.protect_station(lease)
+                    raise RecoveryRequiredError("timer holds zero awaiting the genuine transaction or native closure")
                 raise SecurityError("managed native transaction has no exact accepted local counterpart")
             self.native.require_known_session(native)
             self.native.require_selected(native)

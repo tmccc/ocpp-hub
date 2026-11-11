@@ -336,9 +336,20 @@ class Gateway:
         if action == "StartTransaction":
             integer(payload.get("connectorId"), 1, 1)
             number(payload.get("meterStart"), 1e12)
-            timestamp(payload.get("timestamp"))
+            occurred = timestamp(payload.get("timestamp"))
+            tag = payload.get("idTag")
+            if not isinstance(tag, str):
+                raise DeniedError("a reported start requires a tag")
             known = self.journal.known_start(payload)
-            if not known and not self._tag_allowed(payload.get("idTag"), lifecycle=True):
+            historical = None
+            if (
+                not known
+                and self.policy.strict_cloud_authorization
+                and self.held_start_report is not None
+                and self.held_start_report(tag)
+            ):
+                historical = self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp())
+            if not known and not self._tag_allowed(tag, lifecycle=True, historical=historical is not None):
                 raise DeniedError("tag is not approved for local authorization")
 
             # Permission binding and the pending flag belong to the very same commit as the new Start fact.
@@ -349,11 +360,11 @@ class Gateway:
                 if self.start_observer is not None:
                     self.start_observer(local, payload)
 
-            info = self._tag_info(payload["idTag"]) if self.policy.strict_cloud_authorization and not known else None
+            info = historical or (self._tag_info(tag) if self.policy.strict_cloud_authorization and not known else None)
             if info is not None:
                 if info["status"] != "Accepted":
                     raise DeniedError("authorization changed before accepting the new session")
-                if not self._local_tag(payload["idTag"]):
+                if historical is None and not self._local_tag(tag):
                     self.auth_info.require_dynamic(info)
             return self.journal.start(token, payload, accepted, info)
         if action == "StopTransaction":
@@ -395,7 +406,7 @@ class Gateway:
         raise DeniedError("unsupported charger request")
 
     # Local stop overrides both the static allowlist and an app-generated trusted vendor start grant.
-    def _tag_allowed(self, tag: Any, *, lifecycle: bool = False) -> bool:
+    def _tag_allowed(self, tag: Any, *, lifecycle: bool = False, historical: bool = False) -> bool:
         if not isinstance(tag, str):
             return False
         inhibited = (
@@ -419,6 +430,8 @@ class Gateway:
         )
         if not selected or not self.policy.strict_cloud_authorization:
             return bool(selected)
+        if held_report and historical:
+            return True
         info = self.auth_info.get(tag)
         if info is not None and info["status"] == "Accepted" and not self._local_tag(tag):
             try:

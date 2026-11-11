@@ -83,6 +83,50 @@ def independent_session(j: Journal, lease: dict[str, Any], n: HandoverEvidence, 
     return row is not None and json.loads(row["start"])["idTag"].casefold() != lease["body"]["idTag"].casefold()
 
 
+# Publish the source of each fully verified, open native observation before any cutoff or recovery task can act.
+def record_session_source(j: Journal, n: HandoverEvidence) -> None:
+    lease = j.get(KEY, {})
+    local = n.physical.native_transaction_id
+    if lease.get("state") not in OBSERVABLE:
+        return
+    active = j.active()
+    unreported = local is not None and active is None and not known_timer_closure_gap(j, n)
+    if unreported != lease.get("unreported_native", False):
+        lease = {**lease, "unreported_native": unreported}
+        j.put(KEY, lease)
+    if local is None or local != active or local <= lease["floor"]:
+        return
+    previous = lease.get("bound_local")
+    other = lease.get("other_local")
+    changes: dict[str, Any] = {}
+    row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
+    if row is None:
+        return
+    timer_source = (
+        n.session_plan_id == lease["body"]["planId"]
+        and json.loads(row["start"])["idTag"].casefold() == lease["body"]["idTag"].casefold()
+    )
+    if timer_source:
+        if previous != local:
+            changes.update(bound_local=local, native_plan_confirmed=True)
+            if previous is not None:
+                changes["retire_reason"] = "session_closed"
+        if other == local:
+            changes["other_local"] = None
+    else:
+        independent = independent_session(j, lease, n, local)
+        if previous == local:
+            changes.update(bound_local=None, native_plan_confirmed=False)
+        if independent and other != local:
+            changes["other_local"] = local
+        elif not independent and other == local:
+            changes["other_local"] = None
+        if "hold_since" in lease and (previous == local or other == local and not independent):
+            changes["unidentified_local"] = local
+    if changes:
+        j.put(KEY, {**lease, **changes})
+
+
 # A provisional hold may be lifted only for this same open transaction on a positively identified original plan.
 def require_continuing_session(j: Journal, n: HandoverEvidence, local: int) -> None:
     lease = j.get(KEY, {})
@@ -120,17 +164,15 @@ async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Call
     await g.controls.stop(expected_local=lease["bound_local"], guard=guard)
 
 
-# The two independent closure indicators may arrive in either order for a previously identified one-off.
+# The independent closure reports may arrive in either order for any exact transaction tracked by this timer.
 def known_timer_closure_gap(journal: Journal, native: HandoverEvidence) -> bool:
     lease = journal.get(KEY, {})
     local, physical = journal.active(), native.physical.native_transaction_id
-    bound = lease.get("bound_local")
-    return (
-        lease.get("state") in OBSERVABLE
-        and lease.get("native_plan_confirmed") is True
-        and bound is not None
-        and local != physical
-        and {local, physical} == {None, bound}
+    if lease.get("state") not in OBSERVABLE or (local is None) == (physical is None):
+        return False
+    closing = local if local is not None else physical
+    return closing in (lease.get("unidentified_local"), lease.get("other_local")) or (
+        lease.get("native_plan_confirmed") is True and closing == lease.get("bound_local")
     )
 
 
@@ -168,6 +210,7 @@ class ManagedSchedule:
         if payload["connectorId"] == 1 and payload["status"] == "Available":
             when = datetime.fromisoformat(payload["timestamp"]).timestamp() if "timestamp" in payload else None
             remember_disconnect(self.j, when)
+            self.changed.set()
 
     # Revocation takes effect before asynchronous physical cleanup, including across a clock correction or restart.
     def revoked(self, lease: dict[str, Any]) -> bool:
@@ -514,6 +557,7 @@ class ManagedSchedule:
             and now - lease["hold_since"] >= 60
             and (
                 lease.get("closure_gap")
+                or lease.get("unreported_native")
                 or self.j.active() is not None
                 and self.j.active() in (lease.get("bound_local"), lease.get("unidentified_local"))
             )
@@ -591,12 +635,17 @@ class ManagedSchedule:
                     lease = {**lease, "end_epoch": end}
                     self.j.put(KEY, lease)
                 remaining = end - time.time()
-                if remaining <= 0 and not self.j.get("managed_control_fault"):
+                due = (
+                    remaining <= 0
+                    or lease.get("retire_reason") == "vehicle_disconnected"
+                    or lease.get("unreported_native")
+                )
+                if due and not self.j.get("managed_control_fault"):
                     try:
                         await self.protect_deadline(lease)
                     except DeniedError, UnavailableError, RecoveryRequiredError:
                         pass  # Durable attempt times bound retries. Only actual closure can release the hold.
-                delay = min(remaining, 30) if remaining > 0 else 1
+                delay = 1 if due else min(remaining, 30)
             try:
                 await asyncio.wait_for(self.changed.wait(), delay)
             except TimeoutError:
@@ -609,6 +658,7 @@ class ManagedSchedule:
             lease.get("state") not in OBSERVABLE
             or time.time() < lease.get("end_epoch", float("inf"))
             and lease.get("retire_reason") != "vehicle_disconnected"
+            and not lease.get("unreported_native")
             or not self.hold_authorized()
         ):
             return
@@ -648,7 +698,6 @@ class ManagedSchedule:
         lease = j.get(KEY)
         c.native.require_known_session(n)
         active = j.active()
-        lease, _ = self.identify(lease, n)
         bound = lease.get("bound_local")
         if active is not None and active != bound:
             if lease.get("unidentified_local") == active and independent_session(j, lease, n, active):
@@ -682,8 +731,8 @@ class ManagedSchedule:
             return
         raise RecoveryRequiredError("deadline hold awaits verified closure")
 
-    # Bind the independently read source on ordinary polls and while an unidentified session is held at zero.
-    def identify(self, lease: dict[str, Any], n: HandoverEvidence) -> tuple[dict[str, Any], dict[int, bool]]:
+    # Reconcile native timer presence and transaction history after the verified read has published its source.
+    def observe_timer(self, lease: dict[str, Any], n: HandoverEvidence) -> tuple[dict[str, Any], dict[int, bool]]:
         j = self.j
         present = n.saved_schedule_digest == lease["augmented_digest"]
         state, now = lease["state"], time.time()
@@ -695,26 +744,10 @@ class ManagedSchedule:
         changes: dict[str, Any] = {}
         if present and state == "installing":
             changes.update(state="armed", verified_at=now)
-        previous = lease.get("bound_local")
-        if native_local is not None and native_local in candidates and native_local != previous:
-            if previous is None or candidates.get(previous) is True:
-                changes.update(native_plan_confirmed=True, bound_local=native_local)
-                if previous is not None:
-                    changes["retire_reason"] = "session_closed"
         if candidates and not lease.get("session_seen"):
             changes["session_seen"] = True
         if lease.get("timer_present") is not present:
             changes["timer_present"] = present
-        if actual_id == j.active() and actual_id is not None and independent_session(j, lease, n, actual_id):
-            if lease.get("other_local") != actual_id:
-                changes["other_local"] = actual_id
-            if actual_id == previous:
-                # A fresh conflicting native plan invalidates the old Stop authority for this transaction ID.
-                changes.update(bound_local=None, native_plan_confirmed=False)
-                if "hold_since" in lease:
-                    changes["unidentified_local"] = actual_id
-        elif native_local is not None and native_local == lease.get("other_local") and native_local in candidates:
-            changes["other_local"] = None
         if changes:
             lease = {**lease, **changes}
             j.put(KEY, lease)
@@ -746,7 +779,7 @@ class ManagedSchedule:
             lease = {**lease, "end_epoch": cutoff_epoch(lease["start_epoch"], ZoneInfo(n.configuration["timeZone"]))}
             j.put(KEY, lease)
         actual_id = n.physical.native_transaction_id
-        lease, candidates = self.identify(lease, n)
+        lease, candidates = self.observe_timer(lease, n)
         if self.awaiting_start() and j.active() is None and not n.physical.transaction_open:
             # Preserve a previously accepted lifecycle while the station remains inside the authorized window.
             if now < lease["end_epoch"] and not lease.get("retire_reason") and c.requests.intent().mode == "app":
@@ -760,12 +793,12 @@ class ManagedSchedule:
             not cancelled
             and self.revoked(lease)
             and actual_id is not None
-            and actual_id == lease.get("bound_local") == j.active()
+            and actual_id == j.active()
+            and actual_id != lease.get("other_local")
             and n.physical.transaction_open
         ):
-            if "hold_since" not in lease:
-                j.put(KEY, {**lease, "hold_since": now})
-            c.released_epoch = None
+            await self.protect_deadline(lease)
+            self.begin_hold(j.get(KEY))
             await self.hold_until_closed(n)
         grace_end = min(lease["end_epoch"], lease["start_epoch"] + 600)
         reason = lease.get("retire_reason")
