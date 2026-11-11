@@ -67,7 +67,7 @@ async def connected_bench(
     bench = Bench()
     bench.cp, bench.connection = "B", "Plug"
     bench.history = [{"transactionId": 9000000, "original_record": {"preserve": [1, 2, 3]}}]
-    bench.firmware.plans[9] = {"planId": 9, "limitCurrent": 32, "original": "preserve"}
+    bench.firmware.plans[9] = {"planId": 9, "limitCurrent": 32, "idTag": "NATIVE_TIMER", "original": "preserve"}
     peer = NativeVehiclePeer(bench)
     original = copy.deepcopy(ORIGINAL) | {"connectorNum": "1"}
     peer.configuration = copy.deepcopy(original)

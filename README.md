@@ -797,6 +797,20 @@ feature. Active-session current modulation, selective cleanup beside original pr
 are optional extensions and do not block the delivered daily operation. This is an operational handover for this
 installation, not a claim that every app feature or electrical load has been exercised.
 
+The iCS native timer can send `StartTransaction` directly after yesterday's cloud permission expires.
+The proxy requests fresh cloud authorisation for a previously accepted, configured tag before accepting that
+start. A missing response, explicit denial or intervening Pause prevents a new transaction. Rapid identical
+retries share the cloud decision and the accepted transaction number.
+
+The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
+full native records when the single start sample shows zero current on all three phases, unchanged energy
+and no stop. The session list and allocation counter use assigned transaction numbers. To reconcile the
+specific history fault left by an older release, stop the standalone service and run
+`tools/acknowledge_native_history.py reconcile-start-attempts` with its existing private configuration
+and native specification arguments. It checks the matching schedule attempt, native configuration, owned
+zero hold and settled journal, then records a paused intent. Verify Pause after restart before using Return
+to restore the previous app/schedule permission.
+
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,
 the current actual Boot/binding, confirmed owned station0 and an empty, genuinely acknowledged lifecycle/outbox are

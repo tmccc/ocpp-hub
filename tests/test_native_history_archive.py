@@ -285,3 +285,98 @@ def test_archive_cannot_reopen_under_another_journal_identity(tmp_path: Path) ->
         }
     finally:
         reopened.close()
+
+
+# Model the single start sample recorded by the iCS before it obtains a transaction number.
+def unassigned(name: str = "attempt.json") -> dict[str, Any]:
+    return {
+        "transactionId": -1,
+        "filename": name,
+        "connectorId": 1,
+        "idTagStart": "NATIVE_TIMER",
+        "startTime": 1000,
+        "startMs": 5,
+        "meterStart": 9000,
+        "startQ4": 6,
+        "syncStart": 1,
+        "syncStop": 0,
+        "stopTime": 0,
+        "stopMs": 0,
+        "meterStop": 0,
+        "stopQ4": 0,
+        "idTagStop": "",
+        "stopTimeStr": "",
+        "reasonStr": "",
+        "reason": 0,
+        "idTypeStop": 0,
+        "MeterValues": [
+            {"syncMeter": 1, "timestamp": 1001, "context": 5, "A": [0, 0, 0], "energy": 9000, "Q4dot": 6, "Offer": 320}
+        ],
+    }
+
+
+# Intent: retain all native attempt bodies across reads, counting only assigned IDs for allocation and HA sessions.
+# Why: several failed starts can share -1 without representing either an accepted transaction or delivered energy.
+def test_repeated_unassigned_history(history_journal: Journal) -> None:
+    import json
+
+    from ocpp_hub_core.prototype.managed_view import charger_history
+    from ocpp_hub_core.prototype.trial_allocation import observe_history
+
+    numbered = row(1234)
+    attempts = [unassigned("a"), unassigned("b")]
+    records = [numbered, *attempts]
+    sample = observe_history(records, IDENTITY, "synthetic", 1002)
+    assert sample.floor == 1234 and sample.count == 3
+    assert charger_history(tuple(records)) == charger_history((numbered,))
+    archive = NativeHistoryArchive(history_journal)
+    assert archive.observe([numbered], records, allow_missing=True)["archived_records"] == 1
+    archive.observe([numbered], [numbered], allow_missing=True)
+    assert [json.loads(r[0]) for r in history_journal.db.execute("SELECT body FROM native_start_attempts")] == attempts
+
+
+# Intent: ambiguous or energised unassigned records still reject the complete observation.
+# Why: missing transaction identity cannot hide activity or make a positive operation safe.
+@pytest.mark.parametrize(
+    "change", ["energy", "current", "missing", "duplicate", "syncStop", "fractional", "reason", "idTypeStop", "power"]
+)
+def test_inconsistent_unassigned_history(history_journal: Journal, change: str) -> None:
+    attempt = unassigned()
+    records = [attempt]
+    if change == "energy":
+        attempt["MeterValues"][0]["energy"] += 1
+    elif change == "current":
+        attempt["MeterValues"][0]["A"][0] = 1
+    elif change in ("reason", "idTypeStop"):
+        attempt[change] = 1
+    elif change == "power":
+        attempt["MeterValues"][0]["power"] = 3000
+    elif change == "missing":
+        attempt.pop("MeterValues")
+    elif change == "duplicate":
+        records.append(copy.deepcopy(attempt))
+    elif change == "fractional":
+        attempt["transactionId"] = -1.0
+    else:
+        attempt["syncStop"] = 1
+    archive = NativeHistoryArchive(history_journal)
+    before = contents(history_journal)
+    with pytest.raises(SecurityError):
+        archive.observe([], records, allow_missing=True)
+    assert contents(history_journal) == before
+
+
+# Intent: a retained original attempt must match its entire body whenever its filename is still present.
+# Why: retention tolerance permits disappearance while preserving evidence of a changed or ambiguous record.
+def test_admitted_attempt_body_is_immutable(history_journal: Journal) -> None:
+    original = unassigned()
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([original], [original], allow_missing=True)
+    changed = copy.deepcopy(original)
+    changed["MeterValues"][0]["Offer"] += 1
+    replacement = row(1101) | {"filename": original["filename"]}
+    for records in ([changed], [replacement], [original, replacement]):
+        with pytest.raises(SecurityError):
+            archive.observe([original], records, allow_missing=True)
+    assert archive.observe([original], [], allow_missing=True)["archived_records"] == 0
+    assert history_journal.db.execute("SELECT COUNT(*) FROM native_start_attempts").fetchone()[0] == 1

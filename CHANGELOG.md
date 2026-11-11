@@ -2,6 +2,10 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
+  StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start
+  attempts and exclude them from session and transaction numbering. Add guarded offline reconciliation for
+  installations already held at zero by this history fault.
 - Close commissioning of the installed iCS setup for routine use. Verify app/schedule control at 32 A and enabled
   proxy/health supervision; retain the five deliberately disabled automations. No further dedicated charge, cable or
   phone test is required for the delivered features. Use normal operation logs for follow-up; optional features

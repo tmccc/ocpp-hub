@@ -85,6 +85,7 @@ class Gateway:
         self._tasks: set[asyncio.Task[None]] = set()
         self._flush_lock = asyncio.Lock()
         self._boot_lock = asyncio.Lock()
+        self._start_renewal = asyncio.Lock()
         self._vendor_ready = False
         self.vendor_interval = 60
         self.vendor_registration = "disconnected"
@@ -275,8 +276,23 @@ class Gateway:
                             else {"status": "Invalid"}
                         )
                     return build_call_result(token, {"idTagInfo": info})
+                ticket = self.journal.get("control", {}).get("ticket")
+                if action == "StartTransaction" and self.policy.strict_cloud_authorization:
+                    try:
+                        await self._renew_direct_start(payload, epoch)
+                    except DeniedError, UnavailableError:
+                        if not self.journal.known_start(payload):
+                            raise
+                    self._require_epoch("charger", epoch)
                 if action in ("Authorize", "StartTransaction") and self._tag_allowed(payload.get("idTag")):
                     await self.controls.ensure_ceiling()
+                    self._require_epoch("charger", epoch)
+                if (
+                    action == "StartTransaction"
+                    and self.journal.get("control", {}).get("ticket") != ticket
+                    and not self.journal.known_start(payload)
+                ):
+                    raise DeniedError("a newer owner operation superseded the start")
                 receipt = f"{epoch}:{token}"
                 text = build_call_result(token, self._local_answer(receipt, action, payload))
         except DeniedError, ConflictError:
@@ -414,15 +430,57 @@ class Gateway:
             return info
         return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
 
+    # A native timer can send Start directly on the next day, after its previous cloud approval expired.
+    async def _renew_direct_start(self, payload: dict[str, Any], epoch: int) -> None:
+        tag = payload.get("idTag")
+        if (
+            not isinstance(tag, str)
+            or not self._local_tag(tag)
+            or self.vendor.sender is None
+            or self.journal.known_start(payload)
+            or self.journal.active() is not None
+            or self.journal.get("control", {}).get("inhibit")
+            or self.journal.get("trial_starting")
+            or self.journal.get("trial_phase") not in (None, "active")
+            or self.authorisation.allows(tag)
+        ):
+            return
+        stored = self.auth_info.stored(tag)
+        if stored is None or stored["status"] != "Accepted" or self._tag_info(tag)["status"] != "Expired":
+            return
+        integer(payload.get("connectorId"), 1, 1)
+        number(payload.get("meterStart"), 1e12)
+        timestamp(payload.get("timestamp"))
+        ticket = self.journal.get("control", {}).get("ticket")
+
+        # Work from a retired plug connection or superseded owner operation cannot renew current authority.
+        def guard() -> None:
+            self._require_epoch("charger", epoch)
+            if self.journal.get("control", {}).get("ticket") != ticket or self.auth_info.stored(tag) != stored:
+                raise DeniedError("scheduled start authority changed during renewal")
+
+        # Concurrent retransmissions share the new permission, then use the normal immutable Start receipt.
+        async with self._start_renewal:
+            self._require_epoch("charger", epoch)
+            if self.journal.get("control", {}).get("ticket") != ticket:
+                raise DeniedError("a newer owner operation superseded the start")
+            if self.auth_info.stored(tag) == stored and not self.journal.known_start(payload):
+                await self._cloud_authorize(tag, guard=guard)
+
     # Preserve the actual correlated backend decision, checking generation after every await.
-    async def _cloud_authorize(self, tag: str) -> dict[str, Any]:
+    async def _cloud_authorize(self, tag: str, guard: Callable[[], None] | None = None) -> dict[str, Any]:
         epoch = self._vendor_epoch
         await self._ensure_vendor_boot()
         self._require_epoch("vendor", epoch)
-        result = await self.vendor.call(
-            "Authorize", {"idTag": tag}, priority=5, check=lambda: self._require_epoch("vendor", epoch)
-        )
-        self._require_epoch("vendor", epoch)
+
+        # Recheck both transports and any owner operation after waiting for the outbound gate.
+        def check() -> None:
+            self._require_epoch("vendor", epoch)
+            if guard is not None:
+                guard()
+
+        result = await self.vendor.call("Authorize", {"idTag": tag}, priority=5, check=check)
+        check()
         if result[0] != 3 or set(result[2]) != {"idTagInfo"}:
             raise UnavailableError("actual cloud authorization was unavailable")
         info = validate_info(result[2]["idTagInfo"])

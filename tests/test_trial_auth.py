@@ -394,3 +394,101 @@ async def test_local_start_rechecks_revocation_in_sequence(tmp_path: Path, durin
 def test_metadata_validation(value: Any) -> None:
     with pytest.raises(DeniedError):
         validate_info(value)
+
+
+# Intent: a native timer can send Start directly after yesterday's approval expires.
+# Why: renewal must use the live cloud decision and must still lose to a newer local hold.
+@pytest.mark.parametrize("outcome", ["Accepted", "Blocked", "pause", "offline"])
+async def test_native_direct_start_after_expiry(tmp_path: Path, outcome: str) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    await rig.boot()
+    if outcome != "offline":
+        await rig.cloud()
+    rig.gateway.auth_info.put(START["idTag"], info(expiryDate="2000-01-01T00:00:00Z"))
+    if outcome == "Blocked":
+        rig.actual_info = info(status="Blocked")
+    if outcome == "pause":
+        rig.authorization_release = asyncio.Event()
+    try:
+        pending = asyncio.create_task(rig.charger("direct-start", "StartTransaction", START))
+        if rig.authorization_release is not None:
+            await asyncio.wait_for(rig.authorization_seen.wait(), 1)
+            await rig.gateway.stop()
+            rig.authorization_release.set()
+        result = await pending
+        if outcome == "Accepted":
+            assert result[0] == 3 and result[2]["idTagInfo"] == rig.actual_info
+            assert rig.store.active() == result[2]["transactionId"]
+        else:
+            assert result[0] == 4 and rig.store.active() is None
+        calls = [f for f in rig.vendor_frames if f[0] == 2 and f[2] == "Authorize"]
+        assert len(calls) == int(outcome != "offline")
+    finally:
+        await rig.close()
+
+
+# Intent: two OCPP requests for the same expired scheduled start share renewal and one immutable transaction.
+# Why: the charger retries its timer rapidly when an initial response takes longer than its retry interval.
+async def test_overlapping_direct_starts_share_cloud_decision(tmp_path: Path) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        rig.gateway.auth_info.put(START["idTag"], info(expiryDate="2000-01-01T00:00:00Z"))
+        rig.authorization_release = asyncio.Event()
+        await rig.gateway.receive("charger", build_call("first", "StartTransaction", START))
+        await asyncio.wait_for(rig.authorization_seen.wait(), 1)
+        await rig.gateway.receive("charger", build_call("retry", "StartTransaction", START))
+        await asyncio.sleep(0)
+        rig.authorization_release.set()
+        await rig.gateway.drain()
+        replies = [f for f in rig.charger_frames if f[1] in ("first", "retry")]
+        assert len(replies) == 2 and replies[0][0] == replies[1][0] == 3 and replies[0][2] == replies[1][2]
+        assert rig.store.active() == replies[0][2]["transactionId"]
+        assert sum(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames) == 1
+    finally:
+        await rig.close()
+
+
+# Intent: a cached explicit denial differs from a formerly Accepted decision that expired with time.
+# Why: the arrival of a direct Start cannot independently reverse a revocation or concurrent-use rejection.
+@pytest.mark.parametrize("status", ["Blocked", "Invalid", "Expired", "ConcurrentTx"])
+async def test_direct_start_preserves_explicit_denial(tmp_path: Path, status: str) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        rig.gateway.auth_info.put(START["idTag"], info(status=status))
+        assert (await rig.charger("direct", "StartTransaction", START))[0] == 4
+        assert rig.store.active() is None
+        assert not any(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames)
+    finally:
+        await rig.close()
+
+
+# Intent: work begun under a retired connection, permission or control ticket cannot accept a direct start.
+# Why: a newer owner can release Pause again while the old cloud response is still in flight.
+@pytest.mark.parametrize("change", ["pause_return", "replace", "revoke"])
+async def test_direct_start_rechecks_authority_during_renewal(tmp_path: Path, change: str) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        rig.gateway.auth_info.put(START["idTag"], info(expiryDate="2000-01-01T00:00:00Z"))
+        rig.authorization_release = asyncio.Event()
+        await rig.gateway.receive("charger", build_call("direct", "StartTransaction", START))
+        await asyncio.wait_for(rig.authorization_seen.wait(), 1)
+        if change == "pause_return":
+            await rig.gateway.stop()
+            await rig.gateway.release()
+        elif change == "replace":
+            rig.gateway.attach_charger(rig.charger_send)
+        else:
+            rig.gateway.auth_info.put(START["idTag"], info(status="Blocked"))
+        rig.authorization_release.set()
+        await rig.gateway.drain()
+        assert not any(f[0] == 3 and f[1] == "direct" for f in rig.charger_frames)
+        assert rig.store.active() is None
+        assert rig.gateway.auth_info.get(START["idTag"])["status"] == ("Blocked" if change == "revoke" else "Expired")
+    finally:
+        await rig.close()

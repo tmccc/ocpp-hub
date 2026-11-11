@@ -7,6 +7,7 @@ import re
 import time
 from typing import Any
 
+from .native_start_attempts import split_attempts
 from .security import SecurityError
 from .store import Journal, encoded, fingerprint
 
@@ -48,13 +49,29 @@ class NativeHistoryArchive:
             "PRIMARY KEY(transaction_id,digest))"
         )
 
+        journal.db.execute(
+            "CREATE TABLE IF NOT EXISTS native_start_attempts(digest TEXT PRIMARY KEY,body TEXT NOT NULL)"
+        )
+
     # A savepoint supports both standalone observations and an atomic operator recovery without partial acceptance.
     def observe(
         self, original: list[dict[str, Any]], current: list[dict[str, Any]], *, allow_missing: bool
     ) -> dict[str, int]:
         if type(allow_missing) is not bool:
             raise SecurityError("native history retention permission must be explicit")
-        originals, present = indexed(original), indexed(current)
+        original_rows, admitted_attempts = split_attempts(original)
+        current_rows, attempts = split_attempts(current)
+        originals, present = indexed(original_rows), indexed(current_rows)
+        if any(isinstance(row.get("filename"), str) and row["filename"] in admitted_attempts for row in current_rows):
+            raise SecurityError("an original unassigned start record acquired a transaction number")
+        for name, body in admitted_attempts.items():
+            if (
+                name in attempts
+                and encoded(attempts[name]) != encoded(body)
+                or name not in attempts
+                and not allow_missing
+            ):
+                raise SecurityError("an original unassigned start record changed or is required by strict policy")
         binding = {"identity": fingerprint(self.journal.identity), "original": fingerprint(original)}
         saved = self.journal.get("native_history_archive_binding")
         if saved is not None and saved != binding:
@@ -70,6 +87,10 @@ class NativeHistoryArchive:
         self.journal.db.execute("SAVEPOINT native_history_observation")
         try:
             self.journal.put("native_history_archive_binding", binding)
+            for attempt in (admitted_attempts | attempts).values():
+                self.journal.db.execute(
+                    "INSERT OR IGNORE INTO native_start_attempts VALUES(?,?)", (fingerprint(attempt), encoded(attempt))
+                )
             now = time.time()
             records = {**originals, **{key: row for key, row in present.items() if row["stopTime"] > 0}}
             for identifier, record in records.items():
@@ -127,6 +148,10 @@ def audit_history(journal: Journal, spec_digest: str, current: list[dict[str, An
             raise SecurityError("native history retention policy changed or local Start is enabled")
         NativeHistoryArchive(journal).observe(original, current, allow_missing=True)
         return
+    original, admitted_attempts = split_attempts(original)
+    current, attempts = split_attempts(current)
+    if any(name not in attempts or encoded(attempts[name]) != encoded(row) for name, row in admitted_attempts.items()):
+        raise SecurityError("native bounded handover must preserve every original history record")
     present = {row["transactionId"]: row for row in current}
     if any(present.get(row["transactionId"]) != row for row in original):
         raise SecurityError("native bounded handover must preserve every original history record")

@@ -123,7 +123,7 @@ async def test_managed_boot_releases_six_without_start(
 
 # Intent: assistant Start is refused while an actual owner app or native timer retains its normal permission.
 # Why: disabling local testing must retain the user's charging controls and accept normal power as healthy.
-@pytest.mark.parametrize("source", ["cloud", "native-schedule"])
+@pytest.mark.parametrize("source", ["cloud", "native-schedule", "direct-schedule"])
 async def test_managed_owner_charge_is_permitted_and_healthy(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
@@ -153,6 +153,8 @@ async def test_managed_owner_charge_is_permitted_and_healthy(
                 )
                 assert reply[0] == 3 and reply[2]["status"] == "Accepted"
                 assert len(starts(rig)) == 1
+            elif source == "direct-schedule":
+                session.gateway.auth_info.put(tag, {"status": "Accepted", "expiryDate": "2000-01-01T00:00:00Z"})
             else:
                 reply = await rig.bench.call(charger, "timer-authorize", "Authorize", {"idTag": tag})
                 assert reply[2]["idTagInfo"]["status"] == "Accepted"

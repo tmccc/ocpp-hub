@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enable archived historical-retention tolerance under exclusive offline journal ownership; never charge."""
+"""Reconcile a supported native history fault under exclusive offline journal ownership at verified zero."""
 
 from __future__ import annotations
 
@@ -15,7 +15,10 @@ from tools.trial_proxy import emit, load_core, native_spec, preflight  # noqa: E
 
 load_core()
 
-from ocpp_hub_core.prototype.native_history_recovery import acknowledge_history_policy  # noqa: E402
+from ocpp_hub_core.prototype.native_history_recovery import (  # noqa: E402
+    acknowledge_history_policy,
+    acknowledge_start_attempts,
+)
 from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
 
@@ -25,13 +28,14 @@ async def run(action: str, config_path: Path, spec_path: Path) -> int:
     prepared = preflight(config_path)
     spec = native_spec(spec_path, prepared)
     if action == "check":
-        emit({"policy": "archive_missing", "ceiling_a": 6, "offline_only": True, "charger_changed": False})
+        emit({"inputs_valid": True, "offline_only": True, "charger_changed": False})
         return 0
     journal = Journal(prepared.config.journal, prepared.config.identity)
     try:
         book = ResourceBook(journal, prepared.baseline)
         native = await prepared.observer.observe_handover()
-        emit(acknowledge_history_policy(journal, book, spec, native))
+        reconcile = acknowledge_start_attempts if action == "reconcile-start-attempts" else acknowledge_history_policy
+        emit(reconcile(journal, book, spec, native))
     finally:
         journal.close()
     return 0
@@ -40,7 +44,9 @@ async def run(action: str, config_path: Path, spec_path: Path) -> int:
 # A named acknowledgement is required; the default only validates private inputs without opening the journal.
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("check", "acknowledge"), default="check")
+    parser.add_argument(
+        "action", nargs="?", choices=("check", "acknowledge", "reconcile-start-attempts"), default="check"
+    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--native-bounded-spec", type=Path, required=True)
     args = parser.parse_args()

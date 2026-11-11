@@ -91,6 +91,8 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
 def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for record in records:
+        if record.get("transactionId") == -1:
+            continue
         start, stop = record.get("startTime"), record.get("stopTime", 0)
         first, last = record.get("meterStart"), record.get("meterStop", 0)
         if (

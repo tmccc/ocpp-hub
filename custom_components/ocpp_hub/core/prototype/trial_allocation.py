@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .native_start_attempts import split_attempts
 from .policy import integer
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -45,7 +46,8 @@ def observe_history(value: Any, identity: str, hardware: str, observed_at: float
         if not isinstance(value, list) or len(value) > 10000:
             raise ValueError
         identifiers = []
-        for row in value:
+        numbered, _ = split_attempts(value)
+        for row in numbered:
             if not isinstance(row, dict):
                 raise ValueError
             identifiers.append(integer(row["transactionId"], 1))

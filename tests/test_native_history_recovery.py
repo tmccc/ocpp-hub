@@ -433,3 +433,105 @@ async def test_managed_history_policy_allows_complete_original32_restoration(
             if replacement is not None:
                 await replacement.close()
             fault.journal = Journal(journal.path, journal.identity)
+
+
+# Intent: recover only the expected unassigned attempts under proven zero and retain paused intent across restart.
+# Why: repaired parsing cannot itself clear an unrelated fault or release power at service replacement.
+async def test_recover_unassigned_start_to_verified_pause(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext], unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ocpp_hub_core.prototype.native_history_recovery import acknowledge_start_attempts
+
+    from tests.test_native_history_archive import unassigned
+
+    async with missing_history(tmp_path, tls, unused_tcp_port, monkeypatch) as fault:
+        rig, journal = fault.rig, fault.journal
+        native = await rig.prepared.observer.observe_handover()
+        acknowledge_history_policy(journal, fault.book, rig.spec, native)
+        now = time.time()
+        fault_record = {"at_epoch": now, "classification": "native_authority_or_preservation_failed"}
+        failure = {
+            "at_epoch": now,
+            "type": "SecurityError",
+            "detail": "complete connected-handover native evidence is required",
+        }
+        journal.put("managed_control_fault", fault_record)
+        journal.put("managed_native_failure", failure)
+        journal.put("trial_phase", "blocked")
+        attempt = unassigned()
+        attempt["startTime"] = int(now) - 6
+        attempt["MeterValues"][0]["timestamp"] = attempt["startTime"]
+        rig.bench.history.append(attempt)
+        native = await rig.prepared.observer.observe_handover()
+        journal.put("uncertain_vendor_command", True)
+        before = database(journal)
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert database(journal) == before
+        journal.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
+        initial = {"mode": "app", "revision": 5}
+        journal.put("managed_control_intent", initial)
+        uncertain_id, pause_id = uuid.uuid4().hex, uuid.uuid4().hex
+        uncertain_result = json.dumps({"classification": "start_not_confirmed"})
+        journal.db.execute(
+            "INSERT INTO managed_requests VALUES(?, 'start_test', 2, 'uncertain', ?)", (uncertain_id, uncertain_result)
+        )
+        insert_pause = "INSERT INTO managed_requests VALUES(?, 'pause', ?, 'completed', ?)"
+        for pause_revision, when, verified in ((1, now - 1, True), (3, now + 1, True), (3, now - 1, False)):
+            journal.db.execute(
+                insert_pause, (pause_id, pause_revision, json.dumps({"completed_at": when, "pause_verified": verified}))
+            )
+            before = database(journal)
+            with pytest.raises(RecoveryRequiredError):
+                acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+            assert database(journal) == before
+            journal.db.execute("DELETE FROM managed_requests WHERE id=?", (pause_id,))
+        journal.db.execute(insert_pause, (pause_id, 3, json.dumps({"completed_at": now - 1, "pause_verified": True})))
+        for action, state in (("start", "uncertain"), ("start_test", "accepted"), ("start_test", "running")):
+            journal.db.execute("UPDATE managed_requests SET action=?,state=? WHERE id=?", (action, state, uncertain_id))
+            with pytest.raises(RecoveryRequiredError):
+                acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        journal.db.execute(
+            "UPDATE managed_requests SET action='start_test',state='uncertain' WHERE id=?", (uncertain_id,)
+        )
+        journal.put("managed_native_failure", {**failure, "at_epoch": now - 60})
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        journal.put("managed_native_failure", failure)
+        attempt["startTime"] -= 60
+        old_attempt = await rig.prepared.observer.observe_handover()
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, old_attempt)
+        attempt["startTime"] += 60
+        journal.db.execute(
+            "CREATE TEMP TRIGGER reject_recovery BEFORE INSERT ON meta WHEN NEW.key='native_start_attempt_recovery' "
+            "BEGIN SELECT RAISE(ABORT,'failed receipt write'); END"
+        )
+        before = database(journal)
+        with pytest.raises(sqlite3.IntegrityError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert database(journal) == before
+        journal.db.execute("DROP TRIGGER reject_recovery")
+        result = acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert result["unassigned_attempts"] == 1
+        assert journal.get("managed_control_intent") == {"mode": "paused", "revision": initial["revision"] + 1}
+        assert journal.get("native_start_attempt_recovery")["prior_failure"] == failure
+        assert journal.get("native_start_attempt_recovery")["superseded_test_proofs"] == [
+            {"request_id": uncertain_id, "verified_pause_id": pause_id}
+        ]
+        assert tuple(
+            journal.db.execute("SELECT state,result FROM managed_requests WHERE id=?", (uncertain_id,)).fetchone()
+        ) == ("uncertain", uncertain_result)
+        assert journal.get("control")["inhibit"] and journal.active() is None
+        assert not starts(rig)
+        journal.close()
+        replacement = managed_session(rig)
+        try:
+            await replacement.start()
+            async with rig.charger(replacement) as charger:
+                await introduced(rig, replacement, charger, "attempt-recovery-boot")
+                state = await healthy(ManagedController(replacement))
+                assert state["local_hold_verified"] and state["station_ceiling_a"] == 0 and not starts(rig)
+        finally:
+            await replacement.close()
+            fault.journal = Journal(journal.path, journal.identity)

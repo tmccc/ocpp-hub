@@ -79,13 +79,19 @@ class InfoBook:
         return info
 
     # Only metadata from an actual correlated response can be returned; an expired decision stays expired.
-    def get(self, tag: str) -> dict[str, Any] | None:
+    def stored(self, tag: str) -> dict[str, Any] | None:
         import json
 
         row = self.journal.db.execute("SELECT info FROM auth_info WHERE digest=?", (tag_key(tag),)).fetchone()
         if row is None:
             return None
-        info = validate_info(json.loads(row[0]))
+        return validate_info(json.loads(row[0]))
+
+    # Apply the actual expiry at the moment of use, without losing the original cloud decision.
+    def get(self, tag: str) -> dict[str, Any] | None:
+        info = self.stored(tag)
+        if info is None:
+            return None
         if info["status"] == "Accepted" and "expiryDate" in info and expiry(info["expiryDate"]) <= time.time():
             return {**info, "status": "Expired"}
         return info
