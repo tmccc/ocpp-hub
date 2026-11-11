@@ -174,7 +174,7 @@ def matching_retired_attempt(lease: dict[str, Any], n: HandoverEvidence) -> bool
 
 # Publish the source of each fully verified, open native observation before any cutoff or recovery task can act.
 def record_session_source(j: Journal, n: HandoverEvidence, boot_observation: str | None) -> None:
-    previous_lease = resume_cutoff(j)
+    previous_lease = resume_cutoff(j, reporting=n.physical.transaction_open or j.active() is not None)
     local = n.physical.native_transaction_id
     if local is not None or any(
         candidate["body"]["planId"] == n.session_plan_id and matching_retired_attempt(candidate, n)
@@ -624,6 +624,30 @@ class ManagedSchedule:
         ):
             await self.c.native.read()
             lease = j.get(KEY, {})
+        if (
+            lease.get("state") == "complete"
+            and lease.get("idle_cutoff_released") == "observed_closure"
+            and not self.awaiting_start()
+            and report_matches(lease, tag, occurred)
+            and not self.recorded_start(
+                lease["floor"],
+                tag,
+                start_millisecond_range(payload["timestamp"], timestamp(payload["timestamp"])),
+                number(payload.get("meterStart"), 1e12),
+            )
+        ):
+            native = await self.c.native.read()
+            current = j.get(KEY, {})
+            if (
+                current.get("id") == lease["id"]
+                and matching_unassigned_start(native.history, payload, timestamp(payload["timestamp"])) is not None
+            ):
+                # Exact native history discloses real wire debt after physical closure; hold before allocating its ID.
+                lease = {**current, "recovery_session": True, "hold_since": time.time()}
+                j.put(KEY, lease)
+                await self.protect_station(lease)
+                if not g.controls.ready or g.controls.desired() != 0:
+                    raise UnavailableError("the archived lifecycle report awaits verified zero")
         if lease.get("state") in OBSERVABLE and lease.get("retire_reason") == "late_temporary_occurrence":
             await self.protect_station(lease)
             if not g.controls.ready or g.controls.desired() != 0:
@@ -779,7 +803,16 @@ class ManagedSchedule:
             n.session_plan_id == lease["body"]["planId"] or witnessed is not None and n.session_plan_id is None
         ):
             plan = lease["body"]
-        if plan is None or plan["idTag"].casefold() != tag.casefold():
+        unassigned = None
+        if plan is None:
+            if n.session_plan_id is not None:
+                return None
+            # Exact native history can prove lifecycle data under zero without proving its charging source.
+            unassigned = matching_unassigned_start(n.history, payload, reported)
+            if unassigned is None:
+                return None
+            plan = {"planId": None, "idTag": tag}
+        if plan["idTag"].casefold() != tag.casefold():
             return None
         temporary = plan["planId"] == lease["body"]["planId"]
         reported_day = datetime.fromtimestamp(occurred, zone)
@@ -806,7 +839,7 @@ class ManagedSchedule:
             and c.requests.intent().mode != "app"
         ):
             return None
-        attempt = None
+        attempt = unassigned
         if native_id is None:
             if (
                 temporary
@@ -832,6 +865,13 @@ class ManagedSchedule:
             or j.db.execute("SELECT 1 FROM managed_pending_native_reports WHERE native_id=?", (native_id,)).fetchone()
         ):
             return None
+        if (
+            attempt is not None
+            and j.db.execute(
+                "SELECT 1 FROM managed_unnumbered_reports WHERE attempt=? AND started_ms=?", attempt
+            ).fetchone()
+        ):
+            return None
         if self.recorded_start(lease["floor"], tag, millis, meter):
             return None
         # The one-off can report once. Prior releases recorded its occurrence in the per-plan date map.
@@ -845,7 +885,7 @@ class ManagedSchedule:
             changes: dict[str, Any] = {"unidentified_local": local}
             if attempt is not None:
                 j.db.execute("INSERT INTO managed_unnumbered_reports VALUES(?,?,?)", (*attempt, local))
-            else:
+            if native_id is not None:
                 j.db.execute("INSERT INTO managed_pending_native_reports VALUES(?,?)", (native_id, local))
                 changes["pending_native_reports"] = True
             if temporary:
@@ -1281,7 +1321,10 @@ class ManagedSchedule:
                 lease.get("unidentified_local"),
             )
         if active != lease.get("other_local"):
-            return False
+            # A current Boot authenticates the observation, but cannot identify an unknown session's origin.
+            return active == lease.get("unidentified_local") and not (
+                active == lease.get("bound_local") and lease.get("native_plan_confirmed") is True
+            )
         native = self.c.native
         cutoff = time.time() >= lease.get("end_epoch", float("inf"))
         return (
@@ -1431,9 +1474,8 @@ class ManagedSchedule:
         if not g.current_boot_seen(g._charger_epoch):
             raise RecoveryRequiredError("deadline hold awaits the current charger Boot")
         if c.native.introduced_epoch != g._charger_epoch:
-            if not current_source(g, j.get(KEY, {})):
-                # A blocked introduction read must not prevent newer source evidence reaching the deadline task.
-                await c.native.read()
+            # An authenticated observation can still have an unknown origin; keep reading while introduction recovers.
+            await c.native.read()
             raise RecoveryRequiredError("deadline hold awaits the current charger introduction")
         n = n or await c.native.read()
         await self.await_closure_agreement(n)
@@ -1509,6 +1551,8 @@ class ManagedSchedule:
         lease = j.get(KEY, {})
         state = lease.get("state")
         if state not in {"requested", *OBSERVABLE}:
+            if supervised_timer(lease) and self.needs_source(lease):
+                await self.protect_deadline(lease)
             return
         now = time.time()
         present = n.saved_schedule_digest == lease["augmented_digest"]

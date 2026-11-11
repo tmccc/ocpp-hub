@@ -59,13 +59,13 @@ class TimerBench:
         self.timer = 0
 
     # Register the owner's future timer through the same durable admission path used by management.
-    def request(self) -> None:
-        self.c.schedule.accept(uuid.uuid4().hex, self.c.requests.intent().revision, self.start)
+    def request(self, identifier: str | None = None) -> None:
+        self.c.schedule.accept(identifier or uuid.uuid4().hex, self.c.requests.intent().revision, self.start)
         self.timer = self.session.journal.get(managed_schedule.KEY)["body"]["planId"]
 
     # Wait for independent physical visibility after sending the installation once.
-    async def arm(self) -> None:
-        self.request()
+    async def arm(self, identifier: str | None = None) -> None:
+        self.request(identifier)
         for _ in range(2):
             await healthy(self.c)
         assert self.c.schedule.summary()["state"] == "armed"

@@ -33,7 +33,7 @@ def matches_operation(operation, action, payload):
     if action != "SetChargingProfile":
         return False
     limit = payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
-    return limit == 0 if operation == "zero" else limit > 0
+    return limit == 0 if operation in ("zero", "zero_before_cutoff") else limit > 0
 
 
 # Refuse before physical application or withhold its actual response after the independent device applied it.
@@ -71,7 +71,7 @@ async def fail_one_operation(b, operation, lost_ack):
 
 # Intent: each real physical mutation can refuse or lose its reply, then recover in the same or a replaced process.
 # Why: uncertainty cannot expand Stop scope, report a failed zero as success, or remove an unrelated timer.
-@pytest.mark.parametrize("operation", ["zero", "stop", "clear", "restore"])
+@pytest.mark.parametrize("operation", ["zero", "zero_before_cutoff", "stop", "clear", "restore"])
 @pytest.mark.parametrize("lost_ack", [False, True])
 @pytest.mark.parametrize("restart", [False, True])
 async def test_n08_physical_mutation_recovery(
@@ -94,9 +94,13 @@ async def test_n08_physical_mutation_recovery(
             await early_cleanup_selected(b, 32)
             b.clock.now = END - 60
             local = await unknown_report(b, b.start, None, True)
-            await settle(b)
-            b.clock.now = END
-            if operation != "zero":
+            zero = operation in ("zero", "zero_before_cutoff")
+            if not zero:
+                await settle(b)
+            # Fault the first required zero, rather than waiting until the unknown-source hold has already succeeded.
+            if operation != "zero_before_cutoff":
+                b.clock.now = END
+            if not zero:
                 await settle(b)
             if operation == "stop":
                 b.rig.peer.plan_session = (local, b.timer)
@@ -109,7 +113,7 @@ async def test_n08_physical_mutation_recovery(
                 if operation == "clear":
                     assert b.device.effective_limit() == 0
                 status = await asyncio.wait_for(work, 12)
-                if operation == "zero" and not lost_ack:
+                if operation in ("zero", "zero_before_cutoff") and not lost_ack:
                     assert b.device.effective_limit() == 32 and status["state"] != "healthy"
                 elif operation == "clear" and lost_ack and b.device.effective_limit() == 32:
                     native = await b.c.native.read(closed=True)
@@ -136,7 +140,7 @@ async def test_n08_physical_mutation_recovery(
                 stops = tuple(b.stops())
                 assert set(stops) == {local}
             else:
-                if operation == "zero":
+                if operation in ("zero", "zero_before_cutoff"):
                     await settle(b)
                     assert b.device.effective_limit() == 0 and not b.stops()
                     b.rig.peer.plan_session = (local, 9)

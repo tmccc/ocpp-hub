@@ -831,9 +831,16 @@ continue. Only the identified temporary session receives the timer’s Stop. New
 RemoteStart commands are unavailable while a one-off timer is outstanding. The original native daily
 plan remains enabled, and the proxy preserves a separate Start already acknowledged by an older release.
 An independent continuation depends on that transaction's current source evidence; it cannot exempt
-later unidentified activity from 06:00 protection. Cancelling a later timer before installation preserves
+later unidentified activity from protection. A newly observed unidentified session is held at zero before
+06:00 as well. Reconnect recovery continues reading the source until identification can complete.
+Cancelling a later timer before installation preserves
 an earlier unresolved cutoff. A current change interrupted by the temporary Start rolls back to the
 previous selected current and preserves the remaining timer window after source verification.
+An expired manual Start retains its own reporting obligation while ordinary daily charging can continue.
+Its delayed report is held at zero before the proxy binds it to that command. A report with one matching
+unnumbered native history record can be recorded under verified zero when its plan ID is missing;
+recording it does not identify its charging source or authorize positive current. A contradictory plan ID
+remains blocked.
 Once actual closure and zero output are verified, it removes its timer, verifies the complete original
 timetable and restores the owner's selected ceiling in app mode. If no matching session appears within
 ten minutes of the start, or by 06:00 if sooner, cleanup runs at idle. The station stays at zero while

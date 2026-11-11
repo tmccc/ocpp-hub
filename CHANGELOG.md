@@ -13,6 +13,10 @@
   Preserve archived cutoff duties when a later unsent booking is cancelled. Keep independent-session
   continuation conditional on the current source, and recover either temporary Start report order after
   an interrupted current selection without stopping the session before its deadline.
+  Keep reading the source while reconnect recovery is pending, and hold a newly observed unidentified
+  session at zero immediately. Restore normal daily operation after an independent session closes while
+  preserving an expired manual Start's outstanding report. Record a matching unnumbered native history
+  report under verified zero without treating it as proof of the charging source.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

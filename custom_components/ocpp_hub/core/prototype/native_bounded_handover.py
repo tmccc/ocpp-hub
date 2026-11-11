@@ -416,7 +416,9 @@ class NativeBoundedHandover:
             raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")
 
     # Default recovery requires an empty queue; managed local recovery retains queued observations and the zero hold.
-    async def resume(self, *, local_only: bool = False, continuing_local: int | None = None) -> dict[str, Any]:
+    async def resume(
+        self, *, local_only: bool = False, continuing_local: int | None = None, preserve_expired_start: bool = False
+    ) -> dict[str, Any]:
         if type(local_only) is not bool:
             raise SecurityError("local recovery permission must be explicit")
         async with self.lock:
@@ -455,7 +457,11 @@ class NativeBoundedHandover:
             ).fetchone()
             station = [r for r in present if r.identifier == HUB_PROFILE_ID]
             control = journal.get("control", {})
-            require_lifecycle_idle(gateway, continuing_local=continuing_local)
+            require_lifecycle_idle(
+                gateway,
+                continuing_local=continuing_local,
+                preserve_expired_start=preserve_expired_start and not local_only,
+            )
             if (
                 journal.get("trial_phase") != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"

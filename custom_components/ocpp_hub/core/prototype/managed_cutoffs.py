@@ -35,11 +35,16 @@ def idle_cutoff_pending(lease: dict[str, Any]) -> bool:
 
 
 # An unsent cancellation cannot become the station's only working receipt while an earlier duty remains.
-def resume_cutoff(journal: Journal) -> dict[str, Any]:
+def resume_cutoff(journal: Journal, *, reporting: bool = False) -> dict[str, Any]:
     with nullcontext() if journal.db.in_transaction else journal.atomic():
         current = journal.get(KEY, {})
-        if current.get("state") == "complete" and (
-            current.get("result") in ("cancelled_before_install", "session_closed") or not supervised_timer(current)
+        if (
+            current.get("state") == "complete"
+            and (
+                current.get("result") in ("cancelled_before_install", "session_closed") or not supervised_timer(current)
+            )
+            or reporting
+            and current.get("state") == "requested"
         ):
             pending = [
                 lease

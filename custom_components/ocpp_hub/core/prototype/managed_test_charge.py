@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
+from .managed_start_debt import preserved_start_debt
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError
@@ -404,11 +405,23 @@ class ManagedChargeTests:
             and self.journal.get("managed_owner_pause", {}).get("revision") != c.requests.intent().revision
         )
 
+    # Preserve only this expired local command's debt after fresh closure, without granting a new Start or Stop.
+    def idle_debt(self, native: HandoverEvidence) -> bool:
+        return bool(
+            self.scoped_normal_stop()
+            and preserved_start_debt(self.journal)
+            and not native.physical.transaction_open
+            and native.physical.native_transaction_id is None
+            and all(value == 0 for value in native.currents_a + native.powers_w)
+        )
+
     # Positive writes under expired Start authority need a verified daily or the genuine owner's closed lifecycle.
     def check_positive(self, native: HandoverEvidence) -> None:
         if not self.scoped_normal_stop():
             return
         j, c = self.journal, self.controller
+        if self.idle_debt(native):
+            return
         owner = local_start_receipt(j)
         local = j.active()
         if c.requests.intent().mode == "app" and local is not None:
@@ -521,14 +534,12 @@ class ManagedChargeTests:
                     await c.restore_owner_control(expected)
                 j.put("managed_test_charge", {**self.state(), "state": "completed", "charging": False})
                 return False
-            if (
-                expected.mode == "app"
-                and local is None
-                and not native.physical.transaction_open
-                and g.controls.ready
-                and g.controls.desired() == state["current_a"]
-            ):
-                return False  # A preserved daily may close before the separate owner command reports.
+            if expected.mode == "app" and local is None and not native.physical.transaction_open:
+                if g.controls.ready and g.controls.desired() == state["current_a"]:
+                    return False
+                if self.idle_debt(native):
+                    await c.restore_owner_control(expected)
+                    return False
             await self.hold_expired()
             c.native.require_known_session(native)
             if local is not None and owner.get("local") == local and owner.get("digest") == state.get("tag_digest"):
