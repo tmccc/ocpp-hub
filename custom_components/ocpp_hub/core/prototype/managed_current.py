@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .managed_schedule import KEY
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -81,10 +82,18 @@ class ManagedCurrentLimits:
         return bool(self.journal.get("managed_current_change", {}).get("state") == "pending")
 
     # The first version changes current only while closed and idle; an open car session cannot be silently resumed.
-    def available(self, native: HandoverEvidence | None) -> bool:
+    def available(self, native: HandoverEvidence | None, *, for_schedule: bool = False) -> bool:
         c, g, j = self.controller, self.controller.session.gateway, self.journal
+        timer = j.get(KEY, {})
         return bool(
-            managed_current_ceiling(j, c.native.spec) == 32
+            (
+                for_schedule
+                or timer.get("state") in (None, "complete")
+                or timer.get("state") == "armed"
+                and not timer.get("retire_reason")
+                and "hold_since" not in timer
+            )
+            and managed_current_ceiling(j, c.native.spec) == 32
             and not c.stopping
             and not self.pending()
             and not j.get("managed_control_fault")
@@ -135,6 +144,13 @@ class ManagedCurrentLimits:
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
         with j.atomic():
             j.put("managed_control_intent", {"mode": intent.mode, "revision": revision + 1})
+            timer = j.get(KEY, {})
+            if (
+                timer.get("state") == "armed"
+                and timer.get("control_revision", timer["revision"]) == revision
+                and intent.mode == "app"
+            ):
+                j.put(KEY, {**timer, "control_revision": revision + 1})
             j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "pending"})
             j.db.execute("INSERT INTO managed_current_requests VALUES(?,?)", (identifier, value))
             j.db.execute(

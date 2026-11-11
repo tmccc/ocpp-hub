@@ -376,3 +376,10 @@ async def ready_handover(
     finally:
         native_server.close()
         await native_server.wait_closed()
+
+
+# Terminate transport and journal ownership without the normal shutdown Stop, preserving real durable facts.
+async def crash(session: Any) -> None:
+    await session.runtime.close()
+    session.journal.close()
+    session.closed = True

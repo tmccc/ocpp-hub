@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -34,6 +34,20 @@ def installed_variant(journal: Journal, original: str, actual: str) -> str:
     return original
 
 
+# Remember a verified cable removal even if the next supervisor tick sees a newly connected vehicle.
+def remember_disconnect(journal: Journal, native: HandoverEvidence) -> None:
+    if native.physical.connection == "Unplug":
+        lease = journal.get(KEY, {})
+        if lease.get("state") in OBSERVABLE and not lease.get("retire_reason"):
+            journal.put(KEY, {**lease, "retire_reason": "vehicle_disconnected"})
+
+
+# Resolve the owner's wall-clock end on the date of the actual occurrence, including offset changes before 06:00.
+def cutoff_epoch(start_epoch: int, zone: ZoneInfo) -> int:
+    start = datetime.fromtimestamp(start_epoch, zone)
+    return int(start.replace(hour=6, minute=0, second=0, microsecond=0, fold=0).timestamp())
+
+
 class TimerVehicleDisconnectedError(UnavailableError):
     """The final native read saw the cable removed before the timer could be sent."""
 
@@ -60,6 +74,8 @@ class ManagedSchedule:
             for k in (
                 "state",
                 "start_epoch",
+                "end_epoch",
+                "cleanup_attempts",
                 "result",
                 "verified_at",
                 "session_seen",
@@ -94,10 +110,13 @@ class ManagedSchedule:
             zone = ZoneInfo(n.configuration["timeZone"])
         except KeyError, TypeError, ValueError, ZoneInfoNotFoundError:
             raise SecurityError("a configured charger time zone is required") from None
+        if not 30 <= start_epoch - now <= 24 * 3600:
+            raise SecurityError("a future start within the next day is required")
         start = datetime.fromtimestamp(start_epoch, zone)
+        end_epoch = cutoff_epoch(start_epoch, zone)
         if (
             start_epoch % 60
-            or not 30 <= start_epoch - now <= 24 * 3600
+            or start_epoch >= end_epoch
             or start.date() != datetime.fromtimestamp(now, zone).date()
             or start.replace(fold=0).utcoffset() != start.replace(fold=1).utcoffset()
         ):
@@ -111,16 +130,14 @@ class ManagedSchedule:
             or original.get("recurring") != 127
             or original.get("startTime") != 0
             or original.get("stopModel") != "Duration"
+            or original.get("stopValue") != 360
             or original.get("ConnectorId") != 1
             or original.get("maxEnergy") != 0
             or original.get("type") != "Plan"
             or original.get("eco") != "Fast"
         ):
             raise SecurityError("unsupported native daily timer")
-        duration = integer(original["stopValue"], 1, 1440)
-        next_midnight = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        if start_epoch + duration * 60 >= next_midnight.timestamp():
-            raise SecurityError("temporary timer would overlap the next daily start")
+        duration = (end_epoch - start_epoch) // 60
         amp = integer(original["limitCurrent"], 60, 320)
         amp = min(amp, c.current.selected() * 10)
         # Use a higher free 16-bit ID, as in the captured two-plan native ordering.
@@ -150,6 +167,7 @@ class ManagedSchedule:
             "revision": revision,
             "state": "requested",
             "start_epoch": start_epoch,
+            "end_epoch": end_epoch,
             "floor": j.get("next_transaction"),
             "body": body,
             "install": payload,
@@ -172,7 +190,7 @@ class ManagedSchedule:
         c = self.c
         return (
             c.requests.intent().mode == "app"
-            and c.current.available(n)
+            and c.current.available(n, for_schedule=True)
             and n is not None
             and n.physical.connection == "Plug"
             and c.session.runtime.status.vendor_connected
@@ -243,7 +261,7 @@ class ManagedSchedule:
 
         try:
             reply = await g.charger.call("DataTransfer", payload, check=check, before_send=mark)
-            result = "accepted" if reply[0] == 3 and reply[2] == {"status": "Accepted", "data": ""} else "unconfirmed"
+            result = "accepted" if reply[0] == 3 and reply[2] == {"status": "Accepted", "data": ""} else "rejected"
         except TimerVehicleDisconnectedError:
             if adding and j.get(KEY) == lease and lease["state"] == "requested":
                 self.finish(lease, "cancelled_before_install")
@@ -282,7 +300,7 @@ class ManagedSchedule:
             bool(lease.get("retire_reason"))
             or lease["state"] == "clearing"
             or time.time() >= lease["start_epoch"]
-            or intent.revision != lease["revision"]
+            or intent.revision != lease.get("control_revision", lease["revision"])
             or intent.mode == "paused"
         )
 
@@ -311,6 +329,59 @@ class ManagedSchedule:
             if self.j.get(KEY)["state"] != "complete":
                 raise ReleaseDeferredError("positive release awaits verified native timer removal")
 
+    # Report unresolved physical work without freezing the supervisor that can still verify its recovery.
+    def problem(self) -> str | None:
+        lease = self.j.get(KEY, {})
+        if lease.get("state") not in OBSERVABLE:
+            return None
+        now = time.time()
+        if "cleanup_since" in lease and (
+            lease.get("last_response") == "rejected" or now - lease["cleanup_since"] >= 60
+        ):
+            return "temporary_schedule_cleanup_unconfirmed"
+        if (
+            "hold_since" in lease
+            and now - lease["hold_since"] >= 60
+            and self.j.active() is not None
+            and self.j.active() == lease.get("bound_local")
+        ):
+            return "temporary_schedule_stop_unconfirmed"
+        return None
+
+    # While a cutoff hold is active, allow only the known scheduled session to receive a Stop.
+    async def hold_until_closed(self, n: HandoverEvidence | None = None) -> None:
+        c, j = self.c, self.j
+        lease = j.get(KEY)
+        g = c.session.gateway
+        if c.native.introduced_epoch != g._charger_epoch or not g.current_boot_seen(g._charger_epoch):
+            raise RecoveryRequiredError("deadline hold awaits the current charger introduction")
+        n = n or await c.native.read()
+        c.native.require_known_session(n)
+        active = j.active()
+        bound = lease.get("bound_local")
+        if active is not None and active != bound:
+            raise RecoveryRequiredError("deadline hold awaits reconciliation of the scheduled session")
+        if (
+            active is None
+            and g.controls.ready
+            and g.controls.desired() == 0
+            and not j.get("control", {}).get("uncertain")
+        ):
+            return
+        now = time.time()
+        if now >= lease.get("next_stop", 0):
+            j.put(KEY, {**lease, "next_stop": now + 15})
+            if bound is not None:
+                await g.controls.stop(expected_local=bound)
+            else:
+                # An unplugged vehicle has no transaction to Stop. Inhibit the timer until exact removal is verified.
+                def still_idle() -> None:
+                    if j.active() is not None or c.requests.intent().mode != "app":
+                        raise RecoveryRequiredError("timer hold was superseded")
+
+                await g.controls.set_limit(0, guard=still_idle)
+        raise RecoveryRequiredError("deadline hold awaits verified closure")
+
     # The daily plan stays enabled. Only a fresh verified closed session or missed/cancelled timer permits cleanup.
     async def observe(self, n: HandoverEvidence) -> None:
         c, j = self.c, self.j
@@ -331,6 +402,10 @@ class ManagedSchedule:
             else:
                 await self.send(lease, True)
             return
+        if "end_epoch" not in lease:
+            # An older armed lease has the original six-hour payload. Preserve its digest and enforce its local cutoff.
+            lease = {**lease, "end_epoch": cutoff_epoch(lease["start_epoch"], ZoneInfo(n.configuration["timeZone"]))}
+            j.put(KEY, lease)
         candidates = self.sessions(lease)
         actual_id = n.physical.native_transaction_id
         changes: dict[str, Any] = {}
@@ -352,18 +427,39 @@ class ManagedSchedule:
             j.put(KEY, lease)
         closed = candidates.get(lease.get("bound_local")) is True
         idle = not n.physical.transaction_open and j.active() is None and all(v == 0 for v in n.currents_a + n.powers_w)
-        cancelled = c.requests.intent().mode == "paused" or c.requests.intent().revision != lease["revision"]
+        intent = c.requests.intent()
+        cancelled = intent.mode == "paused" or intent.revision != lease.get("control_revision", lease["revision"])
+        if (
+            not cancelled
+            and now >= lease["end_epoch"]
+            and actual_id is not None
+            and actual_id == lease.get("bound_local") == j.active()
+            and n.physical.transaction_open
+        ):
+            if "hold_since" not in lease:
+                j.put(KEY, {**lease, "hold_since": now})
+            c.released_epoch = None
+            await self.hold_until_closed(n)
         reason = lease.get("retire_reason")
         if closed:
             reason = "session_closed"
+        elif not reason and n.physical.connection == "Unplug":
+            reason = "vehicle_disconnected"
         elif not reason and cancelled:
             reason = "owner_superseded"
         elif not reason and state == "armed" and not present and now < lease["start_epoch"] - 5:
             reason = "disappeared_before_start"
-        elif not reason and now >= lease["start_epoch"] + 600:
+        elif not reason and idle and now >= lease["start_epoch"] + 600:
             reason = "session_source_unverified" if any(candidates.values()) else "no_scheduled_session"
-        should_remove = bool(reason)
-        if not idle or not should_remove:
+        if reason and reason != lease.get("retire_reason"):
+            lease = {**lease, "retire_reason": reason}
+            j.put(KEY, lease)
+        if idle and reason == "vehicle_disconnected" and intent.mode == "app" and "hold_since" not in lease:
+            j.put(KEY, {**lease, "hold_since": now})
+            c.released_epoch = None
+            await self.hold_until_closed(n)
+            lease = j.get(KEY)
+        if not idle or not reason:
             return
         if not present:
             # A timed-out install can still arrive late. Retain its ownership through the start grace period.
@@ -378,7 +474,13 @@ class ManagedSchedule:
             if n.saved_schedule_digest != lease["original_digest"]:
                 raise SecurityError("original native timer is not confirmed")
             self.finish(lease, str(reason))
-        elif state != "clearing" or now - lease["sent_at"] >= 30:
-            lease = {**lease, "retire_reason": reason}
+        elif now >= lease.get("next_clear", 0):
+            attempts = lease.get("cleanup_attempts", 0) + 1
+            lease = {
+                **lease,
+                "cleanup_since": lease.get("cleanup_since", now),
+                "cleanup_attempts": attempts,
+                "next_clear": now + min(300, 30 * 2 ** min(attempts - 1, 4)),
+            }
             j.put(KEY, lease)
             await self.send(lease, False)

@@ -14,7 +14,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .managed_current import managed_current_ceiling
 from .managed_recovery import local_recovery_binding
-from .managed_schedule import TimerVehicleDisconnectedError, installed_variant
+from .managed_schedule import TimerVehicleDisconnectedError, installed_variant, remember_disconnect
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .rpc import UnavailableError
@@ -125,6 +125,7 @@ class NativeBoundedHandover:
         except SecurityError, UnavailableError, TimeoutError:
             self.last_verified_at = 0
             raise
+        remember_disconnect(self.gateway.journal, native)
         self.last_verified_at = native.physical.observed_at
         return native
 

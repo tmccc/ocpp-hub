@@ -3,7 +3,9 @@
 ## Unreleased — iCS prototype and commissioning package
 
 - Add a supervised one-off native timer alongside the original daily schedule, with verified installation
-  and automatic selective cleanup after charging or a missed start.
+  and automatic selective cleanup after charging or a missed start. Delayed starts end at 06:00 local
+  time. The proxy supervises closure of the identified session, retires the timer on an observed
+  unplug, preserves it across idle current changes and reports unconfirmed cleanup to Home Assistant.
 
 - Renew an expired, previously accepted schedule tag against the connected cloud when the iCS sends a direct
   StartTransaction. Concurrent retries share the decision. Archive the firmware's unnumbered, zero-draw start

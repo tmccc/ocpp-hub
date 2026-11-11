@@ -814,13 +814,18 @@ to restore the previous app/schedule permission.
 
 An authenticated `temporary_schedule` request takes a fresh control revision and a future UTC Unix
 `start_epoch` on a whole minute later on the charger's current local date. Under commissioned managed32
-authority, the proxy copies the admitted daily timer's tag and duration into a separate one-off plan,
-using at most the selected current. It keeps the midnight plan and its original integrity binding.
-The service verifies the complete two-plan readback. Once a new session identified by the native plan ID has closed at zero, it
-removes only its own plan and verifies the complete original timetable. If no matching session appears
-within ten minutes of the start, it cleans up at idle and reports the missed or unverified start. A lost response or
-process replacement never replays installation. The status field `temporary_schedule` reports progress;
-a native session plan-ID match provides additional evidence of the trigger.
+authority, the proxy installs a one-off plan using the daily timer's tag and at most the selected current.
+The start must be before 06:00. The duration is the elapsed time to 06:00 on that local date, including
+clock changes. For example, a 03:45 start lasts 135 minutes. The original daily plan stays in place.
+The service verifies the complete two-plan readback. An observed unplug retires the temporary timer.
+Changing the selected current while the timer is armed preserves it and the station ceiling still applies.
+At 06:00, if the identified temporary session is still open, the service holds the station at zero and
+requests closure of that transaction. Zero draw and an accepted Stop reply alone cannot confirm closure.
+Once actual closure and zero output are verified, it removes its timer, verifies the complete original
+timetable and restores the owner's selected ceiling in app mode. If no matching session appears within
+ten minutes of the start, cleanup runs at idle. The status field `temporary_schedule` reports progress.
+Unconfirmed removal is retried with a bounded delay and surfaces through the existing health alert.
+Process replacement reconciles an interrupted installation from native readback.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,

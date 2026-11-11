@@ -104,7 +104,7 @@ async def test_temporary_native_schedule(
 ) -> None:
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", SchedulePeer)
     monkeypatch.setitem(native_bench.ORIGINAL, "timeZone", "Europe/London")
-    logical = datetime(2026, 11, 11, 8, tzinfo=UTC).timestamp()
+    logical = datetime(2026, 11, 11, 3, 42, tzinfo=UTC).timestamp()
     monkeypatch.setattr(managed_schedule, "time", SimpleNamespace(time=lambda: logical))
     target = int(logical) + 180
     async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as rig:
@@ -195,7 +195,8 @@ async def test_temporary_native_schedule(
             lease = s.journal.get(managed_schedule.KEY)
             assert lease["state"] == "armed" and lease["body"]["planId"] != 9
             timer = lease["body"]["planId"]
-            assert lease["body"]["startTime"] == 8 * 60 + 3
+            assert lease["body"]["startTime"] == 3 * 60 + 45
+            assert lease["body"]["stopValue"] == 135 and lease["end_epoch"] == target + 135 * 60
             assert lease["body"]["limitCurrent"] == (320 if outcome == "charge" else 60)
             assert set(rig.bench.firmware.plans) == {9, timer} and not starts(rig)
             assert s.gateway.policy.extensions.get(("IoCharger", "setPlan")) is None

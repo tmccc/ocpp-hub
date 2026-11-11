@@ -9,7 +9,7 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .managed_current import ManagedCurrentLimits, managed_current_ceiling
 from .managed_intent import ControlIntent, ManagedRequests
-from .managed_schedule import ManagedSchedule
+from .managed_schedule import KEY, OBSERVABLE, ManagedSchedule
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .policy import DeniedError
@@ -243,7 +243,10 @@ class ManagedController:
         if self.stopping:
             raise UnavailableError("managed shutdown retains its hold")
         epoch, revision = g._charger_epoch, g.controls._revision
-        native = await self.native.read(closed=True)
+        native = await self.native.read()
+        self.native.require_known_session(native)
+        if native.physical.transaction_open:
+            raise RecoveryRequiredError("owner release awaits actual transaction closure")
         self.require_zero(native)
         if j.get("trial_phase") == "recovering":
             await self.native.resume()
@@ -348,6 +351,14 @@ class ManagedController:
 
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
     async def tick(self) -> dict[str, Any]:
+        status = await self._tick()
+        problem = self.schedule.problem()
+        if problem and status["state"] not in ("attention", "stopping"):
+            status.update(state="degraded", fault=problem, temporary_schedule=self.schedule.summary())
+        return status
+
+    # Retain ordinary recovery and owner-control supervision while schedule alarms are reported separately.
+    async def _tick(self) -> dict[str, Any]:
         await self.current.settle()
         await self.tests.settle()
         s, g, j = self.session, self.session.gateway, self.session.journal
@@ -375,11 +386,14 @@ class ManagedController:
         if j.get("managed_control_fault"):
             await self.hold_fault()
             return {**base, "state": "attention", "fault": j.get("managed_control_fault")["classification"]}
+        timer = j.get(KEY, {})
+        cutoff_hold = timer.get("state") in OBSERVABLE and "hold_since" in timer
         if (
             not base["charger_connected"]
             or not base["boot_verified"]
             or not g.controls.ready
             and self.released_epoch != g._charger_epoch
+            and not cutoff_hold
         ):
             return {**base, "state": "starting", "owner_control_enabled": False}
         verified_pause = False
@@ -391,7 +405,13 @@ class ManagedController:
             if self.requests.intent().mode == "paused":
                 await self.maintain_pause()
             elif self.released_epoch != g._charger_epoch:
+                if cutoff_hold:
+                    await self.schedule.hold_until_closed()
                 if not base["cloud_connected"]:
+                    if cutoff_hold and j.get("trial_phase") == "active":
+                        native = await self.native.read(closed=True)
+                        self.require_paused(native)
+                        await self.schedule.before_release(native)
                     return {**base, "state": "waiting_for_cloud", "owner_control_enabled": False}
                 await self.restore_owner_control()
             native = await self.settled_native()

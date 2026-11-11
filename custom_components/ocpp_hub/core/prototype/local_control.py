@@ -255,16 +255,20 @@ class LocalControl:
         return answer
 
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
-    async def stop(self) -> Frame:
+    async def stop(self, *, expected_local: int | None = None) -> Frame:
+        if expected_local is not None and self.journal.active() not in (None, expected_local):
+            raise RecoveryRequiredError("scheduled Stop no longer owns the active transaction")
         previous = self.journal.get("control", {})
         if self._stopping is None or self._stopping.done() or previous.get("ticket") != self._stop_ticket:
             epoch, ticket = self._claim(True, stopping=True)
             self._stop_ticket = ticket
-            self._stopping = self._launch(self._stop(epoch, ticket, previous.get("start_pending", False)))
+            self._stopping = self._launch(
+                self._stop(epoch, ticket, previous.get("start_pending", False), expected_local)
+            )
         return await asyncio.shield(self._stopping)
 
     # Finish the zero-current hold and known-session stop even if the initiating client disconnects.
-    async def _stop(self, epoch: int, ticket: str, pending_start: bool) -> Frame:
+    async def _stop(self, epoch: int, ticket: str, pending_start: bool, expected_local: int | None = None) -> Frame:
         cap_error: UnavailableError | None = None
         async with self.peer.sequence(0, lambda: self._check(epoch, ticket)) as call:
             try:
@@ -277,7 +281,7 @@ class LocalControl:
                     else UnavailableError("station hold could not be confirmed")
                 )
             local = self.journal.active()
-            if local is not None:
+            if local is not None and expected_local in (None, local):
                 answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":
                     raise UnavailableError("transaction stop was not confirmed")
