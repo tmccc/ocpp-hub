@@ -28,6 +28,7 @@ from .managed_occurrences import (
 from .native_start_attempts import matching_unassigned_start, split_attempts, start_millisecond_range
 from .policy import DeniedError, integer, number
 from .rpc import UnavailableError
+from .schedule_time import cutoff_epoch, temporary_window
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
 from .trial_handover_evidence import HandoverEvidence
@@ -447,12 +448,6 @@ def known_timer_closure_gap(journal: Journal, native: HandoverEvidence) -> bool:
     return closing in (lease.get("unidentified_local"), lease.get("other_local")) or (
         lease.get("native_plan_confirmed") is True and closing == lease.get("bound_local")
     )
-
-
-# Resolve the owner's wall-clock end on the date of the actual occurrence, including offset changes before 06:00.
-def cutoff_epoch(start_epoch: int, zone: ZoneInfo) -> int:
-    start = datetime.fromtimestamp(start_epoch, zone)
-    return int(start.replace(hour=6, minute=0, second=0, microsecond=0, fold=0).timestamp())
 
 
 class TimerVehicleDisconnectedError(UnavailableError):
@@ -922,17 +917,7 @@ class ManagedSchedule:
             zone = ZoneInfo(n.configuration["timeZone"])
         except KeyError, TypeError, ValueError, ZoneInfoNotFoundError:
             raise SecurityError("a configured charger time zone is required") from None
-        if not 30 <= start_epoch - now <= 24 * 3600:
-            raise SecurityError("a future start within the next day is required")
-        start = datetime.fromtimestamp(start_epoch, zone)
-        end_epoch = cutoff_epoch(start_epoch, zone)
-        if (
-            start_epoch % 60
-            or start_epoch >= end_epoch
-            or start.date() != datetime.fromtimestamp(now, zone).date()
-            or start.replace(fold=0).utcoffset() != start.replace(fold=1).utcoffset()
-        ):
-            raise SecurityError("temporary timer requires a future whole minute on the current local date")
+        start, end_epoch = temporary_window(start_epoch, now, zone)
         plans = n.saved_schedule["planList"]
         if len(plans) != 1 or n.saved_schedule_digest != c.native.spec.saved_schedule_digest:
             raise SecurityError("temporary schedule requires the single admitted daily plan")
