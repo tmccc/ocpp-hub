@@ -243,6 +243,14 @@ class ResourceBook:
                 projected = profile_projection(payload)
                 if projected["id"] == HUB_PROFILE_ID and projected["limit"] == 0 and safety:
                     phase = "active"  # Only this recorded zero-current intent proceeds through normal ownership checks.
+            if (
+                phase == "recovering"
+                and action == "DataTransfer"
+                and payload is self.temporary_plan_write
+                and payload.get("messageId") == "clearPlans"
+            ):
+                self.temporary_plan_write = None
+                return  # The bounded native gate verified the exact preimage, closed session and owned zero.
             if phase == "rollback" and action == "ClearChargingProfile" and set(payload) == {"id"}:
                 receipt = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
                 if receipt is not None and receipt["state"] != "absent_verified":

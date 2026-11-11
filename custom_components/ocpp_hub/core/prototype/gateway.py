@@ -71,8 +71,9 @@ def timestamp(value: Any) -> datetime:
 class NativeStartReport:
     """A verified physical occurrence and its receipt to commit with the ordinary local transaction."""
 
-    native_id: int
+    native_id: int | None
     plan_id: int
+    attempt: tuple[str, int] | None
     record: Callable[[int], None] = field(compare=False)
 
 
@@ -90,6 +91,7 @@ class Gateway:
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
         self.status_observer: Callable[[str, dict[str, Any]], None] | None = None
+        self.prepare_report_hold: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self.held_start_report: Callable[[str], bool] | None = None
         self.native_start_report: Callable[[dict[str, Any]], Awaitable[NativeStartReport | None]] | None = None
         self.remote_start_guard: Callable[[], bool] | None = None
@@ -291,6 +293,9 @@ class Gateway:
                             else {"status": "Invalid"}
                         )
                     return build_call_result(token, {"idTagInfo": info})
+                if action == "StartTransaction" and self.prepare_report_hold and not self.journal.known_start(payload):
+                    await self.prepare_report_hold(payload)
+                    self._require_epoch("charger", epoch)
                 ticket = self.journal.get("control", {}).get("ticket")
                 if action == "StartTransaction" and self.policy.strict_cloud_authorization:
                     try:
@@ -399,8 +404,9 @@ class Gateway:
                 if native_report is not None:
                     native_report.record(local)
                 self.authorisation.consume(payload["idTag"], local)
-                control = self.journal.get("control", {})
-                self.journal.put("control", {**control, "start_pending": False})
+                if native_report is None:
+                    control = self.journal.get("control", {})
+                    self.journal.put("control", {**control, "start_pending": False})
                 if self.start_observer is not None:
                     self.start_observer(local, payload)
 

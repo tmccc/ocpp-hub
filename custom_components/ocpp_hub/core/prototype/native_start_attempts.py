@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from calendar import timegm
+from datetime import datetime
 from typing import Any
 
 from .policy import integer
@@ -82,3 +85,35 @@ def split_attempts(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     except ValueError, TypeError, KeyError, IndexError:
         raise SecurityError("unassigned native history has incomplete or contradictory start evidence") from None
     return numbered, attempts
+
+
+# OCPP timestamps can omit native milliseconds or transmit only some of those decimal places.
+def start_millisecond_range(wire_stamp: str, occurred: datetime) -> range:
+    clock = re.search(r"[Tt ]\d{2}:?\d{2}:?\d{2}(?:[.,](\d+))?", wire_stamp)
+    if clock is None:
+        return range(0)
+    digits = len(clock.group(1) or "")
+    width = 10 ** (3 - min(digits, 3))
+    first = timegm(occurred.utctimetuple()) * 1000 + (occurred.microsecond // 1000 // width) * width
+    return range(first, first + width)
+
+
+# Carry the actual native start time through the response, even when the charger reported only the second.
+def matching_unassigned_start(
+    history: tuple[dict[str, Any], ...], payload: dict[str, Any], occurred: datetime
+) -> tuple[str, int] | None:
+    tag, stamp = payload.get("idTag"), payload.get("timestamp")
+    if not isinstance(tag, str) or not isinstance(stamp, str):
+        return None
+    accepted_ms = start_millisecond_range(stamp, occurred)
+    _, attempts = split_attempts(list(history))
+    matches = [
+        (name, start_ms)
+        for name, row in attempts.items()
+        if row["connectorId"] == payload.get("connectorId")
+        and row["idTagStart"].casefold() == tag.casefold()
+        and row["meterStart"] == payload.get("meterStart")
+        and (start_ms := row["startTime"] * 1000 + row["startMs"]) in accepted_ms
+        and ("reservationId" not in payload or row.get("reservationId") == payload["reservationId"])
+    ]
+    return matches[0] if len(matches) == 1 else None

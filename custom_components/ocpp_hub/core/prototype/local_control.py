@@ -402,4 +402,6 @@ class LocalControl:
                 if isinstance(error, ReleaseDeferredError):
                     self._complete(ticket, uncertain=False)
                 raise
-            self._complete(ticket, owner="shared", inhibit=False, uncertain=False, start_pending=False)
+            # Resuming an open independent session cannot consume a separate pending Start.
+            pending = self.journal.active() is not None and self.journal.get("control", {}).get("start_pending", False)
+            self._complete(ticket, owner="shared", inhibit=False, uncertain=False, start_pending=pending)

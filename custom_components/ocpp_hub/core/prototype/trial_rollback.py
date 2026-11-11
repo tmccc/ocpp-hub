@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
 from .gateway import Gateway
+from .managed_schedule import awaiting_owner_start
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import RecoveryRequiredError
@@ -20,15 +22,17 @@ Observe = Callable[[], Awaitable[Evidence]]
 # Both unplugged and independently protected cleanup require actual lifecycle and vendor-write reconciliation.
 def require_lifecycle_idle(gateway: Gateway, *, continuing_local: int | None = None) -> None:
     journal = gateway.journal
-    state = journal.get("control", {})
     lifecycle_pending = journal.db.execute(
         "SELECT 1 FROM outbox WHERE action IN ('StartTransaction','StopTransaction') LIMIT 1"
     ).fetchone()
-    if journal.active() != continuing_local or state.get("start_pending") or lifecycle_pending:
+    if journal.active() != continuing_local or lifecycle_pending:
         raise RecoveryRequiredError("actual Stop, pending start or queued history still requires reconciliation")
     journal.require_vendor_writes_reconciled()
-    if journal.get("vendor_start_grant", {}).get("local") is None and journal.get("vendor_start_grant", {}):
-        raise RecoveryRequiredError("an unbound remote start still requires independent reconciliation")
+    row = journal.db.execute(
+        "SELECT start FROM transactions WHERE local=? AND stop IS NULL", (continuing_local,)
+    ).fetchone()
+    if awaiting_owner_start(journal, json.loads(row["start"])["idTag"] if row is not None else None):
+        raise RecoveryRequiredError("an unbound start still requires independent reconciliation")
 
 
 class Rollback:

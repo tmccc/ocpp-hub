@@ -452,7 +452,23 @@ class NativeBoundedHandover:
             )
             if native.saved_schedule_digest != expected:
                 raise SecurityError("temporary timer write requires its exact native preimage")
-            self.book.owned_present(native.physical)
+            present = self.book.owned_present(native.physical)
+            if payload["messageId"] == "clearPlans" and self.gateway.journal.get("trial_phase") == "recovering":
+                g = self.gateway
+                self.require_known_session(native)
+                if (
+                    not recorded_timer_hold(g.journal, self.spec.digest, self.spec.boot_digest)
+                    or "hold_since" not in lease
+                    or not g.current_boot_seen(g._charger_epoch)
+                    or self.introduced_epoch != g._charger_epoch
+                    or self.introduced_revision != g.controls._revision
+                    or not g.controls.ready
+                    or g.controls.desired() != 0
+                    or any(v != 0 for v in native.currents_a + native.powers_w)
+                    or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
+                ):
+                    raise RecoveryRequiredError("timer removal during recovery awaits a verified physical hold")
+                return
         if action == "ClearChargingProfile":
             require_lifecycle_idle(self.gateway)
             present = self.book.owned_present(native.physical)

@@ -127,7 +127,7 @@ class ManagedController:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
-    def require_paused(self, native: HandoverEvidence) -> None:
+    def require_paused(self, native: HandoverEvidence, *, timer_cleanup: bool = False) -> None:
         g, j = self.session.gateway, self.session.journal
         self.native.require(native, closed=True)
         self.native.require_known_session(native)
@@ -140,7 +140,8 @@ class ManagedController:
             or g.controls.desired() != 0
             or j.get("control", {}).get("owner") != "local"
             or not j.get("control", {}).get("inhibit")
-            or j.get("control", {}).get("start_pending")
+            or not timer_cleanup
+            and j.get("control", {}).get("start_pending")
             or j.get("uncertain_vendor_command")
             or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
             or g.charger._pending
@@ -164,6 +165,9 @@ class ManagedController:
         ):
             await self._stop_requested()
             raise RecoveryRequiredError("requested pause awaits actual physical closure")
+        if self.schedule.awaiting_start() and self.schedule.revoked(self.session.journal.get(KEY, {})):
+            self.require_paused(native, timer_cleanup=True)
+            await self.schedule.observe(native)
         self.require_paused(native)
         g, j = self.session.gateway, self.session.journal
         if j.get("trial_phase") == "recovering":
@@ -490,6 +494,10 @@ class ManagedController:
             elif self.released_epoch != g._charger_epoch:
                 if cutoff_hold:
                     await self.schedule.hold_until_closed()
+                    if self.schedule.awaiting_start() and j.active() is None:
+                        native = await self.native.read(closed=True)
+                        self.require_paused(native, timer_cleanup=True)
+                        await self.schedule.observe(native)
                 elif pending_timer and j.active() is not None and self.native.introduced_epoch == g._charger_epoch:
                     await self.schedule.observe(await self.native.read())
                 if not base["cloud_connected"]:

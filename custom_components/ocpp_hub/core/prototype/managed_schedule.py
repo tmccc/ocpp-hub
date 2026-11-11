@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ..control import HUB_PROFILE_ID
 from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
-from .policy import DeniedError, integer
+from .native_start_attempts import matching_unassigned_start, start_millisecond_range
+from .policy import DeniedError, integer, number
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
@@ -86,6 +87,33 @@ def confirmed_vendor_start(j: Journal, tag_digest: str, local: int | None) -> bo
             "AND action='RemoteStartTransaction' AND state='confirmed'",
             (grant.get("mutation"),),
         ).fetchone()
+    )
+
+
+# Only a positively receipted, distinct owner command can stay pending alongside a native lifecycle.
+def awaiting_owner_start(j: Journal, tag: str | None = None) -> bool:
+    digest = fingerprint(tag.casefold()) if tag is not None else None
+    if j.get("control", {}).get("start_pending"):
+        owner = j.get("managed_test_charge", {})
+        owner_digest = owner.get("tag_digest")
+        if (
+            digest is None
+            or owner.get("start_rpc_accepted") is not True
+            or not isinstance(owner_digest, str)
+            or len(owner_digest) != 64
+            or owner_digest == digest
+        ):
+            return True
+    grant = j.get("vendor_start_grant", {})
+    if not grant or grant.get("local") is not None:
+        return False
+    grant_digest = grant.get("digest")
+    return (
+        digest is None
+        or not isinstance(grant_digest, str)
+        or len(grant_digest) != 64
+        or grant_digest == digest
+        or not confirmed_vendor_start(j, grant_digest, None)
     )
 
 
@@ -279,8 +307,15 @@ class ManagedSchedule:
             "CREATE TABLE IF NOT EXISTS managed_pending_native_reports("
             "native_id INTEGER PRIMARY KEY, local INTEGER NOT NULL UNIQUE REFERENCES transactions(local))"
         )
+        self.j.db.execute(
+            "CREATE TABLE IF NOT EXISTS managed_unnumbered_reports("
+            "attempt TEXT NOT NULL, started_ms INTEGER NOT NULL,"
+            "local INTEGER NOT NULL UNIQUE REFERENCES transactions(local),"
+            "PRIMARY KEY(attempt,started_ms))"
+        )
         controller.session.gateway.status_observer = self.observe_status
         controller.session.gateway.tag_guard = self.permits_tag
+        controller.session.gateway.prepare_report_hold = self.prepare_report_hold
         controller.session.gateway.held_start_report = self.can_record_held_start
         controller.session.gateway.native_start_report = self.prepare_native_report
         controller.session.gateway.remote_start_guard = self.permits_remote_start
@@ -318,9 +353,8 @@ class ManagedSchedule:
         return self.j.get(KEY, {}).get("state") not in {"requested", *OBSERVABLE}
 
     # An older version may already have acknowledged a separate owner Start before the charger reports it.
-    def awaiting_start(self) -> bool:
-        grant = self.j.get("vendor_start_grant", {})
-        return bool(self.j.get("control", {}).get("start_pending") or grant and grant.get("local") is None)
+    def awaiting_start(self, tag: str | None = None) -> bool:
+        return awaiting_owner_start(self.j, tag)
 
     # Only an authenticated charger under an owned, verified zero profile can submit a delayed lifecycle report.
     def held_report_ready(self, *, owner_command: bool = False) -> bool:
@@ -342,34 +376,78 @@ class ManagedSchedule:
             and self.hold_authorized()
         )
 
-    # Record the genuine delayed lifecycle of an already accepted owner command under verified station zero.
-    def can_record_held_start(self, tag: str) -> bool:
-        c, j = self.c, self.j
-        if not self.held_report_ready(owner_command=True):
-            return False
-        prior = c.tests.state()
-        if (
+    # Match a previously accepted command; repeating its network request is never part of recovery.
+    def matches_pending_start(self, tag: str) -> bool:
+        j = self.j
+        digest = fingerprint(tag.casefold())
+        prior = self.c.tests.state()
+        return bool(
             j.get("control", {}).get("start_pending")
             and prior.get("start_rpc_accepted")
-            and prior.get("tag_digest") == fingerprint(tag.casefold())
-        ):
-            return True
-        return confirmed_vendor_start(j, fingerprint(tag.casefold()), None)
+            and prior.get("tag_digest") == digest
+            or confirmed_vendor_start(j, digest, None)
+        )
 
-    # A delayed native report must describe an actual open occurrence on this cable, inside its authorized window.
+    # Close the gap between an independent session's actual Stop and a following Start before the next tick.
+    async def prepare_report_hold(self, payload: dict[str, Any]) -> None:
+        j, g = self.j, self.c.session.gateway
+        lease, tag = j.get(KEY, {}), payload.get("idTag")
+        if (
+            not self.revoked(lease)
+            or j.active() is not None
+            or not lease.get("other_local")
+            or not isinstance(tag, str)
+            or not (tag.casefold() == lease["body"]["idTag"].casefold() or self.matches_pending_start(tag))
+        ):
+            return
+        integer(payload.get("connectorId"), 1, 1)
+        number(payload.get("meterStart"), 1e12)
+        timestamp(payload.get("timestamp"))
+        await self.protect_station(lease)
+        if not g.controls.ready or g.controls.desired() != 0:
+            raise UnavailableError("the following Start awaits the station's confirmed zero")
+
+    # Record the genuine delayed lifecycle of an already accepted owner command under verified station zero.
+    def can_record_held_start(self, tag: str) -> bool:
+        return self.held_report_ready(owner_command=True) and self.matches_pending_start(tag)
+
+    # A changed OCPP spelling of an already recorded occurrence cannot create a second local transaction.
+    def recorded_start(self, floor: int, tag: str, millis: range, meter: float) -> bool:
+        rows = self.j.db.execute(
+            "SELECT t.start,r.started_ms FROM transactions t LEFT JOIN managed_unnumbered_reports r ON r.local=t.local "
+            "WHERE t.local>? AND t.connector=1",
+            (floor,),
+        )
+        for row in rows:
+            start = json.loads(row["start"])
+            if start["idTag"].casefold() != tag.casefold() or start["meterStart"] != meter:
+                continue
+            native_ms = row["started_ms"]
+            if native_ms is None:
+                previous = start_millisecond_range(start["timestamp"], timestamp(start["timestamp"]))
+                if previous.start < millis.stop and millis.start < previous.stop:
+                    return True
+            elif native_ms in millis:
+                return True
+        return False
+
+    # Record a witnessed physical occurrence under zero while the current hold still covers its authorized window.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
         c, j = self.c, self.j
         lease = j.get(KEY, {})
-        if not self.held_report_ready() or self.awaiting_start():
+        if not self.held_report_ready():
             return None
         tag = payload.get("idTag")
         if (
             payload.get("connectorId") != 1
             or not isinstance(tag, str)
             or tag.casefold() != lease["body"]["idTag"].casefold()
+            or self.awaiting_start(tag)
         ):
             return None
-        occurred = timestamp(payload.get("timestamp")).timestamp()
+        meter = number(payload.get("meterStart"), 1e12)
+        reported = timestamp(payload.get("timestamp"))
+        occurred = reported.timestamp()
         zone = ZoneInfo(c.native.spec.original_configuration["timeZone"])
         accepted_at = lease.get("accepted_epoch")
         if accepted_at is None:
@@ -384,14 +462,9 @@ class ManagedSchedule:
         current = j.get(KEY, {})
         native_id = n.physical.native_transaction_id
         if (
-            native_id is None
-            or not current.get("unreported_native")
-            or j.db.execute("SELECT 1 FROM transactions WHERE local=?", (native_id,)).fetchone() is not None
-            or j.db.execute("SELECT 1 FROM managed_pending_native_reports WHERE native_id=?", (native_id,)).fetchone()
-            or not self.held_report_ready()
-            or self.awaiting_start()
+            not self.held_report_ready()
+            or self.awaiting_start(tag)
             or current.get("id") != lease["id"]
-            or not n.physical.transaction_open
             or n.physical.connection == "Unplug"
             or n.saved_schedule is None
             or any(v != 0 for v in n.currents_a + n.powers_w)
@@ -424,21 +497,52 @@ class ManagedSchedule:
             and c.requests.intent().mode != "app"
         ):
             return None
+        attempt = None
+        millis = start_millisecond_range(payload["timestamp"], reported)
+        if native_id is None:
+            if (
+                temporary
+                or n.physical.transaction_open
+                or reported_day.date() != datetime.fromtimestamp(time.time(), zone).date()
+            ):
+                return None
+            attempt = matching_unassigned_start(n.history, payload, reported)
+            if (
+                attempt is None
+                or j.db.execute(
+                    "SELECT 1 FROM managed_unnumbered_reports WHERE attempt=? AND started_ms=?", attempt
+                ).fetchone()
+            ):
+                return None
+            millis = range(attempt[1], attempt[1] + 1)
+        elif (
+            not n.physical.transaction_open
+            or not current.get("unreported_native")
+            or j.db.execute("SELECT 1 FROM transactions WHERE local=?", (native_id,)).fetchone() is not None
+            or j.db.execute("SELECT 1 FROM managed_pending_native_reports WHERE native_id=?", (native_id,)).fetchone()
+        ):
+            return None
+        if self.recorded_start(lease["floor"], tag, millis, meter):
+            return None
         # The one-off can report once. Prior releases recorded its occurrence in the per-plan date map.
         if temporary and (
             current.get("temporary_start_reported") or str(plan["planId"]) in current.get("reported_occurrences", {})
         ):
             return None
 
-        # Bind the witnessed physical ID and the independently allocated ledger ID in the same Start commit.
+        # Claim the occurrence together with its ledger ID. Only fresh matching native evidence permits release.
         def accepted(local: int) -> None:
-            j.db.execute("INSERT INTO managed_pending_native_reports VALUES(?,?)", (native_id, local))
-            changes = {"unidentified_local": local, "pending_native_reports": True}
+            changes = {"unidentified_local": local}
+            if attempt is not None:
+                j.db.execute("INSERT INTO managed_unnumbered_reports VALUES(?,?,?)", (*attempt, local))
+            else:
+                j.db.execute("INSERT INTO managed_pending_native_reports VALUES(?,?)", (native_id, local))
+                changes["pending_native_reports"] = True
             if temporary:
                 changes["temporary_start_reported"] = True
             j.put(KEY, {**current, **changes})
 
-        return NativeStartReport(native_id, plan["planId"], accepted)
+        return NativeStartReport(native_id, plan["planId"], attempt, accepted)
 
     # Never grant a new Start to the retired timer's tag while its physical removal remains unverified.
     def permits_tag(self, tag: str) -> bool:
@@ -604,6 +708,15 @@ class ManagedSchedule:
                 current != lease
                 or c.stopping
                 or j.get("trial_phase") != "active"
+                and not (
+                    not adding
+                    and j.get("trial_phase") == "recovering"
+                    and "hold_since" in current
+                    and c.native.introduced_epoch == epoch
+                    and c.native.introduced_revision == g.controls._revision
+                    and g.controls.ready
+                    and g.controls.desired() == 0
+                )
                 or j.get("managed_control_fault")
                 or not g.current_boot_seen(epoch)
                 or epoch != g._charger_epoch
@@ -939,14 +1052,14 @@ class ManagedSchedule:
             and g.controls.desired() == 0
             and (j.get("trial_phase") == "recovering" or not j.get("control", {}).get("uncertain"))
         ):
-            c.require_paused(n)
+            c.require_paused(n, timer_cleanup=True)
             return
         if bound is not None:
             await request_timer_stop(g, lease, self.hold_authorized)
         else:
             await self.protect_station(lease)
         if active is None and j.active() is None and g.controls.ready and g.controls.desired() == 0:
-            c.require_paused(await c.native.read(closed=True))
+            c.require_paused(await c.native.read(closed=True), timer_cleanup=True)
             return
         raise RecoveryRequiredError("deadline hold awaits verified closure")
 
