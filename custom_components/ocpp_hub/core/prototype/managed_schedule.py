@@ -40,7 +40,8 @@ def remember_disconnect(journal: Journal, observed_at: float | None = None) -> N
     if (
         lease.get("state") in {"requested", *OBSERVABLE}
         and not lease.get("retire_reason")
-        and (observed_at is None or lease.get("accepted_epoch", 0) <= observed_at <= time.time() + 5)
+        # The station reports whole seconds. A fresh or future-dated departure cannot establish cable continuity.
+        and (observed_at is None or observed_at >= int(lease.get("accepted_epoch", 0)) - 5)
     ):
         journal.put(KEY, {**lease, "retire_reason": "vehicle_disconnected"})
 
@@ -408,6 +409,9 @@ class ManagedSchedule:
                         raise RecoveryRequiredError("timer hold was superseded")
 
                 await g.controls.set_limit(0, guard=still_idle)
+            if active is None and j.active() is None:
+                c.require_paused(await c.native.read(closed=True))
+                return
         raise RecoveryRequiredError("deadline hold awaits verified closure")
 
     # The daily plan stays enabled. Only a fresh verified closed session or missed/cancelled timer permits cleanup.
@@ -471,6 +475,7 @@ class ManagedSchedule:
                 j.put(KEY, {**lease, "hold_since": now})
             c.released_epoch = None
             await self.hold_until_closed(n)
+        grace_end = min(lease["end_epoch"], lease["start_epoch"] + 600)
         reason = lease.get("retire_reason")
         if closed:
             reason = "session_closed"
@@ -480,12 +485,18 @@ class ManagedSchedule:
             reason = "owner_superseded"
         elif not reason and state == "armed" and not present and now < lease["start_epoch"] - 5:
             reason = "disappeared_before_start"
-        elif not reason and idle and now >= lease["start_epoch"] + 600:
+        elif not reason and idle and now >= grace_end:
             reason = "session_source_unverified" if any(candidates.values()) else "no_scheduled_session"
         if reason and reason != lease.get("retire_reason"):
             lease = {**lease, "retire_reason": reason}
             j.put(KEY, lease)
-        if idle and reason == "vehicle_disconnected" and intent.mode == "app" and "hold_since" not in lease:
+        if (
+            idle
+            and reason
+            and intent.mode == "app"
+            and "hold_since" not in lease
+            and (present or state == "installing")
+        ):
             j.put(KEY, {**lease, "hold_since": now})
             c.released_epoch = None
             await self.hold_until_closed(n)
@@ -495,7 +506,7 @@ class ManagedSchedule:
         if not present:
             # A timed-out install can still arrive late. Retain its ownership through the start grace period.
             if state == "installing" and lease.get("last_response") != "accepted":
-                if now < lease["start_epoch"] + 600:
+                if now < grace_end:
                     return
                 if not lease.get("absence_verified_at"):
                     j.put(KEY, {**lease, "absence_verified_at": now})

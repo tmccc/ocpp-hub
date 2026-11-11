@@ -825,7 +825,8 @@ At 06:00, if the identified temporary session is still open, the service holds t
 requests closure of that transaction. Zero draw and an accepted Stop reply alone cannot confirm closure.
 Once actual closure and zero output are verified, it removes its timer, verifies the complete original
 timetable and restores the owner's selected ceiling in app mode. If no matching session appears within
-ten minutes of the start, cleanup runs at idle. The status field `temporary_schedule` reports progress.
+ten minutes of the start, or by 06:00 if sooner, cleanup runs at idle. The station stays at zero while
+a retained temporary plan awaits verified removal. The status field `temporary_schedule` reports progress.
 Unconfirmed removal is retried with a bounded delay and surfaces through the existing health alert.
 Process replacement reconciles an interrupted installation from native readback.
 

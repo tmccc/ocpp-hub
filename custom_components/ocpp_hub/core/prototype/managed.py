@@ -420,6 +420,8 @@ class ManagedController:
                 await self.restore_owner_control()
             native = await self.settled_native()
             await self.schedule.observe(native)
+            if self.requests.intent().mode == "app" and self.released_epoch != g._charger_epoch:
+                raise RecoveryRequiredError("timer retirement awaits fresh app-control restoration")
             if self.requests.intent().mode == "paused":
                 self.require_paused(native)
                 verified_pause = True

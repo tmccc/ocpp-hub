@@ -20,6 +20,7 @@ from ocpp_hub_core.prototype import managed_schedule
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
@@ -87,6 +88,8 @@ class TimerBench:
         self.rig.peer.permission_enabled = demand
         self.rig.bench.cp, self.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
         self.device.fire_plan(plan_id)
+        if not demand:
+            self.device.requested_current = 0
         return response[2]["transactionId"]
 
     # Advance an idle peer through the next trigger, selecting the plan from its own complete saved timetable.
@@ -287,7 +290,18 @@ async def test_disconnect_retires_timer(
             await b.c.current.settle()
             assert b.device.effective_limit() <= 6 and b.c.current.selected() == 6
         elif phase == "held-replacement":
+            answer = b.device.answer
+
+            # Retain the timer despite a zero hold and a clear attempt immediately before the crash.
+            def reject_clear(action, payload):
+                if action == "DataTransfer" and payload.get("messageId") == "clearPlans":
+                    return {"status": "Rejected", "data": ""}
+                return answer(action, payload)
+
+            b.device.answer = reject_clear
             await b.c.tick()
+            b.device.answer = answer
+            b.clock.now += 31
             assert b.device.effective_limit() == 0 and b.timer in b.device.plans
         else:
             await b.c.native.read()
@@ -631,3 +645,105 @@ async def test_session_turnover_between_polls(
         for _ in range(2):
             await healthy(b.c)
         assert set(b.device.plans) == {9} and b.device.effective_limit() == 6 and not starts(b.rig)
+
+
+# Intent: a same-second Available report retires the request even when the station drops fractional seconds.
+# Why: comparing whole-second device time to precise receipt time can admit a replacement vehicle.
+async def test_same_second_departure(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        b.clock.now += 0.3
+        b.request()
+        b.clock.now += 0.3
+        event = {
+            "connectorId": 1,
+            "status": "Available",
+            "errorCode": "NoError",
+            "timestamp": datetime.fromtimestamp(int(b.clock.now), UTC).isoformat(),
+        }
+        await b.rig.bench.call(b.sock, "left", "StatusNotification", event)
+        await b.rig.bench.call(b.sock, "another", "StatusNotification", event | {"status": "Preparing"})
+        await healthy(b.c)
+        assert b.c.schedule.summary()["result"] == "cancelled_before_install" and set(b.device.plans) == {9}
+
+
+# Intent: retirement holds the physical station throughout failed removal, including a one-minute last window.
+# Why: the missed-start grace period and a prior retirement reason cannot extend native permission past the cutoff.
+@pytest.mark.parametrize("why", ["closed-before-end", "missed-start", "05:59"])
+async def test_retired_timer_cannot_supply_power(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, why: str
+) -> None:
+    now = int(datetime(2026, 11, 11, 5, 56, tzinfo=ZONE).timestamp()) if why == "05:59" else MORNING
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch, now) as b:
+        await b.arm()
+        answer = b.device.answer
+
+        # Retain the one-off physically until an explicitly retried clear is allowed through.
+        def reject(action, payload):
+            if action == "DataTransfer" and payload["messageId"] == "clearPlans":
+                return {"status": "Rejected", "data": ""}
+            return answer(action, payload)
+
+        b.device.answer = reject
+        b.clock.now = b.start
+        if why == "closed-before-end":
+            local = await b.fire(b.timer)
+            await healthy(b.c)
+            b.clock.now += 60
+            await b.close_transaction(local)
+        else:
+            b.clock.now += 60 if why == "05:59" else 601
+        await b.c.tick()
+        assert b.device.effective_limit() == 0 and b.timer in b.device.plans
+        await b.rig.bench.call(
+            b.sock, "left", "StatusNotification", {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
+        )
+        b.device.fire_plan(b.timer)
+        assert b.device.current == 0
+        b.device.requested_current = 0
+        b.clock.now += 61
+        b.device.answer = answer
+        await healthy(b.c)
+        assert b.device.effective_limit() == 6 and set(b.device.plans) == {9}
+
+
+# Intent: full at zero is still open; Pause waits for the native sensor and OCPP ledger to agree in either order.
+# Why: an existing full session cannot be treated as idle for a temporary schedule or a return to positive current.
+@pytest.mark.parametrize("first", ["native", "ledger"])
+async def test_full_session_needs_both_closures(
+    tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        old = await b.start_plan(9, demand=False)
+        status = await healthy(b.c)
+        assert status["charging_session_open"] and status["power_w"] == 0
+        with pytest.raises(RecoveryRequiredError):
+            b.request()
+        request = uuid.uuid4().hex
+        b.c.command(request, "pause", b.c.requests.intent().revision)
+        await b.c.pause_task
+        if first == "native":
+            b.device.active = None
+        else:
+            await b.close_transaction(old)
+            b.device.active = old
+        await b.c.tick()
+        assert b.c.requests.receipt(request)["state"] != "completed" and b.device.effective_limit() == 0
+        if first == "native":
+            await b.close_transaction(old)
+        else:
+            b.device.active = None
+        assert (await healthy(b.c))["local_hold_verified"]
+        b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+        await healthy(b.c)
+        await b.arm()
+        b.clock.now = b.start
+        new = await b.fire(b.timer, demand=False)
+        assert new != old and (await healthy(b.c))["power_w"] == 0
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        assert b.stops() == [old, new]
+        await b.close_transaction(new)
+        await healthy(b.c)
+        assert set(b.device.plans) == {9} and not starts(b.rig)
