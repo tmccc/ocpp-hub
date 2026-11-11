@@ -419,12 +419,33 @@ class ManagedController:
                         "charger_rpc": g.charger.diagnostics.snapshot(),
                     },
                 )
+                if (
+                    continuing_local is not None
+                    and not isinstance(error, SecurityError)
+                    and supervised_timer(j.get(KEY, {}))
+                    and j.active() == continuing_local
+                ):
+                    self.schedule.begin_hold(j.get(KEY))
+                    raise ReleaseDeferredError(
+                        "independent continuation awaits renewed zero and source proof"
+                    ) from error
                 self.fault("owner_release_unconfirmed")
             raise
         finally:
             self.session.book.before_positive_release = None
         self.released_epoch = epoch
         j.put("managed_owner_epoch", epoch)
+        timer = j.get(KEY, {})
+        if timer.get("state") == "complete" and not timer.get("idle_cutoff_hold") and j.active() is None:
+            # Inventory cleanup can release this verified idle profile while its separate cutoff remains pending.
+            j.put(
+                KEY,
+                {
+                    k: v
+                    for k, v in timer.items()
+                    if k not in ("hold_since", "next_cap", "next_stop", "unidentified_local")
+                },
+            )
         if continuing_local is not None:
             self.schedule.clear_idle_cutoff("verified_session")
         elif expected_intent.mode == "paused" and self.schedule.owner_returning():
