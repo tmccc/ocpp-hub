@@ -168,7 +168,10 @@ def audit_history(journal: Journal, spec_digest: str, current: list[dict[str, An
     if any(name not in attempts or encoded(attempts[name]) != encoded(row) for name, row in admitted_attempts.items()):
         raise SecurityError("native bounded handover must preserve every original history record")
     present = {row["transactionId"]: row for row in current}
-    if any(present.get(row["transactionId"]) != row for row in original):
+    if any(
+        row["transactionId"] not in present or encoded(present[row["transactionId"]]) != encoded(row)
+        for row in original
+    ):
         raise SecurityError("native bounded handover must preserve every original history record")
     if attempts:
         with history_savepoint(journal):

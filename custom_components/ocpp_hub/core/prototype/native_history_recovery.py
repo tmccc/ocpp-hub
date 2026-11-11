@@ -135,7 +135,9 @@ def _reconcile(
             intent = journal.get("managed_control_intent", {})
             # The older parser could only fail on attempts it had never successfully audited.
             NativeHistoryArchive(journal)
-            archived = {r[0] for r in journal.db.execute("SELECT digest FROM native_start_attempts")}
+            archived_names = {
+                json.loads(r[0])["filename"] for r in journal.db.execute("SELECT body FROM native_start_attempts")
+            }
             if (
                 journal.get("native_history_policy") != policy
                 or journal.get("native_start_attempt_recovery") is not None
@@ -154,7 +156,7 @@ def _reconcile(
                 or not any(
                     row["idTagStart"] in plans
                     and 0 <= failure["at_epoch"] - row["startTime"] <= 30
-                    and fingerprint(row) not in archived
+                    and row["filename"] not in archived_names
                     for row in unassigned.values()
                 )
             ):

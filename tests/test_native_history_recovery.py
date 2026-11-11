@@ -491,6 +491,11 @@ async def test_recover_unassigned_start_to_verified_pause(
         with pytest.raises(RecoveryRequiredError):
             acknowledge_start_attempts(journal, fault.book, rig.spec, native)
         assert database(journal) == before
+        attempt["MeterValues"][0]["Offer"] += 1
+        changed_attempt = await rig.prepared.observer.observe_handover()
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, changed_attempt)
+        attempt["MeterValues"][0]["Offer"] -= 1
         journal.db.execute("DELETE FROM native_start_attempts")
         journal.put("native_start_attempt_recovery", {"prior_fault": {"retained": True}})
         before = database(journal)

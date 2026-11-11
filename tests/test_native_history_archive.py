@@ -407,5 +407,11 @@ def test_strict_audit_retains_attempts(history_journal: Journal) -> None:
     audit_history(history_journal, "synthetic", [original], False)
     with pytest.raises(SecurityError):
         audit_history(history_journal, "synthetic", [attempt], False)
+    changed = original | {"meterStart": float(original["meterStart"])}
+    assert changed == original
+    before = contents(history_journal)
+    with pytest.raises(SecurityError):
+        audit_history(history_journal, "synthetic", [changed, unassigned("different")], False)
+    assert contents(history_journal) == before
     assert [json.loads(r[0]) for r in history_journal.db.execute("SELECT body FROM native_start_attempts")] == [attempt]
     assert history_journal.get("native_history_policy") is None
