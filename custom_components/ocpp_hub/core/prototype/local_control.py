@@ -378,10 +378,12 @@ class LocalControl:
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
         epoch, ticket = self._claim(previous.get("inhibit", False))
 
-        # A mode generation supplements the ticket through asynchronous native validation and actual send.
+        restoring_zero = False
+
+        # The positive guard can revoke release; the same ticket and Boot still authorize rollback to zero.
         def check() -> None:
             self._check(epoch, ticket)
-            if guard is not None:
+            if not restoring_zero and guard is not None:
                 guard()
 
         async with self.peer.sequence(1, check) as call:
@@ -391,9 +393,11 @@ class LocalControl:
                     number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a),
                     epoch,
                 )
+                check()
             except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)
+                restoring_zero = True
                 await self._cap(call, 0, epoch)
                 if isinstance(error, ReleaseDeferredError):
                     self._complete(ticket, uncertain=False)

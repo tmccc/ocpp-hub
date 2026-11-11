@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..control import HUB_PROFILE_ID
-from .gateway import timestamp
+from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -99,8 +99,13 @@ def record_session_source(j: Journal, n: HandoverEvidence) -> None:
         return
     active = j.active()
     unreported = local is not None and active != local and not known_timer_closure_gap(j, n)
-    if unreported != lease.get("unreported_native", False):
-        lease = {**lease, "unreported_native": unreported}
+    evidence = lease.get("unreported_source", {})
+    if unreported and (evidence.get("native_id"), evidence.get("plan_id")) != (local, n.session_plan_id):
+        evidence = {"native_id": local, "plan_id": n.session_plan_id, "observed": time.time()}
+    elif not unreported:
+        evidence = {}
+    if unreported != lease.get("unreported_native", False) or evidence != lease.get("unreported_source", {}):
+        lease = {**lease, "unreported_native": unreported, "unreported_source": evidence}
         if unreported and active is not None:
             lease = {
                 **lease,
@@ -286,15 +291,10 @@ class ManagedSchedule:
         )
 
     # A delayed native report must describe an actual open occurrence on this cable, inside its authorized window.
-    async def prepare_native_report(self, payload: dict[str, Any]) -> Callable[[int], None] | None:
+    async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
         c, j = self.c, self.j
         lease = j.get(KEY, {})
-        if (
-            not self.held_report_ready()
-            or self.awaiting_start()
-            or lease.get("vehicle_disconnected")
-            or lease.get("retire_reason") == "vehicle_disconnected"
-        ):
+        if not self.held_report_ready() or self.awaiting_start():
             return None
         tag = payload.get("idTag")
         if (
@@ -305,16 +305,10 @@ class ManagedSchedule:
             return None
         occurred = timestamp(payload.get("timestamp")).timestamp()
         zone = ZoneInfo(c.native.spec.original_configuration["timeZone"])
-        end = lease.get("end_epoch") or cutoff_epoch(lease["start_epoch"], zone)
         accepted_at = lease.get("accepted_epoch")
         if accepted_at is None:
             accepted_at = c.requests.receipt(lease["id"]).get("result", {}).get("accepted_at")
-        if (
-            accepted_at is None
-            or occurred < accepted_at
-            or occurred >= end
-            or occurred > min(time.time(), lease["hold_since"])
-        ):
+        if accepted_at is None or occurred < accepted_at or occurred > time.time():
             return None
         try:
             n = await c.native.read()
@@ -322,16 +316,17 @@ class ManagedSchedule:
         except (SecurityError, TimeoutError) as error:
             raise UnavailableError("delayed timer report awaits verified native evidence") from error
         current = j.get(KEY, {})
+        native_id = n.physical.native_transaction_id
         if (
-            not self.held_report_ready()
+            native_id is None
+            or not current.get("unreported_native")
+            or j.db.execute("SELECT 1 FROM transactions WHERE local=?", (native_id,)).fetchone() is not None
+            or not self.held_report_ready()
             or self.awaiting_start()
             or current.get("id") != lease["id"]
-            or current.get("vehicle_disconnected")
-            or current.get("retire_reason") == "vehicle_disconnected"
             or not n.physical.transaction_open
             or n.physical.connection == "Unplug"
             or n.saved_schedule is None
-            or n.session_plan_id in current.get("reported_plans", [])
             or any(v != 0 for v in n.currents_a + n.powers_w)
             or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
         ):
@@ -339,9 +334,32 @@ class ManagedSchedule:
         plan = next((plan for plan in n.saved_schedule["planList"] if plan["planId"] == n.session_plan_id), None)
         if plan is None or plan["idTag"].casefold() != tag.casefold():
             return None
-        midnight = datetime.fromtimestamp(lease["start_epoch"], zone).replace(hour=0, minute=0, second=0, microsecond=0)
-        begin = lease["start_epoch"] if plan["planId"] == lease["body"]["planId"] else midnight.timestamp()
-        if occurred < begin:
+        temporary = plan["planId"] == lease["body"]["planId"]
+        reported_day = datetime.fromtimestamp(occurred, zone)
+        occurrence = int(reported_day.replace(hour=0, minute=0, second=0, microsecond=0, fold=0).timestamp())
+        if temporary:
+            if (
+                current.get("vehicle_disconnected")
+                or current.get("retire_reason") == "vehicle_disconnected"
+                or occurred < lease["start_epoch"]
+                or occurred >= cutoff_epoch(lease["start_epoch"], zone)
+                or occurred > current["hold_since"]
+            ):
+                return None
+        elif (
+            reported_day.date()
+            not in (
+                datetime.fromtimestamp(time.time(), zone).date(),
+                datetime.fromtimestamp(current.get("unreported_source", {}).get("observed", time.time()), zone).date(),
+            )
+            or occurred >= cutoff_epoch(occurrence, zone)
+            or occurred > current["hold_since"]
+            and c.requests.intent().mode != "app"
+        ):
+            return None
+        key = str(plan["planId"])
+        reported = current.get("reported_occurrences", {})
+        if occurrence <= reported.get(key, -1):
             return None
 
         # The normal ledger allocates its own ID. Only a later matching native ID can authorize Stop or continuation.
@@ -351,11 +369,11 @@ class ManagedSchedule:
                 {
                     **current,
                     "unidentified_local": local,
-                    "reported_plans": [*current.get("reported_plans", []), plan["planId"]],
+                    "reported_occurrences": {**reported, key: occurrence},
                 },
             )
 
-        return accepted
+        return NativeStartReport(native_id, plan["planId"], accepted)
 
     # Never grant a new Start to the retired timer's tag while its physical removal remains unverified.
     def permits_tag(self, tag: str) -> bool:

@@ -246,8 +246,12 @@ class ManagedController:
 
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> None:
+            timer = j.get(KEY, {})
             if continuing_local is not None and (
-                j.active() != continuing_local or j.get(KEY, {}).get("unidentified_local") != continuing_local
+                j.active() != continuing_local
+                or timer.get("unidentified_local") != continuing_local
+                or timer.get("other_local") != continuing_local
+                or timer.get("unreported_native")
             ):
                 raise ReleaseDeferredError("source-specific continuation was superseded")
             if self.stopping or self.requests.intent() != expected_intent:

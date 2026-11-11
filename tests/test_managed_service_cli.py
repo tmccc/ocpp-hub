@@ -9,6 +9,7 @@ import socket
 import ssl
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 
+from tests.handover_helpers import crash
+from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_native_bounded_session import connected_bench
 from tests.test_prototype import BOOT
 from tests.test_prototype_runtime import FAST, until
@@ -358,3 +361,84 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                     callbacks[signal.SIGTERM]()
                 running.cancel()
                 await asyncio.gather(running, return_exceptions=True)
+
+
+# Intent: the production service's independent deadline task protects a full open car while its main poll is stalled.
+# Why: invoking the controller in a test cannot detect a missing, prematurely cancelled, or unwired service task.
+async def test_running_service_enforces_timer_with_stalled_main_poll(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        await crash(b.session)
+        callbacks = {}
+        sessions = []
+        loop = asyncio.get_running_loop()
+        rig = b.rig
+
+        # Keep the pre-commissioned synthetic installation, both protocol peers and the real service loop.
+        def simulated_session(prepared, **kwargs):
+            session = TrialSession(prepared, FAST, **kwargs)
+            sessions.append(session)
+            rig.sessions.append(session)
+            return session
+
+        monkeypatch.setattr(managed_proxy, "preflight", lambda _: rig.prepared)
+        monkeypatch.setattr(managed_proxy, "native_spec", lambda *_: rig.spec)
+        monkeypatch.setattr(managed_proxy, "TrialSession", simulated_session)
+        monkeypatch.setattr(managed_proxy, "notify", lambda _: None)
+        monkeypatch.setattr(loop, "add_signal_handler", lambda sig, callback: callbacks.update({sig: callback}))
+        monkeypatch.setattr(loop, "remove_signal_handler", lambda _: True)
+        spec_path = tmp_path / "native-spec.json"
+        save_private(spec_path, rig.spec.value())
+        status_path = rig.prepared.config.journal.with_suffix(".status.json")
+        running = asyncio.create_task(managed_proxy.serve(tmp_path / "service.json", spec_path))
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        # Observe only the health report published by the actual process loop.
+        async def wait_healthy(open_session):
+            async with asyncio.timeout(22):
+                while True:
+                    if status_path.exists():
+                        status = json.loads(status_path.read_text())
+                        if status.get("state") == "healthy" and status.get("charging_session_open") is open_session:
+                            return status
+                    await asyncio.sleep(0.05)
+
+        try:
+            await until(lambda: bool(sessions) and sessions[0].started)
+            b.session = sessions[0]
+            async with rig.charger(b.session) as b.sock:
+                assert (await rig.bench.call(b.sock, "running-service-boot", "BootNotification", BOOT))[0] == 3
+                assert (await wait_healthy(False))["station_ceiling_a"] == 6
+                b.clock.now = b.start
+                local = await b.fire(b.timer, demand=False)
+                assert (await wait_healthy(True))["power_w"] == 0
+                read = ManagedController.settled_native
+
+                # Suspend the foreground poll at its native observation. Only the service's deadline task can progress.
+                async def stalled(controller):
+                    entered.set()
+                    await release.wait()
+                    return await read(controller)
+
+                monkeypatch.setattr(ManagedController, "settled_native", stalled)
+                await asyncio.wait_for(entered.wait(), 8)
+                b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+                async with asyncio.timeout(35):
+                    while not b.stops():
+                        await asyncio.sleep(0.03)
+                assert b.stops() == [local] and b.device.effective_limit() == 0
+                assert b.session.journal.active() == local and b.timer in b.device.plans
+                release.set()
+                await b.close_transaction(local)
+                assert (await wait_healthy(False))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+                daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
+                assert daily != local and (await wait_healthy(True))["power_w"] > 0 and b.stops() == [local]
+                await b.close_transaction(daily)
+                callbacks[signal.SIGTERM]()
+                assert await asyncio.wait_for(running, 8) == 0
+        finally:
+            release.set()
+            if not running.done():
+                if signal.SIGTERM in callbacks:
+                    callbacks[signal.SIGTERM]()
+                await asyncio.wait_for(running, 10)

@@ -10,6 +10,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -66,6 +67,15 @@ def timestamp(value: Any) -> datetime:
     return parsed.astimezone(UTC)
 
 
+@dataclass(frozen=True)
+class NativeStartReport:
+    """A verified physical occurrence and its receipt to commit with the ordinary local transaction."""
+
+    native_id: int
+    plan_id: int
+    record: Callable[[int], None] = field(compare=False)
+
+
 class Gateway:
     """One admitted charger, independent local control, and one fixed vendor mirror."""
 
@@ -81,7 +91,7 @@ class Gateway:
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
         self.status_observer: Callable[[dict[str, Any]], None] | None = None
         self.held_start_report: Callable[[str], bool] | None = None
-        self.native_start_report: Callable[[dict[str, Any]], Awaitable[Callable[[int], None] | None]] | None = None
+        self.native_start_report: Callable[[dict[str, Any]], Awaitable[NativeStartReport | None]] | None = None
         self.remote_start_guard: Callable[[], bool] | None = None
         self.tag_guard: Callable[[str], bool] | None = None
         self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
@@ -305,6 +315,22 @@ class Gateway:
                     and not self.journal.known_start(payload)
                 ):
                     native_report = await self.native_start_report(payload)
+                    tag = payload.get("idTag")
+                    if (
+                        native_report is not None
+                        and self.policy.strict_cloud_authorization
+                        and isinstance(tag, str)
+                        and self._tag_info(tag)["status"] == "Expired"
+                        and self.auth_info.accepted_for_delayed_report(
+                            tag, timestamp(payload["timestamp"]).timestamp(), payload["timestamp"]
+                        )
+                        is None
+                    ):
+                        await self._renew_direct_start(payload, epoch, held_native=True)
+                        refreshed = await self.native_start_report(payload)
+                        if refreshed is None or refreshed != native_report:
+                            raise DeniedError("the native occurrence changed during cloud authorization")
+                        native_report = refreshed
                     self._require_epoch("charger", epoch)
                     if self.journal.get("control", {}).get("ticket") != ticket:
                         raise DeniedError("a newer owner operation superseded the reported start")
@@ -327,7 +353,7 @@ class Gateway:
 
     # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
     def _local_answer(
-        self, token: str, action: str, payload: dict[str, Any], *, native_report: Callable[[int], None] | None = None
+        self, token: str, action: str, payload: dict[str, Any], *, native_report: NativeStartReport | None = None
     ) -> dict[str, Any]:
         if action == "BootNotification":
             previous_boot = self.journal.get("boot")
@@ -371,7 +397,7 @@ class Gateway:
             # Permission binding and the pending flag belong to the very same commit as the new Start fact.
             def accepted(local: int) -> None:
                 if native_report is not None:
-                    native_report(local)
+                    native_report.record(local)
                 self.authorisation.consume(payload["idTag"], local)
                 control = self.journal.get("control", {})
                 self.journal.put("control", {**control, "start_pending": False})
@@ -491,7 +517,7 @@ class Gateway:
         return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
 
     # A native timer can send Start directly on the next day, after its previous cloud approval expired.
-    async def _renew_direct_start(self, payload: dict[str, Any], epoch: int) -> None:
+    async def _renew_direct_start(self, payload: dict[str, Any], epoch: int, *, held_native: bool = False) -> None:
         tag = payload.get("idTag")
         if (
             not isinstance(tag, str)
@@ -500,8 +526,10 @@ class Gateway:
             or self.journal.known_start(payload)
             or self.journal.active() is not None
             or self.journal.get("control", {}).get("inhibit")
+            and not held_native
             or self.journal.get("trial_starting")
             or self.journal.get("trial_phase") not in (None, "active")
+            and not (held_native and self.journal.get("trial_phase") == "recovering")
             or self.authorisation.allows(tag)
         ):
             return
@@ -516,7 +544,12 @@ class Gateway:
         # Work from a retired plug connection or superseded owner operation cannot renew current authority.
         def guard() -> None:
             self._require_epoch("charger", epoch)
-            if self.journal.get("control", {}).get("ticket") != ticket or self.auth_info.stored(tag) != stored:
+            if (
+                self.journal.get("control", {}).get("ticket") != ticket
+                or self.auth_info.stored(tag) != stored
+                or held_native
+                and (not self.controls.ready or self.controls.desired() != 0)
+            ):
                 raise DeniedError("scheduled start authority changed during renewal")
 
         # Share even a timeout or unchanged expired answer across this burst of retries. A later burst may retry.
@@ -541,7 +574,8 @@ class Gateway:
                     self.journal.get("control", {}).get("ticket") != ticket
                     or current is None
                     or current["status"] != "Accepted"
-                    or not self._tag_allowed(tag)
+                    or not held_native
+                    and not self._tag_allowed(tag)
                 ):
                     raise
             received = True

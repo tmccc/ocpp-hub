@@ -1989,3 +1989,154 @@ async def test_lost_provisional_zero_ack_then_daily_source(tmp_path, tls, unused
         assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
         daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
         assert daily != local and (await healthy(b.c))["power_w"] > 0 and not b.stops() and not starts(b.rig)
+
+
+# Intent: a confirmed source correction during a positive ACK survives subsequent telemetry loss at cutoff.
+# Why: the completed write must restore zero even when the next ordinary native poll cannot perform the correction.
+async def test_lost_source_after_positive_write_with_telemetry_outage(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        b.clock.now = b.start
+        local = await b.start_plan(9)
+        b.rig.peer.plan_session = (local, 987654)
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await b.c.tick()
+        assert b.device.effective_limit() == 0 and not b.stops()
+        b.rig.peer.plan_session = (local, 9)
+        observer = b.session.prepared.observer
+        read = observer._read
+        corrected = asyncio.Event()
+
+        # Lose the separate telemetry path only after a genuine complete read has corrected the open session's source.
+        async def unavailable(action, data=None):
+            raise TimeoutError("independent native read unavailable")
+
+        # The independent charger's physical write precedes delivery of its reply on the control socket.
+        async def after_write(action, payload):
+            if (
+                action == "SetChargingProfile"
+                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
+                and not corrected.is_set()
+            ):
+                b.rig.peer.plan_session = (local, 987654)
+                await b.c.native.read()
+                observer._read = unavailable
+                corrected.set()
+
+        b.rig.bench.before_reply = after_write
+        try:
+            await b.c.tick()
+            assert corrected.is_set() and b.device.effective_limit() == 0 and not b.stops()
+            assert "hold_since" in b.session.journal.get(managed_schedule.KEY)
+        finally:
+            b.rig.bench.before_reply = None
+            observer._read = read
+        b.rig.peer.plan_session = (local, 9)
+        b.clock.now += 16
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and b.session.journal.active() == local
+        await b.close_transaction(local)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9} and not b.stops()
+
+
+# Intent: a retained one-off cannot exclude an independently verified daily occurrence on a later local date.
+# Why: a rejected timer clear can span midnight and the daily tag's original cloud approval may have expired.
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("demand", [False, True])
+async def test_daily_occurrences_during_prolonged_clear_refusal(
+    tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.arm()
+        monkeypatch.setattr(auth_info, "time", SimpleNamespace(time=lambda: b.clock.now))
+        standard = trial_bench.info
+        monkeypatch.setattr(
+            trial_bench,
+            "info",
+            lambda: standard() | {"expiryDate": datetime.fromtimestamp(b.clock.now + 300, UTC).isoformat()},
+        )
+        tag = b.device.plans[9]["idTag"]
+        assert (await b.rig.bench.call(b.sock, "prior-authorization", "Authorize", {"idTag": tag}))[2]["idTagInfo"][
+            "status"
+        ] == "Accepted"
+        answer = b.device.answer
+
+        # Let the independent native station reject cleanup across two actual calendar dates.
+        def refuse_clear(action, payload):
+            if action == "DataTransfer" and payload.get("messageId") == "clearPlans":
+                return {"status": "Rejected", "data": ""}
+            return answer(action, payload)
+
+        b.device.answer = refuse_clear
+        b.clock.now = b.start + 601
+        for _ in range(4):
+            await b.c.tick()
+        assert b.device.effective_limit() == 0 and b.timer in b.device.plans
+        if restart:
+            await crash(b.session)
+            b.session = managed_session(b.rig)
+            await b.session.start()
+            b.c = ManagedController(b.session)
+        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
+            if restart:
+                await introduced(b.rig, b.session, b.sock, "long-clear-boot")
+            for day in (12, 13):
+                b.clock.now = int(datetime(2026, 11, day, tzinfo=ZONE).timestamp())
+                b.device.active = 987654
+                b.device.fire_plan(9)
+                b.rig.peer.paused = False
+                b.rig.peer.permission_enabled = demand
+                b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
+                if not demand:
+                    b.device.requested_current = 0
+                assert b.session.gateway.auth_info.get(tag)["status"] == "Expired"
+                body = START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()}
+                for plan in (b.timer, 987655):
+                    b.rig.peer.plan_session = (987654, plan)
+                    refused = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+                    assert refused[0] == 4 and b.session.journal.active() is None
+                b.rig.peer.plan_session = (987654, 9)
+                await b.c.tick()
+                if day == 13 and not demand:
+                    # The same open daily occurrence may report its Start after midnight.
+                    b.clock.now += 86410
+                    await b.c.tick()
+                if day == 12 and restart:
+                    authorize = trial_bench.info
+
+                    # Replace the observed native ID while the real backend is replying to the expired daily tag.
+                    def changed_transaction():
+                        b.device.active = 987655
+                        b.rig.peer.plan_session = (987655, 9)
+                        return authorize()
+
+                    monkeypatch.setattr(trial_bench, "info", changed_transaction)
+                    try:
+                        changed = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+                        assert (
+                            changed[0] == 4 and b.session.journal.active() is None and b.device.effective_limit() == 0
+                        )
+                    finally:
+                        monkeypatch.setattr(trial_bench, "info", authorize)
+                    b.device.active = 987654
+                    b.rig.peer.plan_session = (987654, 9)
+                reply = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+                assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+                local = reply[2]["transactionId"]
+                assert local != 987654 and b.device.effective_limit() == 0
+                b.rig.peer.plan_session = (local, 9)
+                for _ in range(4):
+                    await b.c.tick()
+                assert b.session.journal.active() == local and b.device.effective_limit() == 6 and not b.stops()
+                assert b.device.current == (6 if demand else 0)
+                if day == 13:
+                    b.device.answer = answer
+                b.clock.now += 301
+                await b.close_transaction(local)
+                for _ in range(4):
+                    await b.c.tick()
+            assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
+            following = datetime.fromtimestamp(b.clock.now, ZONE).replace(hour=0, minute=0, second=0) + timedelta(
+                days=1
+            )
+            daily = await b.advance_idle_to(int(following.timestamp()))
+            assert daily is not None and (await healthy(b.c))["power_w"] > 0 and not b.stops() and not starts(b.rig)
