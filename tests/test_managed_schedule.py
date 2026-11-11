@@ -96,7 +96,7 @@ async def test_temporary_native_schedule(
 ) -> None:
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", SchedulePeer)
     monkeypatch.setitem(native_bench.ORIGINAL, "timeZone", "Europe/London")
-    logical = datetime.now(UTC).replace(hour=8, minute=0, second=0, microsecond=0).timestamp()
+    logical = datetime(2026, 11, 11, 8, tzinfo=UTC).timestamp()
     monkeypatch.setattr(managed_schedule, "time", SimpleNamespace(time=lambda: logical))
     target = int(logical) + 180
     async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as rig:
@@ -113,6 +113,10 @@ async def test_temporary_native_schedule(
             s.gateway.policy = replace(s.gateway.policy, max_current_a=32)
             s.gateway.controls.policy = s.gateway.policy
             await healthy(c)
+            if outcome == "charge":
+                c.current.accept(uuid.uuid4().hex, c.requests.intent().revision, 32)
+                await c.current.settle()
+                assert (await healthy(c))["station_ceiling_a"] == 32
             identifier = uuid.uuid4().hex
             port = unused_tcp_port_factory()
             api = ManagementServer(ManagementSettings(port, tmp_path / "no-token", TOKEN), c, lambda: {})
@@ -123,7 +127,15 @@ async def test_temporary_native_schedule(
                     additional_headers={"Authorization": "Bearer " + TOKEN},
                     subprotocols=["ics-proxy.v1"],
                 ) as client:
-                    args = {"id": identifier, "command": "temporary_schedule", "revision": 0, "start_epoch": target}
+                    args = {
+                        "id": identifier,
+                        "command": "temporary_schedule",
+                        "revision": c.requests.intent().revision,
+                        "start_epoch": target,
+                    }
+                    overlap = target + 12 * 3600
+                    refused = await call(client, **(args | {"start_epoch": overlap}))
+                    assert not refused["ok"] and not c.schedule.summary()
                     reply = await call(client, **args)
                     assert reply["ok"] and reply["result"]["state"] == "accepted"
                     assert await call(client, **args) == reply
@@ -156,6 +168,7 @@ async def test_temporary_native_schedule(
             assert lease["state"] == "armed" and lease["body"]["planId"] != 9
             timer = lease["body"]["planId"]
             assert lease["body"]["startTime"] == 8 * 60 + 3
+            assert lease["body"]["limitCurrent"] == (320 if outcome == "charge" else 60)
             assert set(rig.bench.firmware.plans) == {9, timer} and not starts(rig)
             assert s.gateway.policy.extensions.get(("IoCharger", "setPlan")) is None
             before = (await rig.prepared.observer.observe_handover()).saved_schedule

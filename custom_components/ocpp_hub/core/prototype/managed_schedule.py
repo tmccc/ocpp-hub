@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -114,6 +114,9 @@ class ManagedSchedule:
         ):
             raise SecurityError("unsupported native daily timer")
         duration = integer(original["stopValue"], 1, 1440)
+        next_midnight = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if start_epoch + duration * 60 >= next_midnight.timestamp():
+            raise SecurityError("temporary timer would overlap the next daily start")
         amp = integer(original["limitCurrent"], 60, 320)
         amp = min(amp, c.current.selected() * 10)
         # Use a higher free 16-bit ID, as in the captured two-plan native ordering.
@@ -210,6 +213,14 @@ class ManagedSchedule:
                 or c.requests.intent().revision != lease["revision"]
                 or c.requests.intent().mode != "app"
                 or j.get("control", {}).get("inhibit")
+                or j.get("control", {}).get("uncertain")
+                or j.get("control", {}).get("owner") != "shared"
+                or j.get("control", {}).get("start_pending")
+                or j.get("uncertain_vendor_command")
+                or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
+                or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                or c.requests.pending_return() is not None
+                or g.controls._operations
                 or c.current.pending()
                 or c.tests.lease is not None
                 or j.get("vendor_start_grant")
