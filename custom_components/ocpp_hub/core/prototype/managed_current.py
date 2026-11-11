@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
-from .managed_schedule import KEY
+from .managed_schedule import KEY, OBSERVABLE
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -62,6 +62,8 @@ class ManagedCurrentLimits:
                 intent = controller.requests.intent()
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 controller.session.gateway.controls._claim(True, stopping=True)
+                control = self.journal.get("control")
+                self.journal.put("control", {**control, "resume_limit": change["current_a"]})
                 self.journal.put("managed_current_change", {**change, "state": "interrupted"})
 
     # All current receipts and authority use the session's existing exclusive journal owner.
@@ -72,7 +74,12 @@ class ManagedCurrentLimits:
     # The selected future current remains separate from the effective zero ceiling of an intentional pause.
     def selected(self) -> int:
         ceiling = managed_current_ceiling(self.journal, self.controller.native.spec)
-        value = self.journal.get("control", {}).get("resume_limit", 6)
+        change = self.journal.get("managed_current_change", {})
+        value = (
+            change["current_a"]
+            if change.get("state") == "pending"
+            else self.journal.get("control", {}).get("resume_limit", 6)
+        )
         if type(value) not in (int, float) or not 6 <= value <= ceiling or int(value) != value:
             raise SecurityError("persisted selected current is malformed")
         return int(value)
@@ -163,8 +170,8 @@ class ManagedCurrentLimits:
                 "control",
                 {
                     **control,
-                    "resume_limit": value,
-                    **({"owner": "local", "uncertain": True} if intent.mode == "app" else {}),
+                    # Only the guarded worker may make a pending increase available to a live station.
+                    **({"owner": "local", "uncertain": True} if intent.mode == "app" else {"resume_limit": value}),
                 },
             )
         expected = c.requests.intent()
@@ -224,21 +231,33 @@ class ManagedCurrentLimits:
             intent = c.requests.intent()
             superseded = intent.mode != mode or intent.revision != revision
             timer = j.get(KEY, {})
-            if not superseded and mode == "app" and c.schedule.revoked(timer):
+            active = j.active()
+            retired = c.schedule.revoked(timer)
+            if (
+                not superseded
+                and mode == "app"
+                and (retired or active is not None and timer.get("state") in OBSERVABLE)
+            ):
                 # A concurrent departure may interrupt the read before the positive-write guard runs.
                 with j.atomic():
+                    if active is not None:
+                        timer = {**timer, "unidentified_local": active}
+                        j.put(KEY, timer)
                     c.schedule.begin_hold(timer)
                     j.put("control", {**j.get("control", {}), "resume_limit": previous_value})
-                    if j.active() in (None, timer.get("bound_local")):
-                        g.controls._claim(True, stopping=True)
+                    g.controls._claim(True, stopping=True)
                     j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
-                    c.requests.finish(identifier, "failed", {"classification": "timer_retired"})
+                    reason = "timer_retired" if retired else "session_opened"
+                    c.requests.finish(identifier, "failed", {"classification": reason})
                 await c.schedule.protect_station(j.get(KEY))
                 return
             with j.atomic():
                 if not superseded:
                     j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                     g.controls._claim(True, stopping=True)
+                control = j.get("control", {})
+                if control.get("inhibit") is True:
+                    j.put("control", {**control, "resume_limit": value})
                 j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "uncertain"})
                 c.requests.finish(
                     identifier, "failed" if superseded else "uncertain", {"classification": "current_unconfirmed"}

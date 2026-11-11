@@ -117,6 +117,11 @@ class ManagedController:
             native = await self.native.read()
             self.native.require_known_session(native)
             self.session.book.owned_present(native.physical)
+            controls = self.session.gateway.controls
+            if not native.physical.transaction_open and controls.ready and controls.desired() == 0:
+                self.require_paused(native)
+                controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
+                return
             await self.session.gateway.stop()
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
@@ -322,6 +327,10 @@ class ManagedController:
             raise UnavailableError("managed release authority changed during its native check")
         release_guard = self.schedule.check_release if continuing_local is None else guard
         release_guard()
+        if expected_intent.mode == "paused":
+            guard()
+            self.require_paused(native)
+            self.requests.confirm_pauses()
         self.session.book.before_positive_release = release_guard
         try:
             await g.controls.release(guard=guard)

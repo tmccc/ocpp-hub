@@ -48,6 +48,7 @@ def remember_disconnect(journal: Journal) -> None:
             {
                 **lease,
                 "vehicle_disconnected": True,
+                "departed_local": journal.active(),
                 "retire_reason": lease.get("retire_reason") or "vehicle_disconnected",
             },
         )
@@ -74,20 +75,50 @@ def recorded_station_profile(j: Journal, spec_digest: str, boot_digest: str) -> 
     )
 
 
-# A matching transaction with a different original plan or accepted tag identifies independent work.
+# A vendor grant identifies a separately accepted command only when its exact mutation and tag agree.
+def confirmed_vendor_start(j: Journal, tag_digest: str, local: int | None) -> bool:
+    grant = j.get("vendor_start_grant", {})
+    return bool(
+        grant.get("local") == local
+        and grant.get("digest") == tag_digest
+        and j.db.execute(
+            "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
+            "AND action='RemoteStartTransaction' AND state='confirmed'",
+            (grant.get("mutation"),),
+        ).fetchone()
+    )
+
+
+# A conflicting temporary plan field needs independent proof of the exact owner command and lifecycle.
 def independent_session(j: Journal, lease: dict[str, Any], n: HandoverEvidence, local: int) -> bool:
     if (
         not n.physical.transaction_open
         or n.physical.native_transaction_id != local
-        or n.session_plan_id == lease["body"]["planId"]
+        or n.physical.connection == "Unplug"
     ):
         return False
-    if n.saved_schedule is not None and any(
-        plan["planId"] == n.session_plan_id for plan in n.saved_schedule["planList"]
+    temporary = n.session_plan_id == lease["body"]["planId"]
+    if (
+        not temporary
+        and n.saved_schedule is not None
+        and any(plan["planId"] == n.session_plan_id for plan in n.saved_schedule["planList"])
     ):
         return True
     row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
-    return row is not None and json.loads(row["start"])["idTag"].casefold() != lease["body"]["idTag"].casefold()
+    if row is None:
+        return False
+    tag = json.loads(row["start"])["idTag"].casefold()
+    if tag == lease["body"]["idTag"].casefold():
+        return False
+    if not temporary:
+        return True
+    digest = fingerprint(tag)
+    owner = j.get("managed_test_charge", {})
+    return confirmed_vendor_start(j, digest, local) or (
+        owner.get("start_rpc_accepted") is True
+        and owner.get("local_transaction") == local
+        and owner.get("tag_digest") == digest
+    )
 
 
 # Publish the source of each fully verified, open native observation before any cutoff or recovery task can act.
@@ -97,15 +128,20 @@ def record_session_source(j: Journal, n: HandoverEvidence) -> None:
     if lease.get("state") not in OBSERVABLE:
         return
     active = j.active()
-    unreported = local is not None and active != local and not known_timer_closure_gap(j, n)
+    gap = known_timer_closure_gap(j, n)
+    unreported = local is not None and active != local and not gap
     evidence = lease.get("unreported_source", {})
     if unreported and (evidence.get("native_id"), evidence.get("plan_id")) != (local, n.session_plan_id):
         evidence = {"native_id": local, "plan_id": n.session_plan_id, "observed": time.time()}
     elif not unreported:
         evidence = {}
-    if unreported != lease.get("unreported_native", False) or evidence != lease.get("unreported_source", {}):
-        lease = {**lease, "unreported_native": unreported, "unreported_source": evidence}
-        if unreported and active is not None:
+    if (
+        gap != lease.get("closure_gap", False)
+        or unreported != lease.get("unreported_native", False)
+        or evidence != lease.get("unreported_source", {})
+    ):
+        lease = {**lease, "unreported_native": unreported, "unreported_source": evidence, "closure_gap": gap}
+        if active is not None and (unreported or gap and active == lease.get("other_local")):
             lease = {
                 **lease,
                 "unidentified_local": active,
@@ -137,6 +173,11 @@ def record_session_source(j: Journal, n: HandoverEvidence) -> None:
         independent = independent_session(j, lease, n, local)
         if previous == local:
             changes.update(bound_local=None, native_plan_confirmed=False)
+        if independent and "hold_since" in lease and lease.get("unidentified_local") != local:
+            # This open session inherited a physical zero established for a different or as-yet unidentified ID.
+            changes["unidentified_local"] = local
+        if independent and lease.get("departed_local") == local:
+            changes["departed_local"] = None
         if independent and other != local:
             changes["other_local"] = local
         elif not independent and other == local:
@@ -175,6 +216,8 @@ async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Call
             not authorized()
             or current.get("id") != lease["id"]
             or not current.get("native_plan_confirmed")
+            or current.get("closure_gap")
+            or current.get("unreported_native")
             or current.get("bound_local") != lease["bound_local"]
             or current.get("other_local") == lease["bound_local"]
             or j.active() not in (None, lease["bound_local"])
@@ -289,16 +332,7 @@ class ManagedSchedule:
             and prior.get("tag_digest") == fingerprint(tag.casefold())
         ):
             return True
-        grant = j.get("vendor_start_grant", {})
-        return bool(
-            grant.get("local") is None
-            and grant.get("digest") == fingerprint(tag.casefold())
-            and j.db.execute(
-                "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
-                "AND action='RemoteStartTransaction' AND state='confirmed'",
-                (grant.get("mutation"),),
-            ).fetchone()
-        )
+        return confirmed_vendor_start(j, fingerprint(tag.casefold()), None)
 
     # A delayed native report must describe an actual open occurrence on this cable, inside its authorized window.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
@@ -791,6 +825,7 @@ class ManagedSchedule:
                     or lease.get("retire_reason") == "vehicle_disconnected"
                     or lease.get("vehicle_disconnected")
                     or lease.get("unreported_native")
+                    or lease.get("closure_gap")
                 )
                 if due and not self.j.get("managed_control_fault"):
                     try:
@@ -812,12 +847,17 @@ class ManagedSchedule:
             and lease.get("retire_reason") != "vehicle_disconnected"
             and not lease.get("vehicle_disconnected")
             and not lease.get("unreported_native")
+            and not lease.get("closure_gap")
             or not self.hold_authorized()
         ):
             return
         bound, active = lease.get("bound_local"), j.active()
         if active is not None and active != bound:
-            if active == lease.get("other_local"):
+            if (
+                active == lease.get("other_local")
+                and not lease.get("closure_gap")
+                and active != lease.get("departed_local")
+            ):
                 return
             if lease.get("unidentified_local") != active:
                 lease = {**lease, "unidentified_local": active}
