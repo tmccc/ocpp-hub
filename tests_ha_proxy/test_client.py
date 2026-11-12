@@ -58,6 +58,8 @@ async def peer():
         "lose_reply": False,
         "pending_receipt": False,
         "receipt_delay": 0,
+        "status_delay": 0,
+        "status_failure": False,
     }
     receipts = {}
 
@@ -73,6 +75,10 @@ async def peer():
         control["requests"].append(copy.deepcopy(value))
         if command == "status":
             result = copy.deepcopy(state)
+            await asyncio.sleep(control["status_delay"])
+            if control["status_failure"]:
+                await socket.close()
+                return socket
         elif command in ("pause", "app_control"):
             if command == "app_control" and value["revision"] != state["control_revision"]:
                 await socket.send_json({"ok": False, "error": "not_ready"})

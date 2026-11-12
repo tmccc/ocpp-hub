@@ -39,6 +39,7 @@ def notify(value: str) -> None:
     address = "\0" + destination[1:] if destination.startswith("@") else destination
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as stream:
+            stream.setblocking(False)
             stream.sendto(value.encode(), address)
     except OSError:
         pass  # Running outside a manager must not break the independent charger receiver.

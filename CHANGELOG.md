@@ -2,6 +2,15 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Treat complete native-audit deadlines as unavailable telemetry and enter the existing zero recovery. Keep
+  listening for a genuine Boot after a failed read-only probe, and retain Return while a known closed Stop awaits
+  its cloud acknowledgement. Make watchdog notification best effort without blocking control supervision.
+- Audit rejected routine reports and continue lifecycle delivery. Add exclusive offline, independently attested
+  recovery for legacy rejected reports, uncertain vendor writes and unattributed accepted owner Starts. Recovery
+  retains zero and requires a fresh Pause before a separate Return; ambiguous commands are never replayed.
+- Include response transit in HA freshness, clear recovered fault notices after integration reload, and show unknown
+  last-session energy when malformed native history prevents identifying the latest session.
+
 - Keep running Return exclusive, wake deadline supervision when native evidence reopens a timer obligation,
   and bind ordinary outage recovery to the exact confirmed command source. Reserve bounded lifecycle storage
   independently of routine telemetry, including each accepted transaction's Stop.

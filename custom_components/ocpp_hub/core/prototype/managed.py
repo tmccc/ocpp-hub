@@ -17,6 +17,7 @@ from .managed_current import (
 from .managed_current_recovery import capture_interrupted_collision
 from .managed_intent import ControlIntent, ManagedRequests
 from .managed_release_recovery import reconcile_owner_release, record_release_pause
+from .managed_release_wait import awaiting_known_stops
 from .managed_schedule import (
     KEY,
     ManagedSchedule,
@@ -28,7 +29,7 @@ from .managed_schedule import (
 )
 from .managed_start_binding import ManagedStartBinding
 from .managed_test_charge import ManagedChargeTests
-from .managed_view import charger_history
+from .managed_view import summarize_charger_history
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
@@ -380,11 +381,13 @@ class ManagedController:
         row = j.db.execute(
             "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
-        require_lifecycle_idle(
-            g,
-            continuing_local=continuing_local,
-            preserve_expired_start=self.tests.preserve_debt(native, continuing_local),
-        )
+        pending_stop = continuing_local is None and awaiting_known_stops(j)
+        if not pending_stop:
+            require_lifecycle_idle(
+                g,
+                continuing_local=continuing_local,
+                preserve_expired_start=self.tests.preserve_debt(native, continuing_local),
+            )
         if (
             j.get("trial_phase") not in ("active", "recovering")
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
@@ -404,15 +407,16 @@ class ManagedController:
             or row["state"] != "confirmed"
             or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
             or not allow_offline
+            and not pending_stop
             and j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             or g.controls._operations
             or g.charger._pending
             or j.get("uncertain_vendor_command")
         ):
             raise RecoveryRequiredError("shared control awaits fresh zero and actual history/cloud reconciliation")
-        if g.vendor._pending:
-            # All write debts are settled above; no positive release has started while a routine RPC is in flight.
-            raise ReleaseDeferredError("shared control awaits completion of the current cloud RPC")
+        if pending_stop or g.vendor._pending:
+            # A known closed Stop or ordinary RPC can finish before any positive release is dispatched.
+            raise ReleaseDeferredError("shared control awaits the current cloud acknowledgement")
 
     # Verify again after recovery acknowledgement; release raises only the ceiling and never sends RemoteStart.
     async def restore_owner_control(
@@ -598,14 +602,15 @@ class ManagedController:
             self.current.returned_to_previous()
             self.requests.finish(identifier, "completed", {"app_control_enabled": True, "charging_started": False})
 
-    # Wait for outgoing resource mutations rather than classifying an inventory sampled across a legitimate write.
+    # Resource settling, a complete native audit and closure agreement each have their own bounded wait.
     async def settled_native(self) -> HandoverEvidence:
         async with asyncio.timeout(15):
             while self.session._resource_mutation_inflight():
                 await asyncio.sleep(0.02)
-            if self.current.applying():
-                raise RecoveryRequiredError("current application owns the pending native verification")
-            native = await self.native.read()
+        if self.current.applying():
+            raise RecoveryRequiredError("current application owns the pending native verification")
+        native = await self.native.read()
+        async with asyncio.timeout(15):
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
             await self.schedule.await_closure_agreement(native)
@@ -664,6 +669,12 @@ class ManagedController:
                 "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
             ).fetchone()[0],
             "automatic_charge_restart": False,
+            "vendor_write_uncertain": j.db.execute(
+                "SELECT COUNT(*) FROM mutations WHERE origin='vendor' AND state!='confirmed'"
+            ).fetchone()[0],
+            "operator_reconciliation_required": bool(j.get("uncertain_vendor_command"))
+            or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed'").fetchone()
+            is not None,
             "desired_control": self.requests.intent().mode,
             "control_revision": self.requests.intent().revision,
             "local_hold_verified": False,
@@ -881,6 +892,7 @@ class ManagedController:
                 self.requests.finish(
                     pending_return[0], "completed", {"app_control_enabled": True, "charging_started": False}
                 )
+        history = summarize_charger_history(native.history)
         return {
             **base,
             "local_healthy": bool(local_healthy),
@@ -917,7 +929,8 @@ class ManagedController:
             "history_warning": "records_absent_from_charger"
             if j.get("native_history_summary", {}).get("missing_records", 0)
             else None,
-            "charger_sessions": charger_history(native.history),
+            "charger_sessions": history.sessions,
+            "charger_history_complete": history.complete,
             "temporary_schedule": self.schedule.summary(),
             "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
         }

@@ -101,6 +101,9 @@ class Journal:
             CREATE TABLE IF NOT EXISTS transaction_clock_discontinuities(
                 local INTEGER PRIMARY KEY REFERENCES transactions(local),
                 start_timestamp TEXT NOT NULL,stop_timestamp TEXT NOT NULL,observed_at_epoch REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS rejected_observations(
+                token TEXT PRIMARY KEY,action TEXT NOT NULL,digest TEXT NOT NULL,local INTEGER,
+                code TEXT,prior_state TEXT NOT NULL,recorded_at REAL NOT NULL);
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(transactions)")}
         for name in ("start_info", "stop_info"):
@@ -227,11 +230,17 @@ class Journal:
             raise RecoveryRequiredError("a matching mutation has an unconfirmed outcome")
         count = self.db.execute("SELECT COUNT(*) FROM mutations").fetchone()[0]
         if count >= self.capacity:
-            self.db.execute(
-                "DELETE FROM mutations WHERE token IN "
-                "(SELECT token FROM mutations WHERE state='confirmed' ORDER BY rowid LIMIT ?)",
-                (count - self.capacity + 1,),
-            )
+            protected = {
+                entry["proof"]["attestation"]["mutation_token"]
+                for entry in self.get("managed_operator_debt_reconciliations", {}).values()
+                if entry.get("completed") is None and entry["proof"]["kind"] == "vendor-write"
+            }
+            removable = [
+                row[0]
+                for row in self.db.execute("SELECT token FROM mutations WHERE state='confirmed' ORDER BY rowid")
+                if row[0] not in protected
+            ][: count - self.capacity + 1]
+            self.db.executemany("DELETE FROM mutations WHERE token=?", ((token,) for token in removable))
             if self.db.execute("SELECT COUNT(*) FROM mutations").fetchone()[0] >= self.capacity:
                 raise RecoveryRequiredError("mutation receipt capacity reached; uncertain writes were retained")
         token = uuid.uuid4().hex
@@ -396,6 +405,34 @@ class Journal:
     # Record possible delivery before putting a Start onto the wire.
     def mark_sent(self, item: Delivery) -> None:
         self.db.execute("UPDATE outbox SET state='inflight' WHERE token=?", (item.token,))
+
+    # A correlated rejection terminates only a routine report; lifecycle events retain their quarantine.
+    def reject_observation(self, item: Delivery, code: str | None, *, legacy: bool = False) -> None:
+        if item.action not in (
+            "StatusNotification",
+            "MeterValues",
+            "FirmwareStatusNotification",
+            "DiagnosticsStatusNotification",
+        ):
+            raise RecoveryRequiredError("a lifecycle event cannot be discarded as a routine report")
+        with self.atomic():
+            current = self.next_delivery()
+            expected = "rejected" if legacy else "inflight"
+            if (
+                current is None
+                or current.token != item.token
+                or current.action != item.action
+                or current.payload != item.payload
+                or current.transaction != item.transaction
+                or current.state != expected
+                or legacy != (code is None)
+            ):
+                raise RecoveryRequiredError("routine rejection no longer identifies the exact delivery head")
+            self.db.execute(
+                "INSERT INTO rejected_observations VALUES(?,?,?,?,?,?,?)",
+                (item.token, item.action, fingerprint(item.payload), item.transaction, code, expected, time.time()),
+            )
+            self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))
 
     # Commit the cloud acknowledgement and its transaction mapping atomically.
     def acknowledge(

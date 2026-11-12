@@ -793,6 +793,11 @@ class Gateway:
                 if mutation:
                     confirmed = answer[0] != 4
                     self.journal.mutation_finished(mutation, confirmed)
+                    if not confirmed:
+                        self.journal.put(
+                            "uncertain_vendor_command",
+                            {"mutation": mutation, "action": action, "digest": fingerprint(original)},
+                        )
             text = reply_as(answer, token)
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
@@ -801,7 +806,10 @@ class Gateway:
             try:
                 if mutation and dispatched:
                     self.journal.mutation_finished(mutation, False)
-                    self.journal.put("uncertain_vendor_command", {"action": action, "digest": fingerprint(original)})
+                    self.journal.put(
+                        "uncertain_vendor_command",
+                        {"mutation": mutation, "action": action, "digest": fingerprint(original)},
+                    )
             except sqlite3.Error:
                 self.failures.append("JournalUnavailable")
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
@@ -838,7 +846,8 @@ class Gateway:
                     if row is not None and row[0] == "pending":
                         self.journal.mutation_finished(mutation, False)
                         self.journal.put(
-                            "uncertain_vendor_command", {"action": action, "digest": fingerprint(original)}
+                            "uncertain_vendor_command",
+                            {"mutation": mutation, "action": action, "digest": fingerprint(original)},
                         )
         except sqlite3.Error:
             self.failures.append("JournalUnavailable")
@@ -1077,6 +1086,14 @@ class Gateway:
                         )
                     raise
                 if answer[0] != 3:
+                    if item.action in (
+                        "StatusNotification",
+                        "MeterValues",
+                        "FirmwareStatusNotification",
+                        "DiagnosticsStatusNotification",
+                    ):
+                        self.journal.reject_observation(item, str(answer[2]))
+                        continue
                     self.journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
                     raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
                 metadata: dict[str, Any] | None = None

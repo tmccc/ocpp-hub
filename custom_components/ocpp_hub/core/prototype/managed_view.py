@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -89,9 +90,18 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
     return records
 
 
-# Native history is independently refreshed with each successful audit; strip identities and reject incomplete records.
-def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+@dataclass(frozen=True)
+class ChargerHistorySummary:
+    """Redacted valid records and whether any real record could not be represented honestly."""
+
+    sessions: list[dict[str, Any]]
+    complete: bool
+
+
+# A rejected timestamp cannot establish which session was latest; retain this fact alongside the valid summaries.
+def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHistorySummary:
     summaries: list[dict[str, Any]] = []
+    complete = True
     for record in records:
         if record.get("transactionId") == -1:
             continue
@@ -109,6 +119,7 @@ def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]
             or stop != 0
             and (stop < start or last < first)
         ):
+            complete = False
             continue
         summaries.append(
             {
@@ -117,4 +128,9 @@ def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]
                 "energy_kwh": (last - first) / 1000 if stop else None,
             }
         )
-    return sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20]
+    return ChargerHistorySummary(sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20], complete)
+
+
+# Callers needing just the bounded archive retain the same redacted list contract.
+def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    return summarize_charger_history(records).sessions

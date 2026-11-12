@@ -49,9 +49,11 @@ async def managed_bench(
     contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     port: int,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    initial_history: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[ConnectedBench]:
     monkeypatch.setattr(native_bench, "Bench", OwnerBench)
-    async with connected_bench(directory, contexts, port) as rig:
+    async with connected_bench(directory, contexts, port, initial_history=initial_history) as rig:
         # Synthetic schedule identity is approved without changing private input files or production policy.
         rig.prepared.config = replace(rig.prepared.config, local_tags=frozenset({"NATIVE_TIMER"}))
         yield rig

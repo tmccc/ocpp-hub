@@ -84,6 +84,8 @@ class ProxySensor(ProxyEntity, SensorEntity):
                 return "App / schedule"
             return "Needs attention" if data.get("state") in ("attention", "degraded") else "Waiting for verification"
         if self.key == "last_session_energy":
+            if data.get("charger_history_complete", True) is not True:
+                return None
             return next((r["energy_kwh"] for r in data.get("charger_sessions", []) if r.get("stopped_at")), None)
         return data.get(self.key)
 

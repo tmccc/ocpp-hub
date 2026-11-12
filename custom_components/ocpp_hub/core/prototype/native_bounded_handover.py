@@ -157,7 +157,11 @@ class NativeBoundedHandover:
             self.last_resolved_read = sequence
 
         try:
-            native = await self.observe()
+            try:
+                async with asyncio.timeout(15):
+                    native = await self.observe()
+            except TimeoutError as error:
+                raise NativeTransportUnavailableError("complete native observation exceeded its deadline") from error
             resolve()
             if before != self.authority():
                 raise AuditSupersededError("native bounded audit was superseded by local authority")

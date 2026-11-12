@@ -168,14 +168,20 @@ class ConnectionRuntime:
                 try:
                     await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
                 except TimeoutError:
-                    result = await self.gateway.charger.call(
-                        "TriggerMessage",
-                        {"requestedMessage": "BootNotification"},
-                        check=lambda: self.gateway._require_epoch("charger", epoch),
-                    )
-                    if result[0] != 3 or result[2].get("status") != "Accepted":
-                        raise UnavailableError("charger refused the read-only boot probe")
-                    await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
+                    try:
+                        result = await self.gateway.charger.call(
+                            "TriggerMessage",
+                            {"requestedMessage": "BootNotification"},
+                            check=lambda: self.gateway._require_epoch("charger", epoch),
+                        )
+                        if result[0] != 3 or result[2].get("status") != "Accepted":
+                            raise UnavailableError("charger refused the read-only boot probe")
+                        await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
+                    except (UnavailableError, TimeoutError) as error:
+                        self.status.last_failure = "BootOrCeilingUnavailable"
+                        self.status.charger_fault.record(error, "boot_probe", "TriggerMessage")
+                        # A failed read-only probe does not invalidate a later genuine Boot on this same connection.
+                        await self.gateway.wait_for_boot(epoch)
             else:
                 await self.gateway.wait_for_boot(epoch)
             self.status.boot_observed = self.gateway.current_boot_seen(epoch)
