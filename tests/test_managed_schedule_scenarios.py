@@ -208,6 +208,15 @@ async def test_n04_completed_obligation_connection_boundary(
             async with deadline_task(b):
                 await settle(b, 5)
                 stops = (local,) if resolution == "temporary" else ()
+                # A real peer RPC or the independent supervisor may still own the channel after five polls.
+                async with asyncio.timeout(5):
+                    while b.stops() != list(stops) or b.device.effective_limit() != (0 if stops else 32):
+                        assert set(b.stops()) <= set(stops)
+                        assert not b.session.journal.get("managed_control_fault")
+                        if stops:
+                            assert b.device.effective_limit() == 0
+                        await settle(b)
+                        await asyncio.sleep(0.01)
                 assert b.stops() == list(stops)
                 assert b.device.effective_limit() == (0 if stops else 32)
                 await close_in_order(b, local, "ledger" if outage else "native", stops)
