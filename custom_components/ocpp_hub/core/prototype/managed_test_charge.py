@@ -80,6 +80,7 @@ class ManagedChargeTests:
                         "charging": False,
                     },
                 )
+        self.retire_refused_unsent()
         controller.session.gateway.start_observer = self.started
         controller.native.observation_listener = self.record_source
         controller.native.positive_guard = self.check_positive
@@ -97,6 +98,57 @@ class ManagedChargeTests:
     def state(self) -> dict[str, Any]:
         value: dict[str, Any] = self.journal.get("managed_test_charge", {})
         return value
+
+    # A durable failed receipt proves this request had no effects; it cannot own a later ordinary session.
+    def retire_refused_unsent(self) -> None:
+        state, j = self.state(), self.journal
+        if state.get("state") != "failed" or self.lease is not None:
+            return
+        row = j.db.execute("SELECT action,state,result FROM managed_requests WHERE id=?", (state.get("id"),)).fetchone()
+        result = json.loads(row["result"]) if row is not None else None
+        receipt = local_start_receipt(j)
+        if (
+            row is None
+            or row["action"] not in ("start", "start_test")
+            or row["state"] != "failed"
+            or not isinstance(result, dict)
+            or result.get("classification") != "preflight_refused_unsent"
+            or state.get("start_rpc_accepted") is not False
+            or j.get("control", {}).get("start_pending")
+            or receipt.get("local") is None
+            and receipt.get("stage") in ("prepared", "issued", "accepted")
+            or j.get("uncertain_vendor_command")
+        ):
+            return
+        j.put(
+            "managed_test_charge",
+            {**state, "state": "completed", "charging": False, "recovery_reason": "preflight_refused_unsent"},
+        )
+
+    # Only explicit request-specific provenance can retire a failure before entering the Start command path.
+    def unissued_at_zero(self, native: HandoverEvidence) -> bool:
+        state, j = self.state(), self.journal
+        row = j.db.execute(
+            "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
+        ).fetchone()
+        if (
+            self.lease is not None
+            or state.get("kind") != "normal"
+            or state.get("source") != "local"
+            or state.get("start_attempted") is not False
+            or state.get("start_rpc_accepted") is not False
+            or state.get("local_transaction") is not None
+            or row is None
+            or row["action"] != "start"
+            or row["revision"] != state.get("revision")
+            or row["state"] not in ("failed", "uncertain")
+        ):
+            return False
+        try:
+            self.controller.require_paused(native)
+        except SecurityError, DeniedError, RecoveryRequiredError:
+            return False
+        return True
 
     # Admission is conservative; the worker independently rechecks physical zero before Start.
     def available(self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False) -> bool:
@@ -185,6 +237,7 @@ class ManagedChargeTests:
                     "hard_deadline_epoch": time.time() + STARTUP_BUDGET + (0 if lease.normal else DURATION),
                     "duration_seconds": None if lease.normal else DURATION,
                     "start_rpc_accepted": False,
+                    "start_attempted": False,
                     "current_a": lease.current_a,
                 },
             )
@@ -270,6 +323,7 @@ class ManagedChargeTests:
             tag = tags[0]
             if lease.normal:
                 j.put("managed_test_charge", {**self.state(), "tag_digest": fingerprint(tag.casefold())})
+            j.put("managed_test_charge", {**self.state(), "start_attempted": True})
             await c.session.gateway.start_managed(tag, lambda: self.guard(lease))
             self.guard(lease)
             with j.atomic():
@@ -304,6 +358,7 @@ class ManagedChargeTests:
                 if self.state().get("id") == lease.identifier:
                     j.put("managed_test_charge", {**self.state(), "state": "failed"})
                 self.lease = None
+                self.retire_refused_unsent()
                 self.changed.set()
                 return
             c.requests.finish(lease.identifier, "uncertain", {"classification": "start_not_confirmed"})
@@ -536,7 +591,8 @@ class ManagedChargeTests:
                 and local is None
                 and not native.physical.transaction_open
                 and (
-                    owner.get("stage") in ("unsent", "rejected")
+                    self.unissued_at_zero(native)
+                    or owner.get("stage") in ("unsent", "rejected")
                     or owner.get("local") is not None
                     and j.db.execute(
                         "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner["local"],)
@@ -586,6 +642,7 @@ class ManagedChargeTests:
 
     # Positive flow must belong to the known transaction and the actually accepted local or vendor Start path.
     def observed(self, native: HandoverEvidence) -> None:
+        self.retire_refused_unsent()
         lease, c = self.lease, self.controller
         state = self.state()
         if lease is not None and self.finish_closed_normal(lease):
@@ -603,16 +660,19 @@ class ManagedChargeTests:
         if lease is None:
             owner = local_start_receipt(self.journal)
             if (
-                state.get("expired_normal")
-                and state.get("state") != "completed"
+                state.get("state") != "completed"
                 and not native.physical.transaction_open
                 and self.journal.active() is None
                 and not self.journal.get("control", {}).get("start_pending")
                 and (
-                    owner.get("stage") in ("unsent", "rejected")
-                    or self.journal.db.execute(
-                        "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner.get("local"),)
-                    ).fetchone()
+                    self.unissued_at_zero(native)
+                    or state.get("expired_normal")
+                    and (
+                        owner.get("stage") in ("unsent", "rejected")
+                        or self.journal.db.execute(
+                            "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner.get("local"),)
+                        ).fetchone()
+                    )
                 )
             ):
                 # An explicit Pause can finish this expired debt too, without reviving it on the next Return.

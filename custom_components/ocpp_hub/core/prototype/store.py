@@ -233,8 +233,11 @@ class Journal:
             protected = {
                 entry["proof"]["attestation"]["mutation_token"]
                 for entry in self.get("managed_operator_debt_reconciliations", {}).values()
-                if entry.get("completed") is None and entry["proof"]["kind"] == "vendor-write"
+                if entry.get("completed") is None and entry["proof"]["kind"] in ("vendor-write", "vendor-start")
             }
+            grant = self.get("vendor_start_grant", {})
+            if grant.get("mutation"):
+                protected.add(grant["mutation"])
             removable = [
                 row[0]
                 for row in self.db.execute("SELECT token FROM mutations WHERE state='confirmed' ORDER BY rowid")

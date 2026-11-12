@@ -15,6 +15,7 @@ from ..frames import Frame
 from .composite import FutureScheduleError, verify_composite
 from .policy import DeniedError, Policy, number
 from .rpc import Peer, UnavailableError
+from .security import SecurityError
 from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 
@@ -221,7 +222,7 @@ class LocalControl:
             self.journal.put("control", {**control, "start_pending": False})
 
     # Install the reserved station profile; Accepted confirms receipt, not yet real-device execution or persistence.
-    async def _cap(self, call: Call, limit: float, epoch: int) -> Frame:
+    async def _cap(self, call: Call, limit: float, epoch: int, *, guard: Callable[[], None] | None = None) -> Frame:
         if limit > 0 and self.journal.get("trial_starting"):
             raise DeniedError("initial native admission has not completed")
         self._confirmed_epoch = -1
@@ -232,6 +233,8 @@ class LocalControl:
         # Boot may change on the same socket while a capability or composite RPC awaits its reply.
         def check() -> None:
             self._check(epoch)
+            if guard is not None:
+                guard()
             if revision != self._revision:
                 raise UnavailableError("device introduction changed during station verification")
             if self.journal.get("control", {}).get("ticket") != ticket or self.desired() != desired:
@@ -313,7 +316,7 @@ class LocalControl:
 
         async with self.peer.sequence(0, check) as call:
             if not self.ready:
-                await self._cap(call, limit, epoch)
+                await self._cap(call, limit, epoch, guard=check)
 
     # A positive slider update cannot silently release an explicit zero-current hold.
     async def set_limit(self, value: Any, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
@@ -471,7 +474,7 @@ class LocalControl:
                         record_stage("rejected")
                     raise UnavailableError("transaction start was not confirmed")
                 record_stage("accepted")
-            except UnavailableError, DeniedError, RecoveryRequiredError:
+            except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError:
                 retire_unsent_local_start(self.journal, ticket)
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)

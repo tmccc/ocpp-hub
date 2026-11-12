@@ -21,6 +21,13 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 
 ## In progress
 
+- [~] External-review recovery corrections (2026-11-12): preserve ordinary supervision after unsent local Start
+  refusals and interrupted zero cleanup; complete safe introduction after identical overlapping Boot; retain HA
+  outage notices through setup retries and failed unload. Add exact independent recovery for accepted unbound
+  cloud Starts and Stop-reply delivery faults, keeping zero and requiring actual Stop acknowledgment, a new Pause
+  and separate Return. Legacy mirror backoff and full20-worker evidence validation are hardened. These corrections
+  are offline work; deployment and additional live charging tests are outside this change.
+
 - [~] Standalone iCS coexistence proxy (2026-11-08): second unplugged trial accepted an Absolute stack1 6 A station
   profile, reported a matching composite schedule and retained an accepted manufacturer-cloud session. A one-second
   verification window is corrected. Later unplugged trials verified Stop0/Release6 and profile-free cleanup. Exact

@@ -211,22 +211,39 @@ class ConnectionRuntime:
     async def _confirm_introduced_ceiling(self, epoch: int) -> None:
         gateway, journal = self.gateway, self.gateway.journal
         boot = gateway.boot_observation
+        metadata_revision = gateway.boot_metadata_revision
+        control_revision = gateway.controls._revision
+        ticket = journal.get("control", {}).get("ticket")
         delay = self.settings.retry_min
 
-        # A wait cannot transfer this zero-only retry to newer Boot, owner authority or frozen restoration work.
-        def restricted() -> bool:
+        # Only identical metadata under the same admitted owner can start another complete zero proof.
+        def same_authority() -> bool:
             return (
                 not self._closing
                 and self.ceiling_enabled()
                 and gateway.current_boot_seen(epoch)
                 and boot is not None
-                and gateway.boot_observation == boot
+                and gateway.boot_metadata_revision == metadata_revision
+                and gateway.controls._revision == control_revision
+                and journal.get("control", {}).get("ticket") == ticket
                 and journal.get("native_bounded_handover", {}).get("stage") == "admitted"
                 and journal.get("trial_phase") in ("active", "recovering")
                 and not journal.get("trial_starting")
                 and journal.get("control", {}).get("inhibit") is True
                 and gateway.controls.desired() == 0
             )
+
+        # Every awaited operation still belongs to one actual Boot observation, never its superseded proof.
+        def restricted() -> bool:
+            return same_authority() and gateway.boot_observation == boot
+
+        # A new identical Boot discards the old attempt; the next attempt repeats zero and composite verification.
+        def replace_observation() -> bool:
+            nonlocal boot
+            if same_authority() and gateway.boot_observation is not None and gateway.boot_observation != boot:
+                boot = gateway.boot_observation
+                return True
+            return False
 
         # Capability reads and the CALL gate can await; recheck the same Boot immediately before every zero send.
         def guard() -> None:
@@ -241,12 +258,15 @@ class ConnectionRuntime:
                 return
             except (UnavailableError, TimeoutError) as error:
                 if not restricted():
-                    raise
+                    if not replace_observation():
+                        raise
+                    retrying = True
+                    continue
                 self.status.last_failure = "BootOrCeilingUnavailable"
                 self.status.charger_fault.record(error, "boot_or_ceiling", gateway.charger.diagnostics.action)
                 await asyncio.sleep(delay)
                 gateway._require_epoch("charger", epoch)
-                if not restricted():
+                if not restricted() and not replace_observation():
                     raise UnavailableError("restrictive introduction was superseded") from None
                 retrying = True
                 delay = min(2 * delay, self.settings.retry_max)

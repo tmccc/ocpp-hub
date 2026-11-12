@@ -111,3 +111,18 @@ def test_live_working_receipt_is_not_replaced(journal, state):
     current = {**journal.get(KEY), "state": state}
     journal.put(KEY, current)
     assert resume_cutoff(journal) == current
+
+
+# Intent: reporting a requested receipt selects an older live duty; installed or clearing work keeps its own head.
+# Why: report selection cannot replace a currently installed occurrence or hide a still-unresolved older cutoff.
+@pytest.mark.parametrize("state", ["requested", "armed", "clearing"])
+def test_reporting_restores_only_uninstalled_working_head(journal, state):
+    saved = occurrences(journal)
+    saved["older"]["end_epoch"] = 550
+    journal.put("managed_temporary_occurrences", saved)
+    current = {**journal.get(KEY), "state": state}
+    journal.put(KEY, current)
+    selected = resume_cutoff(journal, reporting=True)
+    assert selected["id"] == ("older" if state == "requested" else current["id"])
+    for name in saved:
+        assert occurrences(journal)[name]["body"] == saved[name]["body"]

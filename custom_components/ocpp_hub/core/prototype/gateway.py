@@ -22,6 +22,7 @@ from .events import validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, known_write
 from .local_control import LocalControl
+from .managed_stop_delivery import approved_stop_metadata, record_stop_ack, reject_stop_reply
 from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
@@ -1094,13 +1095,27 @@ class Gateway:
                     ):
                         self.journal.reject_observation(item, str(answer[2]))
                         continue
+                    if item.action == "StopTransaction":
+                        reject_stop_reply(self.journal, item, answer, reason="cloud_call_error")
+                        raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
                     self.journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
                     raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
                 metadata: dict[str, Any] | None = None
+                ignored_stop_metadata = False
                 tag = item.payload.get("idTag")
                 if self.policy.strict_cloud_authorization and "idTagInfo" in answer[2]:
-                    metadata = validate_info(answer[2]["idTagInfo"])
-                    if item.action == "StartTransaction" and metadata["status"] != "Accepted":
+                    try:
+                        metadata = validate_info(answer[2]["idTagInfo"])
+                    except DeniedError:
+                        if item.action != "StopTransaction":
+                            raise
+                        if not approved_stop_metadata(self.journal, item, answer[2]):
+                            reject_stop_reply(self.journal, item, answer[2], reason="authorization_metadata_invalid")
+                            raise RecoveryRequiredError(
+                                "cloud Stop metadata requires exact independent reconciliation"
+                            ) from None
+                        ignored_stop_metadata = True
+                    if item.action == "StartTransaction" and metadata is not None and metadata["status"] != "Accepted":
                         with self.journal.atomic():
                             if isinstance(tag, str):
                                 self.auth_info.put(tag, metadata)
@@ -1116,5 +1131,15 @@ class Gateway:
                 def acknowledged() -> None:
                     if metadata is not None and isinstance(tag, str):
                         self.auth_info.put(tag, metadata)
+                    if ignored_stop_metadata:
+                        row = self.journal.db.execute(
+                            "SELECT start FROM transactions WHERE local=?", (item.transaction,)
+                        ).fetchone()
+                        rejected_tag = tag if isinstance(tag, str) else json.loads(row[0])["idTag"] if row else None
+                        if isinstance(rejected_tag, str):
+                            self.journal.db.execute(
+                                "DELETE FROM auth_info WHERE digest=?", (fingerprint(rejected_tag.casefold()),)
+                            )
+                    record_stop_ack(self.journal, item, answer[2])
 
                 self.journal.acknowledge(item, answer[2], acknowledged)

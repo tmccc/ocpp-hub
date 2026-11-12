@@ -2,6 +2,16 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Restore ordinary-session supervision after proven unsent Start refusals and crash-interrupted zero cleanup.
+  Clean up prepared local Start receipts when native pre-dispatch reads fail with a security error. Retry the full
+  restrictive introduction proof after an identical overlapping Boot without reusing superseded acknowledgments.
+- Add exact offline recovery for accepted unbound cloud Starts and retained or genuinely acknowledged Stops.
+  Keep zero, immutable lifecycle history and queued closed pairs; require independent evidence, actual Stop wire
+  acknowledgment, a new Pause and a separate Return. Changed Stop replies require new retry evidence.
+- Keep HA fault notification deadlines across failed first refresh, setup retries and failed unloads, then dismiss
+  on fresh recovery. Saturate legacy mirror reconnect backoff without arithmetic overflow. Require fresh full-mode
+  raw-evidence audit output before the validator accepts complete20-worker qualification.
+
 - Treat complete native-audit deadlines as unavailable telemetry and enter the existing zero recovery. Keep
   listening for a genuine Boot after a failed read-only probe, and retain Return while a known closed Stop awaits
   its cloud acknowledgement. Make watchdog notification best effort without blocking control supervision.

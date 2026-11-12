@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlsplit
@@ -65,8 +66,9 @@ class MirrorSettings:
             raise MirrorSettingsError(
                 "invalid_settings", "the queue size and the fallback heartbeat must be at least 1"
             )
-        if min(self.reply_timeout_s, self.connect_timeout_s, self.backoff_min_s, self.backoff_max_s) <= 0:
-            raise MirrorSettingsError("invalid_settings", "timeouts and backoff delays must be positive")
+        delays = (self.reply_timeout_s, self.connect_timeout_s, self.backoff_min_s, self.backoff_max_s)
+        if any(not math.isfinite(value) or value <= 0 for value in delays):
+            raise MirrorSettingsError("invalid_settings", "timeouts and backoff delays must be finite and positive")
         if self.backoff_min_s > self.backoff_max_s:
             raise MirrorSettingsError("invalid_settings", "the minimum backoff delay cannot exceed the maximum")
 

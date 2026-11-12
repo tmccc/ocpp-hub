@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import ssl
 import uuid
 from collections.abc import Callable
@@ -288,7 +289,11 @@ class MirrorLink:
     # The delay before the next connection attempt: doubling from the minimum up to the maximum,
     # or the time the vendor asked for after a refused boot when that is longer.
     def _backoff(self, attempt: int) -> float:
-        delay = min(self._settings.backoff_max_s, self._settings.backoff_min_s * float(2 ** max(attempt - 1, 0)))
+        minimum, maximum = self._settings.backoff_min_s, self._settings.backoff_max_s
+        exponent = max(attempt - 1, 0)
+        # Compare finite binary exponents before scaling, including subnormal minima and arbitrarily long outages.
+        ceiling = math.frexp(maximum)[1] - math.frexp(minimum)[1]
+        delay = maximum if exponent > ceiling else min(maximum, math.ldexp(minimum, exponent))
         delay, self._retry_floor_s = max(delay, self._retry_floor_s), 0.0
         return delay
 

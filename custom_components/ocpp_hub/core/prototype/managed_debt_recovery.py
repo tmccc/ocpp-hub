@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
@@ -13,8 +15,10 @@ from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import delivery_anchor
 from .managed_occurrences import occurrences
 from .managed_recovery_zero import require_original_zero
+from .managed_stop_delivery import KINDS as STOP_KINDS
+from .managed_stop_delivery import NO_REPLY, REJECTION, WIRE_ACK, stop_identity, stop_resolution
 from .native_bounded import NativeBoundedSpec
-from .store import Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
 
@@ -28,6 +32,8 @@ REPORTS = ("StatusNotification", "MeterValues", "FirmwareStatusNotification", "D
 
 # Preserve exact private preimages in the durable proof without publishing raw tags, native bodies or credentials.
 def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, Any]:
+    grant = j.get("vendor_start_grant")
+    row = j.db.execute("SELECT * FROM mutations WHERE token=?", ((grant or {}).get("mutation"),)).fetchone()
     return {
         "anchor": delivery_anchor(j, spec),
         "intent": j.get("managed_control_intent"),
@@ -35,7 +41,10 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "fault": j.get("managed_control_fault"),
         "mutations": [dict(r) for r in j.db.execute("SELECT * FROM mutations WHERE state!='confirmed' ORDER BY token")],
         "marker": j.get("uncertain_vendor_command"),
-        "grant": j.get("vendor_start_grant"),
+        "grant": grant,
+        "grant_mutation": dict(row) if kind == "vendor-start" and row is not None else None,
+        "stop_rejection": j.get(REJECTION),
+        "stop_wire_ack": j.get(WIRE_ACK),
         "test": j.get("managed_test_charge"),
         "receipt": j.get("local_start_receipt"),
         "deferred": j.get("managed_deferred_start"),
@@ -56,10 +65,10 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
 # Current/timer work, other owner requests and original-session uncertainty cannot be waived by another debt's proof.
 def require_common_debt_idle(j: Journal, kind: str) -> None:
     if (
-        any(entry.get("completed") is None for entry in j.get(KEY, {}).values())
+        any(entry.get("completed") is None and not entry.get("superseded") for entry in j.get(KEY, {}).values())
         or j.get("managed_control_fault", {}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
-        or kind != "observation"
+        or kind not in ("observation", "stop-delivery")
         and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
         or j.get("managed_current_change", {}).get("state") not in (None, "completed", "cancelled")
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
@@ -68,11 +77,11 @@ def require_common_debt_idle(j: Journal, kind: str) -> None:
         and j.get("control", {}).get("start_pending")
         or kind != "local-start"
         and j.get("managed_test_charge", {}).get("state") not in (None, "completed")
-        or kind != "observation"
+        or kind not in ("observation", "stop-delivery")
         and j.next_delivery() is not None
         or kind != "vendor-write"
         and j.get("uncertain_vendor_command")
-        or kind != "vendor-write"
+        or kind not in ("vendor-write", "vendor-start")
         and j.get("vendor_start_grant")
         or kind != "vendor-write"
         and j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
@@ -123,6 +132,125 @@ def vendor_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any]:
     ):
         raise RecoveryRequiredError("a bound or unrelated vendor Start grant cannot be retired")
     return {"mutation_token": row["token"], "action": row["action"], "payload_digest": row["digest"]}
+
+
+# Confirmed delivery is not command consumption; pin its actual still-unbound grant and mutation separately.
+def vendor_start_candidate(snapshot: dict[str, Any]) -> dict[str, Any]:
+    grant, row = snapshot["grant"] or {}, snapshot["grant_mutation"] or {}
+    if (
+        not grant
+        or grant.get("local") is not None
+        or not isinstance(grant.get("token"), str)
+        or re.fullmatch(r"[a-f0-9]{32}", grant["token"]) is None
+        or not isinstance(grant.get("digest"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", grant["digest"]) is None
+        or type(grant.get("expires")) not in (int, float)
+        or not math.isfinite(grant["expires"])
+        or row.get("token") != grant.get("mutation")
+        or row.get("origin") != "vendor"
+        or row.get("action") != "RemoteStartTransaction"
+        or row.get("state") != "confirmed"
+        or snapshot["mutations"]
+        or snapshot["marker"]
+        or snapshot["deferred"]
+    ):
+        raise RecoveryRequiredError("vendor Start requires its exact accepted, unbound command and no other debt")
+    return {
+        "mutation_token": row["token"],
+        "action": row["action"],
+        "payload_digest": row["digest"],
+        "grant_token": grant["token"],
+        "grant_digest": fingerprint(grant),
+    }
+
+
+# A retained exact Stop permits only retry; a prior drained Stop needs its actual fault-bound wire receipt.
+def require_stop_tail(j: Journal, head: Delivery) -> None:
+    rows = j.db.execute("SELECT * FROM outbox ORDER BY seq").fetchall()
+    if not rows or rows[0]["token"] != head.token:
+        raise RecoveryRequiredError("Stop recovery no longer identifies its exact outbox head")
+    for row in j.db.execute("SELECT local,start,stop FROM transactions WHERE vendor IS NULL"):
+        pair = [
+            item
+            for item in rows[1:]
+            if item["local"] == row["local"] and item["action"] in ("StartTransaction", "StopTransaction")
+        ]
+        if (
+            row["stop"] is None
+            or len(pair) != 2
+            or pair[0]["action"] != "StartTransaction"
+            or pair[1]["action"] != "StopTransaction"
+            or pair[0]["payload"] != row["start"]
+            or pair[1]["payload"] != row["stop"]
+            or any(item["state"] != "queued" for item in pair)
+        ):
+            raise RecoveryRequiredError("Stop recovery retains ambiguous or orphaned queued lifecycle debt")
+    for item in rows[1:]:
+        if item["state"] != "queued":
+            raise RecoveryRequiredError("Stop recovery cannot waive another ambiguous or rejected delivery")
+        transaction = j.db.execute("SELECT * FROM transactions WHERE local=?", (item["local"],)).fetchone()
+        if item["action"] in REPORTS:
+            if item["local"] is not None and transaction is None:
+                raise RecoveryRequiredError("queued report has no original transaction")
+            if (
+                transaction is not None
+                and transaction["vendor"] is None
+                and not any(
+                    prior["seq"] < item["seq"]
+                    and prior["local"] == item["local"]
+                    and prior["action"] == "StartTransaction"
+                    for prior in rows[1:]
+                )
+            ):
+                raise RecoveryRequiredError("queued report precedes its unmapped Start")
+        elif item["action"] == "StopTransaction" and transaction is not None and transaction["vendor"] is not None:
+            stop_identity(
+                j, Delivery(item["token"], item["action"], json.loads(item["payload"]), item["local"], item["state"])
+            )
+        elif (
+            item["action"] not in ("StartTransaction", "StopTransaction")
+            or transaction is None
+            or transaction["vendor"] is not None
+        ):
+            raise RecoveryRequiredError("Stop recovery retains an unrecognized lifecycle tail")
+
+
+# An exact retained Stop may be retried without dropping any later definitely queued closed lifecycle pair.
+def stop_candidate(j: Journal, snapshot: dict[str, Any], kind: str) -> dict[str, Any]:
+    fault = snapshot["fault"] or {}
+    item: Delivery | None = None
+    if fault.get("classification") != "owner_control_or_delivery_uncertain":
+        raise RecoveryRequiredError("Stop recovery requires the exact latched delivery fault")
+    if kind == "stop-fault":
+        wire = snapshot["stop_wire_ack"] or {}
+        if wire.get("fault") != fault or snapshot["head"] is not None:
+            raise RecoveryRequiredError("drained Stop fault requires its preserved actual wire acknowledgment")
+        row = j.db.execute(
+            "SELECT stop FROM transactions WHERE local=?", (wire.get("local_transaction_id"),)
+        ).fetchone()
+        if row is None or row["stop"] is None:
+            raise RecoveryRequiredError("wire receipt no longer has its original Stop")
+        item = Delivery(
+            wire["delivery_token"], "StopTransaction", json.loads(row["stop"]), wire["local_transaction_id"], "queued"
+        )
+        identity = stop_identity(j, item)
+        if not all(wire.get(key) == value for key, value in identity.items()):
+            raise RecoveryRequiredError("wire receipt does not identify the exact original Stop")
+        reply = wire["reply_digest"]
+    else:
+        item = j.next_delivery()
+        if item is None or item.action != "StopTransaction" or item.state not in ("queued", "inflight", "rejected"):
+            raise RecoveryRequiredError("Stop retry requires the exact retained closed lifecycle head")
+        identity = stop_identity(j, item)
+        require_stop_tail(j, item)
+        rejection = snapshot["stop_rejection"] or {}
+        if rejection and rejection.get("delivery_token") == item.token:
+            if not all(rejection.get(key) == value for key, value in identity.items()):
+                raise RecoveryRequiredError("Stop rejection belongs to another lifecycle")
+            reply = rejection["reply_digest"]
+        else:
+            reply = NO_REPLY
+    return {**identity, "reply_digest": reply, "fault_digest": fingerprint(fault)}
 
 
 # Time, zero and closed sessions alone never identify the accepted owner Start; its exact receipts remain mandatory.
@@ -194,6 +322,10 @@ def debt_candidate(
             raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
         if kind == "vendor-write":
             specific = vendor_candidate(j, snapshot)
+        elif kind == "vendor-start":
+            specific = vendor_start_candidate(snapshot)
+        elif kind in STOP_KINDS:
+            specific = stop_candidate(j, snapshot, kind)
         else:
             require_observation_tail(j)
             head = j.next_delivery()
@@ -220,7 +352,9 @@ def debt_candidate(
 # This postimage excludes later Pause revisions and routine queue drain, but pins every debt retired by the tool.
 def resolved_debt(j: Journal, kind: str, proof: dict[str, Any]) -> dict[str, Any]:
     e = proof["attestation"]
-    if kind == "vendor-write":
+    if kind in STOP_KINDS:
+        return stop_resolution(j, e, proof.get("wire_ack"))
+    if kind in ("vendor-write", "vendor-start"):
         row = j.db.execute("SELECT * FROM mutations WHERE token=?", (e["mutation_token"],)).fetchone()
         return {
             "mutation": dict(row) if row is not None else None,
@@ -254,8 +388,14 @@ def reconcile_debt(
     require_original_zero(j, book, spec, n)
     records, identifier = j.get(KEY, {}), fingerprint(e)
     if identifier in records:
+        if records[identifier].get("superseded"):
+            raise RecoveryRequiredError("operator proof was superseded by another actual cloud reply")
         proof = records[identifier]["proof"]
-        if proof["anchor"] != delivery_anchor(j, spec) or proof["resolved"] != resolved_debt(j, kind, proof):
+        if (
+            proof["kind"] != kind
+            or proof["anchor"] != delivery_anchor(j, spec)
+            or proof["resolved"] != resolved_debt(j, kind, proof)
+        ):
             raise RecoveryRequiredError("previous operator debt proof no longer matches its recorded resolution")
         return {"already_recorded": True, "zero_hold_retained": True, "charging_started": False}
     cls.parse(e)
@@ -286,6 +426,13 @@ def reconcile_debt(
             j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
             if snapshot["grant"]:
                 j.db.execute("DELETE FROM meta WHERE key='vendor_start_grant'")
+        elif kind == "vendor-start":
+            j.db.execute("DELETE FROM meta WHERE key='vendor_start_grant'")
+        elif kind == "stop-delivery":
+            j.db.execute("UPDATE outbox SET state='queued' WHERE token=?", (e["delivery_token"],))
+            proof["wire_ack"] = None
+        elif kind == "stop-fault":
+            proof["wire_ack"] = snapshot["stop_wire_ack"]
         elif kind == "local-start":
             j.put("local_start_receipt", {**snapshot["receipt"], "stage": "reconciled", "proof": identifier})
             j.put(
@@ -325,11 +472,18 @@ def reconcile_debt(
 def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
     j = c.session.journal
     entry = j.get(KEY, {}).get(fault.get("proof"))
-    if fault.get("classification") != FAULT or not entry or entry.get("completed") is not None:
+    if (
+        fault.get("classification") != FAULT
+        or not entry
+        or entry.get("completed") is not None
+        or entry.get("superseded")
+    ):
         return None
     proof: dict[str, Any] = entry["proof"]
     if (
-        proof["installed_fault"] != fault
+        proof["kind"] in STOP_KINDS
+        and proof.get("wire_ack") is None
+        or proof["installed_fault"] != fault
         or proof["anchor"] != delivery_anchor(j, c.native.spec)
         or proof["resolved"] != resolved_debt(j, proof["kind"], proof)
         or j.next_delivery() is not None

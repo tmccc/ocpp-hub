@@ -8,7 +8,6 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -16,6 +15,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import ProxyClient, ProxyError
+from .notification import notice_for
 
 DOMAIN = "ics_proxy"
 LOGGER = logging.getLogger(__name__)
@@ -29,13 +29,27 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Reports can already be several seconds old; poll before their strict 15-second native expiry.
         super().__init__(hass, LOGGER, config_entry=entry, name=DOMAIN, update_interval=timedelta(seconds=5))
         self.client = ProxyClient(async_get_clientsession(hass), entry.data["port"], entry.data["token"])
-        self.problem_since: float | None = None
-        self.notified = False
-        self.notification_cleanup_pending = True
-        self.notification_id = DOMAIN + "_" + entry.entry_id
+        self.notice = notice_for(hass, entry)
+        self.notice_generation = self.notice.claim(lambda: time.monotonic())
+        self.notification_id = self.notice.notification_id
         self.received_at = time.monotonic()
         self.cancel_timer = None
         entry.async_on_unload(self.cancel_expiry)
+
+    # Keep the existing coordinator inspection surface while its debounce belongs to the entry.
+    @property
+    def problem_since(self) -> float | None:
+        return self.notice.problem_since
+
+    # A controlled diagnostic clock adjustment changes the shared outage, never an independent new deadline.
+    @problem_since.setter
+    def problem_since(self, value: float | None) -> None:
+        self.notice.problem_since = value
+
+    # Entity/tests can inspect the same notification state through any current coordinator.
+    @property
+    def notified(self) -> bool:
+        return self.notice.notified
 
     # Snapshot ages continue advancing while awaiting a poll or a failed network request.
     def age(self, key: str) -> float | None:
@@ -78,24 +92,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Short reading/cloud blips settle quietly; sustained trouble is visible without repeatedly creating alerts.
     @callback
     def update_notification(self, okay: bool) -> None:
-        if okay:
-            self.problem_since = None
-            if self.notified or self.notification_cleanup_pending:
-                persistent_notification.async_dismiss(self.hass, self.notification_id)
-                self.notified = False
-                self.notification_cleanup_pending = False
-            return
-        if self.problem_since is None:
-            self.problem_since = time.monotonic()
-        if not self.notified and time.monotonic() - self.problem_since >= 60:
-            persistent_notification.async_create(
-                self.hass,
-                "The local iCS charger proxy needs attention. Check its status on the iCS Charger dashboard. "
-                "The proxy retains its charging limits and any requested pause.",
-                title="Charger proxy needs attention",
-                notification_id=self.notification_id,
-            )
-            self.notified = True
+        self.notice.update(okay, self.notice_generation)
 
     # API errors are classified before HA logs them; tokens and server payloads never appear in UpdateFailed.
     async def _async_update_data(self) -> dict[str, Any]:

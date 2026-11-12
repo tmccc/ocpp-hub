@@ -39,7 +39,7 @@ def validate_info(value: Any) -> dict[str, Any]:
 def expiry(value: Any) -> float:
     if (
         not isinstance(value, str)
-        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})", value) is None
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value) is None
     ):
         raise DeniedError("cloud authorization expiry is malformed")
     try:

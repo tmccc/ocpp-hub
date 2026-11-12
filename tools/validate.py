@@ -147,9 +147,9 @@ def run_full_qualification(path: Path | None, python: str, results: dict[str, bo
         for suite in sorted(required):
             batch = Path(bundle["phases"][suite])
             config = json.loads((batch / "config.json").read_text())
-            if config.get("suite") != suite or config.get("workers") != 20:
-                raise ValueError("qualification phase has the wrong suite or worker count")
-            run_step(
+            if config.get("suite") != suite or config.get("workers") != 20 or config.get("mode") != "full":
+                raise ValueError("qualification phase requires its entire suite in full mode with20 workers")
+            completed = run_step(
                 f"qualification ({suite})",
                 [
                     python,
@@ -163,6 +163,18 @@ def run_full_qualification(path: Path | None, python: str, results: dict[str, bo
                 ],
                 results,
             )
+            audited = json.loads(completed.stdout)
+            if (
+                completed.returncode != 0
+                or audited.get("full_qualification_passed") is not True
+                or audited.get("mode") != "full"
+                or audited.get("suite") != suite
+                or audited.get("workers") != 20
+                or audited.get("commit") != metadata["commit"]
+                or audited.get("source_digest") != metadata["source_digest"]
+            ):
+                results[f"qualification ({suite})"] = False
+                raise ValueError("fresh raw audit did not establish full qualification for this exact suite/source")
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"Full qualification is invalid: {type(error).__name__}: {error}")
         results["full qualification"] = False

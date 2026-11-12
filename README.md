@@ -1037,19 +1037,34 @@ The workflow refuses unrelated faults, ambiguous additional transactions, missin
 commands, active temporary timers, changed configuration/history, and unconfirmed station zero. It never guesses a
 vendor ID, replays Start, invents a Stop, clears unrelated debts or automatically raises current.
 
-`tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for three other specific debts:
-`--kind observation` retires one legacy rejected routine report, `--kind vendor-write` resolves one independently
-settled vendor mutation, and `--kind local-start` retires an accepted owner Start whose source was never identified.
+`tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for six specific debts:
+
+- `--kind observation` retires one legacy rejected routine report.
+- `--kind vendor-write` resolves one independently settled uncertain vendor mutation.
+- `--kind local-start` retires an accepted owner Start whose source was never identified.
+- `--kind vendor-start` retires an accepted, unbound cloud Start grant using its exact confirmed command receipt.
+- `--kind stop-delivery` permits another delivery of one exact closed, mapped Stop retained after a rejected reply.
+- `--kind stop-fault` reconciles the remaining delivery fault after that exact Stop has a preserved real wire receipt.
+
 The service must be stopped with an existing verified local Pause and closed zero hold. `check` validates private
 inputs without network access; `inspect` reads fresh native evidence and supplies the exact candidate digests.
 Use the same `--config` and `--native-bounded-spec` as the service.
 
 For `reconcile --evidence`, copy the candidate fields into an owned private JSON file and add `evidence_sha256` and
-`verified_at_epoch` (independently verified within one hour). Vendor evidence also requires literal
-`command_quiescent: true` and `original_state_independently_verified: true`; owner Start evidence requires literal
-`command_no_longer_pending: true`. The operator must independently establish that the **particular command** was
+`verified_at_epoch` (independently verified within one hour). `vendor-write` evidence also requires literal
+`command_quiescent: true` and `original_state_independently_verified: true`. Both Start kinds require literal
+`command_no_longer_pending: true`; `vendor-start` also requires `original_state_independently_verified: true`.
+The operator must independently establish that the **particular command** was
 cancelled or consumed and cannot execute later. An error reply, zero draw, unplugging, elapsed time, or closed
 same-tag sessions do not establish that fact. The evidence hash records provenance and does not authenticate it.
+
+Both Stop kinds require literal `cloud_stop_independently_verified: true`, `fault_origin_independently_verified: true`
+and `original_state_independently_verified: true`, with the inspected event, transaction, payload and reply digests.
+A Stop retry still requires a genuine correlated cloud CallResult. Only the exact independently approved malformed
+optional authorization metadata may be ignored; it is never cached as permission. Changed replies and CALLERROR
+revoke that retry approval and require fresh evidence. Wire acknowledgment and event deletion commit together.
+Definitely queued closed Start/Stop pairs remain in order behind the recovered head. A later rejected Stop needs its
+own proof. An already drained legacy fault without a preserved matching wire receipt remains quarantined.
 
 Reconciliation archives the exact prior state and changes only its named debt. It has no charger writer and does
 not report successful execution of an uncertain command. Legacy report recovery retains later queued genuine
@@ -1058,6 +1073,11 @@ an explicit fault. After restart and complete delivery, a **new Pause** must ack
 Boot/original-resource/all-phase-zero evidence. Return remains a separate request to restore the previous selected
 offer. No operation automatically replays a command, clears unrelated debts or resumes charging. Redacted status
 includes `vendor_write_uncertain` and `operator_reconciliation_required` even for legacy uncertainty without a marker.
+
+A proven preflight refusal or an explicitly unattempted local Start can finish its lifecycle cleanup without an
+invented session report. The latter still requires fresh verified Pause/zero, including after process replacement.
+Neither case disables supervision of a later ordinary session. An accepted or possibly dispatched Start retains
+its separate command debt until actual binding or independent reconciliation.
 
 - Vendor profile ids are translated, allocated monotonically and retired after their transaction. Vendor station
   profiles cannot reach the reserved local stack. Plan clears resolve every named vendor resource before sending;
