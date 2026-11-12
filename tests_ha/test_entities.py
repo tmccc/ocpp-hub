@@ -122,7 +122,7 @@ async def test_unload_releases_the_port(
 # Why: during the swap the old OCPP integration may still hold the port for a moment.
 async def test_port_in_use_retries_setup(hass: HomeAssistant) -> None:
     with socket.socket() as blocker:
-        blocker.bind(("0.0.0.0", 0))
+        blocker.bind(("127.0.0.1", 0))
         blocker.listen()
         entry = MockConfigEntry(domain=DOMAIN, data={CONF_PORT: blocker.getsockname()[1]})
         entry.add_to_hass(hass)

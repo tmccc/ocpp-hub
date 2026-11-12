@@ -34,6 +34,13 @@ def allow_local_sockets(socket_enabled: None) -> None:
     return None
 
 
+# Intent: bind the actual integration listener to loopback in the isolated test environment.
+# Why: these tests need real local peers while the offline audit must reject wildcard and external listeners.
+@pytest.fixture(autouse=True)
+def local_listener_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("custom_components.ocpp_hub.BIND_HOST", "127.0.0.1")
+
+
 # Wait until a condition holds, letting Home Assistant finish its work between looks.
 # Frames travel over real sockets, so an effect shows up a moment after the cause and a fixed sleep would be a guess.
 async def wait_for(
