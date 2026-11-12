@@ -654,6 +654,20 @@ present or later reappears must still match its complete original JSON body. New
 turned into completed sessions, and historical absence never creates a Stop, cloud acknowledgement or allocation
 reset. The dashboard's native history continues to describe records actually returned by the charger.
 
+Ordinary introduction retries transient native HTTP or stale-observation failures on the same charger connection.
+Changed identity, configuration, history or resource ownership still blocks introduction. A failed read-only vendor
+request returns an error without creating electrical-command uncertainty. At startup, a recognized legacy marker for
+`GetConfiguration`, `GetCompositeSchedule` or `TriggerMessage` can be retired only with a settled journal and no
+unrelated fault or command debt. This migration records its evidence and retains a paused zero recovery; fresh Boot
+and native verification are required. If unrelated debt blocks migration, reconcile it before restarting the service.
+Payload-dependent legacy `DataTransfer` markers require separate reconciliation.
+
+An `owner_release_unconfirmed` fault retains its zero hold across polls and restarts. Issue a new **Pause charging**
+to request reconciliation of that particular fault. The proxy requires current actual Boot, independently verified
+closed all-phase zero, the confirmed owned station profile, unchanged native configuration/schedule/history and no
+lifecycle, command or mutation debt. Successful reconciliation completes Pause and stays at zero. A separate
+**Return to app/schedule** is required to restore the selected ceiling. Other fault classifications remain latched.
+
 The default commissioning policy remains strict. `tools/acknowledge_native_history.py check --config <private-file>
 --native-bounded-spec <private-file>` is dormant input validation. Its explicit `acknowledge` action requires the
 service to be stopped and acquires the existing journal's exclusive lock before fresh native reads. It accepts only

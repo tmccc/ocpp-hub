@@ -15,6 +15,7 @@ from .managed_current import (
     require_current_source,
 )
 from .managed_intent import ControlIntent, ManagedRequests
+from .managed_release_recovery import reconcile_owner_release, record_release_pause
 from .managed_schedule import (
     KEY,
     ManagedSchedule,
@@ -96,6 +97,7 @@ class ManagedController:
             self.session.journal.put(
                 "managed_owner_pause", {"ticket": ticket, "revision": self.requests.intent().revision}
             )
+            record_release_pause(self, identifier)
 
         receipt = self.requests.accept(identifier, action, revision, claim)
         if action == "pause":
@@ -582,6 +584,12 @@ class ManagedController:
             return {**base, "state": "stopping", "owner_control_enabled": False}
         if j.get("managed_control_fault"):
             await self.hold_fault()
+            try:
+                await reconcile_owner_release(self)
+            except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+                pass  # The exact fault remains latched until a new Pause and every independent zero proof agree.
+            if not j.get("managed_control_fault"):
+                return {**base, "state": "reconciling", "owner_control_enabled": False}
             return {**base, "state": "attention", "fault": j.get("managed_control_fault")["classification"]}
         timer = self.schedule.arm_idle_cutoff()
         pending_timer = supervised_timer(timer)

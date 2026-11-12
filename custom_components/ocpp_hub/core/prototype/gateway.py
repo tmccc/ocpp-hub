@@ -26,6 +26,7 @@ from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
 from .store import ConflictError, Journal, RecoveryRequiredError, encoded, fingerprint
+from .vendor_read_recovery import recover_legacy_vendor_read
 
 
 # Reject malformed or non-finite input before handing it to the upstream frame vocabulary.
@@ -94,6 +95,7 @@ class Gateway:
     # Nothing connects here; an offline harness must explicitly supply the peer senders.
     def __init__(self, journal: Journal, policy: Policy | None = None, timeout: float = 1.0) -> None:
         self.journal = journal
+        recover_legacy_vendor_read(journal)
         self.plans = PlanBook(journal)
         self.policy = policy or Policy()
         self.charger = Peer("local", timeout)
@@ -770,7 +772,6 @@ class Gateway:
             try:
                 if mutation and dispatched:
                     self.journal.mutation_finished(mutation, False)
-                if dispatched:
                     self.journal.put("uncertain_vendor_command", {"action": action, "digest": fingerprint(original)})
             except sqlite3.Error:
                 self.failures.append("JournalUnavailable")

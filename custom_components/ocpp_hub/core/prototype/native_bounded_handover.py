@@ -268,13 +268,8 @@ class NativeBoundedHandover:
         try:
             native = await self.read(closed=binding is None)
         except (NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError) as error:
-            if (
-                not supervised_timer(journal.get("managed_temporary_schedule", {}))
-                and journal.get("managed_current_change", {}).get("state") != "recovering"
-            ):
-                raise
             # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
-            raise IntroductionDeferredError("timer recovery awaits fresh introduction evidence") from error
+            raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
         gateway._require_epoch("charger", epoch)
         if binding is None:
             if (

@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Retry ordinary charger introduction after transient native observation failure, with the same permanent binding
+  and ownership checks. Failed read-only vendor RPCs no longer create uncertain electrical-command debt.
+  Conservatively migrate recognized old read markers during startup into a verified Pause.
+- Reconcile an unconfirmed owner release after a new explicit Pause and fresh current-Boot, closed all-phase zero,
+  original configuration/history and settled-journal proof. Retain zero until a separate Return to app/schedule.
 - Retire vendor mutations and provisional Start grants when a final guard proves the command was never sent.
   Preserve uncertainty and the Start grant after cancellation, malformed replies or peer errors following dispatch.
   Update profile transaction ownership
