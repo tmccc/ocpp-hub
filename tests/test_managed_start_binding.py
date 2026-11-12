@@ -186,6 +186,10 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
         )
         returning = uuid.uuid4().hex
         b.c.command(returning, "app_control", b.c.requests.intent().revision)
+        async with asyncio.timeout(5):
+            while b.c.requests.receipt(returning)["state"] in ("accepted", "running"):
+                await b.c.tick()
+                await asyncio.sleep(0.01)
         assert (await healthy(b.c))["station_ceiling_a"] == 6
         assert b.c.requests.receipt(returning)["state"] == "completed"
         assert set(b.device.plans) == {9}

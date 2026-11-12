@@ -407,10 +407,12 @@ class ManagedController:
             and j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             or g.controls._operations
             or g.charger._pending
-            or g.vendor._pending
             or j.get("uncertain_vendor_command")
         ):
             raise RecoveryRequiredError("shared control awaits fresh zero and actual history/cloud reconciliation")
+        if g.vendor._pending:
+            # All write debts are settled above; no positive release has started while a routine RPC is in flight.
+            raise ReleaseDeferredError("shared control awaits completion of the current cloud RPC")
 
     # Verify again after recovery acknowledgement; release raises only the ceiling and never sends RemoteStart.
     async def restore_owner_control(

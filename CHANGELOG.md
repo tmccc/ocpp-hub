@@ -5,6 +5,9 @@
 - Keep running Return exclusive, wake deadline supervision when native evidence reopens a timer obligation,
   and bind ordinary outage recovery to the exact confirmed command source. Reserve bounded lifecycle storage
   independently of routine telemetry, including each accepted transaction's Stop.
+- Keep an accepted Return waiting at zero for a routine cloud RPC after all write debts are settled.
+  Recheck its original revision and every release guard before dispatch; genuine history debt and unconfirmed
+  positive writes retain their existing refusal and uncertainty rules.
 - Provide an explicit offline operator workflow for one cloud-accepted Start with a lost acknowledgement.
   Independently verified mapping and actual Stop acknowledgement precede a new Pause that clears only the
   matching fault at zero; Start replay and automatic positive release remain forbidden.
