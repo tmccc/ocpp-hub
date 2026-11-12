@@ -11,6 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from tools.trial_proxy import emit, load_core, native_spec, preflight  # noqa: E402
+
+load_core()
 from ocpp_hub_core.prototype.managed_delivery_recovery import (  # noqa: E402
     DeliveryAttestation,
     delivery_candidate,
@@ -20,8 +23,6 @@ from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
-
-from tools.trial_proxy import emit, native_spec, preflight  # noqa: E402
 
 
 # The explicit actions have a read-only native observer and journal owner; none has a charger writer or listener.

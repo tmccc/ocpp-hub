@@ -8,12 +8,62 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from websockets.asyncio.client import connect
 
 from tests import test_native_bounded_session as native_bench
+from tests.handover_helpers import NativeVehiclePeer
 from tests.test_managed_api import TOKEN, call
 from tests.test_managed_current import adjustable
 from tests.test_managed_current_tick_race import OneNativeResponseGate, chain
 from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_test_charge import ready
 from tests.test_prototype_tls import tls as tls
+
+
+class SlowSnapshotPeer(NativeVehiclePeer):
+    """Individual HTTP reads finish within five seconds, while one complete snapshot exceeds fifteen."""
+
+    # The fake device owns latency independently of the management controller.
+    def __init__(self, bench):
+        super().__init__(bench)
+        self.slow = False
+        self.delayed_requests = 0
+
+    # Delay exactly one actual snapshot; later evidence can become healthy without retrying the Return command.
+    async def handle(self, reader, writer):
+        if self.slow:
+            self.delayed_requests += 1
+            if self.delayed_requests == 9:
+                self.slow = False
+            await asyncio.sleep(1.8)
+        await super().handle(reader, writer)
+
+
+# Intent: an aggregate native timeout terminates Return as uncertain and permits a new explicit request after recovery.
+# Why: leaving its receipt running forever hides healthy admission behind an operation that no longer exists.
+@pytest.mark.parametrize("slow", [False, True])
+async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_port, monkeypatch, slow):
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SlowSnapshotPeer)
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, peer = b.controller, b.rig.peer
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        request = uuid.uuid4().hex
+        c.command(request, "app_control", c.requests.intent().revision)
+        peer.slow = slow
+        try:
+            await c.tick()
+        finally:
+            peer.slow = False
+        status = await healthy(c)
+        assert c.requests.receipt(request)["state"] == ("uncertain" if slow else "completed")
+        assert not c.requests.return_in_progress() and not starts(b.rig)
+        if slow:
+            assert peer.delayed_requests == 9 and status["local_hold_verified"]
+            assert b.rig.bench.firmware.effective_limit() == 0
+            fresh = uuid.uuid4().hex
+            c.command(fresh, "app_control", c.requests.intent().revision)
+            assert (await healthy(c))["owner_control_enabled"]
+            assert c.requests.receipt(fresh)["state"] == "completed"
+            assert c.requests.receipt(request)["state"] == "uncertain"
+        assert b.rig.bench.firmware.effective_limit() == 6 and not starts(b.rig)
 
 
 # Intent: accepted and running Return refuse Start/current while a newer Pause can still retain zero.

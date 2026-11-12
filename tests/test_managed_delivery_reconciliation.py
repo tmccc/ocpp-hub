@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+import sys
 import time
 import uuid
 from dataclasses import replace
@@ -62,8 +63,9 @@ class CloudReplyFilter:
 # Intent: native6 and commissioned native32 recover only after exact operator evidence, genuine Stop ACK and new Pause.
 # Why: zero/closure alone cannot prove cloud identity, and neither mapping nor restart may silently resume charging.
 @pytest.mark.parametrize("ceiling", [6, 32])
+@pytest.mark.parametrize("local_owner", [False, True])
 async def test_operator_delivery_recovery_retains_zero_until_separate_return(
-    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, ceiling
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, ceiling, local_owner
 ):
     trace = {
         "calls": [],
@@ -89,7 +91,23 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
         native_port = rig.prepared.observer.port
         requests_before_check = list(rig.peer.requests)
         assert await operator.run("check", config, strategy, None, native_port) == 0
+        child = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-B",
+            operator.__file__,
+            "check",
+            "--config",
+            str(config),
+            "--native-bounded-spec",
+            str(strategy),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await child.communicate()
+        assert child.returncode == 0 and not stderr and json.loads(stdout)["inputs_valid"]
         assert not rig.prepared.config.journal.exists() and rig.peer.requests == requests_before_check
+        if local_owner:
+            rig.prepared.config = replace(rig.prepared.config, local_tags=frozenset({"APP_OWNER", "NATIVE_TIMER"}))
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
@@ -108,17 +126,28 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
                 c.command(uuid.uuid4().hex, "set_current", c.requests.intent().revision, current_a=selected)
                 await c.current.settle()
                 await healthy(c)
-            assert (
-                await rig.bench.cloud_call(
-                    "owner-app-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
-                )
-            )[2]["status"] == "Accepted"
-            opened = await rig.bench.call(charger, "owner-report", "StartTransaction", START | {"idTag": "CLOUD_OWNER"})
+            if local_owner:
+                c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+                await c.tests.settle()
+                tag = starts(rig)[-1][3]["idTag"]
+            else:
+                assert (
+                    await rig.bench.cloud_call(
+                        "owner-app-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+                    )
+                )[2]["status"] == "Accepted"
+                tag = "CLOUD_OWNER"
+            opened = await rig.bench.call(charger, "owner-report", "StartTransaction", START | {"idTag": tag})
             local = opened[2]["transactionId"]
+            if local_owner:
+                rig.peer.plan_session = (local, 987654)
             rig.peer.paused, rig.peer.permission_enabled = False, True
             rig.bench.cp, rig.bench.connection = "C", "Charging"
             rig.bench.firmware.fire_plan(9)
             assert rig.bench.firmware.current == selected
+            if local_owner:
+                await healthy(c)
+                assert c.tests.state()["state"] == "running"
             await until(lambda: session.runtime.status.delivery_blocked, timeout=12)
             for _ in range(3):
                 await c.tick()
@@ -146,6 +175,19 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
             counter, binding = session.journal.get("next_transaction"), session.journal.get("trial_binding")
             fault = session.journal.get("managed_control_fault")
             await session.close()
+        if local_owner and ceiling == 6:
+            journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
+            original = journal.get("managed_test_charge")
+            journal.close()
+            for invalid in ({"kind": "test"}, {"state": "starting"}, {"id": "wrong"}, {"local_transaction": local + 1}):
+                journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
+                journal.put("managed_test_charge", original | invalid)
+                journal.close()
+                with pytest.raises(RecoveryRequiredError):
+                    await operator.run("inspect", config, strategy, None, native_port)
+            journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
+            journal.put("managed_test_charge", original)
+            journal.close()
         assert await operator.run("inspect", config, strategy, None, native_port) == 0
         candidate = json.loads(capsys.readouterr().out.splitlines()[-1])["candidate"]
         assert candidate["local"] == local and candidate["start_token"] == next(
@@ -208,6 +250,11 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
             finally:
                 journal.close()
         assert await operator.run("reconcile-start", config, strategy, evidence_path, native_port) == 0
+        if local_owner:
+            journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
+            assert journal.get("managed_test_charge")["state"] == "completed"
+            assert journal.get(KEY)[str(local)]["proof"]["prior_closed_normal_start"]["state"] == "running"
+            journal.close()
         save_private(evidence_path, evidence | {"evidence_sha256": "0" * 64})
         with pytest.raises(RecoveryRequiredError, match="cannot be replaced"):
             await operator.run("reconcile-start", config, strategy, evidence_path, native_port)

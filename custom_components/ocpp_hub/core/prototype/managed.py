@@ -585,7 +585,7 @@ class ManagedController:
                 "UPDATE managed_requests SET state='accepted' WHERE id=? AND state='running'", (identifier,)
             )
             return
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             self.requests.finish(identifier, "uncertain", {"classification": "return_not_confirmed"})
             return
         if self.requests.intent() != expected:
