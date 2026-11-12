@@ -1,4 +1,4 @@
-"""Real management and peer timing cannot classify an accepted current application as unknown ownership."""
+"""Public controller acceptance during real peer I/O preserves current application and later wire controls."""
 
 import asyncio
 import json
@@ -92,13 +92,6 @@ def waiting_locals(task, function):
     return {}
 
 
-# Reject an irrelevant pre-command ordering if the real resource-wait sleep has already nearly elapsed.
-def resource_wait_remaining(task):
-    context = waiting_locals(task, "sleep")
-    handle = context.get("h")
-    return handle.when() - asyncio.get_running_loop().time() if handle is not None else 0
-
-
 class CorrelatedCloudBench(managed_helpers.OwnerBench):
     # The independent vendor correlates actual TLS replies without consuming the tick's 20 ms wait by polling.
     def __init__(self):
@@ -137,9 +130,9 @@ class CorrelatedCloudBench(managed_helpers.OwnerBench):
         return await asyncio.wait_for(future, 2)
 
 
-# Intent: real set_current acceptance during tick's real resource wait cannot supersede or fault the legal worker.
-# Why: a health audit must defer after acceptance and preserve the actual current result and later explicit Return.
-async def test_real_api_current_acceptance_during_tick_resource_wait_completes(
+# Intent: public current acceptance during tick's real resource wait preserves its worker and later wire Pause/Return.
+# Why: management dispatch calls this controller boundary synchronously; the legal ordering needs no wall-time margin.
+async def test_controller_current_acceptance_during_tick_resource_wait_completes(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
@@ -186,19 +179,19 @@ async def test_real_api_current_acceptance_during_tick_resource_wait_completes(
                     release.set()
                     assert (await vendor)[0] == 3
                     assert not b.session._resource_mutation_inflight() and c.current.available(c.latest_native)
-                    if resource_wait_remaining(tick) < 0.012:
-                        # No current command was sent or accepted in this discarded scheduling order.
+                    waiting = chain(tick)
+                    if tick.done() or "settled_native" not in waiting or "sleep" not in waiting:
+                        # No current command was sent or accepted in this irrelevant scheduling order.
                         await asyncio.wait_for(tick, 2)
                         continue
                     peer.arm = True
                     identifier = uuid.uuid4().hex
-                    accepted = await call(
-                        management, "set_current", id=identifier, revision=c.requests.intent().revision, current_a=16
-                    )
-                    assert accepted["ok"] and accepted["result"]["state"] == "accepted"
+                    # No await separates the actual suspended-tick proof from this public acceptance boundary.
+                    accepted = c.command(identifier, "set_current", c.requests.intent().revision, current_a=16)
+                    assert accepted["state"] == "accepted"
                     break
                 else:
-                    raise AssertionError("no actual resource-wait window remained before current acceptance")
+                    raise AssertionError("tick never remained in its actual resource wait before current acceptance")
                 await asyncio.wait_for(peer.entered.wait(), 2)
                 assert peer.gated_request["action"] == "getConfig"
                 worker_stream = waiting_locals(c.current.worker, "read_native").get("writer")
