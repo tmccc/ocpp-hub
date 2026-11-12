@@ -3065,6 +3065,7 @@ async def test_temporary_native_start_order_before_cutoff(
         for _ in range(3):
             await b.c.tick()
         assert not b.stops() and b.device.effective_limit() == 6 and b.device.current == (6 if demand else 0)
+        assert not b.session.journal.get(managed_schedule.KEY).get("cutoff_reached")
         b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
         await b.c.tick()
         assert b.device.effective_limit() == 0 and b.stops() == [local]

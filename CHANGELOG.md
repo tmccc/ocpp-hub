@@ -3,10 +3,12 @@
 ## Unreleased — iCS prototype and commissioning package
 
 - Retire vendor mutations and provisional Start grants when a final guard proves the command was never sent.
-  Preserve uncertainty after any attempted transport, including cancellation. Update profile transaction ownership
+  Preserve uncertainty and the Start grant after cancellation, malformed replies or peer errors following dispatch.
+  Update profile transaction ownership
   only on an exact Accepted reply, including replacement acknowledgements arriving after the previous Stop.
 - Pace restrictive timer retries by elapsed time so wall-clock corrections cannot extend a failed zero or Stop
-  cooldown. A restarted controller retries an authorized restrictive action without inheriting a stale wall deadline.
+  cooldown. Once cutoff has been observed, retain that occurrence's Stop duty across a clock rewind. A restarted
+  gateway retries an authorized restrictive action without inheriting a stale wall deadline.
 - Allow history-retention acknowledgement under the journal's commissioned native32 capability as well as native6,
   preserving the original configuration binding, matching-fault, actual-zero and settled-journal requirements.
 - Add a supervised one-off native timer alongside the original daily schedule, with verified installation

@@ -234,6 +234,7 @@ async def test_resource_capacity_and_profile_retirement(tmp_path: Path) -> None:
     with pytest.raises(RecoveryRequiredError):
         book.reserve(3)
     profile = commands.set_charging_profile(1, commands.PURPOSE_TX, 6, 101, transaction_id=6000002)
+    rig.charger_result = {"status": "Accepted"}
     assert (await rig.vendor("profile", "SetChargingProfile", profile))[0] == 3
     mapped = rig.store.get("vendor_profiles")["101"]
     await rig.charger(

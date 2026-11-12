@@ -740,9 +740,19 @@ class Gateway:
                 )
             ):
                 raise UnavailableError("unobserved charging profile response")
+            if (
+                action == "RemoteStartTransaction"
+                and answer[0] == 3
+                and answer[2]
+                not in (
+                    {"status": "Accepted"},
+                    {"status": "Rejected"},
+                )
+            ):
+                raise UnavailableError("unobserved remote Start response")
             if query is not None:
                 answer = query.response(answer)
-            if grant is not None and (answer[0] != 3 or answer[2].get("status") != "Accepted"):
+            if grant is not None and answer[0] == 3 and answer[2] == {"status": "Rejected"}:
                 self.authorisation.revoke(grant)
             with self.journal.atomic():
                 if profile_write is not None and answer[0] == 3 and answer[2] == {"status": "Accepted"}:

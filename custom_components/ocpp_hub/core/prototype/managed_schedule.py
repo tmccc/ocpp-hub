@@ -369,8 +369,14 @@ def temporary_continuation(j: Journal, lease: dict[str, Any], local: int) -> boo
         and not lease.get("unreported_native")
         and intent.get("mode") == "app"
         and intent.get("revision") == lease.get("control_revision", lease["revision"])
-        and lease["start_epoch"] <= time.time() < lease.get("end_epoch", lease["start_epoch"])
+        and lease["start_epoch"] <= time.time()
+        and not cutoff_due(lease)
     )
+
+
+# Once observed, this occurrence's cutoff cannot become future authority after a calendar correction.
+def cutoff_due(lease: dict[str, Any]) -> bool:
+    return bool(lease.get("cutoff_reached")) or time.time() >= lease.get("end_epoch", float("inf"))
 
 
 # A provisional hold may be lifted only for this same open transaction on a positively identified original plan.
@@ -509,7 +515,7 @@ class ManagedSchedule:
             zone = ZoneInfo(self.c.native.spec.original_configuration["timeZone"])
             lease = {**lease, "end_epoch": cutoff_epoch(lease["start_epoch"], zone)}
             self.j.put(KEY, lease)
-        if time.time() >= lease["end_epoch"] and not lease.get("idle_cutoff_hold"):
+        if cutoff_due(lease) and not lease.get("idle_cutoff_hold"):
             active = self.j.active()
             if (
                 active is not None
@@ -565,7 +571,7 @@ class ManagedSchedule:
             bool(lease.get("retire_reason"))
             or "hold_since" in lease
             and not (lease.get("idle_cutoff_hold") and lease.get("idle_cutoff_replacement"))
-            or time.time() >= lease.get("end_epoch", float("inf"))
+            or cutoff_due(lease)
         )
 
     # The one-off owns its start window until retirement. A second RemoteStart cannot share its lifecycle token.
@@ -1344,7 +1350,7 @@ class ManagedSchedule:
                 active == lease.get("bound_local") and lease.get("native_plan_confirmed") is True
             )
         native = self.c.native
-        cutoff = time.time() >= lease.get("end_epoch", float("inf"))
+        cutoff = cutoff_due(lease)
         return (
             native.last_verified_at == 0
             or cutoff
@@ -1387,7 +1393,7 @@ class ManagedSchedule:
                     self.j.put(KEY, lease)
                 remaining = end - time.time()
                 due = (
-                    remaining <= 0
+                    cutoff_due(lease)
                     or self.needs_source(lease)
                     or lease.get("retire_reason") == "vehicle_disconnected"
                     or lease.get("vehicle_disconnected")
@@ -1402,7 +1408,7 @@ class ManagedSchedule:
                 daily = self.j.active() is not None and self.j.active() == lease.get("other_local")
                 native = self.c.native
                 if (
-                    remaining <= 5
+                    (remaining <= 5 or cutoff_due(lease))
                     and daily
                     and self.c.session.gateway.controls.desired() > 0
                     and native.observation_age() >= 2
@@ -1425,9 +1431,12 @@ class ManagedSchedule:
     async def protect_deadline(self, lease: dict[str, Any]) -> None:
         j = self.j
         lease = self.arm_idle_cutoff()
+        if supervised_timer(lease) and cutoff_due(lease) and not lease.get("cutoff_reached"):
+            lease = {**lease, "cutoff_reached": True}
+            j.put(KEY, lease)
         if (
             lease.get("state") == "complete"
-            and (time.time() < lease.get("end_epoch", float("inf")) or not idle_cutoff_pending(lease))
+            and (not cutoff_due(lease) or not idle_cutoff_pending(lease))
             and not lease.get("idle_cutoff_hold")
             and not lease.get("closure_gap")
             and not lease.get("unreported_native")
@@ -1435,7 +1444,7 @@ class ManagedSchedule:
         ):
             return
         needs_source = self.needs_source(lease)
-        before_end = time.time() < lease.get("end_epoch", float("inf"))
+        before_end = not cutoff_due(lease)
         if (
             not supervised_timer(lease)
             or before_end
@@ -1603,7 +1612,7 @@ class ManagedSchedule:
         lease, candidates = self.observe_timer(lease, n)
         if self.awaiting_start() and j.active() is None and not n.physical.transaction_open:
             # Preserve a previously accepted lifecycle while the station remains inside the authorized window.
-            if now < lease["end_epoch"] and not lease.get("retire_reason") and c.requests.intent().mode == "app":
+            if not cutoff_due(lease) and not lease.get("retire_reason") and c.requests.intent().mode == "app":
                 return
         bound = lease.get("bound_local")
         closed = bound is not None and candidates.get(bound) is True
