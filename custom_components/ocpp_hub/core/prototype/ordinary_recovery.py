@@ -12,6 +12,7 @@ from .local_control import local_start_receipt
 from .managed_cutoffs import supervised_timer
 from .managed_occurrences import occurrences
 from .managed_schedule import recorded_station_profile
+from .managed_start_binding import known_plan_source
 from .rpc import UnavailableError
 from .store import RecoveryRequiredError, ReleaseDeferredError, fingerprint
 from .trial_rollback import require_lifecycle_idle
@@ -76,12 +77,19 @@ class OrdinaryRecovery:
             return None
         tag = json.loads(row["start"])["idTag"].casefold()
         digest = fingerprint(tag)
+        grant = j.get("vendor_start_grant", {})
+        attested = grant.get("native_source")
+        if attested is not None and attested != {
+            "marker": native.session_plan_id,
+            "start": fingerprint(json.loads(row["start"])),
+            "schedule": self.c.native.spec.saved_schedule_digest,
+        }:
+            return None
         for plan in (native.saved_schedule or {}).get("planList", []):
             if plan.get("planId") == native.session_plan_id and str(plan.get("idTag", "")).casefold() == tag:
                 return {"kind": "daily", "plan": plan["planId"], "tag": digest}
-        if native.session_plan_id is not None:
-            return None  # A claimed foreign plan or original plan with the wrong tag contradicts manual source.
-        grant = j.get("vendor_start_grant", {})
+        if native.session_plan_id is not None and (known_plan_source(j, native) or attested is None):
+            return None  # An unknown marker needs the exact command-source attestation made during binding.
         if (
             grant.get("local") == local
             and grant.get("digest") == digest

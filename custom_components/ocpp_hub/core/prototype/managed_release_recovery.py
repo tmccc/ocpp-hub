@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING, Any
 from ..control import HUB_PROFILE_ID
 from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
 from .managed_cutoffs import supervised_timer
+from .managed_delivery_recovery import complete_delivery_recovery, delivery_recovery_evidence
 from .managed_occurrences import occurrences
-from .store import RecoveryRequiredError
+from .store import RecoveryRequiredError, fingerprint
 from .trial_rollback import require_lifecycle_idle
 
 if TYPE_CHECKING:
@@ -27,6 +28,8 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
     if fault.get("classification") == FAULT:
         return True
     if legacy_current_evidence(c, fault) is not None:
+        return True
+    if delivery_recovery_evidence(c, fault) is not None:
         return True
     if fault.get("classification") != "native_authority_or_preservation_failed":
         return False
@@ -57,7 +60,10 @@ def record_release_pause(c: ManagedController, identifier: str) -> None:
         raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
     acknowledgement = {"fault": fault, "pause_request": identifier, "revision": intent.revision}
     current = legacy_current_evidence(c, fault)
-    if current is not None:
+    delivery = delivery_recovery_evidence(c, fault)
+    if delivery is not None:
+        acknowledgement["delivery_reconciliation"] = fingerprint(delivery)
+    elif current is not None:
         acknowledgement["current_failure_evidence"] = current
     elif fault.get("classification") != FAULT:
         acknowledgement["native_failure"] = j.get("managed_native_failure")
@@ -66,6 +72,11 @@ def record_release_pause(c: ManagedController, identifier: str) -> None:
 
 # Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.
 def acknowledged_evidence(c: ManagedController, fault: dict[str, Any], ack: dict[str, Any]) -> bool:
+    delivery = delivery_recovery_evidence(c, fault)
+    if delivery is not None:
+        return ack.get("delivery_reconciliation") == fingerprint(delivery)
+    if "delivery_reconciliation" in ack:
+        return False
     current = legacy_current_evidence(c, fault)
     if current is not None:
         return bool(ack.get("current_failure_evidence") == current)
@@ -105,6 +116,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     boot = g.boot_observation
     ticket = j.get("control", {}).get("ticket")
     current = legacy_current_evidence(c, fault)
+    delivery = delivery_recovery_evidence(c, fault)
 
     # Any newer Pause, Boot, local operation, request or unrelated write debt revokes this snapshot.
     def guard() -> None:
@@ -202,6 +214,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 "prior_fault": fault,
                 "prior_native_failure": ack.get("native_failure"),
                 "prior_current_failure": current,
+                "delivery_reconciliation": fingerprint(delivery) if delivery is not None else None,
                 "pause_request": ack["pause_request"],
                 "revision": intent.revision,
                 "native_digest": native.digest,
@@ -213,6 +226,8 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
         )
         j.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
         j.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
+        if delivery is not None:
+            complete_delivery_recovery(j, delivery, ack["pause_request"])
         if current is not None:
             control = {**control, "resume_limit": current["previous_a"]}
             j.put(

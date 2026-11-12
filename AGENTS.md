@@ -48,7 +48,11 @@
 
 ## Validation
 
-`python tools/validate.py` runs everything CI runs: ruff, the format check, `mypy --strict`, the version check, the translation rules, a YAML check, `compileall`, `git diff --check` and pytest. Use the repository virtualenv (`.venv/bin/python`). `--quick` skips pytest.
+Use the repository Python3.14 virtualenv and `requirements-offline.txt`. `python tools/validate.py --quick` runs
+static checks. Full validation requires `--qualification-report` with raw20-worker evidence for engine/models,
+HA11 client, HA10 client and legacy HA suites from the exact clean commit. Use `tools/parallel_qualify.py` and
+the explicit worker/runtime settings in `docs/developer.md`; never substitute a serial combined suite or a saved
+green flag. `--tests-only -k` is targeted development verification, not full qualification.
 
 ## Release and deploy
 

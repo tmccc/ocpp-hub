@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import MAJOR_VERSION, MINOR_VERSION, Platform
 from homeassistant.core import HomeAssistant
 
 from .coordinator import ProxyCoordinator
@@ -13,11 +13,14 @@ type ProxyEntry = ConfigEntry[ProxyCoordinator]
 
 
 # Connect only to the authenticated management channel; the OCPP service remains independently supervised.
-async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry) -> None:
+async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry) -> bool | None:
     coordinator = ProxyCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    if (MAJOR_VERSION, MINOR_VERSION) < (2026, 11):
+        return True
+    return None
 
 
 # HA reload and shutdown retire only the client's subscriptions, preserving the user's durable requested mode.

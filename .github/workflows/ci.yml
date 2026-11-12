@@ -5,9 +5,13 @@ on:
     branches:
       - "main"
       - "release/**"
+      - "fix/**"
+      - "feature/**"
+      - "refactor/**"
     tags:
       - "v*"
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

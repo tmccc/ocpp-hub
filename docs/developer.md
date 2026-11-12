@@ -14,23 +14,59 @@
 ## Setup and checks
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install pytest pytest-asyncio pyyaml voluptuous websockets ruff==0.16.4 mypy==1.15.0
-.venv/bin/python tools/validate.py          # everything CI runs, then pytest
-.venv/bin/python tools/validate.py --quick  # skip pytest
+python3.14 -m venv .venv
+.venv/bin/pip install -r requirements-offline.txt
+.venv/bin/python tools/validate.py --quick
+.venv/bin/python tools/validate.py --qualification-report /absolute/task/qualification.json
 ```
 
-`validate.py` runs ruff, the format check, `mypy --strict` on `core/`, the version and translation checks, a YAML check, `compileall`, `git diff --check` and pytest. The line limit is 120 characters, comments included.
+`--quick` runs static checks only, including strict typing for the core and HA-free client API, compilation of both
+integrations, version/translation/YAML checks and `git diff --check`. The line limit is120 characters, including comments.
+Full validation re-audits raw execution evidence against the current clean commit; it never treats a report's own
+success flag as proof or silently launches the combined suite in a single process. An explicit `--tests-only -k`
+selection is useful for development and is labelled targeted, with the remaining suites outside that result.
 
 The Home Assistant layer tests need their own virtualenv. Pin the plugin to the Home Assistant version of the server you deploy to (the plugin release pins it):
 
 ```bash
-python3 -m venv .venv-ha
-.venv-ha/bin/pip install pytest-homeassistant-custom-component==0.13.373 "websockets>=15.0.1" ruff==0.16.4
-.venv-ha/bin/python -m pytest tests_ha
+python3.14 -m venv .venv-ha
+.venv-ha/bin/pip install -r requirements-ha-legacy.txt
+TMPDIR=/absolute/task .venv-ha/bin/python tools/offline_ha_validate.py --legacy-ha tests_ha
 ```
 
-`validate.py` runs those tests too when `.venv-ha` exists and says "skip" in its summary when it does not; CI always runs them.
+The separate `ics_proxy` client is tested on actual HA2026.10.4 and2026.11.0. The latter uses
+`requirements-ha-proxy.txt` and keeps the older HA test plugin disabled. Its fixtures instantiate actual HA registries,
+config entries and entities, with synthetic loopback management peers and DNS construction isolated from multicast.
+The packaged legacy Hub retains its HA10 minimum; it is a different deployment domain.
+
+`tools/parallel_qualify.py` freezes ordinary tracked Git blobs and runs20 pinned Docker workers with separate network
+namespaces, read-only source/runtime, task-owned scratch, four spare CPUs and a bounded timeout. All runtime paths,
+immutable image IDs and optional SSH worker settings are explicit arguments. Output belongs outside the repository.
+The engine/model phase uses `--suite engine-model`; the other required phases are `ha-proxy`, `ha-legacy` and
+`ha-proxy-legacy`. Use each phase's matching provisioned virtualenv/image and the exact package pins in its requirements
+file. Host-runtime mode explicitly mounts the worker's `/usr` and virtualenv; image-runtime mode uses the image's
+interpreter/libraries and mounts its matching virtualenv at `/venv`. Package/interpreter identity and the mounted
+virtualenv digest are recorded and checked; source and executed harness bytes are checked before and after the run.
+
+For an existing provisioned Linux worker, the invocation has this form; all capitalized paths/IDs are operator inputs:
+
+```bash
+python3.14 tools/parallel_qualify.py --source "$REPOSITORY" --output "$TASK_OUTPUT" \
+  --worker-host "$SSH_ALIAS" --worker-root "$REMOTE_TASK_ROOT" --worker-python "$WORKER_PYTHON" \
+  --venv "$WORKER_VENV" --image "$FULL_IMAGE_ID" --workers 20 --suite engine-model
+```
+
+Repeat with the matching HA runtimes and suite names. `--runtime-mode image --venv-target /venv` selects an image's
+matching virtualenv; `--readonly-mount HOST=CONTAINER` supplies any explicitly provisioned OpenSSL runtime needed by
+that image. Every attempt has its own directory; interrupted runs are retained and cannot be combined into one pass.
+Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
+must all pass the auditor. The model denominator remains13,440 raw/7,200 runnable inputs, including6,240 two-receipt
+and960 source-proof cases. CI runs those runnable models as20 independent runner jobs and includes all HA suites.
+
+The final qualification JSON contains `commit`, `source_digest` and a `phases` object mapping those four suite names
+to their absolute batch directories. `validate.py --qualification-report` requires all four, all20 workers, and the
+same source identity, and re-runs the raw auditor for each. Missing, skipped, changed-source or failed phases fail
+validation. `OCPP_QUALIFICATION_REPORT` can supply the same path to deployment checks.
 
 ## Rules for code
 

@@ -1,13 +1,11 @@
-## Standalone iCS proxy — managed 6 A deployment and supervised trial record
+## Standalone iCS proxy — commissioned 32 A installation and supervised trial record
 
-This branch adds a separate Linux/Python 3.14 proxy on top of the recorded offline prototype below. The durable
-service and a separate thin Home Assistant client are deployed at the proven 6 A boundary. On 10 November 2026,
-real HA Pause, proxy loss/restart with the pause retained, fault notification/recovery and explicit Return to app
-control passed with the lead attached and no new charging session. Fresh local readings and native charger history
-replace obsolete cloud controls and optional cached information on the charger dashboard. Local Start remains
-disabled; deliberately disabled EV/reserve automations remain off. Higher-current operation and complete app
-compatibility are separate work. The chronological trial notes below describe earlier implementations and limits;
-the current management details and acceptance record appear later in this document.
+This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
+commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
+an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the
+legacy unscoped Start path stays disabled. Fresh local readings and native history supply dashboard evidence.
+Deliberately disabled EV/reserve automations remain off. The chronological notes below include earlier 6 A trials;
+the later management sections describe the commissioned installation and the limits of its physical evidence.
 
 Seven authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
 the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
@@ -630,6 +628,11 @@ against HA2026.11.0 in a disposable container from the deployed image, with no l
 older available HA test plugin pins2026.10.4 and was left disabled; the fixture uses the actual core/config entries
 and substitutes only DNS construction for loopback-only tests.
 
+The client supports both HA2026.10 and2026.11 setup return contracts. After a command receipt is accepted, a slow or
+failed receipt poll reports that physical confirmation is pending; it never repeats the mutation. Start/current
+admission remains closed while Return is accepted or running. A normal Start gives an earlier unconfirmed Pause a
+terminal supersession result, and failed current selections retain the previous verified future setting.
+
 The service/API and thin client were deployed on 2026-11-10 after 1,117 passing offline tests and six actual-HA
 tests. Live HA Pause completed with native6/owned0, closed all-phase-zero and a successful independent health check.
 With the service stopped, direct charger reads still confirmed the zero hold; HA hid current readings and raised
@@ -1006,6 +1009,33 @@ charger's correlated result or error. Unknown commands and undocumented iCS vari
 - Starts, receipts, authorisation binding and outbox events share one SQLite commit. Stops retire profile aliases
   and bound tag grants in the same commit. Read-only storage and failure after an actual charger ACK return errors;
   they cannot publish successful ownership. Unknown outcomes block later writes until explicit reconciliation.
+- Routine observations and lifecycle delivery have separate bounded budgets. Each accepted open transaction reserves
+  its Stop slot, so routine telemetry cannot strand transaction closure, including a legacy full observation queue.
+  Accepted events retain their bodies and FIFO order. Full lifecycle capacity refuses new Starts before acknowledgement;
+  neither capacity nor recovery silently drops already accepted history.
+
+An ambiguous cloud Start remains quarantined because resending it could create a duplicate transaction. For one
+independently verified cloud-accepted Start, `tools/reconcile_managed_delivery.py` provides an operator workflow.
+Its default `check` validates private inputs without opening the journal or contacting the charger. Ordinary HA
+management credentials do not grant transaction-mapping authority.
+
+1. Request Pause and obtain the genuine device Stop. Verify local/native closure and zero. Independently inspect
+   the cloud's accepted record and establish the exact vendor transaction ID; the local/native ID is different.
+2. Stop the service normally. Run `inspect` with its private `--config` and `--native-bounded-spec`; exclusive journal
+   ownership is mandatory. The output supplies identity/spec digests, local ID, retained Start token and Start/Stop
+   body digests. No raw tag, native body or credential is printed.
+3. Put those fields in a private owned evidence JSON file, adding `vendor`, `evidence_sha256` and
+   `verified_at_epoch`. Verification must be recent. The evidence hash records provenance; it does not authenticate
+   the cloud record. The operator must independently verify the mapping. Run `reconcile-start --evidence` with the
+   same private inputs. Only the mapped Start is dequeued; its immutable audit and mapping commit together.
+4. Restart the service and wait for the existing genuine Stop to receive its actual cloud acknowledgement. The fault
+   and zero hold remain. A new Pause can then clear only that audit-bound fault after fresh Boot, resource, native-zero
+   and settled-history checks. Replaying an older Pause does not acknowledge later operator evidence. Return remains
+   a separate explicit action to resume the previous selected offer.
+
+The workflow refuses unrelated faults, ambiguous additional transactions, missing genuine closure, unresolved
+commands, active temporary timers, changed configuration/history, and unconfirmed station zero. It never guesses a
+vendor ID, replays Start, invents a Stop, clears unrelated debts or automatically raises current.
 - Vendor profile ids are translated, allocated monotonically and retired after their transaction. Vendor station
   profiles cannot reach the reserved local stack. Plan clears resolve every named vendor resource before sending;
   unknown/local/unconfirmed resources cannot be cleared, and disable/re-enable keeps a stable mapping.

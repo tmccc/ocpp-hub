@@ -2,6 +2,17 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Keep running Return exclusive, wake deadline supervision when native evidence reopens a timer obligation,
+  and bind ordinary outage recovery to the exact confirmed command source. Reserve bounded lifecycle storage
+  independently of routine telemetry, including each accepted transaction's Stop.
+- Provide an explicit offline operator workflow for one cloud-accepted Start with a lost acknowledgement.
+  Independently verified mapping and actual Stop acknowledgement precede a new Pause that clears only the
+  matching fault at zero; Start replay and automatic positive release remain forbidden.
+- Retire superseded Pause receipts, restore the prior selection after failed paused current changes, and report
+  receipt-read failures as unknown physical confirmation after command acceptance. Support both HA10 and HA11 setup contracts.
+- Preserve pytest failure exits, require a passing mutation baseline, and audit complete20-worker raw evidence
+  for engine/models, HA11 client, HA10 client and the legacy HA layer. Check in the isolated runner and enable all suites in CI.
+
 - Let an accepted current worker finish verification before a concurrent health observation begins. Failed app
   selections retain their previous verified setting, including after process replacement or a newer Pause.
   A new explicit Pause can reconcile the exact historical current/health collision through closed-zero and

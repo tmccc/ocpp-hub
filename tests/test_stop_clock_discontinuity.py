@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
-from ocpp_hub_core.prototype.store import ConflictError, Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.store import ConflictError, Journal
 
 from tests.test_managed_proxy import healthy
 from tests.test_managed_test_charge import positive_flow, ready
@@ -73,10 +74,14 @@ async def test_real_backward_clock_stop_closes_and_retains_exact_raw_history(
 # Intent: queue/storage failure rolls back the terminal Stop and its discontinuity annotation together.
 # Why: a diagnostic row must not claim that a Stop was durably accepted if its actual delivery record was not committed.
 def test_stop_clock_annotation_rolls_back_with_delivery_failure(tmp_path):
-    journal = Journal(tmp_path / "clock.db", "OFFLINE001", capacity=1)
+    journal = Journal(tmp_path / "clock.db", "OFFLINE001")
     try:
         local = journal.start("start", START)["transactionId"]
-        with pytest.raises(RecoveryRequiredError, match="capacity"):
+        journal.db.execute(
+            "CREATE TRIGGER no_stop BEFORE INSERT ON outbox WHEN NEW.action='StopTransaction' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic disk refusal'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic disk refusal"):
             journal.stop("failed-stop", backwards_stop(local))
         assert journal.active() == local
         assert journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()[0] is None

@@ -14,6 +14,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
 from .managed_current import managed_current_ceiling, record_current_source, require_current_session
+from .managed_occurrences import KEY
 from .managed_recovery import local_recovery_binding
 from .managed_schedule import (
     TimerVehicleDisconnectedError,
@@ -68,6 +69,7 @@ class NativeBoundedHandover:
         self.gateway, self.book, self.observe, self.spec, self.choice = gateway, book, observe, spec, choice
         self.command_source_observer: Callable[[HandoverEvidence], None] | None = None
         self.ordinary_source_observer: Callable[[HandoverEvidence], None] | None = None
+        self.schedule_changed: Callable[[], None] | None = None
         self.allow_unplugged = allow_unplugged
         self.lock = asyncio.Lock()
         self.last_verified_at = 0.0
@@ -164,12 +166,17 @@ class NativeBoundedHandover:
                 self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
             )
             self.book.check_originals(native.physical)
-            if native.physical.connection == "Unplug":
-                remember_disconnect(self.gateway.journal)
-            if self.command_source_observer is not None:
-                self.command_source_observer(native)
-            record_session_source(self.gateway.journal, native, self.gateway.boot_observation)
-            record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
+            previous_timer = self.gateway.journal.get(KEY, {})
+            try:
+                if native.physical.connection == "Unplug":
+                    remember_disconnect(self.gateway.journal)
+                if self.command_source_observer is not None:
+                    self.command_source_observer(native)
+                record_session_source(self.gateway.journal, native, self.gateway.boot_observation)
+                record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
+            finally:
+                if self.schedule_changed is not None and self.gateway.journal.get(KEY, {}) != previous_timer:
+                    self.schedule_changed()
             if self.ordinary_source_observer is not None:
                 self.ordinary_source_observer(native)
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:

@@ -19,7 +19,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install dependencies
-        run: pip install ruff==0.16.4 mypy==1.15.0 pytest pytest-asyncio pyyaml voluptuous websockets
+        run: pip install -r requirements-offline.txt
 
       - name: Version check
         run: python tools/version.py check
@@ -34,13 +34,15 @@ jobs:
         run: ruff format --check custom_components
 
       - name: Type check
-        run: mypy --strict --follow-imports=skip custom_components/ocpp_hub/core
+        run: mypy --strict --follow-imports=skip custom_components/ocpp_hub/core custom_components/ics_proxy/api.py
 
       - name: Test
-        run: pytest -q tests/ --junitxml=pytest-report.xml
+        run: |
+          mkdir -p "${RUNNER_TEMP}/engine"
+          TMPDIR="${RUNNER_TEMP}/engine" python tools/offline_validate.py tests/ --junitxml=pytest-report.xml
 
       - name: Compile
-        run: python3 -m compileall -f custom_components/ocpp_hub/
+        run: python3 -m compileall -f custom_components/
 
       - name: Diff check
         run: |
@@ -55,6 +57,19 @@ jobs:
   # The version of the plugin pins the Home Assistant version it tests against; keep it equal to the owner's server.
   ha-layer:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: legacy-hub
+            requirements: requirements-ha-legacy.txt
+            arguments: "--legacy-ha tests_ha/"
+          - suite: proxy-ha10
+            requirements: requirements-ha-legacy.txt
+            arguments: "tests_ha_proxy/"
+          - suite: proxy-ha11
+            requirements: requirements-ha-proxy.txt
+            arguments: "tests_ha_proxy/"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -62,7 +77,31 @@ jobs:
           python-version: "3.14"
 
       - name: Install dependencies
-        run: pip install pytest-homeassistant-custom-component==0.13.373 "websockets>=15.0.1"
+        run: pip install -r "${{ matrix.requirements }}"
 
       - name: Test the Home Assistant layer
-        run: pytest -q tests_ha/
+        run: |
+          mkdir -p "${RUNNER_TEMP}/ha"
+          TMPDIR="${RUNNER_TEMP}/ha" python tools/offline_ha_validate.py ${{ matrix.arguments }}
+
+  model:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: pip install -r requirements-offline.txt
+      - name: Run complete model shard
+        run: python tools/run_model_shard.py --shard ${{ matrix.shard }} --output "${RUNNER_TEMP}/model"
+      - name: Preserve model evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: model-${{ matrix.shard }}
+          path: ${{ runner.temp }}/model

@@ -7,11 +7,20 @@ from typing import TYPE_CHECKING
 
 from .local_control import local_start_receipt
 from .managed_occurrences import occurrences
-from .store import fingerprint
+from .store import Journal, fingerprint
 
 if TYPE_CHECKING:
     from .gateway import Gateway
     from .trial_handover_evidence import HandoverEvidence
+
+
+# An advertised or previously owned native timer cannot be reinterpreted as an unrelated manual command.
+def known_plan_source(journal: Journal, native: HandoverEvidence) -> bool:
+    marker = native.session_plan_id
+    return marker is not None and (
+        any(plan.get("planId") == marker for plan in (native.saved_schedule or {}).get("planList", []))
+        or any(lease["body"]["planId"] == marker for lease in occurrences(journal).values())
+    )
 
 
 class ManagedStartBinding:
@@ -72,6 +81,7 @@ class ManagedStartBinding:
                     catalogue.setdefault(fingerprint(tag.casefold()), []).append(identifier)
             if catalogue != j.get("managed_schedule_tags"):
                 j.put("managed_schedule_tags", catalogue)
+        self.attest_bound_vendor(n, digest)
         pending = j.get("managed_deferred_start", {})
         local = pending.get("local")
         if (
@@ -87,15 +97,8 @@ class ManagedStartBinding:
         if catalogue is None:
             return
         digest = fingerprint(tag.casefold())
-        if digest in catalogue:
-            plan_id = n.session_plan_id
-            if (
-                plan_id is None
-                or plan_id in catalogue[digest]
-                or any(plan_id == lease["body"]["planId"] for lease in timers.values())
-                or any(plan.get("planId") == plan_id for plan in plans)
-            ):
-                return
+        if known_plan_source(j, n) or digest in catalogue and n.session_plan_id is None:
+            return
         if pending["owner"] and pending["vendor"] is not None:
             return
         with j.atomic():
@@ -105,4 +108,52 @@ class ManagedStartBinding:
                     self.gateway.start_observer(local, start)
             elif pending["vendor"] is not None and j.get("vendor_start_grant", {}).get("token") == pending["vendor"]:
                 self.gateway.authorisation.consume(tag, local)
+                grant = j.get("vendor_start_grant", {})
+                j.put(
+                    "vendor_start_grant",
+                    {
+                        **grant,
+                        "native_source": {
+                            "marker": n.session_plan_id,
+                            "start": fingerprint(start),
+                            "schedule": self.original,
+                        },
+                    },
+                )
             j.put("managed_deferred_start", {})
+
+    # Distinct tags bind at allocation; their first complete native read must pin the same source as deferred tags.
+    def attest_bound_vendor(self, n: HandoverEvidence, schedule: str | None) -> None:
+        j = self.journal
+        grant = j.get("vendor_start_grant", {})
+        local = grant.get("local")
+        if (
+            "native_source" in grant
+            or local is None
+            or local != j.active()
+            or local != n.physical.native_transaction_id
+            or not n.physical.transaction_open
+            or schedule != self.original
+            or known_plan_source(j, n)
+        ):
+            return
+        row = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
+        if row is None:
+            return
+        start = json.loads(row["start"])
+        if (
+            grant.get("digest") != fingerprint(start["idTag"].casefold())
+            or not j.db.execute(
+                "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
+                "AND action='RemoteStartTransaction' AND state='confirmed'",
+                (grant.get("mutation"),),
+            ).fetchone()
+        ):
+            return
+        j.put(
+            "vendor_start_grant",
+            {
+                **grant,
+                "native_source": {"marker": n.session_plan_id, "start": fingerprint(start), "schedule": self.original},
+            },
+        )

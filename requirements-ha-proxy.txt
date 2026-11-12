@@ -1,0 +1,9 @@
+# Actual HA11 client runtime, independently qualified from the HA-free engine.
+homeassistant==2026.11.0
+pytest==9.0.3
+pytest-asyncio==1.4.0
+websockets==15.0.1
+pytest-socket==0.8.1
+pytest-aiohttp==1.1.1
+pytest-freezer==0.4.9
+pytest-timeout==2.4.0

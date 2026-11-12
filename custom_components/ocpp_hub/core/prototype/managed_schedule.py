@@ -1122,7 +1122,7 @@ class ManagedSchedule:
                 or j.get("uncertain_vendor_command")
                 or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
                 or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-                or c.requests.pending_return() is not None
+                or c.requests.return_in_progress()
                 or g.controls._operations
                 or c.current.pending()
                 or c.tests.lease is not None

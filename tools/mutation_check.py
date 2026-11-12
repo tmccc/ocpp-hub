@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import ast
 import copy
+import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +50,10 @@ class Mutant:
     line: int
     index: int  # position of the node in ast.walk order
     op_index: int = 0
+
+
+class InvalidTestRunError(RuntimeError):
+    """An unusable test run cannot establish mutation detection or coverage."""
 
 
 # List every mutation site of a module in a stable order.
@@ -103,11 +110,21 @@ def apply_mutant(tree: ast.AST, mutant: Mutant) -> str:
 # Run pytest for the chosen tests and report whether all of them passed.
 # A mutant survives only when the tests stay green; a hanging mutant counts as caught.
 def _tests_pass(pytest_args: list[str]) -> bool:
-    command = [sys.executable, "-m", "pytest", "-q", "-x", "--tb=no", "-p", "no:cacheprovider", *pytest_args]
+    command = [sys.executable, "-B", "-m", "pytest", "-q", "-x", "--tb=no", "-p", "no:cacheprovider", *pytest_args]
     try:
-        return subprocess.run(command, cwd=ROOT, capture_output=True, timeout=TIMEOUT_SECONDS).returncode == 0
+        # Equal-sized mutants can share mtime; a fresh cache namespace prevents reading another mutant's bytecode.
+        with tempfile.TemporaryDirectory(prefix="mutation-cache-", dir=os.environ.get("TMPDIR")) as cache:
+            env = {**os.environ, "PYTHONPYCACHEPREFIX": cache, "PYTHONDONTWRITEBYTECODE": "1"}
+            result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         return False  # a hanging mutant is noticed by the tests
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1 and re.search(
+        r"^(?:FAILED|ERROR) |\b[1-9][0-9]* (?:failed|error)", result.stdout + result.stderr, re.MULTILINE
+    ):
+        return False
+    raise InvalidTestRunError(f"pytest did not execute a usable test run (exit {result.returncode})")
 
 
 # Run every mutant against the tests and yield (mutant, survived).
@@ -116,6 +133,10 @@ def run(target: Path, pytest_args: list[str]) -> Iterator[tuple[Mutant, bool]]:
     original = target.read_text()
     tree = ast.parse(original)
     try:
+        if not _tests_pass(pytest_args):
+            raise InvalidTestRunError("the unmodified test baseline must pass before mutation testing")
+        if target.read_text() != original:
+            raise InvalidTestRunError("the baseline changed the target source")
         for mutant in find_mutants(tree):
             target.write_text(apply_mutant(tree, mutant))
             yield mutant, _tests_pass(pytest_args)
@@ -137,11 +158,15 @@ def main(argv: list[str] | None = None) -> int:
     pytest_args = args[1:] or ["tests"]
     survivors: list[Mutant] = []
     total = 0
-    for mutant, survived in run(target, pytest_args):
-        total += 1
-        if survived:
-            survivors.append(mutant)
-            print(f"SURVIVED {mutant.kind} at line {mutant.line}", flush=True)
+    try:
+        for mutant, survived in run(target, pytest_args):
+            total += 1
+            if survived:
+                survivors.append(mutant)
+                print(f"SURVIVED {mutant.kind} at line {mutant.line}", flush=True)
+    except InvalidTestRunError as error:
+        print(f"INVALID mutation run: {error}", file=sys.stderr)
+        return 2
     print(f"{total} mutants, {len(survivors)} survived, {total - len(survivors)} caught")
     return 1 if survivors else 0
 

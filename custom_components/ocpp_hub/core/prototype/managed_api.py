@@ -133,7 +133,7 @@ class ManagementServer:
                     intent.mode == "paused"
                     and result["healthy"]
                     and result.get("local_hold_verified") is True
-                    and self.controller.requests.pending_return() is None
+                    and not self.controller.requests.return_in_progress()
                     and not self.controller.current.pending()
                     and self.controller.requests.has_capacity()
                 )

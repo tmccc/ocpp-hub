@@ -51,7 +51,14 @@ async def peer():
         ],
     }
     state["charger_sessions"] = copy.deepcopy(state["sessions"])
-    control = {"state": state, "commands": [], "requests": [], "lose_reply": False, "pending_receipt": False}
+    control = {
+        "state": state,
+        "commands": [],
+        "requests": [],
+        "lose_reply": False,
+        "pending_receipt": False,
+        "receipt_delay": 0,
+    }
     receipts = {}
 
     # Replies model only the documented client contract; physical authority is covered by independent core tests.
@@ -82,7 +89,8 @@ async def peer():
                 can_start=True,
                 can_start_test=not paused,
             )
-            result = {"id": value["id"], "state": "completed"}
+            receipts[value["id"]] = {"id": value["id"], "state": "completed"}
+            result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
             if control["lose_reply"]:
                 await socket.close()
                 return socket
@@ -122,10 +130,14 @@ async def peer():
                 await socket.close()
                 return socket
         elif command == "receipt":
+            await asyncio.sleep(control["receipt_delay"])
             result = receipts[value["request_id"]]
         else:
             raise AssertionError("unexpected client command")
-        await socket.send_json({"id": value["id"], "ok": True, "result": result})
+        try:
+            await socket.send_json({"id": value["id"], "ok": True, "result": result})
+        except ConnectionResetError:
+            pass  # The independent client may already have timed out after durable command acceptance.
         await socket.close()
         return socket
 
@@ -153,6 +165,22 @@ async def setup(hass, peer):
     entry = result["result"]
     assert entry.state is ConfigEntryState.LOADED
     return entry
+
+
+# Intent: a recorded Pause reports unknown confirmation on a slow receipt while a fast receipt completes normally.
+# Why: a failed read must not erase known acceptance or cause a second physical command.
+@pytest.mark.parametrize("delay", [0, 11])
+async def test_deferred_pause_receipt_keeps_acceptance_classification(actual_hass, peer, delay):
+    await setup(actual_hass, peer)
+    peer["pending_receipt"], peer["receipt_delay"] = True, delay
+    if delay:
+        with pytest.raises(HomeAssistantError, match="request was recorded; physical confirmation is still pending"):
+            await actual_hass.services.async_call(
+                "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
+            )
+    else:
+        await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    assert peer["commands"].count("pause") == peer["commands"].count("receipt") == 1
 
 
 # Intent: HA startup, reload and unload perform status reads only and never instantiate the legacy OCPP backend.

@@ -140,6 +140,23 @@ class ManagedRequests:
         ).fetchone()
         return (row["id"], row["revision"]) if row is not None else None
 
+    # Admission remains exclusive after the selected Return starts awaiting real charger evidence.
+    def return_in_progress(self) -> bool:
+        return (
+            self.journal.db.execute(
+                "SELECT 1 FROM managed_requests WHERE action='app_control' AND state IN ('accepted','running') LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
+    # A separately authorized normal Start retires earlier Pause requests without replaying their physical effect.
+    def supersede_pauses(self, identifier: str) -> None:
+        self.journal.db.execute(
+            "UPDATE managed_requests SET state='failed',result=? "
+            "WHERE action='pause' AND state IN ('accepted','uncertain')",
+            (json.dumps({"classification": "superseded_by_start", "superseded_by": identifier}),),
+        )
+
     # Make a single operation's final outcome durable without overwriting a newer superseding receipt.
     def finish(self, identifier: str, state: str, result: dict[str, Any]) -> None:
         self.journal.db.execute(

@@ -1,0 +1,10 @@
+# The packaged Hub's HA10 contract and the separate client's HA10 compatibility.
+homeassistant==2026.10.4
+pytest-homeassistant-custom-component==0.13.375
+pytest==9.0.3
+pytest-asyncio==1.4.0
+websockets==15.0.1
+pytest-socket==0.8.1
+pytest-aiohttp==1.1.1
+pytest-freezer==0.4.9
+pytest-timeout==2.4.0

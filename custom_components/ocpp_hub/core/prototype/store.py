@@ -174,10 +174,35 @@ class Journal:
         ):
             raise RecoveryRequiredError("new sessions require a verified durable allocation boundary")
 
-    # Queue a lifecycle event before acknowledging it; retain its stable upstream request id.
-    def enqueue(self, action: str, payload: dict[str, Any], local: int | None = None) -> str:
-        if self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] >= self.capacity:
-            raise RecoveryRequiredError("cloud journal capacity reached; event was not accepted")
+    # Reserve lifecycle storage independently of observations; every accepted open Start retains room for its Stop.
+    def enqueue(
+        self, action: str, payload: dict[str, Any], local: int | None = None, *, _reserved_stop: bool = False
+    ) -> str:
+        if _reserved_stop:
+            row = self.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
+            if (
+                action != "StopTransaction"
+                or row is None
+                or row["stop"] != encoded(payload)
+                or self.db.execute(
+                    "SELECT 1 FROM outbox WHERE action='StopTransaction' AND local=?", (local,)
+                ).fetchone()
+            ):
+                raise ConflictError("Stop delivery does not consume an accepted transaction reservation")
+        elif action in ("StartTransaction", "StopTransaction"):
+            pending = self.db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
+            ).fetchone()[0]
+            reserved = self.db.execute("SELECT COUNT(*) FROM transactions WHERE stop IS NULL").fetchone()[0]
+            if pending + reserved + 1 > max(2, self.capacity):
+                raise RecoveryRequiredError("lifecycle journal capacity reached; event was not accepted")
+        elif (
+            self.db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
+            ).fetchone()[0]
+            >= self.capacity
+        ):
+            raise RecoveryRequiredError("observation journal capacity reached; event was not accepted")
         token = "e-" + uuid.uuid4().hex
         self.db.execute(
             "INSERT INTO outbox(token,action,payload,local) VALUES(?,?,?,?)", (token, action, encoded(payload), local)
@@ -324,7 +349,7 @@ class Journal:
                         "INSERT INTO transaction_clock_discontinuities VALUES(?,?,?,?)",
                         (local, start["timestamp"], payload["timestamp"], time.time()),
                     )
-                self.enqueue("StopTransaction", payload, local)
+                self.enqueue("StopTransaction", payload, local, _reserved_stop=True)
                 profiles = self.get("vendor_profiles", {})
                 transactions = self.get("vendor_profile_transactions", {})
                 retired = [key for key, value in transactions.items() if value == local]
@@ -400,11 +425,11 @@ class Journal:
             self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))
 
     # Explicitly reconcile a cloud Start with an independently established vendor id.
-    def reconcile_start(self, local: int, vendor: int) -> None:
+    def reconcile_start(self, local: int, vendor: int, acknowledged: Callable[[], None] | None = None) -> None:
         if type(local) is not int or type(vendor) is not int or min(local, vendor) < 0:
             raise ConflictError("invalid reconciliation ids")
         row = self.db.execute("SELECT * FROM outbox WHERE local=? AND action='StartTransaction'", (local,)).fetchone()
         if row is None or row["state"] not in ("ambiguous", "inflight"):
             raise ConflictError("transaction is not awaiting explicit reconciliation")
         item = Delivery(row["token"], row["action"], json.loads(row["payload"]), local, row["state"])
-        self.acknowledge(item, {"transactionId": vendor, "idTagInfo": {"status": "Accepted"}})
+        self.acknowledge(item, {"transactionId": vendor, "idTagInfo": {"status": "Accepted"}}, acknowledged)

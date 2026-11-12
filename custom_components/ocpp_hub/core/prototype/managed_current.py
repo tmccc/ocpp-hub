@@ -106,7 +106,7 @@ def require_current_session(g: Gateway, n: HandoverEvidence, local: int) -> None
 class ManagedCurrentLimits:
     """A current request persists its generation before a guarded profile write; Pause always takes precedence."""
 
-    # Interrupted app updates retain their previous selection; no partially applied increase becomes permission.
+    # Interrupted updates retain their previous selection; no unverified target becomes future permission.
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
@@ -143,9 +143,9 @@ class ManagedCurrentLimits:
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 controller.session.gateway.controls._claim(True, stopping=True)
                 control = self.journal.get("control")
-                resume = change["current_a"] if change.get("mode") == "paused" else previous
-                self.journal.put("control", {**control, "resume_limit": resume})
-                self.journal.put("managed_current_change", {**change, "state": "interrupted"})
+                self.journal.put("control", {**control, "resume_limit": previous})
+                state = "uncertain" if change.get("mode") == "paused" else "interrupted"
+                self.journal.put("managed_current_change", {**change, "state": state})
 
     # All current receipts and authority use the session's existing exclusive journal owner.
     @property
@@ -168,6 +168,28 @@ class ManagedCurrentLimits:
     # A pending update blocks Start, Return and another update until its physical outcome has been established.
     def pending(self) -> bool:
         return bool(self.journal.get("managed_current_change", {}).get("state") in ("pending", "recovering"))
+
+    # A completed explicit Return retires the failed target once fresh zero and the previous selection are verified.
+    def returned_to_previous(self) -> None:
+        j = self.journal
+        change = j.get("managed_current_change", {})
+        row = j.db.execute(
+            "SELECT r.action,r.state,c.current_a FROM managed_requests r "
+            "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
+            (change.get("id"),),
+        ).fetchone()
+        if (
+            change.get("state") == "uncertain"
+            and change.get("previous_a") == self.selected()
+            and row is not None
+            and row["action"] == "set_current"
+            and row["state"] in ("failed", "uncertain")
+            and row["current_a"] == change.get("current_a")
+        ):
+            j.put(
+                "managed_current_change",
+                {**change, "state": "cancelled", "recovery_reason": "explicit_return_previous_selection"},
+            )
 
     # A correlated live current worker owns native verification until its accepted revision reaches an outcome.
     def applying(self) -> bool:
@@ -232,7 +254,7 @@ class ManagedCurrentLimits:
             and j.active() is None
             and not j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            and c.requests.pending_return() is None
+            and not c.requests.return_in_progress()
             and c.tests.lease is None
             and c.requests.has_capacity()
             and native is not None
@@ -371,8 +393,8 @@ class ManagedCurrentLimits:
                     j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                     g.controls._claim(True, stopping=True)
                 control = j.get("control", {})
-                if control.get("inhibit") is True:
-                    j.put("control", {**control, "resume_limit": previous_value if mode == "app" else value})
+                if control.get("inhibit") is True and j.get("managed_current_change", {}).get("id") == identifier:
+                    j.put("control", {**control, "resume_limit": previous_value})
                 j.put(
                     "managed_current_change",
                     {

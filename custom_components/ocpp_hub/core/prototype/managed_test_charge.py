@@ -125,7 +125,7 @@ class ManagedChargeTests:
                 else "SELECT 1 FROM outbox LIMIT 1"
             ).fetchone()
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            and c.requests.pending_return() is None
+            and not c.requests.return_in_progress()
             and c.requests.has_capacity()
             and self.state().get("state") not in ACTIVE
             and g.current_boot_seen(g._charger_epoch)
@@ -224,7 +224,7 @@ class ManagedChargeTests:
             or self.state().get("id") != lease.identifier
             or self.state().get("state") not in ACTIVE
             or self.state().get("state") == "stopping"
-            or c.requests.pending_return() is not None
+            or c.requests.return_in_progress()
             or not stopping
             and j.get("control", {}).get("stop_epoch", 0) != lease.stop_epoch
             or lease.source == "local"
@@ -276,6 +276,7 @@ class ManagedChargeTests:
                 self.guard(lease)
                 if lease.normal:
                     j.put("managed_control_intent", {"mode": "app", "revision": lease.revision + 1})
+                    c.requests.supersede_pauses(lease.identifier)
                 j.put(
                     "managed_test_charge",
                     {

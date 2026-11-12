@@ -67,6 +67,7 @@ class ManagedController:
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
         self.schedule = ManagedSchedule(self)
+        self.native.schedule_changed = self.schedule.changed.set
         self.current = ManagedCurrentLimits(self)
         self.tests = ManagedChargeTests(self)
         self.ordinary = OrdinaryRecovery(self)
@@ -592,6 +593,7 @@ class ManagedController:
             return
         with self.session.journal.atomic():
             self.session.journal.put("managed_control_intent", {"mode": "app", "revision": revision + 1})
+            self.current.returned_to_previous()
             self.requests.finish(identifier, "completed", {"app_control_enabled": True, "charging_started": False})
 
     # Wait for outgoing resource mutations rather than classifying an inventory sampled across a legitimate write.
@@ -815,19 +817,6 @@ class ManagedController:
             )
             self.failures += 1
             if self.failures >= 3:
-                lease = j.get(KEY, {})
-                if supervised_timer(lease) and isinstance(error, (NativeTransportUnavailableError, StaleEvidenceError)):
-                    # Telemetry can fail before the deadline. Hold at zero while waiting for a fresh read.
-                    if not lease.get("retire_reason"):
-                        lease = {**lease, "retire_reason": "native_observation_unavailable"}
-                        j.put(KEY, lease)
-                    await self.schedule.protect_station(lease)
-                    return {
-                        **base,
-                        "state": "degraded",
-                        "owner_control_enabled": False,
-                        "fault": "native_observation_unavailable",
-                    }
                 self.fault("native_authority_or_preservation_failed")
             return {**base, "state": "degraded", "fault": "native_authority_or_preservation_failed"}
         self.failures = 0

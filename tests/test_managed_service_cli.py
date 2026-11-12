@@ -20,8 +20,10 @@ from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
+from websockets.asyncio.client import connect
 
 from tests.handover_helpers import crash
+from tests.test_managed_api import TOKEN, call
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_native_bounded_session import connected_bench
 from tests.test_prototype import BOOT
@@ -296,8 +298,14 @@ async def test_stop_request_fences_inflight_release_before_positive_send(
 
 # Intent: the actual managed runner handles a stop signal by retaining zero and writing a stopped report.
 # Why: systemd shutdown must retire both connections and the journal without clearing profiles or restoring32.
+@pytest.mark.parametrize("management_enabled", [False, True])
 async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, monkeypatch: Any
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: Any,
+    unused_tcp_port_factory: Any,
+    management_enabled: bool,
 ) -> None:
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         value = rig.spec.value()
@@ -332,7 +340,14 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
         monkeypatch.setattr(managed_proxy, "notify", notifications.append)
         monkeypatch.setattr(loop, "add_signal_handler", register)
         monkeypatch.setattr(loop, "remove_signal_handler", remove)
-        running = asyncio.create_task(managed_proxy.serve(tmp_path / "trial.json", spec_path))
+        management_path = None
+        if management_enabled:
+            port = unused_tcp_port_factory()
+            secret = tmp_path / "management-token.json"
+            management_path = tmp_path / "management.json"
+            save_private(secret, {"token": TOKEN})
+            save_private(management_path, {"host": "127.0.0.1", "port": port, "token_file": str(secret)})
+        running = asyncio.create_task(managed_proxy.serve(tmp_path / "trial.json", spec_path, management_path))
         try:
             await until(lambda: bool(sessions) and sessions[0].started)
             session = sessions[0]
@@ -342,6 +357,24 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                 await until(
                     lambda: session.gateway.controls.ready and session.gateway.vendor_registration == "Accepted"
                 )
+                if management_enabled:
+                    async with connect(
+                        f"ws://127.0.0.1:{port}/management",
+                        additional_headers={"Authorization": "Bearer " + TOKEN},
+                        subprotocols=["ics-proxy.v1"],
+                        proxy=None,
+                    ) as socket:
+                        status = (await call(socket, "status"))["result"]
+                        assert status["api_version"] == 1 and status["can_pause"] is True
+                        paused = await call(socket, "pause", revision=status["control_revision"])
+                        assert paused["ok"] and paused["result"]["state"] == "accepted"
+                        async with asyncio.timeout(12):
+                            while True:
+                                receipt = (await call(socket, "receipt", request_id=paused["result"]["id"]))["result"]
+                                if receipt["state"] == "completed":
+                                    break
+                                await asyncio.sleep(0.1)
+                        assert rig.bench.firmware.effective_limit() == 0
                 callbacks[signal.SIGTERM]()
                 assert await asyncio.wait_for(running, 8) == 0
             report = json.loads(rig.prepared.config.journal.with_suffix(".status.json").read_text())

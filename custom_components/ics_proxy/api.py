@@ -50,7 +50,7 @@ class ProxyClient:
             or not isinstance(response.get("result"), dict)
         ):
             raise ProxyError("The local charger proxy could not confirm this request")
-        result = response["result"]
+        result: dict[str, Any] = response["result"]
         if command == "status" and (
             type(result.get("api_version")) is not int
             or result.get("api_version") != 1
@@ -72,7 +72,7 @@ class ProxyClient:
                 while receipt.get("state") in ("accepted", "running"):
                     await asyncio.sleep(1)
                     receipt = await self.request("receipt", request_id=identifier)
-        except TimeoutError:
+        except TimeoutError, ProxyError:
             raise ProxyError("The request was recorded; physical confirmation is still pending") from None
         if receipt.get("state") != "completed":
             raise ProxyError("The charger could not confirm the requested control state")
