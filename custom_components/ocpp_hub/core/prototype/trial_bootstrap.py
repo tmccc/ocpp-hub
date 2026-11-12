@@ -16,6 +16,7 @@ EMPTY_BOOTSTRAP_TABLES = frozenset(
         "trial_resources",
         "inbound_receipts",
         "transaction_clock_discontinuities",
+        "rejected_observations",
     }
 )
 

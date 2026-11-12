@@ -105,7 +105,9 @@ async def test_legacy_pristine_baseline_gap_reintroduces_over_real_tls(tmp_path,
 
 # Intent: unrelated metadata, receipt/debt rows or tables cannot turn an ordinary journal into connected admission.
 # Why: a strict pristine repair must not grant fresh authority to an already used or ambiguous installation.
-@pytest.mark.parametrize("blocker", ["metadata", "receipt", "outbox", "resource", "rpc", "clock", "unknown-table"])
+@pytest.mark.parametrize(
+    "blocker", ["metadata", "receipt", "outbox", "resource", "rpc", "clock", "report-audit", "unknown-table"]
+)
 async def test_legacy_baseline_repair_rejects_nonpristine_state(tmp_path, tls, unused_tcp_port, blocker):
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
@@ -128,6 +130,11 @@ async def test_legacy_baseline_repair_rejects_nonpristine_state(tmp_path, tls, u
                 "INSERT INTO transactions(local,connector,start,stop,vendor) VALUES(1001,1,'{}','{}',9001)"
             )
             journal.db.execute("INSERT INTO transaction_clock_discontinuities VALUES(1001,'raw-start','raw-stop',1)")
+        elif blocker == "report-audit":
+            journal.db.execute(
+                "INSERT INTO rejected_observations VALUES('old','StatusNotification','digest',NULL,'NotSupported',"
+                "'inflight',1)"
+            )
         else:
             journal.db.execute("CREATE TABLE unrelated_ordinary_state(value TEXT)")
         before = sorted(journal.db.iterdump())
