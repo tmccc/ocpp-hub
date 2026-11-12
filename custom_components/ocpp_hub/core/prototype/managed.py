@@ -713,6 +713,9 @@ class ManagedController:
             if self.requests.intent().mode == "paused":
                 await self.maintain_pause()
             elif self.ordinary.needed():
+                if not base["cloud_connected"]:
+                    await self.ordinary.hold("restricted_introduction")
+                    return {**base, "state": "waiting_for_cloud", "owner_control_enabled": False}
                 await self.ordinary.recover()
             elif self.released_epoch != g._charger_epoch:
                 if cutoff_hold:

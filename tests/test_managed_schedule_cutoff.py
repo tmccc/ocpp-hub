@@ -468,9 +468,8 @@ async def test_unconfirmed_cleanup(
         async with b.rig.charger(replacement) as sock:
             await introduced(b.rig, replacement, sock, "retry-boot")
             c = ManagedController(replacement)
-            assert (await c.tick())["state"] == "degraded" and c.schedule.summary()["cleanup_attempts"] == 2
-            b.clock.now += 61
-            await healthy(c)
+            # A fresh process may make one guarded retry immediately, without inheriting a wall-clock deadline.
+            assert (await healthy(c))["state"] == "healthy" and c.schedule.summary()["cleanup_attempts"] == 3
             assert set(b.device.plans) == {9} and c.schedule.problem() is None and not starts(b.rig)
 
 
