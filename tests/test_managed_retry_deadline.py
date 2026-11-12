@@ -29,6 +29,7 @@ async def test_stop_gate_uses_current_journal_and_shared_elapsed_clock(
         stale = j.get(managed_schedule.KEY)
         original = b.device.answer
 
+        # Refuse only the fake device's Stop while retaining all other ordinary protocol responses.
         def reject_stop(action, payload):
             return {"status": "Rejected"} if action == "RemoteStopTransaction" else original(action, payload)
 
@@ -58,6 +59,7 @@ async def test_restart_does_not_inherit_stop_wall_cooldown(tmp_path, tls, unused
         b.clock.now = END
         original = b.device.answer
 
+        # Refuse only the fake device's Stop while retaining all other ordinary protocol responses.
         def reject_stop(action, payload):
             return {"status": "Rejected"} if action == "RemoteStopTransaction" else original(action, payload)
 
@@ -106,6 +108,7 @@ async def test_latched_deadline_stop_retries_after_wall_rewind(tmp_path, tls, un
         b.clock.now = END
         original = b.device.answer
 
+        # Refuse only the fake device's Stop while retaining all other ordinary protocol responses.
         def reject_stop(action, payload):
             return {"status": "Rejected"} if action == "RemoteStopTransaction" else original(action, payload)
 
