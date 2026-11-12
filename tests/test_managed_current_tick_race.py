@@ -147,6 +147,26 @@ async def test_controller_current_acceptance_during_tick_resource_wait_completes
         await api.start()
         entered, release = asyncio.Event(), asyncio.Event()
         tick = vendor = None
+        ordinary_send = b.session.gateway.vendor.sender
+        accepted = []
+        identifier = uuid.uuid4().hex
+        token = "settling-resource"
+
+        # Observe the real reply's transport boundary after durable RPC completion, before the next loop turn.
+        # Management dispatch invokes the same synchronous public command; no engine wait or decision is replaced.
+        async def accept_on_wire_reply(raw):
+            frame = decode(raw)
+            if frame[0] == 3 and frame[1] == token:
+                waiting = chain(tick)
+                assert "settled_native" in waiting and "sleep" in waiting, waiting
+                assert not b.session._resource_mutation_inflight() and c.current.available(c.latest_native)
+                peer.arm = True
+                accepted.append(c.command(identifier, "set_current", c.requests.intent().revision, current_a=16))
+                assert accepted[-1]["state"] == "accepted"
+            await ordinary_send(raw)
+
+        assert ordinary_send is not None
+        monkeypatch.setattr(b.session.gateway.vendor, "sender", accept_on_wire_reply)
         try:
             async with connect(
                 f"ws://127.0.0.1:{port}/management",
@@ -160,38 +180,21 @@ async def test_controller_current_acceptance_during_tick_resource_wait_completes
                         await release.wait()
 
                 b.rig.bench.before_reply = hold_ack
-                for attempt in range(5):
-                    entered.clear()
-                    release.clear()
-                    vendor = asyncio.create_task(
-                        b.rig.bench.actual_call(
-                            "settling-resource-" + str(attempt),
-                            "SetChargingProfile",
-                            commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 32, 1234, stack_level=0),
-                        )
+                vendor = asyncio.create_task(
+                    b.rig.bench.actual_call(
+                        token,
+                        "SetChargingProfile",
+                        commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 32, 1234, stack_level=0),
                     )
-                    await asyncio.wait_for(entered.wait(), 2)
-                    assert b.session._resource_mutation_inflight()
-                    tick = asyncio.create_task(c.tick())
-                    await asyncio.sleep(0)
-                    waiting = chain(tick)
-                    assert "settled_native" in waiting and "sleep" in waiting, waiting
-                    release.set()
-                    assert (await vendor)[0] == 3
-                    assert not b.session._resource_mutation_inflight() and c.current.available(c.latest_native)
-                    waiting = chain(tick)
-                    if tick.done() or "settled_native" not in waiting or "sleep" not in waiting:
-                        # No current command was sent or accepted in this irrelevant scheduling order.
-                        await asyncio.wait_for(tick, 2)
-                        continue
-                    peer.arm = True
-                    identifier = uuid.uuid4().hex
-                    # No await separates the actual suspended-tick proof from this public acceptance boundary.
-                    accepted = c.command(identifier, "set_current", c.requests.intent().revision, current_a=16)
-                    assert accepted["state"] == "accepted"
-                    break
-                else:
-                    raise AssertionError("tick never remained in its actual resource wait before current acceptance")
+                )
+                await asyncio.wait_for(entered.wait(), 2)
+                assert b.session._resource_mutation_inflight()
+                tick = asyncio.create_task(c.tick())
+                await asyncio.sleep(0)
+                waiting = chain(tick)
+                assert "settled_native" in waiting and "sleep" in waiting, waiting
+                release.set()
+                assert (await vendor)[0] == 3 and len(accepted) == 1
                 await asyncio.wait_for(peer.entered.wait(), 2)
                 assert peer.gated_request["action"] == "getConfig"
                 worker_stream = waiting_locals(c.current.worker, "read_native").get("writer")
@@ -221,6 +224,7 @@ async def test_controller_current_acceptance_during_tick_resource_wait_completes
         finally:
             release.set()
             peer.release.set()
+            b.session.gateway.vendor.sender = ordinary_send
             b.rig.bench.before_reply = None
             if tick is not None:
                 await asyncio.gather(tick, return_exceptions=True)
