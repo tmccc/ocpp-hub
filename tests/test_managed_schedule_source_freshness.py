@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 from ocpp_hub_core.prototype import managed_schedule
+from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
+from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 
 from tests.test_managed_proxy import healthy, starts
@@ -149,37 +151,43 @@ async def test_source_freshness_during_positive_confirmation(tmp_path, tls, unus
         assert b.device.effective_limit() == 0 and not b.stops()
         b.rig.peer.plan_session = (local, 9)
         observer = b.session.prepared.observer
-        read = observer._read
+        port = observer.port
         observed = asyncio.Event()
 
-        # Interrupt only actual native reads; delay the physical positive write's acknowledgement until the audit ends.
-        async def unavailable(action, data=None):
-            raise TimeoutError("the independent native response was lost")
+        # The independent native endpoint loses its real response while the positive profile ACK remains outstanding.
+        async def unavailable(reader, writer):
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
-        # An idle-only request can observe a valid independently charging transaction without invalidating its origin.
-        async def during_ack(action, payload):
-            if (
-                action == "SetChargingProfile"
-                and not observed.is_set()
-                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
-            ):
-                if failure == "open":
-                    with pytest.raises(SecurityError):
-                        await b.c.native.read(closed=True)
-                else:
-                    observer._read = unavailable
-                    with pytest.raises(TimeoutError):
-                        await b.c.native.read()
-                observed.set()
+        async with await asyncio.start_server(unavailable, "127.0.0.1", 0) as server:
+            # A valid open audit retains its source; lost HTTP evidence retains only the existing timer's zero hold.
+            async def during_ack(action, payload):
+                if (
+                    action == "SetChargingProfile"
+                    and not observed.is_set()
+                    and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
+                ):
+                    if failure == "open":
+                        with pytest.raises(SecurityError):
+                            await b.c.native.read(closed=True)
+                    else:
+                        observer.port = server.sockets[0].getsockname()[1]
+                        with pytest.raises(UnavailableError) as unavailable_audit:
+                            await b.c.native.read()
+                        assert isinstance(unavailable_audit.value.__cause__, NativeTransportUnavailableError)
+                    observed.set()
 
-        b.rig.bench.before_reply = during_ack
-        try:
-            await b.c.tick()
-            assert observed.is_set() and b.device.effective_limit() == (0 if failure == "missing" else 32)
-            assert b.session.journal.active() == local and not b.stops()
-        finally:
-            observer._read = read
-            b.rig.bench.before_reply = None
+            b.rig.bench.before_reply = during_ack
+            try:
+                await b.c.tick()
+                assert observed.is_set() and b.device.effective_limit() == (0 if failure == "missing" else 32)
+                assert b.session.journal.active() == local and not b.stops()
+            finally:
+                observer.port = port
+                b.rig.bench.before_reply = None
         assert (await healthy(b.c))["current_a"] == 32 and not b.stops()
         await b.close_transaction(local)
         await healthy(b.c)
