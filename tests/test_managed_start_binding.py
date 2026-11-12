@@ -13,6 +13,7 @@ from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
+from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
 
 
@@ -178,8 +179,15 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
         for _ in range(4):
             await b.c.tick()
         assert (await healthy(b.c))["local_hold_verified"]
-        b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+        # A healthy physical Pause can precede cloud Stop delivery; Return requires those actual receipts too.
+        await until(
+            lambda: not b.session.journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+            and not b.session.gateway.vendor._pending
+        )
+        returning = uuid.uuid4().hex
+        b.c.command(returning, "app_control", b.c.requests.intent().revision)
         assert (await healthy(b.c))["station_ceiling_a"] == 6
+        assert b.c.requests.receipt(returning)["state"] == "completed"
         assert set(b.device.plans) == {9}
         following = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
         assert following not in b.stops() and (await healthy(b.c))["power_w"] > 0
