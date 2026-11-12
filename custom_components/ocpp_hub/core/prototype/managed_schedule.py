@@ -7,6 +7,7 @@ import json
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -396,11 +397,25 @@ def current_source(gateway: Gateway, lease: dict[str, Any]) -> bool:
     return gateway.boot_observation is not None and lease.get("source_boot") == gateway.boot_observation
 
 
-# Share a durable retry interval and the final source check across Boot recovery and ordinary deadline supervision.
+# Keep one elapsed retry gate across introduction, foreground ticks and the independent deadline task.
+def restrictive_retry_allowed(g: Gateway, lease: dict[str, Any], field: str) -> bool:
+    now = monotonic()
+    g.timer_retry_after = {key: until for key, until in g.timer_retry_after.items() if until > now}
+    key = (lease["id"], field)
+    current = g.journal.get(KEY, {})
+    if current.get("id") == lease["id"] and not current.get(field, 0):
+        g.timer_retry_after.pop(key, None)
+    if key in g.timer_retry_after:
+        return False
+    g.timer_retry_after[key] = now + 15
+    return True
+
+
+# Persist diagnostic wall instants; a restarted gateway retries because elapsed cooldowns cannot survive it.
 async def request_timer_stop(g: Gateway, lease: dict[str, Any], authorized: Callable[[], bool]) -> None:
     j = g.journal
     now = time.time()
-    if not current_source(g, lease) or now < lease.get("next_stop", 0):
+    if not current_source(g, lease) or not restrictive_retry_allowed(g, lease, "next_stop"):
         return
     j.put(KEY, {**lease, "hold_since": lease.get("hold_since", now), "next_stop": now + 15})
 
@@ -1283,10 +1298,11 @@ class ManagedSchedule:
             and g.controls.desired() == 0
             and (j.get("trial_phase") == "recovering" or not j.get("control", {}).get("uncertain"))
         ):
+            g.timer_retry_after.pop((lease["id"], "next_cap"), None)
             return
         lease = j.get(KEY)
         now = time.time()
-        if now < lease.get("next_cap", 0):
+        if not restrictive_retry_allowed(g, lease, "next_cap"):
             return
         j.put(KEY, {**lease, "next_cap": now + 15})
 
@@ -1307,6 +1323,8 @@ class ManagedSchedule:
         except DeniedError, UnavailableError, RecoveryRequiredError:
             # A separate scoped Stop can still succeed when a station write fails. Never release on this evidence.
             return
+        if g.controls.ready and g.controls.desired() == 0:
+            g.timer_retry_after.pop((lease["id"], "next_cap"), None)
 
     # After a new Boot, a previously observed or recovering transaction must be held until its origin is re-established.
     def needs_source(self, lease: dict[str, Any]) -> bool:

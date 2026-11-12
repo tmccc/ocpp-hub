@@ -78,6 +78,16 @@ class NativeStartReport:
     record: Callable[[int], None] = field(compare=False)
 
 
+@dataclass(frozen=True)
+class VendorProfileWrite:
+    """The exact translated profile awaiting a real acceptance, including a new alias reservation."""
+
+    vendor: str
+    local: int
+    transaction: int | None
+    allocated: bool
+
+
 class Gateway:
     """One admitted charger, independent local control, and one fixed vendor mirror."""
 
@@ -103,6 +113,7 @@ class Gateway:
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
+        self.timer_retry_after: dict[tuple[str, str], float] = {}
         self._flush_lock = asyncio.Lock()
         self._boot_lock = asyncio.Lock()
         self._start_renewals: dict[tuple[str, int, int, str | None], asyncio.Future[bool]] = {}
@@ -655,7 +666,15 @@ class Gateway:
         query: TransactionQuery | None = None
         ics_write: IcsWrite | None = None
         grant: str | None = None
+        profile_write: VendorProfileWrite | None = None
+        dispatched = False
         charger_epoch = self._charger_epoch
+
+        # From this boundary onward even a sender exception can follow a physical transmission.
+        def on_dispatch(_action: str) -> None:
+            nonlocal dispatched
+            dispatched = True
+
         try:
             self.policy.kind(action, original)
             self.policy.validate(action, original)
@@ -671,7 +690,7 @@ class Gateway:
 
             # Allocate profile ids and mutation intent only after the in-gate policy check succeeds.
             def prepare() -> dict[str, Any]:
-                nonlocal mutation, query, ics_write, grant
+                nonlocal mutation, query, ics_write, grant, profile_write
                 self._require_epoch("vendor", epoch)
                 self._require_epoch("charger", charger_epoch)
                 self._check_vendor(action, original)
@@ -683,7 +702,17 @@ class Gateway:
                         ics_write = IcsWrite.prepare(original, self.policy, self.journal, self.plans)
                         payload = ics_write.payload
                     else:
+                        old_profiles = self.journal.get("vendor_profiles", {})
                         payload = self._translated_command(action, original)
+                        if action == "SetChargingProfile":
+                            vendor_profile = str(original["csChargingProfiles"]["chargingProfileId"])
+                            actual_profile = payload["csChargingProfiles"]
+                            profile_write = VendorProfileWrite(
+                                vendor_profile,
+                                actual_profile["chargingProfileId"],
+                                actual_profile.get("transactionId"),
+                                vendor_profile not in old_profiles,
+                            )
                     if action == "RemoteStartTransaction":
                         if self.policy.strict_cloud_authorization:
                             info = self.auth_info.get(original["idTag"])
@@ -699,12 +728,25 @@ class Gateway:
                             self.journal.put("vendor_start_grant", {**current_grant, "mutation": mutation})
                 return payload
 
-            answer = await self.charger.call(action, prepare)
+            answer = await self.charger.call(action, prepare, on_dispatch=on_dispatch)
+            if (
+                profile_write is not None
+                and answer[0] == 3
+                and answer[2]
+                not in (
+                    {"status": "Accepted"},
+                    {"status": "Rejected"},
+                    {"status": "NotSupported"},
+                )
+            ):
+                raise UnavailableError("unobserved charging profile response")
             if query is not None:
                 answer = query.response(answer)
             if grant is not None and (answer[0] != 3 or answer[2].get("status") != "Accepted"):
                 self.authorisation.revoke(grant)
             with self.journal.atomic():
+                if profile_write is not None and answer[0] == 3 and answer[2] == {"status": "Accepted"}:
+                    self._accepted_vendor_profile(profile_write)
                 if ics_write is not None and ics_write.accepted(answer):
                     self.plans.accepted(ics_write.plans, ics_write.clearing)
                 if mutation:
@@ -716,13 +758,67 @@ class Gateway:
         except UnavailableError, RecoveryRequiredError, sqlite3.Error:
             # Storage may itself be unavailable; the already durable pre-send intent remains the recovery boundary.
             try:
-                if mutation:
+                if mutation and dispatched:
                     self.journal.mutation_finished(mutation, False)
-                self.journal.put("uncertain_vendor_command", {"action": action, "digest": fingerprint(original)})
+                if dispatched:
+                    self.journal.put("uncertain_vendor_command", {"action": action, "digest": fingerprint(original)})
             except sqlite3.Error:
                 self.failures.append("JournalUnavailable")
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
+        finally:
+            self._finish_vendor_dispatch(action, original, mutation, grant, profile_write, dispatched)
         return text
+
+    # Retire only proven-unsent work; cancellation or any error after dispatch retains physical uncertainty.
+    def _finish_vendor_dispatch(
+        self,
+        action: str,
+        original: dict[str, Any],
+        mutation: str | None,
+        grant: str | None,
+        profile: VendorProfileWrite | None,
+        dispatched: bool,
+    ) -> None:
+        if mutation is None and grant is None and profile is None:
+            return
+        try:
+            with self.journal.atomic():
+                if not dispatched:
+                    if mutation is not None:
+                        self.journal.db.execute("DELETE FROM mutations WHERE token=?", (mutation,))
+                    if grant is not None:
+                        self.authorisation.revoke(grant)
+                    if profile is not None and profile.allocated:
+                        profiles = self.journal.get("vendor_profiles", {})
+                        if profiles.get(profile.vendor) == profile.local:
+                            profiles.pop(profile.vendor)
+                            self.journal.put("vendor_profiles", profiles)
+                elif mutation is not None:
+                    row = self.journal.db.execute("SELECT state FROM mutations WHERE token=?", (mutation,)).fetchone()
+                    if row is not None and row[0] == "pending":
+                        self.journal.mutation_finished(mutation, False)
+                        self.journal.put(
+                            "uncertain_vendor_command", {"action": action, "digest": fingerprint(original)}
+                        )
+        except sqlite3.Error:
+            self.failures.append("JournalUnavailable")
+
+    # Commit the last accepted definition even if the old transaction stopped while its reply was in flight.
+    def _accepted_vendor_profile(self, profile: VendorProfileWrite) -> None:
+        profiles = self.journal.get("vendor_profiles", {})
+        transactions = self.journal.get("vendor_profile_transactions", {})
+        if profile.transaction is None:
+            profiles[profile.vendor] = profile.local
+            transactions.pop(profile.vendor, None)
+        elif self.journal.active() == profile.transaction:
+            profiles[profile.vendor] = profile.local
+            transactions[profile.vendor] = profile.transaction
+        else:
+            if profiles.get(profile.vendor) == profile.local:
+                profiles.pop(profile.vendor)
+                transactions.pop(profile.vendor, None)
+        self.journal.put("vendor_profiles", profiles)
+        self.journal.put("vendor_profile_transactions", transactions)
 
     # Recheck priority, owner and current transaction after acquiring the outgoing CALL gate.
     def _check_vendor(self, action: str, payload: dict[str, Any], require_cap: bool = True) -> None:
@@ -788,9 +884,6 @@ class Gateway:
                     if local is None:
                         raise DeniedError("profile names an unknown cloud transaction")
                     profile["transactionId"] = local
-                    transactions = self.journal.get("vendor_profile_transactions", {})
-                    transactions[key] = local
-                    self.journal.put("vendor_profile_transactions", transactions)
             else:
                 payload["id"] = profiles[key]
         return payload

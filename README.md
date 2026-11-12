@@ -657,7 +657,8 @@ reset. The dashboard's native history continues to describe records actually ret
 The default commissioning policy remains strict. `tools/acknowledge_native_history.py check --config <private-file>
 --native-bounded-spec <private-file>` is dormant input validation. Its explicit `acknowledge` action requires the
 service to be stopped and acquires the existing journal's exclusive lock before fresh native reads. It accepts only
-the specific history-preservation fault with actual native6/HW32, owned confirmed0, closed all-phase-zero, unchanged
+the specific history-preservation fault with native6 or this journal's commissioned native32 under HW32, owned
+confirmed0, closed all-phase-zero, unchanged
 configuration/schedule, matching prior Boot and no lifecycle, unbound Start, command or mutation debt. Archive,
 policy, operator receipt and retirement of that fault commit atomically into inhibited recovery; no charger writer
 exists in the tool. Fresh actual Boot, resource/ledger reconciliation and the ordinary guarded release remain

@@ -79,7 +79,7 @@ def _reconcile(
         else "native bounded handover must preserve every original history record"
     )
     binding = native.physical.configuration_digest
-    if attempts and managed_current_ceiling(journal, spec) == 32:
+    if managed_current_ceiling(journal, spec) == 32:
         spec.require_managed(native, journal.identity, closed=True, allow_unplugged=True)
         binding = fingerprint(native.configuration | {"AmpLmt": "6"})
     else:

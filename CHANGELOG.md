@@ -2,6 +2,13 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Retire vendor mutations and provisional Start grants when a final guard proves the command was never sent.
+  Preserve uncertainty after any attempted transport, including cancellation. Update profile transaction ownership
+  only on an exact Accepted reply, including replacement acknowledgements arriving after the previous Stop.
+- Pace restrictive timer retries by elapsed time so wall-clock corrections cannot extend a failed zero or Stop
+  cooldown. A restarted controller retries an authorized restrictive action without inheriting a stale wall deadline.
+- Allow history-retention acknowledgement under the journal's commissioned native32 capability as well as native6,
+  preserving the original configuration binding, matching-fault, actual-zero and settled-journal requirements.
 - Add a supervised one-off native timer alongside the original daily schedule, with verified installation
   and automatic selective cleanup after charging or a missed start. Delayed starts end at 06:00 local
   time. The proxy supervises closure of the identified session, retires the timer on an observed

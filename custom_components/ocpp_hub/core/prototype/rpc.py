@@ -148,9 +148,10 @@ class Peer:
         check: Callable[[], None] | None = None,
         token: str | None = None,
         before_send: Callable[[], None] | None = None,
+        on_dispatch: Callable[[str], None] | None = None,
     ) -> Frame:
         async with self.gate.enter(priority):
-            return await self._call_locked(action, payload, check, token, before_send)
+            return await self._call_locked(action, payload, check, token, before_send, on_dispatch)
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
     @asynccontextmanager
@@ -197,10 +198,11 @@ class Peer:
                     before_send()
                 if self.before_send is not None:
                     self.before_send(action, actual)
+                message = build_call(unique_id, action, actual)
+                self.diagnostics.sending(action, len(unique_id))
                 if on_dispatch is not None:
                     on_dispatch(action)
-                self.diagnostics.sending(action, len(unique_id))
-                await sender(build_call(unique_id, action, actual))
+                await sender(message)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 if self.after_result is not None:

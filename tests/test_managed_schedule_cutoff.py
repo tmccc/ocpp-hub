@@ -47,6 +47,30 @@ def window(plan: dict[str, Any], day: datetime) -> tuple[int, int] | None:
     return int(start.timestamp()), int(start.timestamp() + plan["stopValue"] * 60)
 
 
+class SchedulerClock:
+    """Calendar advances model elapsed time; clock corrections never rewind the independent retry clock."""
+
+    # Keep explicit elapsed time separate from the calendar used by native plans.
+    def __init__(self, now: float) -> None:
+        self._now = now
+        self.elapsed = 0.0
+
+    # Expose the existing scenario driver's calendar input.
+    @property
+    def now(self) -> float:
+        return self._now
+
+    # Ordinary forward scenario advances also allow cooldowns to elapse.
+    @now.setter
+    def now(self, value: float) -> None:
+        self.elapsed += max(0, value - self._now)
+        self._now = value
+
+    # A host clock correction changes calendar time without asserting any elapsed time.
+    def step_wall(self, value: float) -> None:
+        self._now = value
+
+
 class TimerBench:
     """Send genuine lifecycle messages from the independent charger as its simulated clock advances."""
 
@@ -183,10 +207,11 @@ class TimerBench:
 async def timer_bench(
     tmp_path: Path, tls: Any, port: int, monkeypatch: pytest.MonkeyPatch, now: int = MORNING
 ) -> AsyncIterator[TimerBench]:
-    clock = SimpleNamespace(now=now)
+    clock = SchedulerClock(now)
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", SchedulePeer)
     monkeypatch.setitem(native_bench.ORIGINAL, "timeZone", ZONE.key)
     monkeypatch.setattr(managed_schedule, "time", SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(managed_schedule, "monotonic", lambda: clock.elapsed)
     async with managed_bench(tmp_path, tls, port, monkeypatch) as rig:
         session = managed_session(rig)
         await session.start()
