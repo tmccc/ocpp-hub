@@ -352,8 +352,8 @@ async def test_restart_after_explicit_pause_of_pending_increase(tmp_path, tls, u
             assert (await healthy(b.c))["local_hold_verified"] and b.c.current.selected() == 6
 
 
-# Intent: a replacement with no overlapping session retains the pre-existing interrupted-selection Pause policy.
-# Why: the independent-session fix must not implicitly Return unrelated idle current failures to app control.
+# Intent: idle replacement retains Pause and the previous verified current after an interrupted increase.
+# Why: process loss cannot promote an unverified target or implicitly return control to the app.
 async def test_idle_restart_keeps_existing_fail_closed_policy(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         async with interrupted_increase(b, True) as (_, release):
@@ -367,7 +367,7 @@ async def test_idle_restart_keeps_existing_fail_closed_policy(tmp_path, tls, unu
         async with b.rig.charger(b.session) as b.sock:
             await introduced(b.rig, b.session, b.sock, "idle-pending-selection")
             assert (await healthy(b.c))["local_hold_verified"]
-            assert b.c.requests.intent().mode == "paused" and b.c.current.selected() == 32
+            assert b.c.requests.intent().mode == "paused" and b.c.current.selected() == 6
             assert b.device.effective_limit() == 0 and not b.stops() and not starts(b.rig)
 
 

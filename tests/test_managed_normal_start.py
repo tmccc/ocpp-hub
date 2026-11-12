@@ -461,10 +461,10 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
             await replacement.close()
 
 
-# Intent: regular admission preserves one management slot for a later explicit Pause.
-# Why: a continuously running normal charge must not fill the receipt table so completely that Stop is refused.
+# Intent: retained terminal history permits normal Start while preserving its later explicit Pause.
+# Why: completed UUID evidence must not impose a lifetime command budget or make a running charge unpausable.
 @pytest.mark.parametrize("count", [4094, 4095])
-async def test_normal_start_reserves_future_explicit_pause_capacity(
+async def test_normal_start_and_pause_remain_available_after_terminal_history(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     unused_tcp_port: int,
@@ -479,20 +479,14 @@ async def test_normal_start_reserves_future_explicit_pause_capacity(
                 [(format(index, "032x"),) for index in range(1, count + 1)],
             )
         identifier = uuid.uuid4().hex
-        if count == 4095:
-            before = copy.deepcopy(test.rig.bench.device_calls)
-            with pytest.raises(RecoveryRequiredError):
-                test.controller.command(identifier, "start", 0)
-            assert test.rig.bench.device_calls == before and not starts(test.rig)
-            return
         test.controller.command(identifier, "start", 0)
         await test.controller.tests.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
-        assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 4095
+        assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == count + 1
         test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
         assert (await actual_stop(test, local))["local_hold_verified"]
-        assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 4096
+        assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == count + 2
 
 
 # Intent: the authenticated normal Start protocol rejects caller-selected current, tag or duration before acceptance.

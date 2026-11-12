@@ -116,38 +116,35 @@ class ManagedCurrentLimits:
         change = self.journal.get("managed_current_change", {})
         if change.get("state") == "pending":
             timer = self.journal.get(KEY, {})
-            if (
-                change.get("mode") == "app"
-                and controller.requests.intent().mode == "paused"
-                and (self.journal.active() is not None or change.get("observed_open"))
-            ):
+            previous = change.get("previous_a")
+            if previous is None:
+                # Earlier pending receipts stored the target only. Recover the most recent completed selection.
+                row = self.journal.db.execute(
+                    "SELECT c.current_a FROM managed_current_requests c JOIN managed_requests r ON r.id=c.id "
+                    "WHERE r.state='completed' ORDER BY r.rowid DESC LIMIT 1"
+                ).fetchone()
+                previous = row["current_a"] if row else 6
+            previous = integer(previous, 6, 32)
+            change = {**change, "previous_a": previous}
+            if change.get("mode") == "app" and controller.requests.intent().mode == "paused":
                 # A durable explicit Pause already owns its ticket; the interrupted increase cannot replace it.
                 with self.journal.atomic():
-                    self.journal.put("control", {**self.journal.get("control"), "resume_limit": change["previous_a"]})
+                    self.journal.put("control", {**self.journal.get("control"), "resume_limit": previous})
                     self.journal.put("managed_current_change", {**change, "state": "cancelled"})
                 return
             if controller.requests.intent().mode == "app":
-                previous = change.get("previous_a")
-                if previous is None:
-                    # Earlier pending receipts stored the target only. Recover the most recent completed selection.
-                    row = self.journal.db.execute(
-                        "SELECT c.current_a FROM managed_current_requests c JOIN managed_requests r ON r.id=c.id "
-                        "WHERE r.state='completed' ORDER BY r.rowid DESC LIMIT 1"
-                    ).fetchone()
-                    previous = row["current_a"] if row else 6
                 if timer.get("state") in OBSERVABLE:
-                    self.cancel_under_timer(
-                        change["id"], change["current_a"], integer(previous, 6, 32), "process_replaced"
-                    )
+                    self.cancel_under_timer(change["id"], change["current_a"], previous, "process_replaced")
                 else:
-                    self.cancel_overlap(change["id"], integer(previous, 6, 32), "process_replaced")
+                    self.cancel_overlap(change["id"], previous, "process_replaced")
                 return
             with self.journal.atomic():
                 intent = controller.requests.intent()
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 controller.session.gateway.controls._claim(True, stopping=True)
                 control = self.journal.get("control")
-                self.journal.put("control", {**control, "resume_limit": change["current_a"]})
+                resume = change["current_a"] if change.get("mode") == "paused" else previous
+                self.journal.put("control", {**control, "resume_limit": resume})
                 self.journal.put("managed_current_change", {**change, "state": "interrupted"})
 
     # All current receipts and authority use the session's existing exclusive journal owner.
@@ -171,6 +168,25 @@ class ManagedCurrentLimits:
     # A pending update blocks Start, Return and another update until its physical outcome has been established.
     def pending(self) -> bool:
         return bool(self.journal.get("managed_current_change", {}).get("state") in ("pending", "recovering"))
+
+    # A correlated live current worker owns native verification until its accepted revision reaches an outcome.
+    def applying(self) -> bool:
+        change = self.journal.get("managed_current_change", {})
+        intent = self.controller.requests.intent()
+        worker = self.worker
+        row = self.journal.db.execute(
+            "SELECT action,revision,state FROM managed_requests WHERE id=?", (change.get("id"),)
+        ).fetchone()
+        return bool(
+            change.get("state") == "pending"
+            and change.get("mode") == intent.mode
+            and worker is not None
+            and not worker.done()
+            and row is not None
+            and row["action"] == "set_current"
+            and row["state"] in ("accepted", "running")
+            and row["revision"] + 1 == intent.revision
+        )
 
     # The first version changes current only while closed and idle; an open car session cannot be silently resumed.
     def available(self, native: HandoverEvidence | None, *, for_schedule: bool = False) -> bool:
@@ -218,7 +234,7 @@ class ManagedCurrentLimits:
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             and c.requests.pending_return() is None
             and c.tests.lease is None
-            and j.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] < 4095
+            and c.requests.has_capacity()
             and native is not None
             and 0 <= time.time() - native.physical.observed_at <= 15
             and not native.physical.transaction_open
@@ -356,12 +372,26 @@ class ManagedCurrentLimits:
                     g.controls._claim(True, stopping=True)
                 control = j.get("control", {})
                 if control.get("inhibit") is True:
-                    j.put(
-                        "control", {**control, "resume_limit": previous_value if mode == "app" and overlap else value}
-                    )
-                j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "uncertain"})
+                    j.put("control", {**control, "resume_limit": previous_value if mode == "app" else value})
+                j.put(
+                    "managed_current_change",
+                    {
+                        **j.get("managed_current_change", {}),
+                        "id": identifier,
+                        "current_a": value,
+                        "previous_a": previous_value,
+                        "mode": mode,
+                        "state": "uncertain",
+                    },
+                )
                 c.requests.finish(
-                    identifier, "failed" if superseded else "uncertain", {"classification": "current_unconfirmed"}
+                    identifier,
+                    "failed" if superseded else "uncertain",
+                    {
+                        "classification": "current_unconfirmed",
+                        "requested_current_a": value,
+                        "previous_current_a": previous_value,
+                    },
                 )
             if c.pause_task is None or c.pause_task.done():
                 c.pause_task = asyncio.create_task(c._stop_requested())
@@ -433,7 +463,7 @@ class ManagedCurrentLimits:
                 intent = c.requests.intent()
                 j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 c.session.gateway.controls._claim(True, stopping=True)
-                j.put("control", {**j.get("control"), "resume_limit": change["current_a"]})
+                j.put("control", {**j.get("control"), "resume_limit": change["previous_a"]})
                 j.put("managed_current_change", {**j.get("managed_current_change"), "state": "interrupted"})
             return
         local = j.active()

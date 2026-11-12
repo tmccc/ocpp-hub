@@ -14,6 +14,7 @@ from .managed_current import (
     require_current_session,
     require_current_source,
 )
+from .managed_current_recovery import capture_interrupted_collision
 from .managed_intent import ControlIntent, ManagedRequests
 from .managed_release_recovery import reconcile_owner_release, record_release_pause
 from .managed_schedule import (
@@ -29,10 +30,12 @@ from .managed_start_binding import ManagedStartBinding
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import charger_history
 from .native_http import NativeTransportUnavailableError
+from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
-from .store import RecoveryRequiredError, ReleaseDeferredError, fingerprint
+from .store import RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
+from .trial_evidence import profile_projection
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import require_lifecycle_idle
 from .trial_session import TrialSession
@@ -51,18 +54,24 @@ class ManagedController:
         self.native = session.native_bounded
         self.released_epoch: int | None = None
         self.failures = 0
+        self.native_unavailable = 0
+        self.fault_zero_retry: dict[str, float] = {}
         self.stopping = False
         expected = {"mode": "app_schedule", "spec_digest": self.native.spec.digest, "local_start": False}
         saved = session.journal.get("managed_mode")
         if saved is not None and saved != expected:
             raise SecurityError("managed policy changed across process replacement")
         session.journal.put("managed_mode", expected)
+        capture_interrupted_collision(session.journal, self.native.spec)
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
         self.schedule = ManagedSchedule(self)
         self.current = ManagedCurrentLimits(self)
         self.tests = ManagedChargeTests(self)
+        self.ordinary = OrdinaryRecovery(self)
+        self.native.ordinary_source_observer = self.ordinary.observe
+        self.native.positive_guard = self.require_positive
         self.native.continuation_guard = self.require_continuation
         self.native.recovery_zero_only = self.tests.scoped_normal_stop
         binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest)
@@ -261,33 +270,99 @@ class ManagedController:
                     journal.put("trial_phase", "blocked")
             self.session.gateway.controls.invalidate()
 
-    # A recorded existing ceiling may be lowered to zero; unknown native transactions never receive a guessed Stop.
-    async def hold_fault(self) -> None:
+    # Reuse only the existing owned zero profile; a fault never creates Stop, cleanup or positive authority.
+    async def hold_fault(self, *, occurrence: str | None = None) -> None:
         g, j = self.session.gateway, self.session.journal
-        row = j.db.execute(
-            "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+        fault, control = j.get("managed_control_fault"), j.get("control", {})
+        epoch, boot, revision = g._charger_epoch, g.boot_observation, g.controls._revision
+        binding, handover = j.get("trial_binding", {}), j.get("native_bounded_handover", {})
+        station = j.db.execute(
+            "SELECT * FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
-        if (
-            row is None
-            or row["state"] == "absent_verified"
-            or g.charger.sender is None
-            or not g.current_boot_seen(g._charger_epoch)
-            or fingerprint(j.get("boot")) != self.native.spec.boot_digest
-            or g.controls.ready
-        ):
-            return
+        receipt = tuple(station) if station is not None else None
+        zero = encoded(profile_projection(self.native.choice.payload(0)))
+        # Only this exact owned preimage and ResourceBook's own zero-intent/ACK transitions may cross the RPC waits.
+        allowed = {receipt}
+        if station is not None and station["state"] != "absent_verified":
+            allowed.update(
+                {
+                    (station["key"], zero, station["confirmed"], "pending", None),
+                    (station["key"], zero, station["confirmed"], "uncertain", None),
+                    (station["key"], zero, zero, "confirmed", None),
+                }
+            )
+
+        # Both watchdog and foreground polling must retain the same fault, owner claim and commissioned installation.
+        def guard() -> None:
+            row = j.db.execute(
+                "SELECT * FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+            ).fetchone()
+            timer = j.get(KEY, {})
+            if (
+                self.stopping
+                or not fault
+                or j.get("managed_control_fault") != fault
+                or j.get("control", {}) != control
+                or control.get("owner") != "local"
+                or control.get("inhibit") is not True
+                or g.controls.desired() != 0
+                or j.get("trial_phase") not in ("active", "blocked", "recovering")
+                or g.charger.sender is None
+                or g._charger_epoch != epoch
+                or g.boot_observation != boot
+                or g.controls._revision != revision
+                or not g.current_boot_seen(epoch)
+                or fingerprint(j.get("boot")) != self.native.spec.boot_digest
+                or j.get("managed_mode", {}).get("spec_digest") != self.native.spec.digest
+                or j.get("trial_binding") != binding
+                or binding.get("boot_digest") != self.native.spec.boot_digest
+                or binding.get("station") != self.native.choice.value()
+                or j.get("native_bounded_handover") != handover
+                or handover.get("stage") != "admitted"
+                or handover.get("spec") != self.native.spec.value()
+                or handover.get("fault")
+                or row is None
+                or row["state"] == "absent_verified"
+                or tuple(row) not in allowed
+                or occurrence is not None
+                and (timer.get("id") != occurrence or not supervised_timer(timer))
+            ):
+                raise RecoveryRequiredError("fault zero hold awaits the same admitted owner and current Boot")
+
         try:
-            await g.controls.ensure_ceiling()
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
-            return  # Attention remains latched; an unconfirmed safety cap is never reported as measured zero.
+            guard()
+            if g.controls.ready:
+                return
+            now = time.monotonic()
+            self.fault_zero_retry = {key: until for key, until in self.fault_zero_retry.items() if until > now}
+            key = fingerprint({"fault": fault, "epoch": epoch, "boot": boot, "revision": revision, "control": control})
+            if key in self.fault_zero_retry:
+                return
+            self.fault_zero_retry[key] = now + 15
+            await g.controls.ensure_ceiling(guard=guard)
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+            return  # The fault/debts remain latched; a safety ACK alone is never reported as measured physical zero.
 
     # Require the actual source under whichever operation is currently holding this particular open transaction.
     def require_continuation(self, native: HandoverEvidence, local: int) -> None:
         j = self.session.journal
         if j.get("managed_current_change", {}).get("state") == "recovering":
             require_current_session(self.session.gateway, native, local)
+        elif self.ordinary.active():
+            self.ordinary.require_session(native, local)
         elif not (self.tests.scoped_normal_stop() and self.tests.independent_daily(native, local)):
             require_continuing_session(j, native, local)
+
+    # Preserve scoped test restrictions and recheck ordinary source immediately before any positive physical write.
+    def require_positive(self, native: HandoverEvidence) -> None:
+        self.tests.check_positive(native)
+        if self.ordinary.active():
+            local = self.session.journal.active()
+            self.ordinary.require_authority(local)
+            if local is not None:
+                self.require_continuation(native, local)
+            elif native.physical.transaction_open:
+                raise ReleaseDeferredError("ordinary idle recovery cannot adopt another native session")
 
     # The present owned zero, live introduction and actual reconciled events are prerequisites to any release.
     def require_zero(
@@ -346,12 +421,15 @@ class ManagedController:
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> None:
             timer = j.get(KEY, {})
+            if self.ordinary.active():
+                self.ordinary.require_authority(continuing_local)
             current_recovery = j.get("managed_current_change", {}).get("state") == "recovering"
             if current_recovery:
                 require_current_source(g, continuing_local)
             if (
                 continuing_local is not None
                 and not current_recovery
+                and not self.ordinary.active()
                 and not (self.tests.scoped_normal_stop() and self.tests.current_daily(continuing_local))
                 and (
                     not current_source(g, timer)
@@ -402,7 +480,9 @@ class ManagedController:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
-        release_guard = self.schedule.check_release if continuing_local is None else guard
+        release_guard = (
+            self.schedule.check_release if continuing_local is None and not self.ordinary.active() else guard
+        )
         release_guard()
         if expected_intent.mode == "paused":
             guard()
@@ -426,6 +506,8 @@ class ManagedController:
                         "charger_rpc": g.charger.diagnostics.snapshot(),
                     },
                 )
+                if self.ordinary.active() and isinstance(error, UnavailableError):
+                    raise ReleaseDeferredError("ordinary recovery retains zero pending a new guarded proof") from error
                 if (
                     continuing_local is not None
                     and not isinstance(error, SecurityError)
@@ -517,6 +599,8 @@ class ManagedController:
         async with asyncio.timeout(15):
             while self.session._resource_mutation_inflight():
                 await asyncio.sleep(0.02)
+            if self.current.applying():
+                raise RecoveryRequiredError("current application owns the pending native verification")
             native = await self.native.read()
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
@@ -604,6 +688,7 @@ class ManagedController:
             and self.released_epoch != g._charger_epoch
             and not cutoff_hold
             and not current_hold
+            and not self.ordinary.needed()
             and not (pending_timer and j.active() is not None)
         ):
             if pending_timer:
@@ -627,6 +712,8 @@ class ManagedController:
                 await self.return_requested(*pending_return)
             if self.requests.intent().mode == "paused":
                 await self.maintain_pause()
+            elif self.ordinary.needed():
+                await self.ordinary.recover()
             elif self.released_epoch != g._charger_epoch:
                 if cutoff_hold:
                     await self.schedule.hold_until_closed()
@@ -666,6 +753,46 @@ class ManagedController:
             if self.requests.intent().mode == "paused":
                 self.require_paused(native)
                 verified_pause = True
+        except (NativeTransportUnavailableError, StaleEvidenceError) as error:
+            self.failures = 0
+            self.native_unavailable += 1
+            j.put(
+                "managed_native_failure",
+                {
+                    "type": type(error).__name__,
+                    "detail": str(error)[:1024],
+                    "at_epoch": time.time(),
+                    "availability_only": True,
+                },
+            )
+            if self.native_unavailable >= 3:
+                lease = j.get(KEY, {})
+                if supervised_timer(lease):
+                    if not lease.get("retire_reason"):
+                        lease = {**lease, "retire_reason": "native_observation_unavailable"}
+                        j.put(KEY, lease)
+                    await self.schedule.protect_station(lease)
+                elif self.ordinary.ordinary():
+                    try:
+                        await self.ordinary.hold("native_observation_unavailable")
+                    except SecurityError as failure:
+                        j.put(
+                            "managed_native_failure",
+                            {
+                                "type": type(failure).__name__,
+                                "detail": str(failure)[:1024],
+                                "at_epoch": time.time(),
+                            },
+                        )
+                        self.fault("native_authority_or_preservation_failed")
+                    except DeniedError, UnavailableError, RecoveryRequiredError:
+                        pass  # The admitted zero remains the only retry; no positive authority was created.
+            return {
+                **base,
+                "state": "degraded",
+                "owner_control_enabled": False,
+                "fault": "native_observation_unavailable",
+            }
         except UnavailableError, TimeoutError:
             return {
                 **base,
@@ -701,6 +828,7 @@ class ManagedController:
                 self.fault("native_authority_or_preservation_failed")
             return {**base, "state": "degraded", "fault": "native_authority_or_preservation_failed"}
         self.failures = 0
+        self.native_unavailable = 0
         self.latest_native = native
         previous_intent = self.requests.intent()
         self.tests.observed(native)
@@ -713,6 +841,25 @@ class ManagedController:
                 "control_revision": self.requests.intent().revision,
             }
         control = j.get("control", {})
+        if (
+            self.current.applying()
+            and not s.runtime.status.delivery_blocked
+            and not j.get("uncertain_vendor_command")
+            and not j.get("managed_control_fault")
+            and not j.get("trial_preservation_fault")
+            and not j.get("trial_inventory_fault")
+            and not control.get("start_pending")
+            and not j.get("vendor_start_grant")
+            and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
+        ):
+            intent = self.requests.intent()
+            return {
+                **base,
+                "state": "reconciling",
+                "owner_control_enabled": False,
+                "desired_control": intent.mode,
+                "control_revision": intent.revision,
+            }
         shared = control.get("owner") == "shared" and not control.get("inhibit") and not control.get("uncertain")
         paused = self.requests.intent().mode == "paused"
         if (

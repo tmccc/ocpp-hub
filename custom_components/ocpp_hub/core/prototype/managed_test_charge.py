@@ -126,7 +126,7 @@ class ManagedChargeTests:
             ).fetchone()
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             and c.requests.pending_return() is None
-            and j.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] < (4095 if normal else 4096)
+            and c.requests.has_capacity()
             and self.state().get("state") not in ACTIVE
             and g.current_boot_seen(g._charger_epoch)
             and (normal or c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
@@ -152,7 +152,7 @@ class ManagedChargeTests:
             or not self.available(native, local=action in ("start", "start_test"), normal=action == "start")
         ):
             raise RecoveryRequiredError("test requires current shared six-ampere authority and no pending work")
-        if j.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] >= (4095 if action == "start" else 4096):
+        if not c.requests.has_capacity():
             raise RecoveryRequiredError("management receipt capacity requires maintenance")
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"

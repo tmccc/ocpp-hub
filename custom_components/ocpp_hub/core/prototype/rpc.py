@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from typing import Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
 from .diagnostics import RpcDiagnostics
-from .store import RecoveryRequiredError, fingerprint
+from .store import Journal, RecoveryRequiredError, fingerprint
 
 Sender = Callable[[str], Awaitable[None]]
 
@@ -34,14 +35,36 @@ class RegistrationDeferredError(UnavailableError):
 
 
 class InboundCache:
-    """Per-connection in-flight and completed replies; opaque bodies stay in memory only."""
+    """Bound live handlers while durable connection receipts preserve exact replies without evicting writes."""
 
-    # Bound memory without evicting mutating requests and accidentally executing a retry again.
-    def __init__(self, capacity: int = 4096) -> None:
+    # Only one Gateway owns a journal; prior-process connections cannot receive replies or retain live authority.
+    def __init__(self, capacity: int = 32, *, journal: Journal | None = None) -> None:
         self.capacity = capacity
+        self.db = journal.db if journal is not None else sqlite3.connect(":memory:", isolation_level=None)
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS inbound_receipts("
+            "side TEXT NOT NULL,epoch INTEGER NOT NULL,token TEXT NOT NULL,digest TEXT NOT NULL,response TEXT,"
+            "PRIMARY KEY(side,epoch,token))"
+        )
+        self.db.execute("DELETE FROM inbound_receipts")
         self._items: dict[tuple[str, int, str], tuple[str, asyncio.Future[str]]] = {}
 
-    # Share one execution between duplicate requests, including duplicates that arrive before its reply.
+    # An interrupted handler may have transmitted a mutation; its duplicate receives failure and never replays it.
+    @staticmethod
+    def unavailable(token: str) -> str:
+        return build_call_error(token, "InternalError", "request outcome unavailable; request was not replayed")
+
+    # Commit a terminal result before waking duplicates; a failed commit leaves the durable pending no-replay marker.
+    def complete(self, key: tuple[str, int, str], future: asyncio.Future[str], text: str) -> str:
+        try:
+            self.db.execute("UPDATE inbound_receipts SET response=? WHERE side=? AND epoch=? AND token=?", (text, *key))
+        except sqlite3.Error:
+            text = self.unavailable(key[2])  # The protocol boundary must still answer without repeating physical work.
+        future.set_result(text)
+        self._items.pop(key, None)
+        return text
+
+    # Share live work and persist completed replies so old harmless reads cannot exhaust the Stop acceptance path.
     async def response(self, side: str, epoch: int, frame: Frame, handler: Callable[[], Awaitable[str]]) -> str:
         key = side, epoch, frame[1]
         digest = fingerprint(frame[2:])
@@ -50,23 +73,33 @@ class InboundCache:
             if previous[0] != digest:
                 return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
             return await asyncio.shield(previous[1])
-        if len(self._items) >= self.capacity:
-            return build_call_error(frame[1], "OccurrenceConstraintViolation", "request receipt capacity reached")
+        try:
+            stored = self.db.execute(
+                "SELECT digest,response FROM inbound_receipts WHERE side=? AND epoch=? AND token=?", key
+            ).fetchone()
+            if stored is not None:
+                if stored[0] != digest:
+                    return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
+                return stored[1] if isinstance(stored[1], str) else self.unavailable(frame[1])
+            if len(self._items) >= self.capacity:
+                return build_call_error(frame[1], "OccurrenceConstraintViolation", "request queue is full")
+            self.db.execute("INSERT INTO inbound_receipts VALUES(?,?,?,?,NULL)", (*key, digest))
+        except sqlite3.Error:
+            # Without a durable pre-handler receipt, no command may execute or be silently replayed.
+            return self.unavailable(frame[1])
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._items[key] = digest, future
         try:
             text = await handler()
         except BaseException:
-            future.cancel()
+            # Preserve a bounded terminal answer even on cancellation after a possibly dispatched command.
+            self.complete(key, future, self.unavailable(frame[1]))
             raise
-        future.set_result(text)
-        return text
+        return self.complete(key, future, text)
 
-    # Release completed opaque replies from a retired authenticated connection.
+    # Replacement connections retire their own old results; in-flight old handlers cannot insert them again.
     def retire(self, side: str, epoch: int) -> None:
-        for key in list(self._items):
-            if key[0] == side and key[1] != epoch and self._items[key][1].done():
-                del self._items[key]
+        self.db.execute("DELETE FROM inbound_receipts WHERE side=? AND epoch!=?", (side, epoch))
 
 
 # Preserve the actual peer's result or error while restoring the original requester id.

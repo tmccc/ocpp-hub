@@ -135,10 +135,7 @@ class ManagementServer:
                     and result.get("local_hold_verified") is True
                     and self.controller.requests.pending_return() is None
                     and not self.controller.current.pending()
-                    and self.controller.session.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[
-                        0
-                    ]
-                    < 4095
+                    and self.controller.requests.has_capacity()
                 )
                 result["sessions"] = session_history(self.controller.session.journal)
             return {"id": value["id"], "ok": True, "result": result}

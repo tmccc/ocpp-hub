@@ -32,6 +32,7 @@ class ManagedRequests:
             "id TEXT PRIMARY KEY,action TEXT NOT NULL,revision INTEGER NOT NULL,"
             "state TEXT NOT NULL,result TEXT NOT NULL)"
         )
+        journal.db.execute("CREATE INDEX IF NOT EXISTS managed_requests_state ON managed_requests(state)")
         if journal.get("managed_control_intent") is None:
             journal.put("managed_control_intent", {"mode": "app", "revision": 0})
         self.intent()
@@ -54,6 +55,15 @@ class ManagedRequests:
         ):
             raise SecurityError("managed control intent is malformed")
         return ControlIntent(value["mode"], value["revision"])
+
+    # Historical UUID results remain immutable identities; only unresolved work consumes the bounded ordinary pool.
+    def has_capacity(self) -> bool:
+        return bool(
+            self.journal.db.execute(
+                "SELECT COUNT(*) FROM managed_requests WHERE state IN ('accepted','running','uncertain')"
+            ).fetchone()[0]
+            < 4095
+        )
 
     # Duplicate request identifiers bind both the action and caller's observed revision; no retry repeats a write.
     def existing(self, identifier: str, action: str, revision: int) -> dict[str, Any] | None:
@@ -84,8 +94,7 @@ class ManagedRequests:
         if existing is not None:
             return existing
         current = self.intent()
-        capacity = 4095 if action == "app_control" else 4096
-        if self.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] >= capacity:
+        if action != "pause" and not self.has_capacity():
             raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
         if action == "app_control" and (
             current.revision != revision
@@ -96,6 +105,12 @@ class ManagedRequests:
             raise RecoveryRequiredError("return requires the current revision and no pending return")
         with self.journal.atomic():
             if action == "pause":
+                # One newest restrictive receipt survives even a legacy full ordinary pool; all prior UUID rows remain.
+                self.journal.db.execute(
+                    "UPDATE managed_requests SET state='failed',result=? "
+                    "WHERE action='pause' AND state IN ('accepted','running','uncertain')",
+                    (json.dumps({"classification": "superseded_by_pause", "superseded_by": identifier}),),
+                )
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": current.revision + 1})
                 if on_pause is not None:
                     on_pause()

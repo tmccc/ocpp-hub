@@ -196,10 +196,54 @@ class ConnectionRuntime:
                         delay = min(2 * delay, self.settings.retry_max)
             self.gateway._require_epoch("charger", epoch)
             if self.ceiling_enabled():
-                await self.gateway.controls.ensure_ceiling()
+                await self._confirm_introduced_ceiling(epoch)
         except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError) as error:
             self.status.last_failure = "BootOrCeilingUnavailable"
             self.status.charger_fault.record(error, "boot_or_ceiling", self.gateway.charger.diagnostics.action)
+
+    # Retry only the admitted current Boot's restrictive zero sequence; introduction and Stop are never replayed.
+    async def _confirm_introduced_ceiling(self, epoch: int) -> None:
+        gateway, journal = self.gateway, self.gateway.journal
+        boot = gateway.boot_observation
+        delay = self.settings.retry_min
+
+        # A wait cannot transfer this zero-only retry to newer Boot, owner authority or frozen restoration work.
+        def restricted() -> bool:
+            return (
+                not self._closing
+                and self.ceiling_enabled()
+                and gateway.current_boot_seen(epoch)
+                and boot is not None
+                and gateway.boot_observation == boot
+                and journal.get("native_bounded_handover", {}).get("stage") == "admitted"
+                and journal.get("trial_phase") in ("active", "recovering")
+                and not journal.get("trial_starting")
+                and journal.get("control", {}).get("inhibit") is True
+                and gateway.controls.desired() == 0
+            )
+
+        # Capability reads and the CALL gate can await; recheck the same Boot immediately before every zero send.
+        def guard() -> None:
+            gateway._require_epoch("charger", epoch)
+            if not restricted():
+                raise UnavailableError("restrictive introduction was superseded")
+
+        retrying = False
+        while True:
+            try:
+                await gateway.controls.ensure_ceiling(guard=guard if retrying or restricted() else None)
+                return
+            except (UnavailableError, TimeoutError) as error:
+                if not restricted():
+                    raise
+                self.status.last_failure = "BootOrCeilingUnavailable"
+                self.status.charger_fault.record(error, "boot_or_ceiling", gateway.charger.diagnostics.action)
+                await asyncio.sleep(delay)
+                gateway._require_epoch("charger", epoch)
+                if not restricted():
+                    raise UnavailableError("restrictive introduction was superseded") from None
+                retrying = True
+                delay = min(2 * delay, self.settings.retry_max)
 
     # Classify the live vendor exchange before detach changes registration and pending RPC state.
     def _vendor_stage(self) -> str:

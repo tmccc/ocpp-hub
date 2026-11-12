@@ -404,7 +404,7 @@ def current_source(gateway: Gateway, lease: dict[str, Any]) -> bool:
 
 
 # Keep one elapsed retry gate across introduction, foreground ticks and the independent deadline task.
-def restrictive_retry_allowed(g: Gateway, lease: dict[str, Any], field: str) -> bool:
+def restrictive_retry_allowed(g: Gateway, lease: dict[str, Any], field: str, seconds: float = 15) -> bool:
     now = monotonic()
     g.timer_retry_after = {key: until for key, until in g.timer_retry_after.items() if until > now}
     key = (lease["id"], field)
@@ -413,7 +413,7 @@ def restrictive_retry_allowed(g: Gateway, lease: dict[str, Any], field: str) -> 
         g.timer_retry_after.pop(key, None)
     if key in g.timer_retry_after:
         return False
-    g.timer_retry_after[key] = now + 15
+    g.timer_retry_after[key] = now + seconds
     return True
 
 
@@ -771,6 +771,8 @@ class ManagedSchedule:
         c, j = self.c, self.j
         if j.get("managed_current_change", {}).get("state") == "recovering":
             return await c.current.prepare_native_report(payload)
+        if c.ordinary.active():
+            return await c.ordinary.prepare_native_report(payload)
         lease = j.get(KEY, {})
         if report := self.idle_report(lease, payload):
             return report
@@ -1400,9 +1402,15 @@ class ManagedSchedule:
                     or lease.get("unreported_native")
                     or lease.get("closure_gap")
                 )
-                if due and not self.j.get("managed_control_fault"):
+                if due:
                     try:
-                        await self.protect_deadline(lease)
+                        if self.j.get("managed_control_fault"):
+                            if supervised_timer(lease) and cutoff_due(lease) and not lease.get("cutoff_reached"):
+                                lease = {**lease, "cutoff_reached": True}
+                                self.j.put(KEY, lease)
+                            await self.c.hold_fault(occurrence=lease["id"])
+                        else:
+                            await self.protect_deadline(lease)
                     except DeniedError, UnavailableError, RecoveryRequiredError:
                         pass  # Durable attempt times bound retries. Only actual closure can release the hold.
                 daily = self.j.active() is not None and self.j.active() == lease.get("other_local")
@@ -1675,13 +1683,16 @@ class ManagedSchedule:
                 self.begin_hold(lease)
                 return
             self.finish(lease, str(reason))
-        elif now >= lease.get("next_clear", 0):
+        else:
             attempts = lease.get("cleanup_attempts", 0) + 1
+            delay = min(300, 30 * 2 ** min(attempts - 1, 4))
+            if not restrictive_retry_allowed(c.session.gateway, lease, "next_clear", delay):
+                return
             lease = {
                 **lease,
                 "cleanup_since": lease.get("cleanup_since", now),
                 "cleanup_attempts": attempts,
-                "next_clear": now + min(300, 30 * 2 ** min(attempts - 1, 4)),
+                "next_clear": now + delay,
             }
             j.put(KEY, lease)
             await self.send(lease, False)

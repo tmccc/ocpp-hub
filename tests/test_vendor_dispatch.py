@@ -285,8 +285,8 @@ async def test_cancelled_vendor_start_retains_only_possible_dispatch(
                         with pytest.raises(asyncio.CancelledError):
                             await task
                     elif failure == "native-security":
-                        with pytest.raises(SecurityError):
-                            await task
+                        answer = decode(await task)
+                        assert answer[0] == 4 and answer[2] == "InternalError"
                     else:
                         assert decode(await task)[0] == 4
                     rows = session.journal.db.execute("SELECT state FROM mutations WHERE origin='vendor'").fetchall()

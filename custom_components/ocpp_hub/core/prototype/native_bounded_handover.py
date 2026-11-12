@@ -67,6 +67,7 @@ class NativeBoundedHandover:
             raise SecurityError("unplugged native monitoring requires disabled local Start")
         self.gateway, self.book, self.observe, self.spec, self.choice = gateway, book, observe, spec, choice
         self.command_source_observer: Callable[[HandoverEvidence], None] | None = None
+        self.ordinary_source_observer: Callable[[HandoverEvidence], None] | None = None
         self.allow_unplugged = allow_unplugged
         self.lock = asyncio.Lock()
         self.last_verified_at = 0.0
@@ -136,6 +137,7 @@ class NativeBoundedHandover:
                 "state": journal.get("native_bounded_handover"),
                 "current_capability": journal.get("managed_current_capability"),
                 "temporary_schedule": journal.get("managed_temporary_schedule"),
+                "ordinary_recovery": journal.get("managed_ordinary_recovery"),
                 "resources": [tuple(row) for row in journal.db.execute("SELECT * FROM trial_resources ORDER BY key")],
             }
         )
@@ -168,6 +170,8 @@ class NativeBoundedHandover:
                 self.command_source_observer(native)
             record_session_source(self.gateway.journal, native, self.gateway.boot_observation)
             record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
+            if self.ordinary_source_observer is not None:
+                self.ordinary_source_observer(native)
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
             resolve()
             self.last_verified_at = 0
@@ -178,6 +182,10 @@ class NativeBoundedHandover:
                 raise UnavailableError("timer hold awaits fresh native evidence") from error
             if self.gateway.journal.get("managed_current_change", {}).get("state") == "recovering":
                 raise UnavailableError("current selection hold awaits fresh native evidence") from error
+            ordinary = self.gateway.journal.get("managed_ordinary_recovery", {})
+            intent = self.gateway.journal.get("managed_control_intent", {})
+            if ordinary.get("state") == "holding" and intent == {"mode": "app", "revision": ordinary.get("revision")}:
+                raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
             raise
         except SecurityError, UnavailableError, TimeoutError:
             resolve()

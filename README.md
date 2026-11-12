@@ -655,6 +655,8 @@ turned into completed sessions, and historical absence never creates a Stop, clo
 reset. The dashboard's native history continues to describe records actually returned by the charger.
 
 Ordinary introduction retries transient native HTTP or stale-observation failures on the same charger connection.
+Capability discovery, the restrictive station-zero write and composite verification also retry after an unavailable
+reply, bound to the same admitted Boot. These retries do not replay a Start, Stop or positive release.
 Changed identity, configuration, history or resource ownership still blocks introduction. A failed read-only vendor
 request returns an error without creating electrical-command uncertainty. At startup, a recognized legacy marker for
 `GetConfiguration`, `GetCompositeSchedule` or `TriggerMessage` can be retired only with a settled journal and no
@@ -666,7 +668,46 @@ An `owner_release_unconfirmed` fault retains its zero hold across polls and rest
 to request reconciliation of that particular fault. The proxy requires current actual Boot, independently verified
 closed all-phase zero, the confirmed owned station profile, unchanged native configuration/schedule/history and no
 lifecycle, command or mutation debt. Successful reconciliation completes Pause and stays at zero. A separate
-**Return to app/schedule** is required to restore the selected ceiling. Other fault classifications remain latched.
+**Return to app/schedule** is required to restore the selected ceiling. The same closed-zero acknowledgement can
+recover an older native-authority fault with a matching recorded transport/stale-evidence diagnostic. Changed native
+identity, configuration, history or ownership does not qualify for this transport recovery.
+
+An accepted current update owns its pending native verification, so a concurrent health observation defers until
+the worker finishes. If an app current update fails, the proxy keeps zero and the previous verified selection.
+The failed target remains in its receipt for diagnosis. An older journal fault from the current/health collision
+requires a new explicit Pause, its exact failed-request diagnostic and full closed-zero/settled-journal proof.
+If the old process stopped before recording the failure, startup preserves that exact accepted request for the
+same acknowledgement instead of inventing an outcome.
+Recovery retains zero and restores the previous completed selection, or commissioned 6 A if none was recorded.
+A separate Return is still required.
+
+The deadline watchdog can also retain the existing owned zero profile while a fault remains latched, independently
+of health polling. This restrictive path grants no Start, Stop, cleanup or positive-current authority and preserves
+all pending debts; foreground and watchdog attempts share an elapsed-time retry limit.
+
+Ordinary app/daily sessions can continue after reconnect or process replacement at their previous selected ceiling.
+The proxy first verifies its owned zero, the exact accepted transaction and freshly observed original-plan or
+consumed app-command source. It sends neither a new Start nor an inferred Stop. Unknown native IDs, source
+contradictions and unresolved command debt remain restricted; temporary timers, current changes and test charges
+retain their separate recovery policies. Three unavailable native observations create a recoverable zero hold.
+Fresh native identity/configuration/history and source proof must agree before that hold can be released.
+
+The final vendor send guard rechecks both connection generations, current ownership and current tag permission after
+the awaited native audit. A failed validation receives a correlated protocol error; an identical request ID receives
+its stored result. Completed connection replies live in the private SQLite journal until that connection retires,
+while only running handlers consume the bounded memory pool. Cancellation or a storage failure never authorizes
+replaying a possibly dispatched command.
+
+Management capacity counts unresolved requests, retaining terminal UUID results for idempotency. All charging
+admissions reserve Pause capacity. A new Pause can also replace the active Pause receipt in an older full journal;
+previous UUID rows remain queryable as superseded. Verified-absent resource receipts and their aliases retain their
+ownership history without consuming live-resource capacity. Spontaneous reappearance still blocks control, and an
+explicit reactivation must fit the live-resource limit. These changes do not recycle protocol identifiers.
+
+A Stop naming the exact accepted transaction with a nondecreasing energy meter can close that ledger transaction
+after a device-clock correction. The original reported Start and Stop timestamps remain unchanged; a separate
+private clock-discontinuity record marks reversed chronology. Native closure, resource and delivery checks still
+gate subsequent control. Unknown transactions, lower meters and contradictory Stop reports remain rejected.
 
 The default commissioning policy remains strict. `tools/acknowledge_native_history.py check --config <private-file>
 --native-bounded-spec <private-file>` is dormant input validation. Its explicit `acknowledge` action requires the
@@ -1094,8 +1135,9 @@ The commissioning package is separate from Home Assistant and does not establish
   through the proxy remain unproven. Dynamic grants cover only one trusted start; unknown variants fail closed.
 - Firmware updates, reset and diagnostic uploads stay refused. Unobserved plan stop models, fractional-current device
   behaviour, arbitrary vendor extension bodies and every app screen are outside the validated subset.
-- Resource tables and per-connection reply caches are bounded. Exhaustion and unresolved outcomes need operator
-  reconciliation; no silent id recycling or automatic live recovery UI has been added.
+- Outstanding work and live resource ownership are bounded. Completed UUID replies and independently retired
+  ownership evidence remain retained without imposing a lifetime command/profile budget. Per-connection replies
+  retire with that connection; genuine unresolved outcomes still require reconciliation, with no silent ID recycling.
 - The existing Home Assistant integration, dashboard and deliberately disabled EV/reserve automations are unchanged.
   The temporary charger backend change was fully restored. No release, HA deployment or public push has been made.
 

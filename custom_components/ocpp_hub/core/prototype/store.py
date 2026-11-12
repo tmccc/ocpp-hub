@@ -98,6 +98,9 @@ class Journal:
             CREATE TABLE IF NOT EXISTS mutations(
                 token TEXT PRIMARY KEY, origin TEXT NOT NULL, action TEXT NOT NULL,
                 digest TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS transaction_clock_discontinuities(
+                local INTEGER PRIMARY KEY REFERENCES transactions(local),
+                start_timestamp TEXT NOT NULL,stop_timestamp TEXT NOT NULL,observed_at_epoch REAL NOT NULL);
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(transactions)")}
         for name in ("start_info", "stop_info"):
@@ -305,10 +308,8 @@ class Journal:
             if row is None:
                 raise ConflictError("stop names an unknown transaction")
             start = json.loads(row["start"])
-            if payload["meterStop"] < start["meterStart"] or datetime.fromisoformat(
-                payload["timestamp"].replace("Z", "+00:00")
-            ) < datetime.fromisoformat(start["timestamp"].replace("Z", "+00:00")):
-                raise ConflictError("stop precedes its accepted start")
+            if payload["meterStop"] < start["meterStart"]:
+                raise ConflictError("stop meter precedes its accepted start")
             if row[0] is not None and row[0] != encoded(payload):
                 raise ConflictError("stop contradicts a previously accepted stop")
             if row[0] is None:
@@ -316,6 +317,13 @@ class Journal:
                     "UPDATE transactions SET stop=?,live=0,stop_info=? WHERE local=?",
                     (encoded(payload), encoded(info or {}), local),
                 )
+                if datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00")) < datetime.fromisoformat(
+                    start["timestamp"].replace("Z", "+00:00")
+                ):
+                    self.db.execute(
+                        "INSERT INTO transaction_clock_discontinuities VALUES(?,?,?,?)",
+                        (local, start["timestamp"], payload["timestamp"], time.time()),
+                    )
                 self.enqueue("StopTransaction", payload, local)
                 profiles = self.get("vendor_profiles", {})
                 transactions = self.get("vendor_profile_transactions", {})

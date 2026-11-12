@@ -15,6 +15,7 @@ from .managed_occurrences import occurrences
 from .policy import DeniedError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
+from .trial_bootstrap import initialize_trial_baseline
 from .trial_evidence import Evidence, Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
 
@@ -105,16 +106,10 @@ class ResourceBook:
             "CREATE TABLE IF NOT EXISTS trial_resources("
             "key TEXT PRIMARY KEY,desired TEXT,confirmed TEXT,state TEXT NOT NULL,observed_digest TEXT)"
         )
-        saved = journal.get("trial_baseline")
-        if saved is not None and saved != baseline.value():
-            raise SecurityError("journal belongs to another trial baseline")
-        if saved is None:
-            occupied = journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-            occupied += journal.db.execute("SELECT COUNT(*) FROM mutations").fetchone()[0]
-            if occupied:
-                raise SecurityError("trial requires a new journal or its original verified baseline")
-            journal.put("trial_baseline", baseline.value())
-            journal.put("trial_phase", "prepared")
+        journal.db.execute(
+            "CREATE INDEX IF NOT EXISTS trial_resources_live ON trial_resources(state) WHERE state!='absent_verified'"
+        )
+        initialize_trial_baseline(journal, baseline.value())
 
     # Public health information includes no endpoints, identifiers, body contents or credentials.
     def status(self) -> dict[str, Any]:
@@ -282,9 +277,16 @@ class ResourceBook:
                     if scope == tuple(canonical[k] for k in ("connector", "purpose")):
                         raise DeniedError("trial profile would replace an original profile scope")
             with self.journal.atomic():
-                if self.journal.db.execute("SELECT 1 FROM trial_resources WHERE key=?", (key,)).fetchone() is None:
-                    if self.journal.db.execute("SELECT COUNT(*) FROM trial_resources").fetchone()[0] >= 128:
+                existing = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
+                if existing is None or existing["state"] == "absent_verified":
+                    if (
+                        self.journal.db.execute(
+                            "SELECT COUNT(*) FROM trial_resources WHERE state!='absent_verified'"
+                        ).fetchone()[0]
+                        >= 128
+                    ):
                         raise RecoveryRequiredError("trial resource receipt capacity reached")
+                if existing is None:
                     self.journal.db.execute(
                         "INSERT INTO trial_resources VALUES(?,?,NULL,'pending',NULL)", (key, encoded(canonical))
                     )

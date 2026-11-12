@@ -25,6 +25,7 @@ from .local_control import LocalControl
 from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
+from .security import SecurityError
 from .store import ConflictError, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
 
@@ -129,7 +130,7 @@ class Gateway:
         self.boot_observation: str | None = None
         self._boot_seen = asyncio.Event()
         self._vendor_epoch = 0
-        self._inbound = InboundCache()
+        self._inbound = InboundCache(journal=journal)
         self.failures: list[str] = []
 
     # Restrict new transports or changed introductions before they can authorize any charging-capable request.
@@ -367,7 +368,7 @@ class Gateway:
             text = build_call_error(
                 token, "PropertyConstraintViolation", "request conflicts with local policy or state"
             )
-        except UnavailableError, RecoveryRequiredError, sqlite3.Error:
+        except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
             if mutation:
                 try:
                     self.journal.mutation_finished(mutation, False)
@@ -730,7 +731,35 @@ class Gateway:
                             self.journal.put("vendor_start_grant", {**current_grant, "mutation": mutation})
                 return payload
 
-            answer = await self.charger.call(action, prepare, on_dispatch=on_dispatch)
+            # Native validation awaits HTTP after preparation; revoke stale origin, ownership or tag authority then.
+            def check() -> None:
+                self._require_epoch("vendor", epoch)
+                self._require_epoch("charger", charger_epoch)
+                self._check_vendor(action, original, own_mutation=mutation)
+                if mutation is not None:
+                    row = self.journal.db.execute(
+                        "SELECT origin,action,digest,state FROM mutations WHERE token=?", (mutation,)
+                    ).fetchone()
+                    if row is None or tuple(row) != ("vendor", action, fingerprint(original), "pending"):
+                        raise DeniedError("this vendor request no longer owns its pending mutation")
+                if action == "RemoteStartTransaction":
+                    if self.policy.strict_cloud_authorization:
+                        info = self.auth_info.get(original["idTag"])
+                        if info is None or info["status"] != "Accepted":
+                            raise DeniedError("cloud authorization expired during native validation")
+                        if not self._local_tag(original["idTag"]):
+                            self.auth_info.require_dynamic(info)
+                    if grant is not None:
+                        saved = self.journal.get("vendor_start_grant", {})
+                        if (
+                            saved.get("token") != grant
+                            or saved.get("local") is not None
+                            or not self.authorisation.allows(original["idTag"])
+                            or not self._tag_allowed(original["idTag"])
+                        ):
+                            raise DeniedError("this vendor start no longer owns its current tag grant")
+
+            answer = await self.charger.call(action, prepare, check=check, on_dispatch=on_dispatch)
             if (
                 profile_write is not None
                 and answer[0] == 3
@@ -767,7 +796,7 @@ class Gateway:
             text = reply_as(answer, token)
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
-        except UnavailableError, RecoveryRequiredError, sqlite3.Error:
+        except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
             # Storage may itself be unavailable; the already durable pre-send intent remains the recovery boundary.
             try:
                 if mutation and dispatched:
@@ -832,7 +861,9 @@ class Gateway:
         self.journal.put("vendor_profile_transactions", transactions)
 
     # Recheck priority, owner and current transaction after acquiring the outgoing CALL gate.
-    def _check_vendor(self, action: str, payload: dict[str, Any], require_cap: bool = True) -> None:
+    def _check_vendor(
+        self, action: str, payload: dict[str, Any], require_cap: bool = True, *, own_mutation: str | None = None
+    ) -> None:
         kind = self.policy.kind(action, payload)
         if (
             kind == "write"
@@ -842,7 +873,13 @@ class Gateway:
             raise DeniedError("trial vendor controls are frozen")
         control = self.journal.get("control", {})
         if kind == "write" and action != "RemoteStopTransaction":
-            self.journal.require_vendor_writes_reconciled()
+            if own_mutation is None:
+                self.journal.require_vendor_writes_reconciled()
+            elif self.journal.db.execute(
+                "SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed' AND token!=? LIMIT 1",
+                (own_mutation,),
+            ).fetchone():
+                raise RecoveryRequiredError("another vendor write still requires reconciliation")
             if require_cap and not self.controls.ready:
                 raise UnavailableError("station ceiling is not confirmed for this charger connection")
         if (
@@ -864,6 +901,28 @@ class Gateway:
             if vendor is not None and self.journal.local_id(vendor) is None:
                 raise DeniedError("cloud profile no longer names the active transaction")
 
+    # A retired alias needs a new live slot before an explicit request can recreate its independently absent profile.
+    def _vendor_profile_retired(self, local: int) -> bool:
+        if not self.journal.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trial_resources'"
+        ).fetchone():
+            return False
+        row = self.journal.db.execute(
+            "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(local),)
+        ).fetchone()
+        return bool(row is not None and row[0] == "absent_verified")
+
+    # Retain every alias identity while independently absent trial profiles stop consuming the live namespace bound.
+    def _vendor_profile_capacity(self, profiles: dict[str, int]) -> bool:
+        if not self.journal.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trial_resources'"
+        ).fetchone():
+            return len(profiles) < self.journal.capacity
+        absent = {
+            row[0] for row in self.journal.db.execute("SELECT key FROM trial_resources WHERE state='absent_verified'")
+        }
+        return sum("profile:" + str(local) not in absent for local in profiles.values()) < self.journal.capacity
+
     # Translate session ids in both control directions and isolate vendor profile ids from local profile 7001.
     def _translated_command(self, action: str, original: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = json.loads(encoded(original))
@@ -880,7 +939,7 @@ class Gateway:
             if key not in profiles:
                 if action == "ClearChargingProfile":
                     raise DeniedError("cloud does not own this profile")
-                if len(profiles) >= self.journal.capacity:
+                if not self._vendor_profile_capacity(profiles):
                     raise DeniedError("vendor profile namespace is full")
                 local_profile = int(self.journal.get("next_vendor_profile", 99999)) + 1
                 if local_profile >= 2**31:
@@ -888,6 +947,12 @@ class Gateway:
                 self.journal.put("next_vendor_profile", local_profile)
                 profiles[key] = local_profile
                 self.journal.put("vendor_profiles", profiles)
+            elif (
+                action == "SetChargingProfile"
+                and self._vendor_profile_retired(profiles[key])
+                and not self._vendor_profile_capacity(profiles)
+            ):
+                raise DeniedError("vendor profile namespace is full")
             if action == "SetChargingProfile":
                 profile["chargingProfileId"] = profiles[key]
                 if "transactionId" in profile:

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
 from .managed_cutoffs import supervised_timer
 from .managed_occurrences import occurrences
 from .store import RecoveryRequiredError
@@ -20,16 +22,60 @@ PROOF = "managed_release_reconciliation"
 FAULT = "owner_release_unconfirmed"
 
 
+# Legacy ordinary transport latches require their exact stored availability diagnostic, never generic authority drift.
+def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
+    if fault.get("classification") == FAULT:
+        return True
+    if legacy_current_evidence(c, fault) is not None:
+        return True
+    if fault.get("classification") != "native_authority_or_preservation_failed":
+        return False
+    failure = c.session.journal.get("managed_native_failure", {})
+    at, observed = fault.get("at_epoch"), failure.get("at_epoch")
+    return (
+        failure.get("type") in ("NativeTransportUnavailableError", "StaleEvidenceError")
+        and isinstance(at, (int, float))
+        and not isinstance(at, bool)
+        and isinstance(observed, (int, float))
+        and not isinstance(observed, bool)
+        and 0 < at < 2**53
+        and 0 < observed < 2**53
+        and math.isfinite(at)
+        and math.isfinite(observed)
+        and 0 <= at - observed <= 2
+    )
+
+
 # Call inside the existing Pause acceptance transaction after its new paused revision has been recorded.
 def record_release_pause(c: ManagedController, identifier: str) -> None:
     j = c.session.journal
     fault = j.get("managed_control_fault", {})
-    if fault.get("classification") != FAULT:
+    if not recoverable_fault(c, fault):
         return
     intent = c.requests.intent()
     if intent.mode != "paused":
         raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
-    j.put(ACK, {"fault": fault, "pause_request": identifier, "revision": intent.revision})
+    acknowledgement = {"fault": fault, "pause_request": identifier, "revision": intent.revision}
+    current = legacy_current_evidence(c, fault)
+    if current is not None:
+        acknowledgement["current_failure_evidence"] = current
+    elif fault.get("classification") != FAULT:
+        acknowledgement["native_failure"] = j.get("managed_native_failure")
+    j.put(ACK, acknowledgement)
+
+
+# Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.
+def acknowledged_evidence(c: ManagedController, fault: dict[str, Any], ack: dict[str, Any]) -> bool:
+    current = legacy_current_evidence(c, fault)
+    if current is not None:
+        return bool(ack.get("current_failure_evidence") == current)
+    return bool(
+        "current_failure_evidence" not in ack
+        and (
+            fault.get("classification") == FAULT
+            or ack.get("native_failure") == c.session.journal.get("managed_native_failure")
+        )
+    )
 
 
 # Prove only this fault is recoverable; never clear vendor uncertainty or release positive current here.
@@ -39,8 +85,9 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     ack = j.get(ACK, {})
     intent = c.requests.intent()
     if (
-        fault.get("classification") != FAULT
+        not recoverable_fault(c, fault)
         or ack.get("fault") != fault
+        or not acknowledged_evidence(c, fault, ack)
         or intent.mode != "paused"
         or ack.get("revision") != intent.revision
     ):
@@ -57,6 +104,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     epoch, revision = g._charger_epoch, g.controls._revision
     boot = g.boot_observation
     ticket = j.get("control", {}).get("ticket")
+    current = legacy_current_evidence(c, fault)
 
     # Any newer Pause, Boot, local operation, request or unrelated write debt revokes this snapshot.
     def guard() -> None:
@@ -66,6 +114,8 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or c.requests.intent() != intent
             or j.get(ACK) != ack
             or j.get("managed_control_fault") != fault
+            or not recoverable_fault(c, fault)
+            or not acknowledged_evidence(c, fault, ack)
             or g._charger_epoch != epoch
             or g.boot_observation != boot
             or boot is None
@@ -95,6 +145,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or g.charger._pending
             or g.vendor._pending
             or j.get("managed_current_change", {}).get("state") in ("pending", "recovering", "interrupted", "uncertain")
+            and current is None
             or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
             or j.get("managed_test_charge", {}).get("state") not in (None, "completed")
             or any(supervised_timer(lease) for lease in occurrences(j).values())
@@ -149,6 +200,8 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             PROOF,
             {
                 "prior_fault": fault,
+                "prior_native_failure": ack.get("native_failure"),
+                "prior_current_failure": current,
                 "pause_request": ack["pause_request"],
                 "revision": intent.revision,
                 "native_digest": native.digest,
@@ -160,6 +213,33 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
         )
         j.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
         j.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
+        if current is not None:
+            control = {**control, "resume_limit": current["previous_a"]}
+            j.put(
+                "managed_current_change",
+                {
+                    **current["change"],
+                    "state": "cancelled",
+                    "previous_a": current["previous_a"],
+                    "recovery_reason": "explicit_pause_verified_zero",
+                },
+            )
+            # This outcome confirms only reconciliation at zero; the requested target was never completed.
+            j.db.execute(
+                "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND state='uncertain'",
+                (
+                    json.dumps(
+                        {
+                            "classification": "current_unconfirmed",
+                            "reconciled_at_zero": True,
+                            "requested_current_a": current["change"]["current_a"],
+                            "previous_current_a": current["previous_a"],
+                        }
+                    ),
+                    current["change"]["id"],
+                ),
+            )
+            j.db.execute("DELETE FROM meta WHERE key=?", (INTERRUPTED,))
         j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
         j.put("trial_phase", "recovering")
         j.put("trial_starting", False)

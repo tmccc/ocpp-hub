@@ -2,6 +2,28 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Let an accepted current worker finish verification before a concurrent health observation begins. Failed app
+  selections retain their previous verified setting, including after process replacement or a newer Pause.
+  A new explicit Pause can reconcile the exact historical current/health collision through closed-zero and
+  settled-journal proof; the failed target never supplies future Return authority.
+  Deadline supervision can still request the already owned zero profile while a fault is latched, with current
+  Boot and ownership guards and shared elapsed-time backoff. The fault and all pending debts remain intact.
+- Recheck vendor connection, ownership and tag authority after native validation and immediately before dispatch.
+  Return stable protocol errors for unavailable validation. Keep completed connection replies in the private journal
+  so old reads cannot fill the live request pool or prevent a cloud Stop; never replay an interrupted mutation.
+- Count unresolved management work and live resource ownership instead of lifetime history. Retain UUID results,
+  retired resource evidence and profile aliases; every charging admission reserves Pause capacity. An explicit
+  Pause can also restrict a legacy full pool without discarding prior request identities.
+- Commit initial ownership metadata atomically and recover only the verified pristine interrupted-bootstrap shape.
+  Accept an exact known transaction's increasing-meter Stop across a device-clock correction, preserve its raw
+  timestamps and record the discontinuity separately. Unknown IDs, conflicting duplicates and lower meters remain
+  rejected.
+- Retry only restrictive introduction reads and zero verification on the current Boot. Pace temporary-timer
+  cleanup by elapsed time so a wall-clock correction cannot postpone cleanup and owner Return.
+- Recover ordinary app/daily sessions after a reconnect using confirmed station zero, the exact accepted transaction
+  and fresh native source evidence. Continuation sends neither Start nor Stop. Temporary native HTTP loss remains
+  recoverable; three unavailable observations retain a restrictive hold instead of a permanent authority fault.
+  An older matching transport-only fault can be acknowledged by a new explicit Pause after full closed-zero proof.
 - Retry ordinary charger introduction after transient native observation failure, with the same permanent binding
   and ownership checks. Failed read-only vendor RPCs no longer create uncertain electrical-command debt.
   Conservatively migrate recognized old read markers during startup into a verified Pause.
