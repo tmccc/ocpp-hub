@@ -183,12 +183,24 @@ def test_full_validator_requires_complete_full_mode(tmp_path, mode, complete, ex
 
 # Intent: edited inputs, entire omitted families and incomplete recovery suffixes cannot qualify.
 # Why: raw phase success alone does not prove the pinned finite universe or its eventual recovery was exercised.
-def test_model_audit_regenerates_inputs_and_requires_exact_recovery_evidence(tmp_path):
+def test_model_audit_regenerates_inputs_and_requires_exact_recovery_evidence(tmp_path, monkeypatch):
     _, bundle_path = qualification_input(tmp_path / "synthetic-model-tamper", "full", True)
     bundle = json.loads(bundle_path.read_text())
     batch = Path(bundle["phases"]["engine-model"])
     arguments = [str(batch), "--expected-commit", bundle["commit"], "--expected-source-digest", bundle["source_digest"]]
     assert audit.main(arguments) == 0
+    original_scratch = audit.tempfile.TemporaryDirectory
+
+    # An unset TMPDIR must use the platform default, while this test's actual scratch stays inside its task directory.
+    def portable_scratch(*args, **kwargs):
+        assert kwargs.get("dir") is None
+        return original_scratch(*args, **kwargs)
+
+    with monkeypatch.context() as environment:
+        environment.delenv("TMPDIR", raising=False)
+        environment.setattr(audit.tempfile, "tempdir", str(tmp_path))
+        environment.setattr(audit.tempfile, "TemporaryDirectory", portable_scratch)
+        assert audit.main(arguments) == 0
     path = batch / "sequence-manifest.jsonl"
     original = path.read_text()
     rows = [json.loads(line) for line in original.splitlines()]

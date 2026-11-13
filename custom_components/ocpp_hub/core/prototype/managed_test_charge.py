@@ -142,13 +142,13 @@ class ManagedChargeTests:
         ).fetchone()
         if (
             self.lease is not None
-            or state.get("kind") != "normal"
+            or state.get("kind") not in ("normal", "test")
             or state.get("source") != "local"
             or not unissued
             or state.get("start_rpc_accepted") is not False
             or state.get("local_transaction") is not None
             or row is None
-            or row["action"] != "start"
+            or row["action"] != ("start" if state.get("kind") == "normal" else "start_test")
             or row["revision"] != state.get("revision")
             or row["state"] not in ("failed", "uncertain")
         ):
@@ -158,6 +158,32 @@ class ManagedChargeTests:
         except SecurityError, DeniedError, RecoveryRequiredError:
             return False
         return True
+
+    # Exact not-accepted provenance and fresh physical zero settle only this request and its metadata together.
+    def retire_unissued_at_zero(self, native: HandoverEvidence) -> None:
+        if not self.unissued_at_zero(native):
+            return
+        state, j = self.state(), self.journal
+        with j.atomic():
+            j.db.execute(
+                "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND revision=? "
+                "AND action=? AND state='uncertain'",
+                (
+                    json.dumps({"classification": "start_not_accepted_at_verified_zero"}),
+                    state["id"],
+                    state["revision"],
+                    "start" if state["kind"] == "normal" else "start_test",
+                ),
+            )
+            j.put(
+                "managed_test_charge",
+                {
+                    **state,
+                    "state": "completed",
+                    "charging": False,
+                    "recovery_reason": "start_not_accepted_at_verified_zero",
+                },
+            )
 
     # A genuinely closed, mapped owner session can finish its metadata while its separate Stop delivery stays retained.
     def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
@@ -386,10 +412,18 @@ class ManagedChargeTests:
             if not tags:
                 raise DeniedError("no current approved local tag is available for this test")
             tag = tags[0]
-            if lease.normal:
-                j.put("managed_test_charge", {**self.state(), "tag_digest": fingerprint(tag.casefold())})
-            j.put("managed_test_charge", {**self.state(), "start_attempted": True})
-            await c.session.gateway.start_managed(tag, lambda: self.guard(lease), request_id=lease.identifier)
+
+            # Commit the attempt marker with LocalControl's receipt, never before its owned task first executes.
+            def prepared() -> None:
+                self.guard(lease)
+                j.put(
+                    "managed_test_charge",
+                    {**self.state(), "tag_digest": fingerprint(tag.casefold()), "start_attempted": True},
+                )
+
+            await c.session.gateway.start_managed(
+                tag, lambda: self.guard(lease), request_id=lease.identifier, on_prepared=prepared
+            )
             self.guard(lease)
             with j.atomic():
                 self.guard(lease)
@@ -643,6 +677,7 @@ class ManagedChargeTests:
             if expected.mode == "paused" or active is not None and not self.current_daily(active):
                 await self.hold_expired()
             native = await c.native.read()
+            self.retire_unissued_at_zero(native)
             local, owner = j.active(), local_start_receipt(j)
             if expected.mode == "app" and local is not None and self.independent_daily(native, local):
                 if g.controls.ready and g.controls.desired() == state["current_a"]:
@@ -708,6 +743,7 @@ class ManagedChargeTests:
     # Positive flow must belong to the known transaction and the actually accepted local or vendor Start path.
     def observed(self, native: HandoverEvidence) -> None:
         self.retire_refused_unsent()
+        self.retire_unissued_at_zero(native)
         self.retire_closed_at_zero(native)
         lease, c = self.lease, self.controller
         state = self.state()

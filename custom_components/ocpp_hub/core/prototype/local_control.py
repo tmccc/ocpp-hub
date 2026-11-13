@@ -405,14 +405,29 @@ class LocalControl:
         return await self._owned(self._start(tag))
 
     # A managed test supplies a live per-request guard without enabling the unrestricted local Start policy.
-    async def start_managed(self, tag: str, guard: Callable[[], None], *, request_id: str | None = None) -> Frame:
+    async def start_managed(
+        self,
+        tag: str,
+        guard: Callable[[], None],
+        *,
+        request_id: str | None = None,
+        on_prepared: Callable[[], None] | None = None,
+    ) -> Frame:
         if self.policy.allow_local_start or not 6 <= self.policy.max_current_a <= 32:
             raise DeniedError("managed Start requires the restricted installation policy")
-        return await self._owned(self._start(tag, guard=guard, shared=True, request_id=request_id))
+        return await self._owned(
+            self._start(tag, guard=guard, shared=True, request_id=request_id, on_prepared=on_prepared)
+        )
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
     async def _start(
-        self, tag: str, *, guard: Callable[[], None] | None = None, shared: bool = False, request_id: str | None = None
+        self,
+        tag: str,
+        *,
+        guard: Callable[[], None] | None = None,
+        shared: bool = False,
+        request_id: str | None = None,
+        on_prepared: Callable[[], None] | None = None,
     ) -> Frame:
         if guard is not None:
             guard()
@@ -440,6 +455,8 @@ class LocalControl:
                     "request_id": request_id,
                 },
             )
+            if on_prepared is not None:
+                on_prepared()
 
         # The request generation is checked again after native validation and immediately before each actual send.
         def check() -> None:

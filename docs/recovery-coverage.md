@@ -40,6 +40,11 @@ and real Boot response, so native restoration precedes it. Real unavailable star
 with no premature controller. HA cannot retry setup after terminal unload/removal without reactivation. Excluded
 inputs are absent from runnable collection; they are never pytest skips.
 
+Focused scheduler-loss controls cancel the real owned Start task before its first execution and inject a real SQLite
+preparation-write failure. The attempt marker and prepared receipt commit together; neither missing preparation nor
+an explicit rejected/unsent command may strand its exact management request after a fresh verified Pause. These
+controls model task/runtime loss, not literal OS power failure. Issued/accepted unknown debt keeps its stricter proof.
+
 ## Risk matrix
 
 | Boundary | Safety | Recovery | Bound |

@@ -27,7 +27,7 @@ def canonical_manifest(root, suite):
         if suite == "engine-model":
             raise ValueError("engine model registry is missing")
         return [], None
-    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/home/tonym/codex")) as scratch:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
         output = Path(scratch) / "manifest.jsonl"
         generated = subprocess.run(
             [sys.executable, "-B", str(source / "tools/schedule_sequence_manifest.py"), str(output), "--suite", suite],

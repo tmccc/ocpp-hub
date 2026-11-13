@@ -42,6 +42,7 @@ RISKS = (
         "Request-bound unsent proof recovers via fresh Pause/Return; unknown debt requires exact reconciliation.",
         (
             "tests/test_managed_start_cap_failure.py",
+            "tests/test_managed_start_scheduling_loss.py",
             "tests/test_managed_start_debt_recovery.py",
             "tests/test_managed_stop_replacement.py",
         ),

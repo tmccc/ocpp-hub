@@ -8,6 +8,8 @@
 - Record managed Start provenance before positive-cap work, atomically settle exact genuinely closed local
   receipt/lifecycle state at verified zero, and reject receipts for another HA command. Hold zero through exact
   known native/ledger closure delays instead of creating a permanent authority fault.
+- Commit the managed attempt marker atomically with its prepared receipt, including loss before its owned task runs.
+  Retire only exact proven not-accepted requests at verified zero. Keep qualification scratch paths portable.
 - Keep fully verified normal local sessions under native-outage zero supervision, with exact completed request,
   accepted receipt and pinned native source required before continuation. Process replacement retains its Pause policy.
 
