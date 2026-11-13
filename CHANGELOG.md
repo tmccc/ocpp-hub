@@ -2,6 +2,9 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Permit the known empty saved-reply table when repairing a pristine legacy bootstrap gap; retain refusal of
+  nonempty reply/debt state, unknown tables and unrelated metadata.
+
 - Exercise combined storage/native/charger failures under the actual service poller, and repeated HA outages under
   its real scheduler. Require exact control completion and independently observed failed native reads in recovery
   helpers; add pending physical Pause and lost-before-effect current checks.

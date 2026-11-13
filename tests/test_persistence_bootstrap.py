@@ -11,6 +11,7 @@ import pytest
 from ocpp_hub_core.prototype.rpc import InboundCache
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.trial_bootstrap import pristine_interrupted_bootstrap
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 from ocpp_hub_core.prototype.trial_session import TrialSession
 
@@ -148,3 +149,47 @@ async def test_legacy_baseline_repair_rejects_nonpristine_state(tmp_path, tls, u
         finally:
             journal.close()
         assert rig.bench.device_calls == []
+
+
+# Intent: only an empty known reply table is permitted; an orphan or unknown empty table remains blocking.
+# Why: these direct predicate controls isolate the reply-table guard from the already-blocking nonempty outbox.
+@pytest.mark.parametrize("blocker", ["orphan-reply", "unknown-empty-table"])
+def test_pristine_bootstrap_reply_schema_guard_is_independent(tmp_path, blocker):
+    journal = Journal(tmp_path / "shape-only.db", "OFFLINE001")
+    try:
+        # This is a predicate-only shape fixture, never a baseline admitted through ResourceBook or TrialSession.
+        journal.put("trial_baseline", {"fixture": "schema predicate only"})
+        assert pristine_interrupted_bootstrap(journal)
+        assert journal.db.execute("SELECT COUNT(*) FROM delivery_replies").fetchone()[0] == 0
+        if blocker == "orphan-reply":
+            # Deliberately create an invalid orphan to ensure reply rows themselves, not another table, block repair.
+            journal.db.execute("PRAGMA foreign_keys=OFF")
+            try:
+                journal.db.execute(
+                    "INSERT INTO delivery_replies VALUES(?,?,?,?,?)",
+                    ("orphan", "StopTransaction", "{}", None, '[3,"orphan",{}]'),
+                )
+            finally:
+                journal.db.execute("PRAGMA foreign_keys=ON")
+            assert journal.db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert journal.db.execute("SELECT COUNT(*) FROM delivery_replies").fetchone()[0] == 1
+            assert journal.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+        else:
+            journal.db.execute("CREATE TABLE unknown_empty_feature(value TEXT)")
+            assert journal.db.execute("SELECT COUNT(*) FROM unknown_empty_feature").fetchone()[0] == 0
+        # Every other known debt table is empty, so neither negative can pass via an unrelated debt check.
+        for table in (
+            "transactions",
+            "receipts",
+            "outbox",
+            "mutations",
+            "transaction_clock_discontinuities",
+            "rejected_observations",
+        ):
+            assert journal.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] == 0
+        before = sorted(journal.db.iterdump())
+        assert pristine_interrupted_bootstrap(journal) is False
+        assert sorted(journal.db.iterdump()) == before
+        assert journal.get("trial_phase") is None and not journal.db.in_transaction
+    finally:
+        journal.close()

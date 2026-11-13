@@ -12,6 +12,7 @@ EMPTY_BOOTSTRAP_TABLES = frozenset(
         "transactions",
         "receipts",
         "outbox",
+        "delivery_replies",
         "mutations",
         "trial_resources",
         "inbound_receipts",
