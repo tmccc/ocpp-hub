@@ -39,7 +39,7 @@ class Bench:
     def __init__(self) -> None:
         self.firmware = Firmware()
         self.calls: list[list[Any]] = []
-        self.vendor_replies: list[list[Any]] = []
+        self.sent_vendor_replies: list[list[Any]] = []
         self.configuration = "trial"
         self.cp, self.connection = "A", "Unplug"
         self.online = True
@@ -111,7 +111,7 @@ class Bench:
             else:
                 answer = {}
             await connection.send(build_call_result(frame[1], answer))
-            self.vendor_replies.append([3, frame[1], copy.deepcopy(answer)])
+            self.sent_vendor_replies.append([3, frame[1], copy.deepcopy(answer)])
 
     # Read replies independently from server commands, so local control and lifecycle RPCs cannot deadlock the peer.
     async def read_charger(self, charger: Any) -> None:

@@ -75,7 +75,7 @@ async def test_process_sigkill_automatic_current_overlap(
         events.append("original-start")
         mapped = await child.delivered(local)
         cloud_start = next(frame for frame in reversed(bench.calls) if frame[0] == 2 and frame[2] == "StartTransaction")
-        cloud_reply = next(frame for frame in bench.vendor_replies if frame[1] == cloud_start[1])
+        cloud_reply = next(frame for frame in bench.sent_vendor_replies if frame[1] == cloud_start[1])
         assert mapped["vendor"] == cloud_reply[2]["transactionId"]
         snapshot = child.durable()
         assert snapshot["metadata"]["managed_current_change"]["state"] == "pending"
