@@ -11,6 +11,22 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from tests_model.catalog import FAMILIES  # noqa: E402
+
+
+# Keep the full model root fail-closed while enrolling exact registered engine functions in other test roots.
+def collection_targets() -> list[str]:
+    return [
+        "tests_model",
+        *sorted(
+            {
+                family.test_function
+                for family in FAMILIES
+                if "engine-model" in family.suites and not family.test_function.startswith("tests_model/")
+            }
+        ),
+    ]
 
 
 # CI runs twenty separate machines; each subprocess preserves pytest's true exit and raw phase evidence.
@@ -34,7 +50,7 @@ def main() -> int:
     }
     command = [sys.executable, "-B", "tools/offline_validate.py", "-p", "tools.qualification_evidence"]
     collected = subprocess.run(
-        [*command, "tests_model", "--collect-only"], cwd=ROOT, env=env, capture_output=True, text=True
+        [*command, *collection_targets(), "--collect-only"], cwd=ROOT, env=env, capture_output=True, text=True
     )
     (args.output / "collection.log").write_text(collected.stdout + collected.stderr)
     if collected.returncode:

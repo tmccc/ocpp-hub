@@ -44,11 +44,15 @@ async def test_current_domain_sequences(tmp_path, model_tls, monkeypatch, record
             state = await healthy(c)
             assert state["requested_current_a"] == case.target
             assert firmware.effective_limit() == (0 if case.intent == "paused" else case.target)
+            completed = c.requests.receipt(identifier)
+            assert completed["state"] == "completed"
+            assert completed["result"] == {"current_a": case.target, "charging_started": False}
             events.append("choose")
             before = list(b.rig.bench.device_calls)
-            c.command(identifier, "set_current", revision, current_a=case.target)
+            duplicate = c.command(identifier, "set_current", revision, current_a=case.target)
             await c.current.settle()
             assert b.rig.bench.device_calls == before
+            assert duplicate == completed and c.requests.receipt(identifier) == completed
             assert receipt["id"] == identifier
             events.append("replay")
             await ordinary_recovery(b, case.target, case.demand)

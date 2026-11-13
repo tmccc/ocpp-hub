@@ -65,6 +65,9 @@ must all pass the auditor. The source-pinned registry declares44,556 raw/16,716 
 source, including HA families, then verifies exact input/event/recovery evidence. See the
 [recovery coverage matrix](recovery-coverage.md) for scopes, focused-only risks and limits.
 CI derives the exact model collection from that registry across20 independent runner jobs and includes all HA suites.
+The model shard collector retains the complete `tests_model` root and adds exact registered engine test functions
+from other roots. Its structural regression checks the real collection against the canonical manifest, including
+process-death families, while excluding ordinary named tests from the model-only CI partition.
 
 The final qualification JSON contains `commit`, `source_digest` and a `phases` object mapping those four suite names
 to their absolute batch directories. `validate.py --qualification-report` requires all four, all20 workers, and the
