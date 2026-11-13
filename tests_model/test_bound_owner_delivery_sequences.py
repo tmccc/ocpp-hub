@@ -13,7 +13,6 @@ from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import starts
 from tests.test_managed_start_delivery_recovery import approve_retry, map_unknown_retry
 from tests.test_prototype import START
-from tests.test_prototype_runtime import until
 from tests_model.catalog import input_digest
 from tests_model.review_cases import bound_owner_delivery_candidates
 from tests_model.test_schedule_sequences import model_tls as model_tls
@@ -66,10 +65,12 @@ async def test_bound_owner_delivery_sequences(
             assert child.durable()["metadata"]["local_start_receipt"]["local"] == local
             events.append("late-start")
             expected = "ambiguous" if case.cloud == "silent" else "rejected"
-            await until(
-                lambda: bool(child.durable()["outbox"]) and child.durable()["outbox"][0]["state"] == expected,
-                timeout=230,
-            )
+            async with asyncio.timeout(230):
+                while True:
+                    snapshot = child.durable()
+                    if snapshot["outbox"] and snapshot["outbox"][0]["state"] == expected:
+                        break
+                    await asyncio.sleep(0.1)
             head = child.durable()["outbox"][0]
             quarantined = child.durable()
             assert next(row for row in quarantined["requests"] if row["id"] == identifier)["state"] == "uncertain"

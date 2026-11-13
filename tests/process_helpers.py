@@ -7,7 +7,7 @@ import signal
 import sqlite3
 import sys
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from types import SimpleNamespace
 
 from ocpp_hub_core.prototype.trial_session import save_private
@@ -120,7 +120,9 @@ class ServiceProcess:
 
     # An independent read-only connection observes only durable committed facts, including a live WAL.
     def durable(self):
-        with sqlite3.connect("file:" + str(self.rig.prepared.config.journal) + "?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect("file:" + str(self.rig.prepared.config.journal) + "?mode=ro", uri=True)) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
             metadata = {key: json.loads(value) for key, value in db.execute("SELECT key,value FROM meta")}
             requests = [
                 dict(zip(("id", "action", "revision", "state", "result"), row))
