@@ -20,6 +20,7 @@ through the full validator before attaching execution claims. Generated reports 
 |---|---:|---:|---|
 | `current_domain` | 2,916 | 2,916 engine | All729 directed integer6..32A pairs including same-value requests; app/paused, both demands, exact UUID replay; two later sessions/outages. |
 | `process_start` | 36 | 36 engine | Six actual SQL/preparation/COMMIT SIGKILL boundaries,6/16/32A, both demands; parent peers survive; independent committed-WAL read, new process/Pause/Return and two later sessions/outages. |
+| `process_overlap` | 8 | 8 engine | Both6/32A directions, held native before/after applied target, both demands; real SIGKILL with mapped original session, automatic prior-cap restoration and atomic receipt retirement, original outage, new selection before Pause/Return, exact old UUID replay and two later sessions/outages. |
 | `process_current` | 36 | 36 engine | Six directed6/16/32A changes, app/paused, request commit and both sides of success COMMIT; real SIGKILL, previous/committed selection, two later sessions/outages. |
 | `storage_fifo` | 192 | 192 engine |6/32A, proof/ACK write or deferred-COMMIT failure twice,1/3 queued real pairs, changed malformed/CALLERROR reply, all repair/Pause/replacement orders; exact new proofs/ACKs, new Pause/Return and two later sessions/outages. |
 | `two_receipt` | 11,520 | 6,240 engine | Existing timer/source/cutoff/cancel grammar; original plans and next daily occurrence. |
@@ -34,7 +35,7 @@ through the full validator before attaching execution claims. Generated reports 
 | `ha_receipt` | 160 | 160 each HA runtime | Four controls, initial/first/second/third response, five identity shapes, two terminal results; exact UUID, one mutation, readable status. |
 | `ha_outage_lifecycle` | 384 | 240 each HA runtime | True first setup/failed reload, reload/unload/remove/disable-enable, stale healthy/fault callback, admitted retry/deadline/stale/lifecycle orders; recovery and second outage/deadline/recovery. |
 
-Engine totals: **44,556 raw / 16,716 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
+Engine totals: **44,564 raw / 16,724 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
 Legacy HA has no registered finite family; its complete ordinary suite remains required. Ordinary functional tests
 are additional executions and are counted separately by collection. The generated registry must agree with these totals.
 
@@ -69,10 +70,10 @@ No risk is marked universally covered. Real hardware/network behavior and unboun
 offline qualification. This work requires neither live charging nor deployment.
 
 Additional named regression tests cover actual Accepted-Start death before/after publication with a late genuine
-Start/Stop lifecycle, Return request/success commit death, and issued-unknown quarantine controls. Uncommitted current receipts become failed only with a verified Return to their prior selection; a new Pause revokes
+Start/Stop lifecycle, Return request/success commit death, and issued-unknown quarantine controls. Uncommitted current receipts become failed only with verified restoration to their prior selection through explicit Return or exact automatic original-session recovery; a new Pause revokes
 only an older uncertain Return. Unknown issued debt
 is deliberately retained: its safety-only negative controls do not claim functional recovery from missing evidence.
-The finite process families cover known no-dispatch recovery and current selection; they do not enumerate every
+The finite process families cover known no-dispatch recovery, current selection and automatic original-session recovery; they do not enumerate every
 socket write or arbitrary interpreter instruction.
 
 HTTP property checks cover every byte split of six valid messages and every incomplete prefix of two self-delimiting
@@ -81,6 +82,11 @@ real TLS for Start/Stop/Status/MeterValues, reject before durable effects, and p
 On each HA runtime,11 raw malformed response shapes cross status/mutation/receipt positions, enormous integers
 exercise age/current/progress fields, true first/reload failures recover, and every27 integer current service choices
 is exercised. These are named property/regression cases; inner loop iterations are not extra finite-model executions.
+
+Automatic current retirement additionally has labeled stored-state correlation controls, terminal-result byte preservation,
+real statement/deferred-COMMIT rollback/retry, and unrelated-debt preservation. These direct boundary tests do not
+claim that every corrupt state is reachable over the wire. Existing original-session source, Pause and failed-restoration
+controls also check immutable terminal receipts after successful recovery.
 
 ## Evidence contract
 

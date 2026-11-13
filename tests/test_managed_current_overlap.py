@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
@@ -58,7 +61,15 @@ async def interrupted_increase(b, applied):
 
 # Confirm real daily continuation and the next midnight through unchanged firmware plan fields and protocol events.
 async def assert_daily_recovery(b, local, original, demand, prior_stops=()):
+    identifier = b.session.journal.get("managed_current_change")["id"]
+    receipt = b.c.requests.receipt(identifier)
     status = await healthy(b.c)
+    after = b.c.requests.receipt(identifier)
+    if receipt["state"] == "failed":
+        assert after == receipt
+    elif receipt["state"] == "uncertain":
+        assert after["state"] == "failed"
+        assert after["result"]["classification"] == "superseded_by_verified_overlap_recovery"
     assert b.c.requests.intent().mode == "app" and b.c.current.selected() == 6
     assert b.device.effective_limit() == status["station_ceiling_a"] == 6
     assert b.device.current == (6 if demand else 0)
@@ -173,6 +184,90 @@ async def test_restart_during_pending_increase(
             await introduced(b.rig, b.session, b.sock, "pending-current-replacement")
             assert not b.stops() and b.device.effective_limit() == 0
             await assert_daily_recovery(b, local, original, demand)
+
+
+# Intent: actual automatic recovery owns the transaction that settles metadata and its process-replaced receipt.
+# Why: a helper-only transaction test would miss removal of the production caller's atomic boundary.
+@pytest.mark.parametrize("failure", ["metadata", "receipt", "commit", "unknown-source", "new-pause"])
+async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tcp_port, monkeypatch, failure):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        async with interrupted_increase(b, True) as (identifier, release):
+            local = await b.start_plan(9)
+            await b.c.native.read()
+            async with asyncio.timeout(3):
+                while b.session.journal.next_delivery() is not None or b.session.gateway.vendor._pending:
+                    await asyncio.sleep(0.01)
+            b.c.current.worker.cancel()
+            await asyncio.gather(b.c.current.worker, return_exceptions=True)
+            release.set()
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        j = b.session.journal
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "atomic-overlap-replacement")
+            before = b.c.requests.receipt(identifier)
+            assert before["state"] == "uncertain"
+            if failure == "commit":
+                j.db.execute("CREATE TABLE overlap_parent(id INTEGER PRIMARY KEY)")
+                j.db.execute(
+                    "CREATE TABLE overlap_child(id REFERENCES overlap_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+                )
+                trigger = "AFTER UPDATE ON managed_requests WHEN NEW.state='failed'"
+                effect = "INSERT INTO overlap_child VALUES(1)"
+            else:
+                trigger = (
+                    "BEFORE INSERT ON meta WHEN NEW.key='managed_current_change' AND "
+                    "json_extract(NEW.value,'$.state')='cancelled'"
+                    if failure == "metadata"
+                    else "BEFORE UPDATE ON managed_requests WHEN NEW.state='failed'"
+                )
+                effect = "SELECT RAISE(ABORT,'synthetic overlap settlement refusal')"
+            j.db.execute(f"CREATE TRIGGER refuse_overlap {trigger} BEGIN {effect}; END")
+            with pytest.raises(sqlite3.IntegrityError):
+                await b.c.current.recover_overlap()
+            assert not j.db.in_transaction
+            assert j.get("managed_current_change")["state"] == "recovering"
+            assert b.c.requests.receipt(identifier) == before
+            assert b.device.effective_limit() == 6 and not b.stops()
+            j.db.execute("DROP TRIGGER refuse_overlap")
+            if failure == "new-pause":
+                b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
+                await b.c.pause_task
+                pause_control = copy.deepcopy(j.get("control"))
+                pause_intent = b.c.requests.intent()
+                await b.c.current.recover_overlap()
+                assert j.get("control") == pause_control and b.c.requests.intent() == pause_intent
+                assert b.c.requests.receipt(identifier) == before and b.device.effective_limit() == 0
+                await b.close_transaction(local)
+                assert (await healthy(b.c))["local_hold_verified"]
+                b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+                assert (await healthy(b.c))["owner_control_enabled"]
+                assert b.c.requests.receipt(identifier)["state"] == "failed"
+                assert b.c.requests.receipt(identifier)["result"]["classification"] == "superseded_by_verified_return"
+                return
+            if failure == "unknown-source":
+                b.rig.peer.plan_session = (local, 987654)
+                with pytest.raises((SecurityError, RecoveryRequiredError)):
+                    await b.c.current.recover_overlap()
+                assert b.device.effective_limit() == 0 and not b.stops()
+                assert j.get("managed_current_change")["state"] == "recovering"
+                assert b.c.requests.receipt(identifier) == before
+                b.rig.peer.plan_session = (local, 9)
+            trace = len(b.rig.bench.device_calls)
+            await b.c.current.recover_overlap()
+            limits = [
+                frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+                for frame in b.rig.bench.device_calls[trace:]
+                if frame[2] == "SetChargingProfile"
+            ]
+            assert limits and limits[-1] == 6
+            if failure != "unknown-source":
+                assert limits[0] == 0
+            assert j.get("managed_current_change")["state"] == "cancelled"
+            assert b.c.requests.receipt(identifier)["state"] == "failed"
+            assert j.active() == local and b.device.effective_limit() == 6 and not b.stops()
 
 
 # Intent: an accepted daily lifecycle with missing or conflicting native plan evidence stays at zero until identified.

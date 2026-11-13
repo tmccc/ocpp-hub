@@ -14,7 +14,12 @@ from tests_model.control_cases import (
     stop_candidates,
     vendor_candidates,
 )
-from tests_model.deep_cases import current_domain_candidates, process_current_candidates, process_start_candidates
+from tests_model.deep_cases import (
+    current_domain_candidates,
+    process_current_candidates,
+    process_overlap_candidates,
+    process_start_candidates,
+)
 from tests_model.ha_cases import outage_candidates, outage_exclusion, receipt_candidates, receipt_exclusion
 from tests_model.recovery_cases import start_candidates, start_exclusion
 from tests_model.schedule_cases import candidates, exclusion, source_candidates, source_exclusion
@@ -39,6 +44,24 @@ class Family:
 
 
 FAMILIES = (
+    Family(
+        "process_overlap",
+        ("engine-model",),
+        "tests/test_real_process_death.py::test_process_sigkill_automatic_current_overlap",
+        process_overlap_candidates,
+        no_exclusion,
+        8,
+        8,
+        ("PROCESS-DEATH", "CURRENT-ROLLBACK", "CURRENT-IDEMPOTENCY", "NEXT-SESSION"),
+        (
+            "actual_sigkill",
+            "independent_mapping",
+            "automatic_restore",
+            "receipt_retired_before_new_selection",
+            "later_selection_verified",
+            "peers_survived",
+        ),
+    ),
     Family(
         "storage_fifo",
         ("engine-model",),

@@ -123,3 +123,49 @@ def process_current_candidates():
             ("app", "paused"),
         )
     )
+
+
+@dataclass(frozen=True)
+class ProcessOverlapCase:
+    """An original plan session survives an unconfirmed selection and actual service process replacement."""
+
+    initial: int
+    target: int
+    boundary: str
+    demand: bool
+
+    # Both physical sides of the selection retain independent demand and direction in the denominator.
+    @property
+    def identifier(self):
+        return f"process-overlap-{self.initial}-{self.target}-{self.boundary}-{int(self.demand)}"
+
+    # Automatic retirement and a new selection precede any explicit Pause/Return that could hide an orphan.
+    @property
+    def events(self):
+        return (
+            "current-pending",
+            "held-native",
+            "original-start",
+            "cloud-mapped",
+            "sigkill",
+            "restart",
+            "automatic-restore",
+            "retired-receipt",
+            "original-outage",
+            "original-closed",
+            "new-selection",
+            "replay-old",
+            "lifecycle-1",
+            "outage-1",
+            "lifecycle-2",
+            "outage-2",
+        )
+
+
+# Exercise increases and decreases before dispatch and after physical application under both real demand states.
+def process_overlap_candidates():
+    return tuple(
+        ProcessOverlapCase(initial, target, boundary, demand)
+        for initial, target in ((6, 32), (32, 6))
+        for boundary, demand in product(("native-before", "native-after"), (False, True))
+    )

@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import os
 import uuid
 
@@ -13,9 +14,171 @@ from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import starts
 from tests.test_prototype import START
 from tests_model.catalog import input_digest
-from tests_model.deep_cases import process_current_candidates, process_start_candidates
+from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
+from tests_model.test_current_sequences import BoundaryPeer
 from tests_model.test_schedule_sequences import model_tls as model_tls
 from tests_model.test_schedule_sequences import tls_for_case
+
+
+# Intent: automatic recovery after real process death retires its exact abandoned choice before later selections.
+# Why: a restored physical ceiling alone can conceal an orphan uncertain request that later blocks debt recovery.
+@pytest.mark.parametrize("case", process_overlap_candidates(), ids=lambda case: case.identifier)
+async def test_process_sigkill_automatic_current_overlap(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
+):
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BoundaryPeer)
+    events = []
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        case.initial,
+    ) as child:
+        await child.start()
+        ready = await child.status()
+        peer, bench = child.rig.peer, child.rig.bench
+        plans, configuration = copy.deepcopy(bench.firmware.plans), copy.deepcopy(peer.configuration)
+        seen_target = False
+
+        # Only the independent device observes the real applied profile/composite before arming its next HTTP read.
+        async def after_device(action, payload):
+            nonlocal seen_target
+            if action == "SetChargingProfile":
+                profile = payload["csChargingProfiles"]
+                if profile["chargingProfileId"] == 7001:
+                    seen_target |= profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == case.target
+            if action == "GetCompositeSchedule" and seen_target and not peer.entered.is_set():
+                peer.arm = True
+
+        bench.before_reply = after_device if case.boundary == "native-after" else None
+        peer.arm = case.boundary == "native-before"
+        identifier, revision = uuid.uuid4().hex, ready["control_revision"]
+        assert (await child.request("set_current", id=identifier, revision=revision, current_a=case.target))["ok"]
+        events.append("current-pending")
+        await asyncio.wait_for(peer.entered.wait(), 5)
+        assert json.loads(peer.request)["action"] == "getConfig"
+        assert bench.firmware.effective_limit() == (case.target if seen_target else case.initial)
+        assert seen_target is (case.boundary == "native-after")
+        bench.before_reply = None
+        events.append("held-native")
+        local = max(row["transactionId"] for row in bench.history) + 1
+        bench.firmware.active = local
+        bench.firmware.fire_plan(9)
+        bench.cp, bench.connection = ("C", "Charging") if case.demand else ("B", "Plug")
+        peer.paused, peer.permission_enabled = False, case.demand
+        bench.firmware.requested_current = 32 if case.demand else 0
+        peer.plan_session = (local, 9)
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"})
+        assert answer[0] == 3 and answer[2]["transactionId"] == local
+        events.append("original-start")
+        mapped = await child.delivered(local)
+        cloud_start = next(frame for frame in reversed(bench.calls) if frame[0] == 2 and frame[2] == "StartTransaction")
+        cloud_reply = next(frame for frame in bench.vendor_replies if frame[1] == cloud_start[1])
+        assert mapped["vendor"] == cloud_reply[2]["transactionId"]
+        snapshot = child.durable()
+        assert snapshot["metadata"]["managed_current_change"]["state"] == "pending"
+        assert next(row for row in snapshot["requests"] if row["id"] == identifier)["state"] == "accepted"
+        events.append("cloud-mapped")
+        await child.kill()
+        events.append("sigkill")
+        peer.release.set()
+        first_restart_call = len(bench.device_calls)
+        await child.start()
+        events.append("restart")
+        await child.status(
+            lambda value: (
+                value.get("owner_control_enabled") is True
+                and value.get("station_ceiling_a") == case.initial
+                and bench.firmware.effective_limit() == case.initial
+            )
+        )
+        profiles = [
+            frame[3]["csChargingProfiles"]
+            for frame in bench.device_calls[first_restart_call:]
+            if frame[2] == "SetChargingProfile"
+        ]
+        limits = [profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] for profile in profiles]
+        assert limits and limits[0] == 0 and set(limits) <= {0, case.initial}
+        assert child.durable()["metadata"]["managed_control_intent"] == {"mode": "app", "revision": revision + 1}
+        events.append("automatic-restore")
+        receipt = (await child.request("receipt", request_id=identifier))["result"]
+        assert receipt["state"] == "failed"
+        assert receipt["result"] == {
+            "classification": "superseded_by_verified_overlap_recovery",
+            "current_a": case.initial,
+        }
+        assert child.durable()["metadata"]["managed_current_change"]["state"] == "cancelled"
+        events.append("retired-receipt")
+        await child.native_outage(case.initial, case.demand)
+        events.append("original-outage")
+        assert (
+            await bench.call(
+                child.socket,
+                uuid.uuid4().hex,
+                "StopTransaction",
+                {
+                    "transactionId": local,
+                    "meterStop": 1500,
+                    "timestamp": "2026-01-01T00:01:00Z",
+                },
+            )
+        )[0] == 3
+        peer.permission_enabled = False
+        await child.delivered(local, closed=True)
+        state = await child.status(lambda value: value.get("can_set_current") is True)
+        events.append("original-closed")
+        newer = uuid.uuid4().hex
+        assert (
+            await child.request("set_current", id=newer, revision=state["control_revision"], current_a=case.target)
+        )["ok"]
+        state = await child.status(
+            lambda value: value.get("requested_current_a") == case.target and value.get("can_set_current") is True
+        )
+        assert (await child.request("receipt", request_id=newer))["result"]["state"] == "completed"
+        assert bench.firmware.effective_limit() == case.target
+        events.append("new-selection")
+        before = copy.deepcopy(bench.device_calls)
+        assert (await child.request("set_current", id=identifier, revision=revision, current_a=case.target))[
+            "result"
+        ] == receipt
+        assert bench.device_calls == before
+        assert (await child.request("receipt", request_id=identifier))["result"] == receipt
+        assert not (await child.request("set_current", id=identifier, revision=revision, current_a=case.initial))["ok"]
+        assert bench.device_calls == before
+        after_replay = child.durable()["metadata"]
+        assert after_replay["managed_current_change"]["id"] == newer
+        assert after_replay["managed_control_intent"]["revision"] == state["control_revision"]
+        events.append("replay-old")
+        later = await child.ordinary_recovery(case.target, case.demand, start_minute=2)
+        assert len(later) == len(set(later)) == 2 and local not in later
+        assert not child.durable()["outbox"]
+        events.extend(case.events[-4:])
+        assert not [
+            frame for frame in bench.device_calls if frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction")
+        ]
+        assert bench.firmware.plans == plans and peer.configuration == configuration
+        assert not [
+            row
+            for row in child.durable()["requests"]
+            if row["action"] != "pause" and row["state"] in ("accepted", "running", "uncertain")
+        ]
+        assert events == list(case.events) and len(child.kills) == 1
+    record_property("model_case", case.identifier)
+    record_property("model_family", "process_overlap")
+    record_property("model_input_sha256", input_digest("process_overlap", case))
+    record_property("completed_events", events)
+    record_property("suffix_complete", True)
+    for key in (
+        "independent_mapping",
+        "automatic_restore",
+        "receipt_retired_before_new_selection",
+        "later_selection_verified",
+        "peers_survived",
+    ):
+        record_property(key, True)
+    record_property("actual_sigkill", child.kills[0]["returncode"] == -9)
 
 
 # Intent: real SIGKILL at every pre-dispatch atomic boundary preserves no-send proof and fresh owner recovery.

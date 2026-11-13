@@ -126,10 +126,51 @@ class ServiceProcess:
                 dict(zip(("id", "action", "revision", "state", "result"), row))
                 for row in db.execute("SELECT id,action,revision,state,result FROM managed_requests")
             ]
-            return {"metadata": metadata, "requests": requests}
+            db.row_factory = sqlite3.Row
+            transactions = [dict(row) for row in db.execute("SELECT * FROM transactions")]
+            outbox = [dict(row) for row in db.execute("SELECT * FROM outbox")]
+            return {"metadata": metadata, "requests": requests, "transactions": transactions, "outbox": outbox}
+
+    # Observe genuine committed cloud mapping and ACK drain without manufacturing delivery evidence.
+    async def delivered(self, local, *, closed=False):
+        async with asyncio.timeout(10):
+            while True:
+                snapshot = self.durable()
+                row = next((row for row in snapshot["transactions"] if row["local"] == local), None)
+                if (
+                    row is not None
+                    and row["vendor"] is not None
+                    and (not closed or row["stop"] is not None)
+                    and not any(item["local"] == local for item in snapshot["outbox"])
+                ):
+                    return row
+                await asyncio.sleep(0.05)
+
+    # Four actual HTTP failures establish protective zero; fresh owner and physical evidence establish repair.
+    async def native_outage(self, expected, demand):
+        peer, firmware = self.rig.peer, self.rig.bench.firmware
+        while not peer.failed_reads.empty():
+            peer.failed_reads.get_nowait()
+        peer.unavailable = True
+        try:
+            async with asyncio.timeout(25):
+                for _ in range(4):
+                    assert (await peer.failed_reads.get())["action"] == "getConfig"
+            await self.status(lambda value: value.get("fault") == "native_observation_unavailable")
+            assert firmware.effective_limit() == 0
+        finally:
+            peer.unavailable = False
+        await self.status(
+            lambda value: (
+                value.get("owner_control_enabled") is True
+                and value.get("station_ceiling_a") == expected
+                and value.get("current_a") == (expected if demand else 0)
+                and firmware.effective_limit() == expected
+            )
+        )
 
     # Independent real charger reports and native power retain lifecycle supervision after process replacement.
-    async def ordinary_recovery(self, expected, demand):
+    async def ordinary_recovery(self, expected, demand, *, start_minute=0):
         state = await self.status(lambda value: value.get("charger_connected") is True)
         assert (await self.request("pause", revision=state["control_revision"]))["ok"]
         state = await self.status(lambda value: value.get("local_hold_verified") is True)
@@ -148,7 +189,7 @@ class ServiceProcess:
                 | {
                     "idTag": "NATIVE_TIMER",
                     "meterStart": 2000 + epoch * 100,
-                    "timestamp": f"2026-01-01T00:0{epoch * 2}:00Z",
+                    "timestamp": f"2026-01-01T00:{start_minute + epoch * 2:02}:00Z",
                 },
             )
             assert result[0] == 3 and result[2]["idTagInfo"]["status"] == "Accepted"
@@ -162,26 +203,13 @@ class ServiceProcess:
             self.rig.bench.firmware.requested_current = 32 if demand else 0
             await self.status(
                 lambda value: (
-                    value.get("station_ceiling_a") == expected and value.get("current_a") == (expected if demand else 0)
+                    value.get("owner_control_enabled") is True
+                    and value.get("station_ceiling_a") == expected
+                    and value.get("current_a") == (expected if demand else 0)
+                    and self.rig.bench.firmware.effective_limit() == expected
                 )
             )
-            while not self.rig.peer.failed_reads.empty():
-                self.rig.peer.failed_reads.get_nowait()
-            self.rig.peer.unavailable = True
-            try:
-                # A fourth actual HTTP attempt follows the third completed supervisor failure/protective action.
-                async with asyncio.timeout(25):
-                    for _ in range(4):
-                        assert (await self.rig.peer.failed_reads.get())["action"] == "getConfig"
-                await self.status(lambda value: value.get("fault") == "native_observation_unavailable")
-                assert self.rig.bench.firmware.effective_limit() == 0
-            finally:
-                self.rig.peer.unavailable = False
-            await self.status(
-                lambda value: (
-                    value.get("station_ceiling_a") == expected and value.get("current_a") == (expected if demand else 0)
-                )
-            )
+            await self.native_outage(expected, demand)
             stop = await self.rig.bench.call(
                 self.socket,
                 uuid.uuid4().hex,
@@ -189,12 +217,14 @@ class ServiceProcess:
                 {
                     "transactionId": local,
                     "meterStop": 2100 + epoch * 100,
-                    "timestamp": f"2026-01-01T00:0{epoch * 2 + 1}:00Z",
+                    "timestamp": f"2026-01-01T00:{start_minute + epoch * 2 + 1:02}:00Z",
                 },
             )
             assert stop[0] == 3
             self.rig.peer.permission_enabled = False
+            await self.delivered(local, closed=True)
             await self.status(lambda value: value.get("can_start") is True)
+        assert len(locals_seen) == len(set(locals_seen)) == 2
         return locals_seen
 
     # SIGKILL bypasses all service finally/signal cleanup while the parent device/cloud/native peers survive.

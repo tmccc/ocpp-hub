@@ -18,7 +18,7 @@ RISKS = (
     Risk(
         "PROCESS-DEATH",
         "Actual SIGKILL cannot replay one-shot Start or promote an uncommitted selection.",
-        "Fresh process, real Boot, new Pause/Return and two later lifecycle/outage recoveries remain functional.",
+        "Fresh Boot recovers through Pause/Return or exact automatic original-session restoration and later outages.",
         ("tests/test_real_process_death.py",),
         "Named SQL/COMMIT boundaries; independent peers survive. Process death is not hardware power loss.",
     ),
@@ -39,15 +39,15 @@ RISKS = (
     Risk(
         "CURRENT-IDEMPOTENCY",
         "Replaying an exact current UUID cannot repeat physical changes.",
-        "Same-value controls and distinct subsequent lifecycle/outage recoveries remain functional.",
-        ("tests_model/test_current_domain_sequences.py",),
+        "Same-value controls, abandoned-request retirement and later lifecycle/outage recovery remain functional.",
+        ("tests_model/test_current_domain_sequences.py", "tests/test_managed_current_retirement.py"),
         "Exact same UUID/body; unrelated and changed-body conflicts retain focused coverage.",
     ),
     Risk(
         "STORAGE-COMMIT",
         "Repeated real statement/COMMIT failures preserve proof, FIFO and immutable lifecycle rows.",
         "Repair plus exact independent retry evidence, real ACK and new Pause/Return recover two later sessions.",
-        ("tests/test_journal_fault_recovery.py",),
+        ("tests/test_journal_fault_recovery.py", "tests/test_managed_current_retirement.py"),
         "ABORT and deferred-FK integration cuts; actual FULL and writer-BUSY transaction controls.",
     ),
     Risk(
@@ -135,8 +135,13 @@ RISKS = (
     Risk(
         "CURRENT-ROLLBACK",
         "Refused, malformed, uncertain or superseded target cannot become future resume authority.",
-        "Fresh zero/Pause/Return retains prior verified current and later ordinary sessions remain supervised.",
-        ("tests/test_managed_current_interrupted_recovery.py", "tests/test_managed_current_legacy_recovery.py"),
+        "Restoration retains prior current; failed settlement retries from zero and later sessions stay supervised.",
+        (
+            "tests/test_managed_current_interrupted_recovery.py",
+            "tests/test_managed_current_legacy_recovery.py",
+            "tests/test_managed_current_retirement.py",
+            "tests/test_managed_current_overlap.py",
+        ),
         "Directed6/16/32 pairs; process loss at native boundaries, not arbitrary in-flight shielded RPC kills.",
     ),
     Risk(

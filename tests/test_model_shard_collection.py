@@ -57,7 +57,7 @@ def test_model_ci_enrolls_external_families_without_ordinary_cases(tmp_path):
     observed = collect(tmp_path / "actual", collection_targets())
     assert len(observed) == len(set(observed)) and set(observed) == declared
     process = {identifier for identifier in declared if identifier.startswith("tests/test_real_process_death.py::")}
-    assert len(process) == 72 and process <= set(observed)
+    assert len(process) == 80 and process <= set(observed)
     assert not any("test_process_accepted_start_late_lifecycle" in identifier for identifier in observed)
     assert not any("test_process_return_commit_preserves_honest_receipt" in identifier for identifier in observed)
     old = set(collect(tmp_path / "old-negative-control", ["tests_model"]))

@@ -169,17 +169,33 @@ class ManagedCurrentLimits:
     def pending(self) -> bool:
         return bool(self.journal.get("managed_current_change", {}).get("state") in ("pending", "recovering"))
 
-    # A completed explicit Return retires the failed target once fresh zero and the previous selection are verified.
-    def returned_to_previous(self) -> None:
+    # Verified restoration retires only its exact abandoned target, in the caller's authority transaction.
+    def returned_to_previous(self, *, recovery: dict[str, Any] | None = None) -> None:
         j = self.journal
         change = j.get("managed_current_change", {})
         row = j.db.execute(
-            "SELECT r.action,r.state,c.current_a FROM managed_requests r "
+            "SELECT r.action,r.state,r.revision,r.result,c.current_a FROM managed_requests r "
             "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
             (change.get("id"),),
         ).fetchone()
+        automatic = recovery is not None
+        eligible = change.get("state") in ("uncertain", "interrupted", "cancelled")
+        if recovery is not None:
+            # Native observations may refresh during awaits; only immutable request/authority fields are compared.
+            keys = ("id", "current_a", "previous_a", "mode", "recovery_revision")
+            eligible = (
+                change.get("state") == "recovering"
+                and all(change.get(key) == recovery.get(key) for key in keys)
+                and change.get("mode") == "app"
+                and not self.controller.stopping
+                and self.controller.requests.intent().mode == "app"
+                and self.controller.requests.intent().revision == change.get("recovery_revision")
+                and row is not None
+                and row["revision"] + 1 == change.get("recovery_revision")
+                and (row["state"] != "uncertain" or json.loads(row["result"]) == {"classification": "process_replaced"})
+            )
         if (
-            change.get("state") in ("uncertain", "interrupted", "cancelled")
+            eligible
             and change.get("previous_a") == self.selected()
             and row is not None
             and row["action"] == "set_current"
@@ -188,15 +204,31 @@ class ManagedCurrentLimits:
         ):
             j.put(
                 "managed_current_change",
-                {**change, "state": "cancelled", "recovery_reason": "explicit_return_previous_selection"},
+                {
+                    **change,
+                    "state": "cancelled",
+                    "recovery_reason": "verified_overlap_recovery"
+                    if automatic
+                    else "explicit_return_previous_selection",
+                },
             )
-            # The same verified Return transaction retires this exact unconfirmed target's request as failed.
+            # Preserve terminal failed results byte for byte; only this exact uncertain request can be retired.
             j.db.execute(
                 "UPDATE managed_requests SET state='failed',result=? "
-                "WHERE id=? AND action='set_current' AND state='uncertain'",
+                "WHERE id=? AND action='set_current' AND revision=? AND state='uncertain'",
                 (
-                    json.dumps({"classification": "superseded_by_verified_return", "current_a": self.selected()}),
+                    json.dumps(
+                        {
+                            "classification": (
+                                "superseded_by_verified_overlap_recovery"
+                                if automatic
+                                else "superseded_by_verified_return"
+                            ),
+                            "current_a": self.selected(),
+                        }
+                    ),
                     change["id"],
+                    row["revision"],
                 ),
             )
 
@@ -485,6 +517,11 @@ class ManagedCurrentLimits:
         if c.requests.intent().mode != "app" or c.requests.intent().revision != change["recovery_revision"]:
             j.put("managed_current_change", {**change, "state": "cancelled"})
             return
+        if not c.stopping and c.session.gateway.controls.desired() != 0:
+            # Restoration may have succeeded before settlement storage failed; retry from a new restrictive ticket.
+            with j.atomic():
+                c.session.gateway.controls._claim(True, stopping=True)
+                c.released_epoch = None
         await self.protect_overlap()
         native = await c.native.read()
         c.native.require_known_session(native)
@@ -501,7 +538,8 @@ class ManagedCurrentLimits:
         if local is not None:
             require_current_session(c.session.gateway, native, local)
         await c.restore_owner_control(continuing_local=local)
-        j.put("managed_current_change", {**j.get("managed_current_change"), "state": "cancelled"})
+        with j.atomic():
+            self.returned_to_previous(recovery=change)
 
     # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
