@@ -180,7 +180,8 @@ class ServiceProcess:
             lambda value: value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == expected
         )
         locals_seen = []
-        for epoch in range(2):
+        demands = demand if isinstance(demand, tuple) else (demand, demand)
+        for epoch, demand in enumerate(demands):
             result = await self.rig.bench.call(
                 self.socket,
                 uuid.uuid4().hex,

@@ -2,6 +2,16 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Persist bounded observation retry receipts with their queue admission, preserving genuine repeated statuses and
+  conservative cable-departure handling across reconnects, new Boots and process replacement.
+- Retry explicit cloud Start errors with a persisted bounded budget. Preserve valid denied-session mappings for
+  real Stop delivery and fresh Pause recovery; provide exact offline retry or mapping recovery when outcomes remain
+  unresolved. Recovery attempts can themselves fail without disabling the next supported reconciliation.
+- Reconcile exactly identified issued and unpublished owner Starts with independently verified cancellation, and
+  settle genuine late mapped lifecycles at verified zero. Preserve truthful original RPC outcomes.
+- Add588 finite cloud refusal, observation retry and real issued-command SIGKILL histories, with later-session
+  recovery; add real SQLite rollback, ID-reuse and ordinary lost-reply controls. Check charger-specific diagnostics
+  in the introduction test instead of a shared last-error field.
 - Add a source-linked recovery coverage matrix and finite Start, Boot, current, Stop, cloud-debt and actual HA
   lifecycle/receipt permutations. Regenerate qualification inputs independently and require exact per-case recovery
   evidence on both HA runtimes, with explicit exclusions and coverage limits.

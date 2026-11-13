@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .policy import DeniedError, integer
-from .store import ConflictError, Journal
+from .store import ConflictError, Journal, RecoveryRequiredError
 
 STATUSES = frozenset(
     {
@@ -41,7 +41,7 @@ def event_time(value: Any) -> datetime:
 
 
 # Prevent a malformed but acknowledged record from poisoning all subsequent cloud delivery.
-def validate_observation(action: str, payload: dict[str, Any], journal: Journal) -> None:
+def validate_observation(action: str, payload: dict[str, Any], journal: Journal, *, check_history: bool = True) -> None:
     if action == "StatusNotification":
         integer(payload.get("connectorId"), maximum=1)
         if (
@@ -54,10 +54,27 @@ def validate_observation(action: str, payload: dict[str, Any], journal: Journal)
             event_time(payload["timestamp"])
     elif action == "MeterValues":
         integer(payload.get("connectorId"), maximum=1)
-        if "transactionId" in payload:
+        if "transactionId" in payload and not check_history:
+            integer(payload["transactionId"])
+        if "transactionId" in payload and check_history:
             local = integer(payload["transactionId"])
-            if journal.db.execute("SELECT local FROM transactions WHERE local=?", (local,)).fetchone() is None:
+            transaction = journal.db.execute(
+                "SELECT local,stop,vendor FROM transactions WHERE local=?", (local,)
+            ).fetchone()
+            if transaction is None:
                 raise ConflictError("meter names an unknown local transaction")
+            if transaction["stop"] is not None:
+                if journal.db.execute(
+                    "SELECT 1 FROM transactions WHERE local>? AND vendor IS NULL LIMIT 1", (local,)
+                ).fetchone():
+                    raise RecoveryRequiredError("historical meter awaits the later session's cloud identity")
+                if (
+                    transaction["vendor"] is not None
+                    and journal.db.execute(
+                        "SELECT 1 FROM transactions WHERE local>? AND vendor=? LIMIT 1", (local, transaction["vendor"])
+                    ).fetchone()
+                ):
+                    raise ConflictError("historical meter cannot name a reused cloud transaction")
         rows = payload.get("meterValue")
         if not isinstance(rows, list) or not 1 <= len(rows) <= 128:
             raise DeniedError("invalid meter rows")

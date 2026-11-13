@@ -199,7 +199,13 @@ class ManagedChargeTests:
             or type(local) is not int
             or not (state.get("start_rpc_accepted") is True or receipt.get("request_id") == state.get("id"))
             or receipt.get("local") != local
-            or receipt.get("stage") != "accepted"
+            or receipt.get("stage") not in ("issued", "accepted")
+            or receipt.get("stage") == "issued"
+            and (
+                state.get("start_rpc_accepted") is not False
+                or receipt.get("request_id") != state.get("id")
+                or state.get("start_attempted") is not True
+            )
             or receipt.get("digest") != state.get("tag_digest")
             or j.get("control", {}).get("start_pending")
         ):

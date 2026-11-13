@@ -79,6 +79,10 @@ class Journal:
     def _initialize(self, path: Path, identity: str) -> None:
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+            old_identity = self.get("identity")
+            if old_identity is not None and old_identity != identity:
+                raise ConflictError("journal belongs to another charger")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -88,7 +92,7 @@ class Journal:
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS transactions(
                 local INTEGER PRIMARY KEY, connector INTEGER NOT NULL, start TEXT UNIQUE NOT NULL,
-                stop TEXT, vendor INTEGER UNIQUE, live INTEGER NOT NULL DEFAULT 0);
+                stop TEXT, vendor INTEGER, live INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_connector ON transactions(connector) WHERE stop IS NULL;
             CREATE TABLE IF NOT EXISTS receipts(
                 token TEXT PRIMARY KEY, action TEXT NOT NULL, digest TEXT NOT NULL, response TEXT NOT NULL);
@@ -109,6 +113,8 @@ class Journal:
         for name in ("start_info", "stop_info"):
             if name not in columns:
                 self.db.execute("ALTER TABLE transactions ADD COLUMN " + name + " TEXT")
+        self._migrate_vendor_ids()
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_open_vendor ON transactions(vendor) WHERE stop IS NULL")
         with self.atomic():
             old = self.get("identity")
             if old is not None and old != identity:
@@ -118,6 +124,50 @@ class Journal:
             self.db.execute("UPDATE outbox SET state='ambiguous' WHERE state='inflight' AND action='StartTransaction'")
             self.db.execute("UPDATE outbox SET state='queued' WHERE state='inflight'")
             self.db.execute("UPDATE transactions SET live=0")
+            head = self.next_delivery()
+            if head is not None and head.action == "StartTransaction" and head.state == "ambiguous":
+                # The same exact proof normalization is used after a live timeout and an interrupted process.
+                from .managed_start_delivery import supersede_unknown_start_retry
+
+                supersede_unknown_start_retry(self, head)
+
+    # Preserve history while allowing a cloud ID to recur only after its previous lifecycle has drained.
+    def _migrate_vendor_ids(self) -> None:
+        unique_vendor = any(
+            row["unique"]
+            and [column["name"] for column in self.db.execute("PRAGMA index_info(" + row["name"] + ")")] == ["vendor"]
+            and not row["partial"]
+            for row in self.db.execute("PRAGMA index_list(transactions)")
+        )
+        if not unique_vendor:
+            return
+        expected = {"local", "connector", "start", "stop", "vendor", "live", "start_info", "stop_info"}
+        if {row["name"] for row in self.db.execute("PRAGMA table_info(transactions)")} != expected or self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE tbl_name='transactions' AND "
+            "(type='trigger' OR type='index' AND sql IS NOT NULL "
+            "AND name NOT IN ('one_open_connector','one_open_vendor'))"
+        ).fetchone():
+            raise RecoveryRequiredError("transaction mapping migration cannot discard an unknown schema extension")
+        self.db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.atomic():
+                self.db.execute(
+                    "CREATE TABLE transactions_new(local INTEGER PRIMARY KEY,connector INTEGER NOT NULL,"
+                    "start TEXT UNIQUE NOT NULL,stop TEXT,vendor INTEGER,live INTEGER NOT NULL DEFAULT 0,"
+                    "start_info TEXT,stop_info TEXT)"
+                )
+                self.db.execute(
+                    "INSERT INTO transactions_new(local,connector,start,stop,vendor,live,start_info,stop_info) "
+                    "SELECT local,connector,start,stop,vendor,live,start_info,stop_info FROM transactions"
+                )
+                self.db.execute("DROP TABLE transactions")
+                self.db.execute("ALTER TABLE transactions_new RENAME TO transactions")
+                self.db.execute("CREATE UNIQUE INDEX one_open_connector ON transactions(connector) WHERE stop IS NULL")
+                self.db.execute("CREATE UNIQUE INDEX one_open_vendor ON transactions(vendor) WHERE stop IS NULL")
+                if self.db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise RecoveryRequiredError("transaction mapping migration failed its history reference check")
+        finally:
+            self.db.execute("PRAGMA foreign_keys=ON")
 
     # Commit all related facts together, or publish none of them.
     @contextmanager
@@ -396,8 +446,8 @@ class Journal:
 
     # Read-only historical queries may name a completed session; controls still use active-only local_id.
     def historical_local_id(self, vendor: int) -> int | None:
-        row = self.db.execute("SELECT local FROM transactions WHERE vendor=?", (vendor,)).fetchone()
-        return int(row[0]) if row else None
+        rows = self.db.execute("SELECT local FROM transactions WHERE vendor=? LIMIT 2", (vendor,)).fetchall()
+        return int(rows[0][0]) if len(rows) == 1 else None
 
     # Peek rather than delete: a process death must not remove an unacknowledged event.
     def next_delivery(self) -> Delivery | None:
@@ -440,7 +490,12 @@ class Journal:
 
     # Commit the cloud acknowledgement and its transaction mapping atomically.
     def acknowledge(
-        self, item: Delivery, result: dict[str, Any], acknowledged: Callable[[], None] | None = None
+        self,
+        item: Delivery,
+        result: dict[str, Any],
+        acknowledged: Callable[[], None] | None = None,
+        *,
+        allow_denied: bool = False,
     ) -> None:
         with self.atomic():
             if item.action == "StartTransaction":
@@ -449,14 +504,23 @@ class Journal:
                 vendor = result.get("transactionId")
                 if (
                     type(vendor) is not int
-                    or vendor < 0
+                    or not 0 <= vendor < 2**31
                     or not isinstance(result.get("idTagInfo"), dict)
-                    or result["idTagInfo"].get("status") != "Accepted"
+                    or result["idTagInfo"].get("status")
+                    not in (
+                        ("Accepted", "Blocked", "Expired", "Invalid", "ConcurrentTx") if allow_denied else ("Accepted",)
+                    )
                 ):
                     raise RecoveryRequiredError("cloud did not accept the local transaction")
                 old = self.vendor_id(int(item.transaction))
                 if old is not None and old != vendor:
                     raise ConflictError("cloud attempted to change a transaction mapping")
+                if self.db.execute(
+                    "SELECT 1 FROM transactions t WHERE vendor=? AND local!=? AND "
+                    "(stop IS NULL OR EXISTS(SELECT 1 FROM outbox o WHERE o.local=t.local)) LIMIT 1",
+                    (vendor, item.transaction),
+                ).fetchone():
+                    raise ConflictError("cloud transaction still belongs to another undelivered local lifecycle")
                 try:
                     self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
                 except sqlite3.IntegrityError:
@@ -470,7 +534,7 @@ class Journal:
         if type(local) is not int or type(vendor) is not int or min(local, vendor) < 0:
             raise ConflictError("invalid reconciliation ids")
         row = self.db.execute("SELECT * FROM outbox WHERE local=? AND action='StartTransaction'", (local,)).fetchone()
-        if row is None or row["state"] not in ("ambiguous", "inflight"):
+        if row is None or row["state"] not in ("ambiguous", "inflight", "rejected"):
             raise ConflictError("transaction is not awaiting explicit reconciliation")
         item = Delivery(row["token"], row["action"], json.loads(row["payload"]), local, row["state"])
         self.acknowledge(item, {"transactionId": vendor, "idTagInfo": {"status": "Accepted"}}, acknowledged)

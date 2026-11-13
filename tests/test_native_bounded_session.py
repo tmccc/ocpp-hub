@@ -256,7 +256,7 @@ async def test_connected_first_boot_rechecks_native_guard_and_history(
             rig.peer.configuration["untouched"] = "external-change"
         async with rig.charger(session) as charger:
             await rig.bench.call(charger, "raced-boot", "BootNotification", BOOT)
-            await until(lambda: session.runtime.status.last_failure == "BootOrCeilingUnavailable")
+            await until(lambda: session.runtime.status.charger_fault.stage == "boot_or_ceiling")
             assert not session.gateway.controls.ready
             assert session.journal.get("trial_phase") == "blocked"
             assert rig.bench.received_limits == [] and not rig.bench.firmware.profiles

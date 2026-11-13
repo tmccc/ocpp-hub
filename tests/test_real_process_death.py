@@ -8,7 +8,9 @@ import uuid
 
 import pytest
 
+from tests import test_managed_proxy as managed_bench_module
 from tests import test_native_bounded_session as native_bench
+from tests.cloud_start_helpers import StartReplyBench
 from tests.process_helpers import process_rig
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import starts
@@ -316,8 +318,12 @@ async def test_process_sigkill_current_selection(
 
 # Intent: a real accepted one-shot command can report its actual lifecycle after a process dies before publication.
 # Why: durable acceptance and an exact later closed lifecycle must settle the original receipt without replaying Start.
-@pytest.mark.parametrize("phase", ["after-accepted-commit", "after-managed-success-commit"])
-async def test_process_accepted_start_late_lifecycle(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase):
+@pytest.mark.parametrize("phase", ["before-accepted-commit", "after-accepted-commit", "after-managed-success-commit"])
+@pytest.mark.parametrize("cloud_reply", ["Accepted", "Blocked"])
+async def test_process_accepted_start_late_lifecycle(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase, cloud_reply
+):
+    monkeypatch.setattr(managed_bench_module, "OwnerBench", StartReplyBench)
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with process_rig(
         tmp_path, tls_for_case(tmp_path, model_tls), unused_tcp_port_factory(), unused_tcp_port_factory(), monkeypatch
@@ -329,7 +335,7 @@ async def test_process_accepted_start_late_lifecycle(tmp_path, model_tls, monkey
         request = asyncio.create_task(child.request("start", id=identifier, revision=ready["control_revision"]))
         await child.gate(phase, identifier)
         before = child.durable()["metadata"]
-        assert before["local_start_receipt"]["stage"] == "accepted"
+        assert before["local_start_receipt"]["stage"] == ("issued" if phase == "before-accepted-commit" else "accepted")
         assert before["managed_test_charge"].get("local_transaction") is None
         assert len(starts(child.rig)) == 1
         tag = starts(child.rig)[0][3]["idTag"]
@@ -337,6 +343,7 @@ async def test_process_accepted_start_late_lifecycle(tmp_path, model_tls, monkey
         await asyncio.gather(request, return_exceptions=True)
         await child.start()
         await child.status(lambda value: value.get("charger_connected") is True)
+        child.rig.bench.start_replies = [cloud_reply]
         result = await child.rig.bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", START | {"idTag": tag})
         assert result[0] == 3 and result[2]["idTagInfo"]["status"] == "Accepted"
         local = result[2]["transactionId"]
@@ -349,6 +356,7 @@ async def test_process_accepted_start_late_lifecycle(tmp_path, model_tls, monkey
             {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"},
         )
         assert result[0] == 3
+        await child.delivered(local, closed=True)
         state = (await child.request("status"))["result"]
         assert (await child.request("pause", revision=state["control_revision"]))["ok"]
         await child.status(lambda value: value.get("local_hold_verified") is True)

@@ -46,6 +46,7 @@ class DebtAttestation:
             "command_no_longer_pending",
             "cloud_stop_independently_verified",
             "fault_origin_independently_verified",
+            "cloud_start_not_accepted",
         ):
             if key in value and value[key] is not True:
                 raise SecurityError(
@@ -128,6 +129,22 @@ class StopDeliveryAttestation(DebtAttestation):
     original_state_independently_verified: bool
 
 
+@dataclass(frozen=True)
+class StartDeliveryAttestation(DebtAttestation):
+    """Independent nonacceptance permits a bounded retry of the original closed Start and its genuine Stop."""
+
+    delivery_token: str
+    local_transaction_id: int
+    payload_digest: str
+    start_digest: str
+    stop_digest: str
+    reply_digest: str
+    fault_digest: str
+    cloud_start_not_accepted: bool
+    fault_origin_independently_verified: bool
+    original_state_independently_verified: bool
+
+
 ATTESTATIONS: dict[str, type[DebtAttestation]] = {
     "vendor-write": VendorWriteAttestation,
     "local-start": LocalStartAttestation,
@@ -135,4 +152,5 @@ ATTESTATIONS: dict[str, type[DebtAttestation]] = {
     "vendor-start": VendorStartAttestation,
     "stop-delivery": StopDeliveryAttestation,
     "stop-fault": StopDeliveryAttestation,
+    "start-delivery": StartDeliveryAttestation,
 }

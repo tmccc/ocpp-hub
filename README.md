@@ -1018,7 +1018,15 @@ charger's correlated result or error. Unknown commands and undocumented iCS vari
   Accepted events retain their bodies and FIFO order. Full lifecycle capacity refuses new Starts before acknowledgement;
   neither capacity nor recovery silently drops already accepted history.
 
-An ambiguous cloud Start remains quarantined because resending it could create a duplicate transaction. For one
+An explicit cloud Start CALLERROR keeps the original event token and body for at most three transmissions, with
+60 then120 seconds between attempts. The retry budget and deadline survive restart. Exhaustion retains the event
+for independently approved retry. A valid non-Accepted Start result keeps its real cloud transaction ID so its
+genuine Stop can still deliver; the denied session stays at zero. After its real Stop acknowledgement, a fresh
+verified Pause clears only its matching fault. The tag's denied authorization remains until a new actual cloud
+approval permits it. Return remains a separate action.
+
+An ambiguous cloud Start remains quarantined because resending it could create a duplicate transaction. Managed
+mode applies its existing zero hold even if the owner's session is open; this can interrupt that charge. For one
 independently verified cloud-accepted Start, `tools/reconcile_managed_delivery.py` provides an operator workflow.
 Its default `check` validates private inputs without opening the journal or contacting the charger. Ordinary HA
 management credentials do not grant transaction-mapping authority.
@@ -1041,16 +1049,21 @@ The workflow refuses unrelated faults, ambiguous additional transactions, missin
 commands, active temporary timers, changed configuration/history, and unconfirmed station zero. It never guesses a
 vendor ID, replays Start, invents a Stop, clears unrelated debts or automatically raises current.
 
-`tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for six specific debts:
+`tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for seven specific debts:
 
 - `--kind observation` retires one legacy rejected routine report.
 - `--kind vendor-write` resolves one independently settled uncertain vendor mutation.
-- `--kind local-start` retires an accepted owner Start whose source was never identified.
+- `--kind local-start` retires an issued or accepted owner Start whose source was never identified, including a
+  lost RemoteStart reply or acceptance committed before management publication.
 - `--kind vendor-start` retires an accepted, unbound cloud Start grant using its exact confirmed command receipt.
 - `--kind stop-delivery` permits another delivery of one exact closed, mapped Stop retained after a rejected reply.
 - `--kind stop-fault` reconciles the remaining delivery fault after that exact Stop has a preserved real wire receipt.
+- `--kind start-delivery` permits a new bounded retry budget for one quarantined genuine closed Start/Stop pair,
+  only after independent verification that the cloud did not already accept that Start.
 
-The service must be stopped with an existing verified local Pause and closed zero hold. `check` validates private
+The service must be stopped with an existing paused intent and independently verified closed zero hold. An
+unresolved issued Start can prevent Pause completion; that does not replace the independent physical-zero check.
+`check` validates private
 inputs without network access; `inspect` reads fresh native evidence and supplies the exact candidate digests.
 Use the same `--config` and `--native-bounded-spec` as the service.
 
@@ -1069,6 +1082,14 @@ optional authorization metadata may be ignored; it is never cached as permission
 revoke that retry approval and require fresh evidence. Wire acknowledgment and event deletion commit together.
 Definitely queued closed Start/Stop pairs remain in order behind the recovered head. A later rejected Stop needs its
 own proof. An already drained legacy fault without a preserved matching wire receipt remains quarantined.
+
+`start-delivery` requires literal `cloud_start_not_accepted: true`, `fault_origin_independently_verified: true` and
+`original_state_independently_verified: true`, plus the inspected exact event/lifecycle/reply digests. An unknown
+outcome needs independent cloud inspection; a timeout alone never proves nonacceptance. Retry keeps the same
+event identity and queued genuine Stop. Actual Start mapping and Stop acknowledgements must both commit before
+a new Pause can consume the proof. A further unknown outcome or exhausted retry supersedes that permission and
+supports new exact mapping or retry evidence, including after process replacement. Legacy rejected Starts can
+also use the mapping workflow when the actual cloud transaction number is independently established.
 
 Reconciliation archives the exact prior state and changes only its named debt. It has no charger writer and does
 not report successful execution of an uncertain command. Legacy report recovery retains later queued genuine

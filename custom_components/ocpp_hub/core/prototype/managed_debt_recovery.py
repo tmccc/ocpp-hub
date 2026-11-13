@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING, Any
 from .local_control import local_start_receipt
 from .managed_cutoffs import supervised_timer
 from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
-from .managed_delivery_recovery import delivery_anchor
+from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
 from .managed_occurrences import occurrences
 from .managed_recovery_zero import require_original_zero
+from .managed_start_delivery import KIND as START_KIND
+from .managed_start_delivery import RETRIES, start_resolution
 from .managed_stop_delivery import KINDS as STOP_KINDS
 from .managed_stop_delivery import NO_REPLY, REJECTION, WIRE_ACK, stop_identity, stop_resolution
 from .native_bounded import NativeBoundedSpec
@@ -45,6 +47,7 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "grant_mutation": dict(row) if kind == "vendor-start" and row is not None else None,
         "stop_rejection": j.get(REJECTION),
         "stop_wire_ack": j.get(WIRE_ACK),
+        "start_retries": j.get(RETRIES),
         "test": j.get("managed_test_charge"),
         "receipt": j.get("local_start_receipt"),
         "deferred": j.get("managed_deferred_start"),
@@ -68,7 +71,7 @@ def require_common_debt_idle(j: Journal, kind: str) -> None:
         any(entry.get("completed") is None and not entry.get("superseded") for entry in j.get(KEY, {}).values())
         or j.get("managed_control_fault", {}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
-        or kind not in ("observation", "stop-delivery")
+        or kind not in ("observation", "stop-delivery", START_KIND)
         and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
         or j.get("managed_current_change", {}).get("state") not in (None, "completed", "cancelled")
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
@@ -77,7 +80,8 @@ def require_common_debt_idle(j: Journal, kind: str) -> None:
         and j.get("control", {}).get("start_pending")
         or kind != "local-start"
         and j.get("managed_test_charge", {}).get("state") not in (None, "completed")
-        or kind not in ("observation", "stop-delivery")
+        and not (kind == START_KIND and closed_normal_delivery(j))
+        or kind not in ("observation", "stop-delivery", START_KIND)
         and j.next_delivery() is not None
         or kind != "vendor-write"
         and j.get("uncertain_vendor_command")
@@ -258,10 +262,17 @@ def local_start_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
     state, receipt = snapshot["test"] or {}, local_start_receipt(j)
     requests = snapshot["requests"]
     deadline = state.get("hard_deadline_epoch")
+    published = state.get("start_rpc_accepted") is True
+    unpublished = (
+        state.get("start_rpc_accepted") is False
+        and state.get("start_attempted") is True
+        and receipt.get("stage") in ("issued", "accepted")
+        and receipt.get("request_id") == state.get("id")
+    )
     if (
         state.get("kind") != "normal"
         or state.get("source") != "local"
-        or state.get("start_rpc_accepted") is not True
+        or not (published or unpublished)
         or state.get("local_transaction") is not None
         or state.get("state") not in ("expired", "interrupted", "stopping", "awaiting_power")
         or not isinstance(deadline, (int, float))
@@ -270,8 +281,10 @@ def local_start_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
         or len(requests) != 1
         or requests[0]["id"] != state.get("id")
         or requests[0]["action"] != "start"
-        or state.get("revision") != requests[0]["revision"] + 1
-        or receipt.get("stage") != "accepted"
+        or state.get("revision") != requests[0]["revision"] + int(published)
+        or published
+        and receipt.get("stage") != "accepted"
+        or receipt.get("request_id") not in (None, state.get("id"))
         or receipt.get("local") is not None
         or not receipt.get("ticket")
         or receipt.get("digest") != state.get("tag_digest")
@@ -306,6 +319,55 @@ def local_start_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
     }
 
 
+# Exact independent nonacceptance can authorize retry, never erase a Start or fabricate its cloud mapping.
+def start_retry_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any]:
+    head, fault = j.next_delivery(), snapshot["fault"] or {}
+    if (
+        head is None
+        or head.action != "StartTransaction"
+        or head.state not in ("rejected", "ambiguous")
+        or fault.get("classification") != "owner_control_or_delivery_uncertain"
+    ):
+        raise RecoveryRequiredError("Start retry needs its exact quarantined delivery head and fault")
+    row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (head.transaction,)).fetchone()
+    rows = snapshot["outbox"]
+    if row is None or row["stop"] is None or row["vendor"] is not None or json.loads(row["start"]) != head.payload:
+        raise RecoveryRequiredError("Start retry requires its genuine closed unmapped lifecycle")
+    for transaction in j.db.execute("SELECT local,start,stop FROM transactions WHERE vendor IS NULL"):
+        pair = [
+            r
+            for r in rows
+            if r["local"] == transaction["local"] and r["action"] in ("StartTransaction", "StopTransaction")
+        ]
+        if (
+            transaction["stop"] is None
+            or len(pair) != 2
+            or [r["action"] for r in pair] != ["StartTransaction", "StopTransaction"]
+            or pair[0]["payload"] != transaction["start"]
+            or pair[1]["payload"] != transaction["stop"]
+            or any(r["state"] != "queued" for r in pair if r["token"] != head.token)
+        ):
+            raise RecoveryRequiredError("Start retry cannot waive another ambiguous or orphaned lifecycle")
+    for queued in rows[1:]:
+        if queued["state"] != "queued" or queued["action"] not in (*REPORTS, "StartTransaction", "StopTransaction"):
+            raise RecoveryRequiredError("Start retry retains unrelated delivery uncertainty")
+        if (
+            queued["local"] is not None
+            and j.db.execute("SELECT 1 FROM transactions WHERE local=?", (queued["local"],)).fetchone() is None
+        ):
+            raise RecoveryRequiredError("queued report has no original transaction")
+    retry = (snapshot["start_retries"] or {}).get(head.token, {})
+    return {
+        "delivery_token": head.token,
+        "local_transaction_id": head.transaction,
+        "payload_digest": fingerprint(head.payload),
+        "start_digest": fingerprint(json.loads(row["start"])),
+        "stop_digest": fingerprint(json.loads(row["stop"])),
+        "reply_digest": retry.get("reply_digest", NO_REPLY),
+        "fault_digest": fingerprint(fault),
+    }
+
+
 # Inspection returns only correlation digests; a fresh independent observer and exclusive Journal owner are required.
 def debt_candidate(
     j: Journal, book: ResourceBook, spec: NativeBoundedSpec, n: HandoverEvidence, kind: str
@@ -317,6 +379,10 @@ def debt_candidate(
     snapshot = debt_snapshot(j, spec, kind)
     if kind == "local-start":
         specific = local_start_candidate(j, snapshot)
+    elif kind == START_KIND:
+        if snapshot["requests"]:
+            raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
+        specific = start_retry_candidate(j, snapshot)
     else:
         if snapshot["requests"]:
             raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
@@ -354,6 +420,8 @@ def resolved_debt(j: Journal, kind: str, proof: dict[str, Any]) -> dict[str, Any
     e = proof["attestation"]
     if kind in STOP_KINDS:
         return stop_resolution(j, e, proof.get("wire_ack"))
+    if kind == START_KIND:
+        return start_resolution(j, e)
     if kind in ("vendor-write", "vendor-start"):
         row = j.db.execute("SELECT * FROM mutations WHERE token=?", (e["mutation_token"],)).fetchone()
         return {
@@ -403,6 +471,7 @@ def reconcile_debt(
     if any(e.get(key) != value for key, value in candidate.items()):
         raise RecoveryRequiredError("operator evidence does not identify the exact current debt")
     snapshot = debt_snapshot(j, spec, kind)
+    closed_start = kind == START_KIND and closed_normal_delivery(j)
     fault = {"classification": FAULT, "proof": identifier, "at_epoch": time.time()}
     proof = {
         "kind": kind,
@@ -433,6 +502,32 @@ def reconcile_debt(
             proof["wire_ack"] = None
         elif kind == "stop-fault":
             proof["wire_ack"] = snapshot["stop_wire_ack"]
+        elif kind == START_KIND:
+            retries = j.get(RETRIES, {})
+            j.put(
+                RETRIES,
+                {
+                    **retries,
+                    e["delivery_token"]: {
+                        "local": e["local_transaction_id"],
+                        "payload_digest": e["payload_digest"],
+                        "reply_digest": e["reply_digest"],
+                        "errors": 0,
+                        "next_epoch": 0,
+                    },
+                },
+            )
+            j.db.execute("UPDATE outbox SET state='queued' WHERE token=?", (e["delivery_token"],))
+            if closed_start:
+                j.put(
+                    "managed_test_charge",
+                    {
+                        **snapshot["test"],
+                        "state": "completed",
+                        "charging": False,
+                        "recovery_reason": "operator_verified_closed_start_delivery",
+                    },
+                )
         elif kind == "local-start":
             j.put("local_start_receipt", {**snapshot["receipt"], "stage": "reconciled", "proof": identifier})
             j.put(
@@ -483,6 +578,8 @@ def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> d
     if (
         proof["kind"] in STOP_KINDS
         and proof.get("wire_ack") is None
+        or proof["kind"] == START_KIND
+        and (proof.get("start_wire_ack") is None or proof.get("stop_wire_ack") is None)
         or proof["installed_fault"] != fault
         or proof["anchor"] != delivery_anchor(j, c.native.spec)
         or proof["resolved"] != resolved_debt(j, proof["kind"], proof)

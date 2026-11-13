@@ -50,7 +50,7 @@ def closed_normal_delivery(j: Journal) -> bool:
         and tuple(request) == ("start", "completed")
         and head is not None
         and head.action == "StartTransaction"
-        and head.state == "ambiguous"
+        and head.state in ("ambiguous", "rejected")
         and head.transaction == local
     )
 
@@ -181,7 +181,7 @@ def delivery_candidate(j: Journal, book: ResourceBook, spec: NativeBoundedSpec, 
         fault.get("classification") != FAULT
         or head is None
         or head.action != "StartTransaction"
-        or head.state != "ambiguous"
+        or head.state not in ("ambiguous", "rejected")
     ):
         raise RecoveryRequiredError("the delivery head is not one ambiguous managed Start")
     row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (head.transaction,)).fetchone()

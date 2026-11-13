@@ -22,7 +22,15 @@ from .events import validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, known_write
 from .local_control import LocalControl
+from .managed_start_delivery import (
+    record_start_denial,
+    record_start_error,
+    record_start_wire_ack,
+    retry_deferred,
+    supersede_unknown_start_retry,
+)
 from .managed_stop_delivery import approved_stop_metadata, record_stop_ack, reject_stop_reply
+from .observation_receipts import ObservationReceipts
 from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
@@ -135,6 +143,8 @@ class Gateway:
         self._boot_seen = asyncio.Event()
         self._vendor_epoch = 0
         self._inbound = InboundCache(journal=journal)
+        self._observations = ObservationReceipts(journal)
+        self._start_retry_waits: dict[str, tuple[str, float]] = {}
         self.failures: list[str] = []
 
     # Restrict new transports or changed introductions before they can authorize any charging-capable request.
@@ -387,13 +397,15 @@ class Gateway:
     ) -> dict[str, Any]:
         if action == "BootNotification":
             previous_boot = self.journal.get("boot")
-            if previous_boot != payload:
-                # A later return to the same body cannot erase an intervening introduction revocation.
-                self.boot_metadata_revision += 1
             if previous_boot is not None and previous_boot != payload:
                 self._restrict_trial_introduction()
                 self.controls.invalidate()
-            self.journal.put("boot", payload)
+            with self.journal.atomic():
+                self._observations.boot(self._charger_epoch)
+                self.journal.put("boot", payload)
+            if previous_boot != payload:
+                # A later return to the same body cannot erase an intervening introduction revocation.
+                self.boot_metadata_revision += 1
             self._boot_charger_epoch = self._charger_epoch
             self.boot_observation = uuid.uuid4().hex
             self._boot_seen.set()
@@ -466,14 +478,14 @@ class Gateway:
             "FirmwareStatusNotification",
             "DiagnosticsStatusNotification",
         ):
-            validate_observation(action, payload, self.journal)
+            validate_observation(action, payload, self.journal, check_history=False)
             with self.journal.atomic():
-                self.journal.enqueue(action, payload, payload.get("transactionId"))
+                published = self._observations.accept(self._charger_epoch, token.partition(":")[2], action, payload)
                 if action == "StatusNotification":
                     self.journal.put("last_status", payload)
                     if self.status_observer is not None:
                         self.status_observer(token, payload)
-                elif action == "MeterValues" and type(payload.get("transactionId")) is int:
+                elif published and action == "MeterValues" and type(payload.get("transactionId")) is int:
                     rows = payload.get("meterValue", [])
                     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
                         observed = timestamp(rows[0].get("timestamp"))
@@ -1070,7 +1082,15 @@ class Gateway:
             await self._ensure_vendor_boot()
             while (item := self.journal.next_delivery()) is not None:
                 if item.state in ("ambiguous", "inflight", "rejected"):
+                    if item.action == "StartTransaction" and item.state in ("ambiguous", "inflight"):
+                        with self.journal.atomic():
+                            self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
+                            current_head = self.journal.next_delivery()
+                            assert current_head is not None
+                            supersede_unknown_start_retry(self.journal, current_head)
                     raise RecoveryRequiredError("cloud delivery requires explicit reconciliation")
+                if retry_deferred(self.journal, item, self._start_retry_waits):
+                    return
                 payload = dict(item.payload)
                 if item.action in ("MeterValues", "StopTransaction") and "transactionId" in payload:
                     vendor = self.journal.vendor_id(integer(payload["transactionId"]))
@@ -1091,10 +1111,14 @@ class Gateway:
                     answer = await self.vendor.call(item.action, payload, token=item.token, before_send=before_send)
                 except UnavailableError, asyncio.CancelledError:
                     if sent:
-                        self.journal.db.execute(
-                            "UPDATE outbox SET state=? WHERE token=?",
-                            ("ambiguous" if item.action == "StartTransaction" else "queued", item.token),
-                        )
+                        with self.journal.atomic():
+                            self.journal.db.execute(
+                                "UPDATE outbox SET state=? WHERE token=?",
+                                ("ambiguous" if item.action == "StartTransaction" else "queued", item.token),
+                            )
+                            current_head = self.journal.next_delivery()
+                            if current_head is not None:
+                                supersede_unknown_start_retry(self.journal, current_head)
                     raise
                 if answer[0] != 3:
                     if item.action in (
@@ -1108,7 +1132,8 @@ class Gateway:
                     if item.action == "StopTransaction":
                         reject_stop_reply(self.journal, item, answer, reason="cloud_call_error")
                         raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
-                    self.journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
+                    if item.action == "StartTransaction" and not record_start_error(self.journal, item, answer):
+                        return
                     raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
                 metadata: dict[str, Any] | None = None
                 ignored_stop_metadata = False
@@ -1125,22 +1150,14 @@ class Gateway:
                                 "cloud Stop metadata requires exact independent reconciliation"
                             ) from None
                         ignored_stop_metadata = True
-                    if item.action == "StartTransaction" and metadata is not None and metadata["status"] != "Accepted":
-                        with self.journal.atomic():
-                            if isinstance(tag, str):
-                                self.auth_info.put(tag, metadata)
-                            self.journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
-                            control = self.journal.get("control", {})
-                            self.journal.put(
-                                "control", {**control, "owner": "local", "inhibit": True, "uncertain": True}
-                            )
-                        await self.controls.ensure_ceiling()
-                        raise RecoveryRequiredError("cloud rejected an already local session; zero hold retained")
+                denied = item.action == "StartTransaction" and metadata is not None and metadata["status"] != "Accepted"
 
                 # Cache updates and deletion of this durable event share its actual acknowledgement commit.
                 def acknowledged() -> None:
                     if metadata is not None and isinstance(tag, str):
                         self.auth_info.put(tag, metadata)
+                    if denied:
+                        record_start_denial(self.journal, item, answer[2])
                     if ignored_stop_metadata:
                         row = self.journal.db.execute(
                             "SELECT start FROM transactions WHERE local=?", (item.transaction,)
@@ -1151,5 +1168,18 @@ class Gateway:
                                 "DELETE FROM auth_info WHERE digest=?", (fingerprint(rejected_tag.casefold()),)
                             )
                     record_stop_ack(self.journal, item, answer[2])
+                    record_start_wire_ack(self.journal, item, answer[2])
 
-                self.journal.acknowledge(item, answer[2], acknowledged)
+                try:
+                    self.journal.acknowledge(item, answer[2], acknowledged, allow_denied=denied)
+                except ConflictError, RecoveryRequiredError:
+                    if item.action == "StartTransaction":
+                        with self.journal.atomic():
+                            self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
+                            current_head = self.journal.next_delivery()
+                            assert current_head is not None
+                            supersede_unknown_start_retry(self.journal, current_head)
+                    raise
+                if denied:
+                    await self.controls.ensure_ceiling()
+                    raise RecoveryRequiredError("cloud denied the mapped local session; zero hold retained")

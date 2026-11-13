@@ -13,6 +13,7 @@ from .managed_cutoffs import supervised_timer
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
 from .managed_delivery_recovery import complete_delivery_recovery, delivery_recovery_evidence
 from .managed_occurrences import occurrences
+from .managed_start_delivery import complete_denied_start, denied_start_evidence
 from .store import RecoveryRequiredError, fingerprint
 from .trial_rollback import require_lifecycle_idle
 
@@ -33,6 +34,8 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
     if delivery_recovery_evidence(c, fault) is not None:
         return True
     if operator_recovery_evidence(c, fault) is not None:
+        return True
+    if denied_start_evidence(c, fault) is not None:
         return True
     if fault.get("classification") != "native_authority_or_preservation_failed":
         return False
@@ -65,10 +68,13 @@ def record_release_pause(c: ManagedController, identifier: str) -> None:
     current = legacy_current_evidence(c, fault)
     delivery = delivery_recovery_evidence(c, fault)
     operator = operator_recovery_evidence(c, fault)
+    denied = denied_start_evidence(c, fault)
     if operator is not None:
         acknowledgement["operator_reconciliation"] = fingerprint(operator)
     elif delivery is not None:
         acknowledgement["delivery_reconciliation"] = fingerprint(delivery)
+    elif denied is not None:
+        acknowledgement["denied_start_reconciliation"] = fingerprint(denied)
     elif current is not None:
         acknowledgement["current_failure_evidence"] = current
     elif fault.get("classification") != FAULT:
@@ -78,6 +84,11 @@ def record_release_pause(c: ManagedController, identifier: str) -> None:
 
 # Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.
 def acknowledged_evidence(c: ManagedController, fault: dict[str, Any], ack: dict[str, Any]) -> bool:
+    denied = denied_start_evidence(c, fault)
+    if denied is not None:
+        return ack.get("denied_start_reconciliation") == fingerprint(denied)
+    if "denied_start_reconciliation" in ack:
+        return False
     operator = operator_recovery_evidence(c, fault)
     if operator is not None:
         return ack.get("operator_reconciliation") == fingerprint(operator)
@@ -172,13 +183,16 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             and current is None
             or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
             or j.get("managed_test_charge", {}).get("state") not in (None, "completed")
+            and not (denied_start_evidence(c, fault) or {}).get("normal")
             or any(supervised_timer(lease) for lease in occurrences(j).values())
             or any(lease.get("state") == "requested" for lease in occurrences(j).values())
             or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
             or j.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action!='pause' AND state IN ('accepted','running') LIMIT 1"
+                "SELECT 1 FROM managed_requests WHERE action!='pause' AND state IN ('accepted','running') "
+                "AND id IS NOT ? LIMIT 1",
+                (((denied_start_evidence(c, fault) or {}).get("normal") or {}).get("id"),),
             ).fetchone()
         ):
             raise RecoveryRequiredError("release reconciliation awaits the exact paused zero and settled journal")
@@ -243,6 +257,9 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             complete_delivery_recovery(j, delivery, ack["pause_request"])
         if operator is not None:
             complete_operator_recovery(j, operator, ack["pause_request"])
+        denied = denied_start_evidence(c, fault)
+        if denied is not None:
+            complete_denied_start(j, denied, ack["pause_request"])
         if current is not None:
             control = {**control, "resume_limit": current["previous_a"]}
             j.put(

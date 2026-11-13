@@ -18,6 +18,9 @@ through the full validator before attaching execution claims. Generated reports 
 
 | Family | Raw | Admitted per suite | Inputs and mandatory recovery |
 |---|---:|---:|---|
+| `observation_retry` | 120 | 120 engine | Six observation classes, four actual reply/cloud cuts, same/replacement/process/new-Boot boundaries over real TLS; exact publication counts, preserved new untimed reports and two later mapped lifecycles. |
+| `cloud_start_recovery` | 432 | 432 engine | One/two cloud CALLERRORs and four denied authorization statuses; native/local,6/16/32A, both demands, every close/Pause/replacement order; genuine mapped Stop, fresh Pause/Return and two later sessions/outages. |
+| `issued_start_proof` | 36 | 36 engine | Three genuine SIGKILL issued/accepted-before-publication boundaries,6/16/32A, app/paused and both later demand orders; exact independent cancellation proof, terminal receipt before further controls and two later sessions/outages. |
 | `current_domain` | 2,916 | 2,916 engine | All729 directed integer6..32A pairs including same-value requests; app/paused, both demands, exact UUID replay; two later sessions/outages. |
 | `process_start` | 36 | 36 engine | Six actual SQL/preparation/COMMIT SIGKILL boundaries,6/16/32A, both demands; parent peers survive; independent committed-WAL read, new process/Pause/Return and two later sessions/outages. |
 | `process_overlap` | 8 | 8 engine | Both6/32A directions, held native before/after applied target, both demands; real SIGKILL with mapped original session, automatic prior-cap restoration and atomic receipt retirement, original outage, new selection before Pause/Return, exact old UUID replay and two later sessions/outages. |
@@ -35,7 +38,7 @@ through the full validator before attaching execution claims. Generated reports 
 | `ha_receipt` | 160 | 160 each HA runtime | Four controls, initial/first/second/third response, five identity shapes, two terminal results; exact UUID, one mutation, readable status. |
 | `ha_outage_lifecycle` | 384 | 240 each HA runtime | True first setup/failed reload, reload/unload/remove/disable-enable, stale healthy/fault callback, admitted retry/deadline/stale/lifecycle orders; recovery and second outage/deadline/recovery. |
 
-Engine totals: **44,564 raw / 16,724 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
+Engine totals: **45,152 raw / 17,312 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
 Legacy HA has no registered finite family; its complete ordinary suite remains required. Ordinary functional tests
 are additional executions and are counted separately by collection. The generated registry must agree with these totals.
 
@@ -54,6 +57,8 @@ These controls model task/runtime/process death, not literal hardware power fail
 
 | Boundary | Safety | Recovery | Bound |
 |---|---|---|---|
+| Observation retry | Durable CALL identity is distinct from equal message bodies; pending receipts cannot be evicted | BEGIN/statement/COMMIT refusal rolls back receipt, queue and local status; repaired retry and later sessions succeed | A bounded recent retry window; new untimed reports after a fresh replacement Boot remain distinct. |
+| Cloud Start reply | Explicit error retry, denied authorization and unknown delivery have different receipts | Retry budget survives restart; exact new proof after recovery itself fails; denied Start keeps mapping for real Stop | Three total transmissions with60/120-second linear waits; no automatic retry of an unknown outcome. |
 | Start dispatch | Prepared/unsent/rejected differs from issued/accepted unknown; exact request/tag binding | Exact closed mapped lifecycle and atomic receipt/metadata settlement at verified zero | Unknown/unbound debt still needs supported exact evidence. |
 | Current/native proof | Real503/EOF/bad JSON, profile/composite rejection, applied CALLERROR, excessive composite | Prior selection unless target fully confirmed before revocation; new Pause/Return | All integer pairs for successful selection/idempotency; failure-order grammar uses representative currents. |
 | Boot | Incomplete old proof cannot cross Boot | Fresh pair after incomplete proof; completed pair may survive identical metadata | Changed identity/configuration retains blocking focused tests. |
@@ -72,8 +77,10 @@ offline qualification. This work requires neither live charging nor deployment.
 Additional named regression tests cover actual Accepted-Start death before/after publication with a late genuine
 Start/Stop lifecycle, Return request/success commit death, and issued-unknown quarantine controls. Uncommitted current receipts become failed only with verified restoration to their prior selection through explicit Return or exact automatic original-session recovery; a new Pause revokes
 only an older uncertain Return. Unknown issued debt
-is deliberately retained: its safety-only negative controls do not claim functional recovery from missing evidence.
-The finite process families cover known no-dispatch recovery, current selection and automatic original-session recovery; they do not enumerate every
+is deliberately retained without independent evidence; the separate issued-proof family proves its supported
+operator cancellation workflow, fresh Pause/Return and later functional recovery. Ordinary lost RemoteStart
+replies and CALLERRORs have directed real-TLS recovery tests too.
+The finite process families cover known no-dispatch recovery, issued-proof recovery, current selection and automatic original-session recovery; they do not enumerate every
 socket write or arbitrary interpreter instruction.
 
 HTTP property checks cover every byte split of six valid messages and every incomplete prefix of two self-delimiting
@@ -87,6 +94,21 @@ Automatic current retirement additionally has labeled stored-state correlation c
 real statement/deferred-COMMIT rollback/retry, and unrelated-debt preservation. These direct boundary tests do not
 claim that every corrupt state is reachable over the wire. Existing original-session source, Pause and failed-restoration
 controls also check immutable terminal receipts after successful recovery.
+
+Observation receipts commit with the queued event and local status effects. Pending publications are pinned;
+terminal retention is bounded by the journal capacity (default10,000), with room for currently pending observations.
+A replacement socket or process retains the logical generation until its first accepted Boot. A new Boot permits
+fresh untimed events under reused counters; validated timed observations can still match their exact earlier CALL
+and body. A new CALL ID always remains a new report. An identical untimed counter/body before replacement Boot
+is inherently ambiguous: publication follows the retained retry window, while local cable-departure handling stays
+conservative. No finite cache promises recognition after unbounded intervening traffic.
+
+Mapping migration preserves original lifecycle, authorization metadata and clock-discontinuity references in one
+SQLite transaction. A cloud number can recur only after the previous lifecycle and all its queued records drain.
+Active controls use the sole open local session; historical queries refuse multiple matches. Late historical
+meter reports wait while a newer mapping is unknown and are refused if its number was reused, preventing old
+samples from being published into the new session. Migration rollback, wrong identity and repeated zero IDs have
+directed checks. A code rollback must retain this journal and use a version compatible with any reused IDs.
 
 ## Evidence contract
 

@@ -77,10 +77,13 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
             if (
                 entry.get("completed") is None
                 and not entry.get("superseded")
-                and proof["kind"] in KINDS
+                and proof["kind"] in (*KINDS, "start-delivery")
                 and j.get("managed_control_fault") == proof["installed_fault"]
                 and (
                     proof["attestation"]["delivery_token"] == item.token
+                    or proof["kind"] == "start-delivery"
+                    and proof["attestation"]["local_transaction_id"] == item.transaction
+                    and proof.get("start_wire_ack") is not None
                     or proof.get("wire_ack") is not None
                     and j.db.execute(
                         "SELECT 1 FROM outbox WHERE token=?", (proof["attestation"]["delivery_token"],)

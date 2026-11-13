@@ -16,6 +16,20 @@ class Risk:
 
 RISKS = (
     Risk(
+        "OBSERVATION-RETRY",
+        "One identifiable observation retry creates one durable cloud publication without erasing a new report.",
+        "Actual local reply loss, cloud ACK/refusal and replacement retain delivery and two later mapped lifecycles.",
+        ("tests/test_observation_receipts.py", "tests/test_transaction_mapping_reuse.py"),
+        "Bounded recent receipts; untimed reused IDs after a new Boot cannot establish historical event identity.",
+    ),
+    Risk(
+        "CLOUD-START-REFUSAL",
+        "Explicit errors have a bounded persisted retry budget; denied authorization retains zero and real mapping.",
+        "Genuine Stop ACK, new Pause and separate Return recover later sessions; unknown outcomes need exact evidence.",
+        ("tests/test_managed_start_delivery_recovery.py", "tests/test_managed_issued_start_recovery.py"),
+        "Named reply forms and repeated recovery failures; operator statements are an explicit independent input.",
+    ),
+    Risk(
         "PROCESS-DEATH",
         "Actual SIGKILL cannot replay one-shot Start or promote an uncommitted selection.",
         "Fresh Boot recovers through Pause/Return or exact automatic original-session restoration and later outages.",

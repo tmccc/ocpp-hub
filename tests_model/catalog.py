@@ -22,6 +22,7 @@ from tests_model.deep_cases import (
 )
 from tests_model.ha_cases import outage_candidates, outage_exclusion, receipt_candidates, receipt_exclusion
 from tests_model.recovery_cases import start_candidates, start_exclusion
+from tests_model.review_cases import cloud_start_candidates, issued_start_candidates, observation_candidates
 from tests_model.schedule_cases import candidates, exclusion, source_candidates, source_exclusion
 from tests_model.storage_debt_cases import storage_fifo_candidates
 
@@ -44,6 +45,37 @@ class Family:
 
 
 FAMILIES = (
+    Family(
+        "issued_start_proof",
+        ("engine-model",),
+        "tests_model/test_issued_start_sequences.py::test_issued_start_proof_sequences",
+        issued_start_candidates,
+        no_exclusion,
+        36,
+        36,
+        ("START-DISPATCH", "PROCESS-DEATH", "DURABILITY", "NEXT-SESSION"),
+        ("actual_sigkill", "independent_durable_read", "peers_survived", "independent_mapping"),
+    ),
+    Family(
+        "observation_retry",
+        ("engine-model",),
+        "tests_model/test_observation_sequences.py::test_observation_retry_sequences",
+        observation_candidates,
+        no_exclusion,
+        120,
+        120,
+        ("OBSERVATION-RETRY", "DURABILITY", "NEXT-SESSION"),
+    ),
+    Family(
+        "cloud_start_recovery",
+        ("engine-model",),
+        "tests_model/test_cloud_start_sequences.py::test_cloud_start_recovery_sequences",
+        cloud_start_candidates,
+        no_exclusion,
+        432,
+        432,
+        ("CLOUD-START-REFUSAL", "RESTART", "NEXT-SESSION"),
+    ),
     Family(
         "process_overlap",
         ("engine-model",),

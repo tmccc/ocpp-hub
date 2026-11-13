@@ -203,7 +203,8 @@ async def test_late_cloud_rejection_holds_zero_and_retains_original_receipt(tmp_
     with pytest.raises(RecoveryRequiredError):
         await rig.cloud()
     assert rig.firmware.effective_limit() == 0 and rig.store.get("control")["inhibit"]
-    assert rig.store.next_delivery().state == "rejected"
+    assert rig.store.next_delivery() is None
+    assert rig.store.vendor_id(original["transactionId"]) == 9001
     assert (await rig.charger("retry", "StartTransaction", START))[2] == original
     await rig.close()
 
