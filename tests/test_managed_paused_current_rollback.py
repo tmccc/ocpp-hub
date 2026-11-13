@@ -117,7 +117,10 @@ async def test_pending_paused_selection_restarts_at_previous_current(
                 assert (await healthy(recovered))["owner_control_enabled"]
                 assert recovered.requests.receipt(returning)["state"] == "completed"
                 assert recovered.current.selected() == b.rig.bench.firmware.effective_limit() == previous
-                assert recovered.requests.receipt(request)["state"] == "uncertain"
+                # Verified Return retires the abandoned target; it must not leave an orphan recovery blocker.
+                receipt = recovered.requests.receipt(request)
+                assert receipt["state"] == "failed"
+                assert receipt["result"] == {"classification": "superseded_by_verified_return", "current_a": previous}
                 assert replacement.journal.get("managed_current_change")["state"] == "cancelled"
                 assert not starts(b.rig)
         finally:
