@@ -2,7 +2,7 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
-- Register the same reserved listener-port fixtures for model-only and combined test collection, preventing
+- Register the same reserved listener-port fixtures for model and HA proxy test collection, preventing
   unbound process-test ports from colliding with automatic loopback allocations during qualification.
 
 - Permit the known empty saved-reply table when repairing a pristine legacy bootstrap gap; retain refusal of

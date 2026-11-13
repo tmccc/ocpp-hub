@@ -10,6 +10,9 @@ from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry, device_registry, entity_registry, frame
 
+from tests.conftest import unused_tcp_port as unused_tcp_port
+from tests.conftest import unused_tcp_port_factory as unused_tcp_port_factory
+
 
 class LoopbackResolver(ThreadedResolver):
     """Mirror HA's resolver lifecycle without network discovery in a network-none container."""
