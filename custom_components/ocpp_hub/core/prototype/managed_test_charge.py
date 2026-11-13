@@ -258,12 +258,16 @@ class ManagedChargeTests:
     # Fault supervision still settles exact local closure; cloud delivery retains its independent recovery gate.
     async def retire_closed_after_fault(self) -> None:
         state = self.state()
+        request = self.journal.db.execute(
+            "SELECT state FROM managed_requests WHERE id=?", (state.get("id"),)
+        ).fetchone()
         if (
             self.controller.stopping
             or self.controller.requests.intent().mode != "paused"
             or state.get("kind") != "normal"
             or state.get("source") != "local"
             or state.get("state") == "completed"
+            and (request is None or request["state"] not in ("accepted", "running", "uncertain"))
             or local_start_receipt(self.journal).get("local") is None
         ):
             return

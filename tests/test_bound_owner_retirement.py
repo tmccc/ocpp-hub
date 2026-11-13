@@ -19,7 +19,10 @@ from tests_model.test_schedule_sequences import model_tls as model_tls
 # Intent: each real SQLite refusal retains the exact local lease/request and all cloud evidence until one commit.
 # Why: releasing in-memory authority before failed durable settlement can make a closed owner permanently unrecoverable.
 @pytest.mark.parametrize("boundary", ["request", "metadata", "commit"])
-async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(tmp_path, model_tls, monkeypatch, boundary):
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
+    tmp_path, model_tls, monkeypatch, boundary, legacy_metadata
+):
     monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
     async with mp.managed_bench(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch) as rig:
         async with running(rig, "atomic-unmapped-owner", owner_tag="APP_OWNER") as (s, c, sock):
@@ -50,6 +53,10 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(tmp_path, mod
                 )
             )[0] == 3
             j = s.journal
+            if legacy_metadata:
+                # Older releases committed completed metadata before their separate request update: retain that input.
+                j.put("managed_test_charge", {**c.tests.state(), "state": "completed"})
+                assert c.requests.receipt(identifier)["state"] in ("accepted", "running", "uncertain")
             if boundary == "commit":
                 j.db.execute("CREATE TABLE owner_parent(id INTEGER PRIMARY KEY)")
                 j.db.execute("CREATE TABLE owner_child(id REFERENCES owner_parent(id) DEFERRABLE INITIALLY DEFERRED)")

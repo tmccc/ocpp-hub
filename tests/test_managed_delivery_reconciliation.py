@@ -181,7 +181,8 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
             journal.close()
             for invalid in ({"kind": "test"}, {"state": "starting"}, {"id": "wrong"}, {"local_transaction": local + 1}):
                 journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
-                journal.put("managed_test_charge", original | invalid)
+                # Legacy metadata remained running after closure; validate that older recovery input independently.
+                journal.put("managed_test_charge", original | {"state": "running"} | invalid)
                 journal.close()
                 with pytest.raises(RecoveryRequiredError):
                     await operator.run("inspect", config, strategy, None, native_port)
@@ -253,7 +254,12 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
         if local_owner:
             journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
             assert journal.get("managed_test_charge")["state"] == "completed"
-            assert journal.get(KEY)[str(local)]["proof"]["prior_closed_normal_start"]["state"] == "running"
+            assert journal.get(KEY)[str(local)]["proof"]["prior_closed_normal_start"] is None
+            request = journal.get("managed_test_charge")["id"]
+            assert (
+                journal.db.execute("SELECT state FROM managed_requests WHERE id=?", (request,)).fetchone()[0]
+                == "completed"
+            )
             journal.close()
         save_private(evidence_path, evidence | {"evidence_sha256": "0" * 64})
         with pytest.raises(RecoveryRequiredError, match="cannot be replaced"):
