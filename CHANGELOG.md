@@ -2,6 +2,14 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Retain exact received cloud replies across acknowledgement write/commit failure and replacement, without
+  replaying a known outcome. Keep unknown Starts and real refusals under their existing restrictive recovery.
+- Bind every simultaneous recovery proof to the new Pause and retain each denied session's own Stop receipt.
+  Add narrowly attested recovery for legacy storage latches and coupled vendor-command/cloud-mapping debt.
+- Keep failed Start/current cleanup supervised until storage recovers, preserve newer owner instructions and
+  retire disconnected transports and Boot confirmation even if their durable generation update fails.
+- Add repeated real SQLite failure, same-service/replacement, mixed-proof and later-session recovery checks.
+
 - Persist bounded observation retry receipts with their queue admission, preserving genuine repeated statuses and
   conservative cable-departure handling across reconnects, new Boots and process replacement.
 - Retry explicit cloud Start errors with a persisted bounded budget. Preserve valid denied-session mappings for

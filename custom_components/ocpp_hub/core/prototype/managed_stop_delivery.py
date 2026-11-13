@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .managed_combined_start_recovery import KIND as COMBINED_KIND
+from .managed_combined_start_recovery import combined_stop_matches, record_combined_stop_ack, retains_denial_fault
 from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 
 REJECTION = "managed_stop_reply_rejection"
@@ -77,10 +79,11 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
             if (
                 entry.get("completed") is None
                 and not entry.get("superseded")
-                and proof["kind"] in (*KINDS, "start-delivery")
+                and proof["kind"] in (*KINDS, "start-delivery", COMBINED_KIND)
                 and j.get("managed_control_fault") == proof["installed_fault"]
                 and (
                     proof["attestation"]["delivery_token"] == item.token
+                    or combined_stop_matches(proof, identity)
                     or proof["kind"] == "start-delivery"
                     and proof["attestation"]["local_transaction_id"] == item.transaction
                     and proof.get("start_wire_ack") is not None
@@ -95,10 +98,11 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
                     **entry,
                     "superseded": {"reply_digest": rejection["reply_digest"], "at_epoch": time.time()},
                 }
-                j.put(
-                    "managed_control_fault",
-                    {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
-                )
+                if not retains_denial_fault(j, proof):
+                    j.put(
+                        "managed_control_fault",
+                        {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
+                    )
                 changed = True
         if changed:
             j.put(PROOFS, records)
@@ -153,6 +157,23 @@ def record_stop_ack(j: Journal, item: Delivery, response: dict[str, Any]) -> Non
     if not j.db.in_transaction:
         raise RecoveryRequiredError("Stop wire acknowledgment must share its actual journal commit")
     identity = stop_identity(j, item)
+    record_combined_stop_ack(j, item, response, identity)
+    denials = j.get("managed_start_denials", {})
+    denial = denials.get(str(item.transaction))
+    if denial is not None:
+        if (
+            denial["local"] != identity["local_transaction_id"]
+            or denial["vendor"] != identity["vendor_transaction_id"]
+            or denial["start_digest"] != identity["start_digest"]
+        ):
+            raise RecoveryRequiredError("denied session Stop does not match its immutable Start")
+        wire = {
+            **identity,
+            "fault": denial.get("fault"),
+            "reply_digest": fingerprint(response),
+            "at_epoch": time.time(),
+        }
+        j.put("managed_start_denials", {**denials, str(item.transaction): {**denial, "wire_ack": wire}})
     records, changed = j.get(PROOFS, {}), False
     for key, entry in records.items():
         proof = entry["proof"]

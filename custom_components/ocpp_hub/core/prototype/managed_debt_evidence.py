@@ -42,6 +42,8 @@ class DebtAttestation:
             raise SecurityError("operator debt evidence needs recent independent verification")
         for key in (
             "command_quiescent",
+            "command_session_independently_verified",
+            "cloud_start_accepted",
             "original_state_independently_verified",
             "command_no_longer_pending",
             "cloud_stop_independently_verified",
@@ -55,7 +57,7 @@ class DebtAttestation:
         for key in ("mutation_token", "request_id", "grant_token"):
             if key in value and (not isinstance(value[key], str) or re.fullmatch(r"[a-f0-9]{32}", value[key]) is None):
                 raise SecurityError("operator evidence has an invalid command identity")
-        for key in ("observation_token", "delivery_token"):
+        for key in ("observation_token", "delivery_token", "stop_delivery_token"):
             if key in value and (
                 not isinstance(value[key], str) or re.fullmatch(r"e-[a-f0-9]{32}", value[key]) is None
             ):
@@ -77,6 +79,25 @@ class VendorWriteAttestation(DebtAttestation):
     payload_digest: str
     command_quiescent: bool
     original_state_independently_verified: bool
+
+
+@dataclass(frozen=True)
+class VendorStartMappingAttestation(DebtAttestation):
+    """Independently settle one exact vendor command and identify its cloud-accepted closed lifecycle."""
+
+    mutation_token: str
+    action: str
+    payload_digest: str
+    local_transaction_id: int
+    vendor_transaction_id: int
+    delivery_token: str
+    stop_delivery_token: str
+    start_digest: str
+    stop_digest: str
+    command_quiescent: bool
+    original_state_independently_verified: bool
+    command_session_independently_verified: bool
+    cloud_start_accepted: bool
 
 
 @dataclass(frozen=True)
@@ -145,12 +166,25 @@ class StartDeliveryAttestation(DebtAttestation):
     original_state_independently_verified: bool
 
 
+@dataclass(frozen=True)
+class StorageFaultAttestation(DebtAttestation):
+    """The operator independently establishes the old latch's cause and absence of commands that can execute later."""
+
+    fault_digest: str
+    diagnostic_digest: str
+    command_quiescent: bool
+    fault_origin_independently_verified: bool
+    original_state_independently_verified: bool
+
+
 ATTESTATIONS: dict[str, type[DebtAttestation]] = {
     "vendor-write": VendorWriteAttestation,
+    "vendor-start-mapping": VendorStartMappingAttestation,
     "local-start": LocalStartAttestation,
     "observation": ObservationAttestation,
     "vendor-start": VendorStartAttestation,
     "stop-delivery": StopDeliveryAttestation,
     "stop-fault": StopDeliveryAttestation,
     "start-delivery": StartDeliveryAttestation,
+    "storage-fault": StorageFaultAttestation,
 }

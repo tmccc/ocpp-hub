@@ -1002,7 +1002,8 @@ charger's correlated result or error. Unknown commands and undocumented iCS vari
 - The local receiver and controls remain available during cloud outages. Cloud registration honours Accepted,
   Pending and Rejected replies and retry intervals across reconnects. Independent OCPP heartbeats continue through
   an ambiguous history delivery; websocket Ping/Pong detects dead transports. Losing or replacing the local charger
-  retires its cloud connection. Old readers cannot detach a newer connection.
+  retires its cloud connection, Boot and ceiling confirmation even if saving the disconnect generation fails.
+  A new connection needs a successful durable generation and genuine Boot. Old readers cannot detach it.
 - A local stop installs a constant `ChargePointMaxProfile` at 0 A, then stops the known transaction. The hold survives
   restart and is reapplied on reconnect. An independent fake firmware can fire an already stored native timer with
   no network request and still cannot draw current through that hold. An explicit start/release preserves any
@@ -1018,12 +1019,28 @@ charger's correlated result or error. Unknown commands and undocumented iCS vari
   Accepted events retain their bodies and FIFO order. Full lifecycle capacity refuses new Starts before acknowledgement;
   neither capacity nor recovery silently drops already accepted history.
 
+A correlated cloud reply is retained while its acknowledgement transaction retries. Once the reply itself has
+been saved, replacement uses that exact response, including a denied authorization, without transmitting the
+request again. Dequeue or a committed rejection retires the reply in the same transaction. Storage blockage alone
+does not become a permanent owner fault when the received outcome is known and retryable. If storage prevented
+saving a Start reply before replacement, its outcome remains unknown and requires independent reconciliation.
+
+Start and current-setting workers retain ownership of failed cleanup while storage recovers. They retry cleanup,
+not positive commands. An exact prepared, unissued Start can be retired after its worker has ended; an issued or
+accepted command retains its stricter recovery requirements. A failed current selection preserves the previous
+verified selection and any newer Pause or Boot.
+
 An explicit cloud Start CALLERROR keeps the original event token and body for at most three transmissions, with
 60 then120 seconds between attempts. The retry budget and deadline survive restart. Exhaustion retains the event
 for independently approved retry. A valid non-Accepted Start result keeps its real cloud transaction ID so its
 genuine Stop can still deliver; the denied session stays at zero. After its real Stop acknowledgement, a fresh
 verified Pause clears only its matching fault. The tag's denied authorization remains until a new actual cloud
 approval permits it. Return remains a separate action.
+
+Each denied session retains its own actual Stop acknowledgement. A Pause covering several denials completes only
+the exact associated sessions, after every required Stop has been acknowledged. It also binds every applicable
+mapping or operator proof; changed, added or removed evidence requires a new Pause. Historical denial records with
+no fault association do not acquire a new fault or fabricated completion merely because the queue is empty.
 
 An ambiguous cloud Start remains quarantined because resending it could create a duplicate transaction. Managed
 mode applies its existing zero hold even if the owner's session is open; this can interrupt that charge. For one
@@ -1049,7 +1066,7 @@ The workflow refuses unrelated faults, ambiguous additional transactions, missin
 commands, active temporary timers, changed configuration/history, and unconfirmed station zero. It never guesses a
 vendor ID, replays Start, invents a Stop, clears unrelated debts or automatically raises current.
 
-`tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for seven specific debts:
+`tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for nine specific debts:
 
 - `--kind observation` retires one legacy rejected routine report.
 - `--kind vendor-write` resolves one independently settled uncertain vendor mutation.
@@ -1060,6 +1077,10 @@ vendor ID, replays Start, invents a Stop, clears unrelated debts or automaticall
 - `--kind stop-fault` reconciles the remaining delivery fault after that exact Stop has a preserved real wire receipt.
 - `--kind start-delivery` permits a new bounded retry budget for one quarantined genuine closed Start/Stop pair,
   only after independent verification that the cloud did not already accept that Start.
+- `--kind storage-fault` reconciles a plain legacy delivery fault whose temporary storage cause and absence of
+  pending commands have been independently established, after all actual delivery and command debt has settled.
+- `--kind vendor-start-mapping` jointly settles one uncertain canonical cloud RemoteStart and its exact closed
+  lifecycle, using independent command-settlement, association and accepted cloud-mapping evidence.
 
 The service must be stopped with an existing paused intent and independently verified closed zero hold. An
 unresolved issued Start can prevent Pause completion; that does not replace the independent physical-zero check.
@@ -1090,6 +1111,18 @@ event identity and queued genuine Stop. Actual Start mapping and Stop acknowledg
 a new Pause can consume the proof. A further unknown outcome or exhausted retry supersedes that permission and
 supports new exact mapping or retry evidence, including after process replacement. Legacy rejected Starts can
 also use the mapping workflow when the actual cloud transaction number is independently established.
+
+`storage-fault` requires literal `command_quiescent: true`, `fault_origin_independently_verified: true` and
+`original_state_independently_verified: true`, with the inspected fault and diagnostic/history digests. Zero and an
+empty queue do not establish the cause. Any unresolved historical owner request, unknown mapping, refused Stop,
+active grant, current operation or other recovery proof is refused; this route does not waive old uncertain work.
+
+`vendor-start-mapping` requires literal `command_quiescent: true`, `command_session_independently_verified: true`,
+`cloud_start_accepted: true` and `original_state_independently_verified: true`. Supply the independently verified
+`vendor_transaction_id` with the inspected command and lifecycle fields. The command must match the exact tag and
+optional connector form; commands with an additional charging profile are refused. Command settlement and Start
+mapping commit together, without retransmitting either Start. The genuine Stop stays queued. Its actual cloud
+acknowledgement and a fresh verified Pause precede Return; an unrelated command or lifecycle cannot share this proof.
 
 Reconciliation archives the exact prior state and changes only its named debt. It has no charger writer and does
 not report successful execution of an uncertain command. Legacy report recovery retains later queued genuine

@@ -13,7 +13,7 @@ from .managed_cutoffs import supervised_timer
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
 from .managed_delivery_recovery import complete_delivery_recovery, delivery_recovery_evidence
 from .managed_occurrences import occurrences
-from .managed_start_delivery import complete_denied_start, denied_start_evidence
+from .managed_start_delivery import DENIALS, complete_denied_start, denial_faults, denied_start_evidence
 from .store import RecoveryRequiredError, fingerprint
 from .trial_rollback import require_lifecycle_idle
 
@@ -25,23 +25,43 @@ PROOF = "managed_release_reconciliation"
 FAULT = "owner_release_unconfirmed"
 
 
-# Legacy ordinary transport latches require their exact stored availability diagnostic, never generic authority drift.
-def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
-    if fault.get("classification") == FAULT:
-        return True
-    if legacy_current_evidence(c, fault) is not None:
-        return True
-    if delivery_recovery_evidence(c, fault) is not None:
-        return True
-    if operator_recovery_evidence(c, fault) is not None:
-        return True
-    if denied_start_evidence(c, fault) is not None:
-        return True
+# Capture every applicable proof together; selecting one cannot acknowledge another proof on the same fault.
+def release_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
+    evidence: dict[str, Any] = {}
+    operator = operator_recovery_evidence(c, fault)
+    active = [
+        entry
+        for entry in c.session.journal.get("managed_operator_debt_reconciliations", {}).values()
+        if entry.get("completed") is None
+        and not entry.get("superseded")
+        and entry["proof"].get("installed_fault") == fault
+    ]
+    if active and (len(active) != 1 or operator is None):
+        return None
+    denied = denied_start_evidence(c, fault)
+    sources = denial_faults(c.session.journal, fault)
+    if denied is None and any(
+        denial.get("fault") in sources and denial.get("completed") is None
+        for denial in c.session.journal.get(DENIALS, {}).values()
+    ):
+        return None
+    current = legacy_current_evidence(c, fault)
+    if current is not None:
+        evidence["current_failure_evidence"] = current
+    for key, proof in (
+        ("delivery_reconciliation", delivery_recovery_evidence(c, fault)),
+        ("operator_reconciliation", operator),
+        ("denied_start_reconciliation", denied),
+    ):
+        if proof is not None:
+            evidence[key] = fingerprint(proof)
+    if evidence or fault.get("classification") == FAULT:
+        return evidence
     if fault.get("classification") != "native_authority_or_preservation_failed":
-        return False
+        return None
     failure = c.session.journal.get("managed_native_failure", {})
     at, observed = fault.get("at_epoch"), failure.get("at_epoch")
-    return (
+    eligible = (
         failure.get("type") in ("NativeTransportUnavailableError", "StaleEvidenceError")
         and isinstance(at, (int, float))
         and not isinstance(at, bool)
@@ -53,62 +73,32 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
         and math.isfinite(observed)
         and 0 <= at - observed <= 2
     )
+    return {"native_failure": failure} if eligible else None
+
+
+# Generic authority faults still require independently identified evidence, even at an apparently idle zero.
+def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
+    return release_evidence(c, fault) is not None
 
 
 # Call inside the existing Pause acceptance transaction after its new paused revision has been recorded.
 def record_release_pause(c: ManagedController, identifier: str) -> None:
     j = c.session.journal
     fault = j.get("managed_control_fault", {})
-    if not recoverable_fault(c, fault):
+    evidence = release_evidence(c, fault)
+    if evidence is None:
         return
     intent = c.requests.intent()
     if intent.mode != "paused":
         raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
-    acknowledgement = {"fault": fault, "pause_request": identifier, "revision": intent.revision}
-    current = legacy_current_evidence(c, fault)
-    delivery = delivery_recovery_evidence(c, fault)
-    operator = operator_recovery_evidence(c, fault)
-    denied = denied_start_evidence(c, fault)
-    if operator is not None:
-        acknowledgement["operator_reconciliation"] = fingerprint(operator)
-    elif delivery is not None:
-        acknowledgement["delivery_reconciliation"] = fingerprint(delivery)
-    elif denied is not None:
-        acknowledgement["denied_start_reconciliation"] = fingerprint(denied)
-    elif current is not None:
-        acknowledgement["current_failure_evidence"] = current
-    elif fault.get("classification") != FAULT:
-        acknowledgement["native_failure"] = j.get("managed_native_failure")
-    j.put(ACK, acknowledgement)
+    j.put(ACK, {"fault": fault, "pause_request": identifier, "revision": intent.revision, **evidence})
 
 
 # Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.
 def acknowledged_evidence(c: ManagedController, fault: dict[str, Any], ack: dict[str, Any]) -> bool:
-    denied = denied_start_evidence(c, fault)
-    if denied is not None:
-        return ack.get("denied_start_reconciliation") == fingerprint(denied)
-    if "denied_start_reconciliation" in ack:
-        return False
-    operator = operator_recovery_evidence(c, fault)
-    if operator is not None:
-        return ack.get("operator_reconciliation") == fingerprint(operator)
-    if "operator_reconciliation" in ack:
-        return False
-    delivery = delivery_recovery_evidence(c, fault)
-    if delivery is not None:
-        return ack.get("delivery_reconciliation") == fingerprint(delivery)
-    if "delivery_reconciliation" in ack:
-        return False
-    current = legacy_current_evidence(c, fault)
-    if current is not None:
-        return bool(ack.get("current_failure_evidence") == current)
-    return bool(
-        "current_failure_evidence" not in ack
-        and (
-            fault.get("classification") == FAULT
-            or ack.get("native_failure") == c.session.journal.get("managed_native_failure")
-        )
-    )
+    expected = release_evidence(c, fault)
+    actual = {key: value for key, value in ack.items() if key not in ("fault", "pause_request", "revision")}
+    return expected is not None and actual == expected
 
 
 # Prove only this fault is recoverable; never clear vendor uncertainty or release positive current here.
@@ -140,6 +130,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     current = legacy_current_evidence(c, fault)
     delivery = delivery_recovery_evidence(c, fault)
     operator = operator_recovery_evidence(c, fault)
+    denied = denied_start_evidence(c, fault)
 
     # Any newer Pause, Boot, local operation, request or unrelated write debt revokes this snapshot.
     def guard() -> None:
@@ -242,6 +233,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 "prior_current_failure": current,
                 "delivery_reconciliation": fingerprint(delivery) if delivery is not None else None,
                 "operator_reconciliation": fingerprint(operator) if operator is not None else None,
+                "denied_start_reconciliation": fingerprint(denied) if denied is not None else None,
                 "pause_request": ack["pause_request"],
                 "revision": intent.revision,
                 "native_digest": native.digest,
@@ -257,7 +249,6 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             complete_delivery_recovery(j, delivery, ack["pause_request"])
         if operator is not None:
             complete_operator_recovery(j, operator, ack["pause_request"])
-        denied = denied_start_evidence(c, fault)
         if denied is not None:
             complete_denied_start(j, denied, ack["pause_request"])
         if current is not None:

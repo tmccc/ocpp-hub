@@ -111,6 +111,20 @@ meter reports wait while a newer mapping is unknown and are refused if its numbe
 samples from being published into the new session. Migration rollback, wrong identity and repeated zero IDs have
 directed checks. A code rollback must retain this journal and use a version compatible with any reused IDs.
 
+Additional focused regressions cover healthy managed delivery while actual acknowledgement BEGIN, statement and
+deferred-COMMIT writes fail, with two failure cycles, saved-reply replacement and later sessions/native outages.
+They distinguish failure to save a received reply from failure of its acknowledgement commit. Unknown Start,
+denied authorization, exhausted errors and Stop refusal retain separate recovery obligations.
+
+The mixed-proof cases use the actual mapping tool and bind every proof across an accepted Pause and held native
+reads. Multiple denied sessions need their own actual Stop receipts. Coupled vendor-command/mapping cases use
+independent association and settlement evidence, atomic rollback and genuine later Stop delivery.
+
+Worker regressions include both poll orderings, repeated cleanup refusal, a newer Pause/Boot and the actual service
+and management API without helper ticks. Disconnect regressions fail the actual generation transaction and require
+volatile Boot/control retirement, autonomous cloud disconnection and fresh reconnection. These are focused tests
+linked by the risk matrix; their case counts do not change the finite-family totals above or claim a new qualification.
+
 ## Evidence contract
 
 Follow `developer.md`: four complete20-worker phases (`engine-model`, `ha-proxy`, `ha-proxy-legacy`, `ha-legacy`)

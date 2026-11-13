@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -110,6 +111,7 @@ class ManagedCurrentLimits:
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
+        self._closing = False
         self.journal.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_current_requests(id TEXT PRIMARY KEY,current_a INTEGER)"
         )
@@ -405,59 +407,82 @@ class ManagedCurrentLimits:
                 guard()
                 j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "completed"})
                 c.requests.finish(identifier, "completed", {"current_a": value, "charging_started": False})
-        except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
-            j.put("managed_current_failure", {"type": type(error).__name__, "detail": str(error)[:1024]})
-            intent = c.requests.intent()
-            superseded = intent.mode != mode or intent.revision != revision
-            timer = j.get(KEY, {})
-            active = j.active()
-            retired = c.schedule.revoked(timer)
-            overlap = active is not None or j.get("managed_current_change", {}).get("observed_open")
-            if not superseded and mode == "app" and timer.get("state") in OBSERVABLE:
-                reason = "current_unconfirmed"
-                if retired:
-                    reason = "timer_retired"
-                elif active is not None or timer.get("unreported_native"):
-                    reason = "session_opened"
-                self.cancel_under_timer(identifier, value, previous_value, reason)
-                await c.schedule.protect_station(j.get(KEY))
+        except (
+            DeniedError,
+            SecurityError,
+            RecoveryRequiredError,
+            UnavailableError,
+            TimeoutError,
+            sqlite3.Error,
+        ) as error:
+            await self._failed_apply(identifier, value, previous_value, mode, revision, error)
+
+    # Keep exact failed work owned while SQLite is unavailable; repair cannot replay a positive profile.
+    async def _failed_apply(
+        self, identifier: str, value: int, previous_value: int, mode: str, revision: int, error: Exception
+    ) -> None:
+        c, g, j = self.controller, self.controller.session.gateway, self.journal
+        while not self._closing and not c.stopping:
+            try:
+                change = j.get("managed_current_change", {})
+                if change.get("id") != identifier or change.get("state") != "pending":
+                    return
+                j.put("managed_current_failure", {"type": type(error).__name__, "detail": str(error)[:1024]})
+                intent = c.requests.intent()
+                superseded = intent.mode != mode or intent.revision != revision
+                timer = j.get(KEY, {})
+                active = j.active()
+                retired = c.schedule.revoked(timer)
+                overlap = active is not None or j.get("managed_current_change", {}).get("observed_open")
+                if not superseded and mode == "app" and timer.get("state") in OBSERVABLE:
+                    reason = "current_unconfirmed"
+                    if retired:
+                        reason = "timer_retired"
+                    elif active is not None or timer.get("unreported_native"):
+                        reason = "session_opened"
+                    self.cancel_under_timer(identifier, value, previous_value, reason)
+                    await c.schedule.protect_station(j.get(KEY))
+                    return
+                if not superseded and mode == "app" and overlap:
+                    self.cancel_overlap(identifier, previous_value, "session_opened")
+                    try:
+                        await self.protect_overlap()
+                    except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
+                        pass  # Durable operation recovery retries zero; a lost acknowledgement never grants Stop.
+                    return
+                with j.atomic():
+                    if not superseded:
+                        j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                        g.controls._claim(True, stopping=True)
+                    control = j.get("control", {})
+                    if control.get("inhibit") is True and j.get("managed_current_change", {}).get("id") == identifier:
+                        j.put("control", {**control, "resume_limit": previous_value})
+                    j.put(
+                        "managed_current_change",
+                        {
+                            **j.get("managed_current_change", {}),
+                            "id": identifier,
+                            "current_a": value,
+                            "previous_a": previous_value,
+                            "mode": mode,
+                            "state": "uncertain",
+                        },
+                    )
+                    c.requests.finish(
+                        identifier,
+                        "failed" if superseded else "uncertain",
+                        {
+                            "classification": "current_unconfirmed",
+                            "requested_current_a": value,
+                            "previous_current_a": previous_value,
+                        },
+                    )
+                if c.pause_task is None or c.pause_task.done():
+                    c.pause_task = asyncio.create_task(c._stop_requested())
                 return
-            if not superseded and mode == "app" and overlap:
-                self.cancel_overlap(identifier, previous_value, "session_opened")
-                try:
-                    await self.protect_overlap()
-                except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
-                    pass  # Durable operation recovery retries zero; a lost acknowledgement never grants Stop.
-                return
-            with j.atomic():
-                if not superseded:
-                    j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
-                    g.controls._claim(True, stopping=True)
-                control = j.get("control", {})
-                if control.get("inhibit") is True and j.get("managed_current_change", {}).get("id") == identifier:
-                    j.put("control", {**control, "resume_limit": previous_value})
-                j.put(
-                    "managed_current_change",
-                    {
-                        **j.get("managed_current_change", {}),
-                        "id": identifier,
-                        "current_a": value,
-                        "previous_a": previous_value,
-                        "mode": mode,
-                        "state": "uncertain",
-                    },
-                )
-                c.requests.finish(
-                    identifier,
-                    "failed" if superseded else "uncertain",
-                    {
-                        "classification": "current_unconfirmed",
-                        "requested_current_a": value,
-                        "previous_current_a": previous_value,
-                    },
-                )
-            if c.pause_task is None or c.pause_task.done():
-                c.pause_task = asyncio.create_task(c._stop_requested())
+            except sqlite3.Error:
+                # A later Pause is read again on every retry and retains its own revision and control ticket.
+                await asyncio.sleep(0.1)
 
     # Persist the failed operation's zero hold without manufacturing durable owner Pause intent or Stop authority.
     def cancel_overlap(self, identifier: str, previous: int, reason: str) -> None:
@@ -599,10 +624,11 @@ class ManagedCurrentLimits:
 
     # Supervision observes the completed update instead of sampling through a legitimate profile replacement.
     async def settle(self) -> None:
-        if self.worker is not None and not self.worker.done():
+        if self.worker is not None and not self.worker.cancelled():
             await asyncio.shield(self.worker)
 
     # Retire all owned current work before the single journal owner closes its database.
     async def close(self) -> None:
+        self._closing = True
         if self.worker is not None:
             await asyncio.gather(self.worker, return_exceptions=True)

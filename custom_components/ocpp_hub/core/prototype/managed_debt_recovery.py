@@ -10,6 +10,8 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
+from .managed_combined_start_recovery import KIND as COMBINED_KIND
+from .managed_combined_start_recovery import combined_candidate, combined_resolution
 from .managed_cutoffs import supervised_timer
 from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
@@ -19,6 +21,7 @@ from .managed_start_delivery import KIND as START_KIND
 from .managed_start_delivery import RETRIES, start_resolution
 from .managed_stop_delivery import KINDS as STOP_KINDS
 from .managed_stop_delivery import NO_REPLY, REJECTION, WIRE_ACK, stop_identity, stop_resolution
+from .managed_storage_recovery import storage_candidate, storage_resolution
 from .native_bounded import NativeBoundedSpec
 from .store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_handover_evidence import HandoverEvidence
@@ -48,6 +51,7 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "stop_rejection": j.get(REJECTION),
         "stop_wire_ack": j.get(WIRE_ACK),
         "start_retries": j.get(RETRIES),
+        "denials": j.get("managed_start_denials"),
         "test": j.get("managed_test_charge"),
         "receipt": j.get("local_start_receipt"),
         "deferred": j.get("managed_deferred_start"),
@@ -62,6 +66,7 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "outbox": [dict(row) for row in j.db.execute("SELECT * FROM outbox ORDER BY seq")],
         "transactions": [dict(row) for row in j.db.execute("SELECT * FROM transactions ORDER BY local")],
         "kind": kind,
+        **({"storage_resolution": storage_resolution(j)} if kind == "storage-fault" else {}),
     }
 
 
@@ -71,7 +76,7 @@ def require_common_debt_idle(j: Journal, kind: str) -> None:
         any(entry.get("completed") is None and not entry.get("superseded") for entry in j.get(KEY, {}).values())
         or j.get("managed_control_fault", {}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
-        or kind not in ("observation", "stop-delivery", START_KIND)
+        or kind not in ("observation", "stop-delivery", START_KIND, COMBINED_KIND)
         and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
         or j.get("managed_current_change", {}).get("state") not in (None, "completed", "cancelled")
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
@@ -81,13 +86,13 @@ def require_common_debt_idle(j: Journal, kind: str) -> None:
         or kind != "local-start"
         and j.get("managed_test_charge", {}).get("state") not in (None, "completed")
         and not (kind == START_KIND and closed_normal_delivery(j))
-        or kind not in ("observation", "stop-delivery", START_KIND)
+        or kind not in ("observation", "stop-delivery", START_KIND, COMBINED_KIND)
         and j.next_delivery() is not None
-        or kind != "vendor-write"
+        or kind not in ("vendor-write", COMBINED_KIND)
         and j.get("uncertain_vendor_command")
         or kind not in ("vendor-write", "vendor-start")
         and j.get("vendor_start_grant")
-        or kind != "vendor-write"
+        or kind not in ("vendor-write", COMBINED_KIND)
         and j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
     ):
         raise RecoveryRequiredError("operator reconciliation cannot waive another unsettled operation")
@@ -377,8 +382,12 @@ def debt_candidate(
     require_original_zero(j, book, spec, n)
     require_common_debt_idle(j, kind)
     snapshot = debt_snapshot(j, spec, kind)
-    if kind == "local-start":
+    if kind == COMBINED_KIND:
+        specific = combined_candidate(j, snapshot)
+    elif kind == "local-start":
         specific = local_start_candidate(j, snapshot)
+    elif kind == "storage-fault":
+        specific = storage_candidate(j, snapshot)
     elif kind == START_KIND:
         if snapshot["requests"]:
             raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
@@ -418,6 +427,10 @@ def debt_candidate(
 # This postimage excludes later Pause revisions and routine queue drain, but pins every debt retired by the tool.
 def resolved_debt(j: Journal, kind: str, proof: dict[str, Any]) -> dict[str, Any]:
     e = proof["attestation"]
+    if kind == COMBINED_KIND:
+        return combined_resolution(j, e, proof.get("wire_ack"))
+    if kind == "storage-fault":
+        return storage_resolution(j)
     if kind in STOP_KINDS:
         return stop_resolution(j, e, proof.get("wire_ack"))
     if kind == START_KIND:
@@ -472,7 +485,11 @@ def reconcile_debt(
         raise RecoveryRequiredError("operator evidence does not identify the exact current debt")
     snapshot = debt_snapshot(j, spec, kind)
     closed_start = kind == START_KIND and closed_normal_delivery(j)
-    fault = {"classification": FAULT, "proof": identifier, "at_epoch": time.time()}
+    fault = (
+        snapshot["fault"]
+        if kind == COMBINED_KIND
+        else {"classification": FAULT, "proof": identifier, "at_epoch": time.time()}
+    )
     proof = {
         "kind": kind,
         "attestation": e,
@@ -490,7 +507,16 @@ def reconcile_debt(
     with j.atomic():
         if snapshot != debt_snapshot(j, spec, kind) or records != j.get(KEY, {}):
             raise RecoveryRequiredError("operator reconciliation authority changed")
-        if kind == "vendor-write":
+        if kind == COMBINED_KIND:
+            j.reconcile_mutation(e["mutation_token"])
+            j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
+            current = j.next_delivery()
+            assert current is not None
+            j.acknowledge_in_transaction(
+                current, {"transactionId": e["vendor_transaction_id"], "idTagInfo": {"status": "Accepted"}}
+            )
+            proof["wire_ack"] = None
+        elif kind == "vendor-write":
             j.reconcile_mutation(e["mutation_token"])
             j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
             if snapshot["grant"]:
@@ -548,7 +574,7 @@ def reconcile_debt(
                     e["request_id"],
                 ),
             )
-        else:
+        elif kind != "storage-fault":
             assert head is not None
             j.db.execute(
                 "INSERT INTO rejected_observations VALUES(?,?,?,?,?,?,?)",
@@ -566,17 +592,31 @@ def reconcile_debt(
 # A new Pause can acknowledge one exact proof only after its retained lifecycle and all unrelated debts settle.
 def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
     j = c.session.journal
-    entry = j.get(KEY, {}).get(fault.get("proof"))
-    if (
-        fault.get("classification") != FAULT
-        or not entry
-        or entry.get("completed") is not None
-        or entry.get("superseded")
-    ):
+    records = j.get(KEY, {})
+    if fault.get("classification") == "owner_control_or_delivery_uncertain":
+        matches = [
+            (identifier, entry)
+            for identifier, entry in records.items()
+            if entry.get("completed") is None
+            and not entry.get("superseded")
+            and entry["proof"]["kind"] == COMBINED_KIND
+            and entry["proof"]["installed_fault"] == fault
+        ]
+        if len(matches) != 1:
+            return None
+        identifier, entry = matches[0]
+    elif fault.get("classification") == FAULT:
+        identifier = fault.get("proof")
+        entry = records.get(identifier)
+    else:
+        return None
+    if not entry or entry.get("completed") is not None or entry.get("superseded"):
         return None
     proof: dict[str, Any] = entry["proof"]
+    if identifier != fingerprint(proof["attestation"]):
+        return None
     if (
-        proof["kind"] in STOP_KINDS
+        proof["kind"] in (*STOP_KINDS, COMBINED_KIND)
         and proof.get("wire_ack") is None
         or proof["kind"] == START_KIND
         and (proof.get("start_wire_ack") is None or proof.get("stop_wire_ack") is None)

@@ -59,8 +59,9 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
                 await asyncio.gather(c.tests.worker, *victims, return_exceptions=True)
                 assert len(victims) == 1 and victims[0].cancelled()
             else:
-                with pytest.raises(sqlite3.IntegrityError, match="synthetic preparation marker failure"):
-                    await c.tests.settle()
+                await c.tests.settle()
+                assert c.requests.receipt(identifier)["state"] == "uncertain"
+                assert c.requests.receipt(identifier)["result"]["classification"] == "start_not_confirmed"
                 s.journal.db.execute("DROP TRIGGER fail_start_marker")
         finally:
             loop.set_task_factory(original_factory)

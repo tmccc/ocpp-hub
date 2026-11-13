@@ -18,6 +18,7 @@ from typing import Any
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
 from .auth_info import InfoBook, validate_info
 from .authorisation import VendorAuthorisation
+from .delivery_reply import DeliveryReply
 from .events import validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, known_write
@@ -36,7 +37,7 @@ from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
 from .security import SecurityError
-from .store import ConflictError, Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
 
 
@@ -131,6 +132,8 @@ class Gateway:
         self._tasks: set[asyncio.Task[None]] = set()
         self.timer_retry_after: dict[tuple[str, str], float] = {}
         self._flush_lock = asyncio.Lock()
+        self._delivery_reply: DeliveryReply | None = None
+        self.delivery_outcome_uncertain = False
         self._boot_lock = asyncio.Lock()
         self._start_renewals: dict[tuple[str, int, int, str | None], asyncio.Future[bool]] = {}
         self._vendor_ready = False
@@ -183,6 +186,11 @@ class Gateway:
         if epoch == self._charger_epoch:
             self.charger.detach()
             self.boot_observation = None
+            self._boot_seen.clear()
+            self._boot_charger_epoch = -1
+            self.controls.invalidate()
+            self._charger_epoch = epoch + 1
+            self._inbound.retire("charger", self._charger_epoch)
             self._charger_epoch = self.journal.connection_epoch()
 
     # A vendor outage never closes the local charger or cancels its handlers.
@@ -195,7 +203,12 @@ class Gateway:
 
     # A persisted introduction is useful for history but is not proof of the current charger generation.
     def current_boot_seen(self, epoch: int) -> bool:
-        return epoch == self._charger_epoch and self._boot_charger_epoch == epoch
+        return (
+            epoch == self._charger_epoch
+            and self._boot_charger_epoch == epoch
+            and self.charger.sender is not None
+            and self.boot_observation is not None
+        )
 
     # Waiters still check generation after waking, so a replacement's Boot cannot introduce an old connection.
     async def wait_for_boot(self, epoch: int) -> None:
@@ -1079,11 +1092,22 @@ class Gateway:
     async def flush(self) -> None:
         epoch = self._vendor_epoch
         async with self._flush_lock:
+            self.delivery_outcome_uncertain = bool(
+                self._delivery_reply and not self._delivery_reply.storage_only(self.journal)
+            )
             self._require_epoch("vendor", epoch)
             await self._ensure_vendor_boot()
             while (item := self.journal.next_delivery()) is not None:
-                if item.state in ("ambiguous", "inflight", "rejected"):
+                if self._delivery_reply is None:
+                    self._delivery_reply = DeliveryReply.restore(self.journal, item)
+                    self.delivery_outcome_uncertain = bool(
+                        self._delivery_reply and not self._delivery_reply.storage_only(self.journal)
+                    )
+                if self._delivery_reply is not None:
+                    self._delivery_reply.require(item)
+                elif item.state in ("ambiguous", "inflight", "rejected"):
                     if item.action == "StartTransaction" and item.state in ("ambiguous", "inflight"):
+                        self.delivery_outcome_uncertain = True
                         with self.journal.atomic():
                             self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
                             current_head = self.journal.next_delivery()
@@ -1093,7 +1117,7 @@ class Gateway:
                         with self.journal.atomic():
                             latch_start_delivery_fault(self.journal)
                     raise RecoveryRequiredError("cloud delivery requires explicit reconciliation")
-                if retry_deferred(self.journal, item, self._start_retry_waits):
+                if self._delivery_reply is None and retry_deferred(self.journal, item, self._start_retry_waits):
                     return
                 payload = dict(item.payload)
                 if item.action in ("MeterValues", "StopTransaction") and "transactionId" in payload:
@@ -1101,89 +1125,139 @@ class Gateway:
                     if vendor is None:
                         raise RecoveryRequiredError("transaction mapping is not known; event retained")
                     payload["transactionId"] = vendor
-                try:
-                    current = item
-                    sent = False
-
-                    # Persist possible delivery inside the CALL gate, immediately before send.
-                    def before_send() -> None:
-                        nonlocal sent
-                        self._require_epoch("vendor", epoch)
-                        self.journal.mark_sent(current)
-                        sent = True
-
-                    answer = await self.vendor.call(item.action, payload, token=item.token, before_send=before_send)
-                except UnavailableError, asyncio.CancelledError:
-                    if sent:
-                        with self.journal.atomic():
-                            self.journal.db.execute(
-                                "UPDATE outbox SET state=? WHERE token=?",
-                                ("ambiguous" if item.action == "StartTransaction" else "queued", item.token),
-                            )
-                            current_head = self.journal.next_delivery()
-                            if current_head is not None:
-                                supersede_unknown_start_retry(self.journal, current_head)
-                    raise
-                if answer[0] != 3:
-                    if item.action in (
-                        "StatusNotification",
-                        "MeterValues",
-                        "FirmwareStatusNotification",
-                        "DiagnosticsStatusNotification",
-                    ):
-                        self.journal.reject_observation(item, str(answer[2]))
-                        continue
-                    if item.action == "StopTransaction":
-                        reject_stop_reply(self.journal, item, answer, reason="cloud_call_error")
-                        raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
-                    if item.action == "StartTransaction" and not record_start_error(self.journal, item, answer):
-                        return
-                    raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
-                metadata: dict[str, Any] | None = None
-                ignored_stop_metadata = False
-                tag = item.payload.get("idTag")
-                if self.policy.strict_cloud_authorization and "idTagInfo" in answer[2]:
+                if self._delivery_reply is None:
                     try:
-                        metadata = validate_info(answer[2]["idTagInfo"])
-                    except DeniedError:
-                        if item.action != "StopTransaction":
-                            raise
-                        if not approved_stop_metadata(self.journal, item, answer[2]):
-                            reject_stop_reply(self.journal, item, answer[2], reason="authorization_metadata_invalid")
-                            raise RecoveryRequiredError(
-                                "cloud Stop metadata requires exact independent reconciliation"
-                            ) from None
-                        ignored_stop_metadata = True
-                denied = item.action == "StartTransaction" and metadata is not None and metadata["status"] != "Accepted"
+                        current = item
+                        sent = False
 
-                # Cache updates and deletion of this durable event share its actual acknowledgement commit.
-                def acknowledged() -> None:
-                    if metadata is not None and isinstance(tag, str):
-                        self.auth_info.put(tag, metadata)
-                    if denied:
-                        record_start_denial(self.journal, item, answer[2])
-                    if ignored_stop_metadata:
-                        row = self.journal.db.execute(
-                            "SELECT start FROM transactions WHERE local=?", (item.transaction,)
-                        ).fetchone()
-                        rejected_tag = tag if isinstance(tag, str) else json.loads(row[0])["idTag"] if row else None
-                        if isinstance(rejected_tag, str):
-                            self.journal.db.execute(
-                                "DELETE FROM auth_info WHERE digest=?", (fingerprint(rejected_tag.casefold()),)
-                            )
-                    record_stop_ack(self.journal, item, answer[2])
-                    record_start_wire_ack(self.journal, item, answer[2])
+                        # Persist possible delivery inside the CALL gate, immediately before send.
+                        def before_send() -> None:
+                            nonlocal sent
+                            self._require_epoch("vendor", epoch)
+                            self.journal.mark_sent(current)
+                            sent = True
+                            self.delivery_outcome_uncertain = item.action in ("StartTransaction", "StopTransaction")
 
+                        answer = await self.vendor.call(item.action, payload, token=item.token, before_send=before_send)
+                    except UnavailableError, asyncio.CancelledError:
+                        if sent:
+                            with self.journal.atomic():
+                                self.journal.db.execute(
+                                    "UPDATE outbox SET state=? WHERE token=?",
+                                    ("ambiguous" if item.action == "StartTransaction" else "queued", item.token),
+                                )
+                                current_head = self.journal.next_delivery()
+                                if current_head is not None:
+                                    supersede_unknown_start_retry(self.journal, current_head)
+                        raise
+                    self._delivery_reply = DeliveryReply.received(item, answer)
+                    self.delivery_outcome_uncertain = not self._delivery_reply.storage_only(self.journal)
+                else:
+                    answer = self._delivery_reply.answer
                 try:
-                    self.journal.acknowledge(item, answer[2], acknowledged, allow_denied=denied)
-                except ConflictError, RecoveryRequiredError:
+                    self._delivery_reply.save(self.journal, self.journal.next_delivery() or item)
+                    disposition = self._record_delivery_reply(item, answer)
+                except sqlite3.Error:
+                    if item.action == "StartTransaction" and self.delivery_outcome_uncertain:
+                        try:
+                            with self.journal.atomic():
+                                latch_start_delivery_fault(self.journal)
+                            await self.controls.ensure_ceiling()
+                        except (
+                            sqlite3.Error,
+                            DeniedError,
+                            SecurityError,
+                            RecoveryRequiredError,
+                            UnavailableError,
+                            TimeoutError,
+                        ):
+                            pass  # Retain the real reply and original storage error even if zero cannot be confirmed.
+                    raise  # Keep the actual reply until its local transaction can commit.
+                except DeniedError, ConflictError, RecoveryRequiredError:
                     if item.action == "StartTransaction":
                         with self.journal.atomic():
-                            self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
-                            current_head = self.journal.next_delivery()
-                            assert current_head is not None
-                            supersede_unknown_start_retry(self.journal, current_head)
-                    raise
-                if denied:
+                            head = self.journal.next_delivery()
+                            if head is not None and head.token == item.token and head.state == "inflight":
+                                self.journal.db.execute(
+                                    "UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,)
+                                )
+                                current_head = self.journal.next_delivery()
+                                assert current_head is not None
+                                supersede_unknown_start_retry(self.journal, current_head)
+                    self._delivery_reply = None
+                    raise RecoveryRequiredError("cloud reply requires exact delivery reconciliation") from None
+                self._delivery_reply = None
+                self.delivery_outcome_uncertain = False
+                if disposition == "deferred":
+                    return
+                if disposition == "denied":
                     await self.controls.ensure_ceiling()
                     raise RecoveryRequiredError("cloud denied the mapped local session; zero hold retained")
+            self._delivery_reply = None
+
+    # Apply only a real correlated reply; storage failures leave its single bounded receipt available for retry.
+    def _record_delivery_reply(self, item: Delivery, answer: Frame) -> str:
+        if answer[0] != 3:
+            if item.action in (
+                "StatusNotification",
+                "MeterValues",
+                "FirmwareStatusNotification",
+                "DiagnosticsStatusNotification",
+            ):
+                self.journal.reject_observation(item, str(answer[2]))
+                return "acknowledged"
+            if item.action == "StopTransaction":
+                reject_stop_reply(self.journal, item, answer, reason="cloud_call_error")
+                raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
+            if item.action == "StartTransaction" and not record_start_error(self.journal, item, answer):
+                return "deferred"
+            raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
+        metadata: dict[str, Any] | None = None
+        ignored_stop_metadata = False
+        tag = item.payload.get("idTag")
+        if self.policy.strict_cloud_authorization and "idTagInfo" in answer[2]:
+            try:
+                metadata = validate_info(answer[2]["idTagInfo"])
+            except DeniedError:
+                if item.action != "StopTransaction":
+                    if item.action != "StartTransaction":
+                        self.journal.reject_observation(item, "invalid_authorization_metadata")
+                        return "acknowledged"
+                    raise
+                if not approved_stop_metadata(self.journal, item, answer[2]):
+                    reject_stop_reply(self.journal, item, answer[2], reason="authorization_metadata_invalid")
+                    raise RecoveryRequiredError(
+                        "cloud Stop metadata requires exact independent reconciliation"
+                    ) from None
+                ignored_stop_metadata = True
+        denied = item.action == "StartTransaction" and metadata is not None and metadata["status"] != "Accepted"
+
+        # Cache updates and deletion of this durable event share its actual acknowledgement commit.
+        def acknowledged() -> None:
+            if metadata is not None and isinstance(tag, str):
+                self.auth_info.put(tag, metadata)
+            if denied:
+                record_start_denial(self.journal, item, answer[2])
+            if ignored_stop_metadata:
+                row = self.journal.db.execute(
+                    "SELECT start FROM transactions WHERE local=?", (item.transaction,)
+                ).fetchone()
+                rejected_tag = tag if isinstance(tag, str) else json.loads(row[0])["idTag"] if row else None
+                if isinstance(rejected_tag, str):
+                    self.journal.db.execute(
+                        "DELETE FROM auth_info WHERE digest=?", (fingerprint(rejected_tag.casefold()),)
+                    )
+            record_stop_ack(self.journal, item, answer[2])
+            record_start_wire_ack(self.journal, item, answer[2])
+
+        try:
+            self.journal.acknowledge(item, answer[2], acknowledged, allow_denied=denied)
+        except ConflictError, RecoveryRequiredError:
+            if item.action == "StartTransaction":
+                with self.journal.atomic():
+                    self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
+                    current_head = self.journal.next_delivery()
+                    assert current_head is not None
+                    supersede_unknown_start_retry(self.journal, current_head)
+            raise
+        return "denied" if denied else "acknowledged"

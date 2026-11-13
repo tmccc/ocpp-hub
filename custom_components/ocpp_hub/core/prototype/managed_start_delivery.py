@@ -207,7 +207,7 @@ def record_start_denial(j: Journal, item: Delivery, response: dict[str, Any]) ->
                 "reply_digest": fingerprint(response),
                 "denied_at": time.time(),
                 "completed": None,
-                "fault": fault if created_fault else None,
+                "fault": fault if fault.get("classification") == "owner_control_or_delivery_uncertain" else None,
             },
         },
     )
@@ -215,36 +215,78 @@ def record_start_denial(j: Journal, item: Delivery, response: dict[str, Any]) ->
     j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
 
 
-# The actual closed denied lifecycle's Stop acknowledgment can be acknowledged by a new verified Pause only.
+# Only the active exact Stop-tool proof can bridge its original generic fault; no native or historic null row qualifies.
+def denial_faults(j: Journal, fault: dict[str, Any]) -> list[dict[str, Any]]:
+    if fault.get("classification") == "owner_control_or_delivery_uncertain":
+        return [fault]
+    if fault.get("classification") != "operator_debt_reconciled_at_zero":
+        return []
+    identifier = fault.get("proof")
+    entry = j.get(PROOFS, {}).get(identifier)
+    if not entry or entry.get("completed") is not None or entry.get("superseded"):
+        return []
+    proof = entry["proof"]
+    prior = proof.get("prior", {}).get("fault")
+    if (
+        proof.get("installed_fault") != fault
+        or proof.get("kind") not in ("stop-delivery", "stop-fault")
+        or fingerprint(proof.get("attestation")) != identifier
+        or not isinstance(prior, dict)
+        or prior.get("classification") != "owner_control_or_delivery_uncertain"
+    ):
+        return []
+    return [prior]
+
+
+# Each associated denial needs its own genuine Stop; the legacy singleton can identify only one exact session.
 def denied_start_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
     j = c.session.journal
-    wire = j.get("managed_stop_wire_acknowledgment", {})
-    denial = j.get(DENIALS, {}).get(str(wire.get("local_transaction_id")))
-    if (
-        fault.get("classification") != "owner_control_or_delivery_uncertain"
-        or wire.get("fault") != fault
-        or not denial
-        or denial.get("completed") is not None
-        or wire.get("vendor_transaction_id") != denial["vendor"]
-        or wire.get("start_digest") != denial["start_digest"]
-        or denial.get("fault") != fault
-        or j.next_delivery() is not None
-    ):
+    sources = denial_faults(j, fault)
+    if len(sources) != 1 or j.next_delivery() is not None:
         return None
-    row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (denial["local"],)).fetchone()
-    if (
-        row is None
-        or row["stop"] is None
-        or row["vendor"] != denial["vendor"]
-        or fingerprint(json.loads(row["start"])) != denial["start_digest"]
-        or fingerprint(json.loads(row["stop"])) != wire.get("stop_digest")
-    ):
+    bridged = {}
+    if sources[0] != fault:
+        # Import at the function boundary to avoid a module cycle; readiness never calls denial evidence.
+        from .managed_debt_recovery import operator_recovery_evidence
+
+        operator = operator_recovery_evidence(c, fault)
+        if operator is None:
+            return None
+        bridged["operator_reconciliation"] = fingerprint(operator)
+    fault = sources[0]
+    members = []
+    for denial in sorted(j.get(DENIALS, {}).values(), key=lambda value: value["local"]):
+        if denial.get("fault") != fault or denial.get("completed") is not None:
+            continue
+        wire = denial.get("wire_ack") or j.get("managed_stop_wire_acknowledgment", {})
+        row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (denial["local"],)).fetchone()
+        if (
+            wire.get("fault") != fault
+            or wire.get("local_transaction_id") != denial["local"]
+            or wire.get("vendor_transaction_id") != denial["vendor"]
+            or wire.get("start_digest") != denial["start_digest"]
+            or row is None
+            or row["stop"] is None
+            or row["vendor"] != denial["vendor"]
+            or fingerprint(json.loads(row["start"])) != denial["start_digest"]
+            or fingerprint(json.loads(row["stop"])) != wire.get("stop_digest")
+        ):
+            return None
+        members.append({"denial": denial, "wire": wire, "normal": denied_normal_identity(j, denial["local"])})
+    if not members or sum(member["normal"] is not None for member in members) > 1:
         return None
-    return {"denial": denial, "wire": wire, "fault": fault, "normal": denied_normal_identity(j, denial["local"])}
+    primary = next((member for member in members if member["normal"] is not None), members[0])
+    return {**primary, "fault": fault, **bridged, **({"denials": members} if len(members) > 1 else {})}
 
 
-# Consume exactly this denied lifecycle's proof in the same commit as the owner's zero-hold acknowledgment.
+# Consume each captured denial separately; a shared fault cannot substitute another session's Stop receipt.
 def complete_denied_start(j: Journal, proof: dict[str, Any], pause: str) -> None:
+    for member in proof.get("denials", [proof]):
+        complete_one_denial(j, member, pause)
+
+
+# Preserve terminal owner result bytes while completing only this exact denied lifecycle's stored evidence.
+def complete_one_denial(j: Journal, proof: dict[str, Any], pause: str) -> None:
     records = j.get(DENIALS)
     key = str(proof["denial"]["local"])
     if records.get(key) != proof["denial"]:

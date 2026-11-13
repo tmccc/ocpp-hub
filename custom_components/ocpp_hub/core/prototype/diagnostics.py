@@ -33,6 +33,7 @@ STAGES = frozenset(
         "authorization",
         "session",
         "charger_receive",
+        "charger_retirement",
         "boot_or_ceiling",
     }
 )

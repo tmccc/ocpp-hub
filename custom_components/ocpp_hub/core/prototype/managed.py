@@ -872,9 +872,12 @@ class ManagedController:
             }
         shared = control.get("owner") == "shared" and not control.get("inhibit") and not control.get("uncertain")
         paused = self.requests.intent().mode == "paused"
+        delivery_uncertain = s.runtime.status.delivery_blocked and (
+            s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain
+        )
         if (
             not (shared or verified_pause or verified_idle_hold)
-            or s.runtime.status.delivery_blocked
+            or delivery_uncertain
             or j.get("uncertain_vendor_command")
         ):
             if not self.stopping:
@@ -889,6 +892,7 @@ class ManagedController:
             (shared or verified_pause or verified_idle_hold)
             and j.get("trial_phase") == "active"
             and not control.get("uncertain")
+            and not s.runtime.status.delivery_blocked
         )
         healthy = local_healthy and cloud
         if healthy and not paused:

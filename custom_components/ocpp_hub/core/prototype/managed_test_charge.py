@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .local_control import local_start_receipt
+from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_start_binding import known_plan_source
 from .managed_start_debt import preserved_start_debt
@@ -55,6 +55,7 @@ class ManagedChargeTests:
         self.controller = controller
         self.lease: TestLease | None = None
         self.worker: asyncio.Task[None] | None = None
+        self._closing = False
         self.timer: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
         self.source: tuple[HandoverEvidence, str | None, int] | None = None
@@ -479,26 +480,59 @@ class ManagedChargeTests:
             if lease.normal:
                 lease.revision += 1
                 lease.mode = "app"
-        except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
-            j.put(
-                "managed_test_failure",
-                {
-                    "type": type(error).__name__,
-                    "detail": str(error)[:1024],
-                    "at_epoch": time.time(),
-                    "effects_started": effects,
-                },
-            )
-            if not effects:
-                c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
-                if self.state().get("id") == lease.identifier:
-                    j.put("managed_test_charge", {**self.state(), "state": "failed"})
-                self.lease = None
-                self.retire_refused_unsent()
-                self.changed.set()
+        except (
+            DeniedError,
+            SecurityError,
+            RecoveryRequiredError,
+            UnavailableError,
+            TimeoutError,
+            sqlite3.Error,
+        ) as error:
+            await self._failed_start(lease, error, effects)
+
+    # Keep cleanup owned until storage recovers; never repeat a positive Start sequence after its failure.
+    async def _failed_start(self, lease: TestLease, error: Exception, effects: bool) -> None:
+        c, j = self.controller, self.journal
+        if isinstance(error, sqlite3.Error):
+            lease.deadline = min(lease.deadline, time.monotonic())
+            self.changed.set()
+        while not self._closing and not c.stopping:
+            try:
+                if self.state().get("id") != lease.identifier:
+                    return
+                receipt = local_start_receipt(j)
+                if (
+                    receipt.get("request_id") == lease.identifier
+                    and receipt.get("digest") == self.state().get("tag_digest")
+                    and receipt.get("stage") == "prepared"
+                    and receipt.get("local") is None
+                ):
+                    retire_unsent_local_start(j, receipt.get("ticket"))
+                j.put(
+                    "managed_test_failure",
+                    {
+                        "type": type(error).__name__,
+                        "detail": str(error)[:1024],
+                        "at_epoch": time.time(),
+                        "effects_started": effects,
+                    },
+                )
+                if not effects:
+                    c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
+                    if self.state().get("id") == lease.identifier:
+                        j.put("managed_test_charge", {**self.state(), "state": "failed"})
+                    self.lease = None
+                    self.retire_refused_unsent()
+                    self.changed.set()
+                    return
+                c.requests.finish(lease.identifier, "uncertain", {"classification": "start_not_confirmed"})
+                self.stop(lease, "start_not_confirmed")
                 return
-            c.requests.finish(lease.identifier, "uncertain", {"classification": "start_not_confirmed"})
-            self.stop(lease, "start_not_confirmed")
+            except sqlite3.Error:
+                # Only failed cleanup is retried; the independent deadline still owns restrictive zero.
+                lease.deadline = min(lease.deadline, time.monotonic())
+                self.changed.set()
+                await asyncio.sleep(0.1)
 
     # Bind an actual accepted Start inside its ledger transaction, including sessions ending between native polls.
     def started(self, local: int, payload: dict[str, Any]) -> None:
@@ -775,7 +809,7 @@ class ManagedChargeTests:
 
     # Polling waits for the short native/start sequence; its independent Stop timer continues to run meanwhile.
     async def settle(self) -> None:
-        if self.worker is not None and not self.worker.done():
+        if self.worker is not None and not self.worker.cancelled():
             await asyncio.shield(self.worker)
 
     # Positive flow must belong to the known transaction and the actually accepted local or vendor Start path.
@@ -1002,6 +1036,7 @@ class ManagedChargeTests:
 
     # Shutdown retires timers and awaits owned workers before their journal can be closed.
     async def close(self) -> None:
+        self._closing = True
         self.lease = None
         self.changed.set()
         if self.timer is not None:

@@ -65,6 +65,7 @@ class RuntimeStatus:
     reconnects: int = 0
     heartbeats: int = 0
     delivery_blocked: bool = False
+    delivery_blocked_cause: str | None = None
     boot_observed: bool = False
     last_failure: str | None = None
     vendor_attempts: int = 0
@@ -156,10 +157,16 @@ class ConnectionRuntime:
             if probe is not None:
                 probe.cancel()
                 await asyncio.gather(probe, return_exceptions=True)
-            self.gateway.detach_charger(epoch)
-            if self._charger is connection:
-                self._charger = None
-                self.status.charger_connected = False
+            try:
+                self.gateway.detach_charger(epoch)
+            except sqlite3.Error as error:
+                self.status.last_failure = type(error).__name__
+                self.status.charger_fault.record(error, "charger_retirement", "None")
+            finally:
+                if self._charger is connection:
+                    self._charger = None
+                    self.status.charger_connected = False
+                    self.status.boot_observed = False
 
     # Explicitly enabled read-only probing never fabricates a boot or changes charger configuration.
     async def _boot_probe(self, epoch: int) -> None:
@@ -409,10 +416,16 @@ class ConnectionRuntime:
                     continue
                 await self.gateway.flush()
                 self.status.delivery_blocked = False
+                self.status.delivery_blocked_cause = None
             except RegistrationDeferredError as error:
                 await asyncio.sleep(error.retry_after)
-            except (RecoveryRequiredError, ConflictError, sqlite3.Error) as error:
+            except (RecoveryRequiredError, ConflictError) as error:
                 self.status.delivery_blocked = True
+                self.status.delivery_blocked_cause = "reconciliation"
+                self.status.last_failure = type(error).__name__
+            except sqlite3.Error as error:
+                self.status.delivery_blocked = True
+                self.status.delivery_blocked_cause = "storage"
                 self.status.last_failure = type(error).__name__
             await asyncio.sleep(self.settings.pump_interval)
 

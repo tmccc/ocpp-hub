@@ -99,6 +99,11 @@ class Journal:
             CREATE TABLE IF NOT EXISTS outbox(
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, action TEXT NOT NULL,
                 payload TEXT NOT NULL, local INTEGER, state TEXT NOT NULL DEFAULT 'queued');
+            CREATE TABLE IF NOT EXISTS delivery_replies(
+                token TEXT PRIMARY KEY REFERENCES outbox(token) ON DELETE CASCADE,
+                action TEXT NOT NULL, payload TEXT NOT NULL, local INTEGER, answer TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS retire_delivery_reply AFTER UPDATE OF state ON outbox
+                WHEN NEW.state!='inflight' BEGIN DELETE FROM delivery_replies WHERE token=NEW.token; END;
             CREATE TABLE IF NOT EXISTS mutations(
                 token TEXT PRIMARY KEY, origin TEXT NOT NULL, action TEXT NOT NULL,
                 digest TEXT NOT NULL, state TEXT NOT NULL);
@@ -121,8 +126,14 @@ class Journal:
                 raise ConflictError("journal belongs to another charger")
             self.put("identity", identity)
             # An upstream Start may have been accepted before its response was lost.
-            self.db.execute("UPDATE outbox SET state='ambiguous' WHERE state='inflight' AND action='StartTransaction'")
-            self.db.execute("UPDATE outbox SET state='queued' WHERE state='inflight'")
+            self.db.execute(
+                "UPDATE outbox SET state='ambiguous' WHERE state='inflight' AND action='StartTransaction' "
+                "AND NOT EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=outbox.token)"
+            )
+            self.db.execute(
+                "UPDATE outbox SET state='queued' WHERE state='inflight' "
+                "AND NOT EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=outbox.token)"
+            )
             self.db.execute("UPDATE transactions SET live=0")
             head = self.next_delivery()
             if head is not None and head.action == "StartTransaction" and head.state == "ambiguous":
@@ -284,7 +295,8 @@ class Journal:
             protected = {
                 entry["proof"]["attestation"]["mutation_token"]
                 for entry in self.get("managed_operator_debt_reconciliations", {}).values()
-                if entry.get("completed") is None and entry["proof"]["kind"] in ("vendor-write", "vendor-start")
+                if entry.get("completed") is None
+                and entry["proof"]["kind"] in ("vendor-write", "vendor-start", "vendor-start-mapping")
             }
             grant = self.get("vendor_start_grant", {})
             if grant.get("mutation"):
@@ -498,36 +510,49 @@ class Journal:
         allow_denied: bool = False,
     ) -> None:
         with self.atomic():
-            if item.action == "StartTransaction":
-                if item.transaction is None:
-                    raise RecoveryRequiredError("start is missing its local transaction")
-                vendor = result.get("transactionId")
-                if (
-                    type(vendor) is not int
-                    or not 0 <= vendor < 2**31
-                    or not isinstance(result.get("idTagInfo"), dict)
-                    or result["idTagInfo"].get("status")
-                    not in (
-                        ("Accepted", "Blocked", "Expired", "Invalid", "ConcurrentTx") if allow_denied else ("Accepted",)
-                    )
-                ):
-                    raise RecoveryRequiredError("cloud did not accept the local transaction")
-                old = self.vendor_id(int(item.transaction))
-                if old is not None and old != vendor:
-                    raise ConflictError("cloud attempted to change a transaction mapping")
-                if self.db.execute(
-                    "SELECT 1 FROM transactions t WHERE vendor=? AND local!=? AND "
-                    "(stop IS NULL OR EXISTS(SELECT 1 FROM outbox o WHERE o.local=t.local)) LIMIT 1",
-                    (vendor, item.transaction),
-                ).fetchone():
-                    raise ConflictError("cloud transaction still belongs to another undelivered local lifecycle")
-                try:
-                    self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
-                except sqlite3.IntegrityError:
-                    raise ConflictError("cloud transaction already belongs to another local session") from None
-            if acknowledged is not None:
-                acknowledged()
-            self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))
+            self.acknowledge_in_transaction(item, result, acknowledged, allow_denied=allow_denied)
+
+    # The exclusive caller must already own one transaction for a compound independently attested resolution.
+    def acknowledge_in_transaction(
+        self,
+        item: Delivery,
+        result: dict[str, Any],
+        acknowledged: Callable[[], None] | None = None,
+        *,
+        allow_denied: bool = False,
+    ) -> None:
+        if not self.db.in_transaction:
+            raise RecoveryRequiredError("compound acknowledgement requires an existing journal transaction")
+        if item.action == "StartTransaction":
+            if item.transaction is None:
+                raise RecoveryRequiredError("start is missing its local transaction")
+            vendor = result.get("transactionId")
+            if (
+                type(vendor) is not int
+                or not 0 <= vendor < 2**31
+                or not isinstance(result.get("idTagInfo"), dict)
+                or result["idTagInfo"].get("status")
+                not in (
+                    ("Accepted", "Blocked", "Expired", "Invalid", "ConcurrentTx") if allow_denied else ("Accepted",)
+                )
+            ):
+                raise RecoveryRequiredError("cloud did not accept the local transaction")
+            old = self.vendor_id(int(item.transaction))
+            if old is not None and old != vendor:
+                raise ConflictError("cloud attempted to change a transaction mapping")
+            if self.db.execute(
+                "SELECT 1 FROM transactions t WHERE vendor=? AND local!=? AND "
+                "(stop IS NULL OR EXISTS(SELECT 1 FROM outbox o WHERE o.local=t.local)) LIMIT 1",
+                (vendor, item.transaction),
+            ).fetchone():
+                raise ConflictError("cloud transaction still belongs to another undelivered local lifecycle")
+            try:
+                self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
+            except sqlite3.IntegrityError:
+                raise ConflictError("cloud transaction already belongs to another local session") from None
+        if acknowledged is not None:
+            acknowledged()
+        self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))
 
     # Explicitly reconcile a cloud Start with an independently established vendor id.
     def reconcile_start(self, local: int, vendor: int, acknowledged: Callable[[], None] | None = None) -> None:
