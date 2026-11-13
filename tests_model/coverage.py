@@ -31,6 +31,7 @@ RISKS = (
             "tests/test_managed_issued_start_recovery.py",
             "tests/test_start_delivery_fault.py",
             "tests/test_bound_owner_retirement.py",
+            "tests/test_cloud_denial_zero_boundary.py",
         ),
         "Named reply forms and repeated recovery failures; operator statements are an explicit independent input.",
     ),
@@ -45,7 +46,11 @@ RISKS = (
         "DURABILITY",
         "Independent read-only WAL observations distinguish staged from actual committed facts.",
         "Reopening the real journal rolls back partial transactions and retains exact completed receipts.",
-        ("tests/test_real_process_death.py", "tests/test_journal_fault_recovery.py"),
+        (
+            "tests/test_real_process_death.py",
+            "tests/test_journal_fault_recovery.py",
+            "tests/test_process_durable_reader.py",
+        ),
         "No disk cache, filesystem corruption or physical fsync-failure claim.",
     ),
     Risk(

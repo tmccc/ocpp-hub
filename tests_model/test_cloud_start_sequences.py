@@ -65,7 +65,18 @@ async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, 
             expected_attempts = 2 if case.fault == "error-once" else 3 if case.fault == "error-twice" else 1
             assert len(starts) == expected_attempts and len({f[1] for f in starts}) == 1
             if not case.fault.startswith("error-"):
+                fault = s.journal.get("managed_control_fault")
+                assert fault and s.journal.get("control")["inhibit"]
+                # Cloud acknowledgement commits before its separate zero RPC/composite confirmation completes.
+                await until(
+                    lambda: (
+                        rig.bench.firmware.effective_limit() == 0
+                        and s.gateway.controls.ready
+                        and s.gateway.controls.desired() == 0
+                    )
+                )
                 assert rig.bench.firmware.effective_limit() == 0 and s.journal.get("managed_control_fault")
+                assert s.journal.get("managed_control_fault") == fault
             for event in case.events:
                 if event == "close":
                     rig.peer.permission_enabled = False
