@@ -31,8 +31,10 @@ async def paused_ready(
     contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     port: int,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    cli_route: bool = False,
 ) -> AsyncIterator[ChargeRig]:
-    async with ready(directory, contexts, port, monkeypatch) as test:
+    async with ready(directory, contexts, port, monkeypatch, cli_route=cli_route) as test:
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         status = await healthy(test.controller)
         assert status["local_hold_verified"] and status["station_ceiling_a"] == 0

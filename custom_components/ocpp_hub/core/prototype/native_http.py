@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from .ics import unique_object
@@ -29,11 +30,12 @@ async def framing_line(reader: asyncio.StreamReader) -> bytes:
 async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
     status = await framing_line(reader)
     fields = status.split()
-    if len(status) <= 8192 and len(fields) >= 2 and fields[0] in (b"HTTP/1.0", b"HTTP/1.1"):
-        code = fields[1]
-        if code in (b"408", b"429") or len(code) == 3 and code.startswith(b"5") and code.isdigit():
-            raise ConnectionError("native HTTP temporarily unavailable")
-    if len(status) > 8192 or len(fields) < 2 or fields[1] != b"200":
+    if len(status) > 8192 or len(fields) < 2 or fields[0] not in (b"HTTP/1.0", b"HTTP/1.1"):
+        raise SecurityError("native reader received an invalid HTTP status line")
+    code = fields[1]
+    if code in (b"408", b"429") or len(code) == 3 and code.startswith(b"5") and code.isdigit():
+        raise ConnectionError("native HTTP temporarily unavailable")
+    if code != b"200":
         raise SecurityError("native reader received a non-success HTTP response")
     headers: dict[bytes, bytes] = {}
     total = 0
@@ -61,7 +63,10 @@ async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
             line = await framing_line(reader)
             if len(line) > 128:
                 raise ValueError("native chunk header is oversized")
-            size = int(line.split(b";", 1)[0].strip(), 16)
+            raw_size = line.split(b";", 1)[0].strip()
+            if re.fullmatch(rb"[0-9a-fA-F]+", raw_size) is None:
+                raise ValueError("native chunk size is not hexadecimal wire syntax")
+            size = int(raw_size, 16)
             if not 0 <= size <= MAXIMUM - len(body):
                 raise ValueError("native body is oversized")
             if size == 0:

@@ -18,6 +18,10 @@ through the full validator before attaching execution claims. Generated reports 
 
 | Family | Raw | Admitted per suite | Inputs and mandatory recovery |
 |---|---:|---:|---|
+| `current_domain` | 2,916 | 2,916 engine | All729 directed integer6..32A pairs including same-value requests; app/paused, both demands, exact UUID replay; two later sessions/outages. |
+| `process_start` | 36 | 36 engine | Six actual SQL/preparation/COMMIT SIGKILL boundaries,6/16/32A, both demands; parent peers survive; independent committed-WAL read, new process/Pause/Return and two later sessions/outages. |
+| `process_current` | 36 | 36 engine | Six directed6/16/32A changes, app/paused, request commit and both sides of success COMMIT; real SIGKILL, previous/committed selection, two later sessions/outages. |
+| `storage_fifo` | 192 | 192 engine |6/32A, proof/ACK write or deferred-COMMIT failure twice,1/3 queued real pairs, changed malformed/CALLERROR reply, all repair/Pause/replacement orders; exact new proofs/ACKs, new Pause/Return and two later sessions/outages. |
 | `two_receipt` | 11,520 | 6,240 engine | Existing timer/source/cutoff/cancel grammar; original plans and next daily occurrence. |
 | `source_proof` | 1,920 | 960 engine | Source loss/restoration, observation, cutoff, replacement; fresh continuation proof. |
 | `start_recovery` | 25,920 | 4,320 engine | Normal/fixed test,6/16/32A, nine actual refusal/native/protocol failures, demand, both closure orders, restore/Pause/successful-restart/observe/replay orders; later daily, outage and open-session reconnect. |
@@ -28,41 +32,55 @@ through the full validator before attaching execution claims. Generated reports 
 | `stop_delivery` | 288 | 288 engine | Daily/local/closed-before-poll origins, malformed info/CALLERROR, demand, all real ACK/Pause/replacement/observe orders after exact offline proof; fresh Pause/Return and later session/outage. |
 | `vendor_debt` | 24 | 24 engine | Accepted unbound/uncertain cloud Start, demand, all Pause/replacement/observe orders; distinct proof, new Pause/Return and later session/outage. |
 | `ha_receipt` | 160 | 160 each HA runtime | Four controls, initial/first/second/third response, five identity shapes, two terminal results; exact UUID, one mutation, readable status. |
-| `ha_outage_lifecycle` | 288 | 192 each HA runtime | True first setup/failed reload, reload/unload/remove, stale healthy/fault callback, admitted retry/deadline/stale/lifecycle orders; recovery and second outage/deadline/recovery. |
+| `ha_outage_lifecycle` | 384 | 240 each HA runtime | True first setup/failed reload, reload/unload/remove/disable-enable, stale healthy/fault callback, admitted retry/deadline/stale/lifecycle orders; recovery and second outage/deadline/recovery. |
 
-Engine totals: **41,376 raw / 13,536 admitted**. Each HA client runtime has **448 raw / 352 admitted**.
+Engine totals: **44,556 raw / 16,716 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
 Legacy HA has no registered finite family; its complete ordinary suite remains required. Ordinary functional tests
 are additional executions and are counted separately by collection. The generated registry must agree with these totals.
 
 Excluded inputs remain in the full manifest with exact reasons. Existing timer/source causal exclusions remain.
 Start replay follows an accepted Pause; fixed timed tests require6A; `restart-ready` means successful listener startup
 and real Boot response, so native restoration precedes it. Real unavailable startup/restoration has a separate test
-with no premature controller. HA cannot retry setup after terminal unload/removal without reactivation. Excluded
+with no premature controller. HA cannot retry setup after terminal unload/removal/disable without reactivation. Excluded
 inputs are absent from runnable collection; they are never pytest skips.
 
 Focused scheduler-loss controls cancel the real owned Start task before its first execution and inject a real SQLite
 preparation-write failure. The attempt marker and prepared receipt commit together; neither missing preparation nor
-an explicit rejected/unsent command may strand its exact management request after a fresh verified Pause. These
-controls model task/runtime loss, not literal OS power failure. Issued/accepted unknown debt keeps its stricter proof.
+an explicit rejected/unsent command may strand its exact management request after a fresh verified Pause. Actual subprocess tests additionally send SIGKILL at named boundaries while independently owned peers survive.
+These controls model task/runtime/process death, not literal hardware power failure. Issued/accepted unknown debt keeps its stricter proof.
 
 ## Risk matrix
 
 | Boundary | Safety | Recovery | Bound |
 |---|---|---|---|
 | Start dispatch | Prepared/unsent/rejected differs from issued/accepted unknown; exact request/tag binding | Exact closed mapped lifecycle and atomic receipt/metadata settlement at verified zero | Unknown/unbound debt still needs supported exact evidence. |
-| Current/native proof | Real503/EOF/bad JSON, profile/composite rejection, applied CALLERROR, excessive composite | Prior selection unless target fully confirmed before revocation; new Pause/Return | Representative currents; same-value/idempotency and old formats have focused controls. |
+| Current/native proof | Real503/EOF/bad JSON, profile/composite rejection, applied CALLERROR, excessive composite | Prior selection unless target fully confirmed before revocation; new Pause/Return | All integer pairs for successful selection/idempotency; failure-order grammar uses representative currents. |
 | Boot | Incomplete old proof cannot cross Boot | Fresh pair after incomplete proof; completed pair may survive identical metadata | Changed identity/configuration retains blocking focused tests. |
-| Stop delivery | Original token/body/history retained; proof and pre-ACK Pause cannot fabricate ACK | Exact evidence, genuine wire ACK, new Pause, separate Return | Head permutations; FIFO tails/repeated rejection have focused tests. |
+| Stop delivery | Original token/body/history retained; proof and pre-ACK Pause cannot fabricate ACK | Exact evidence, genuine wire ACK, new Pause, separate Return | Head permutations plus192 real repeated-storage/FIFO histories with1/3 queued pairs. |
 | Cloud debt | Accepted unbound/uncertain commands never replay automatically | Distinct independent attestations then later ordinary lifecycle | Single cloud command grammar. |
 | Closure disagreement | Exact known zero-output mismatch retains station zero | Fresh native/ledger agreement permits later sessions | Unknown IDs, nonzero phases and unrelated faults cannot use this path. |
-| SQLite writes | Real abort triggers at proof, ACK/dequeue and receipt/metadata completion | Atomic rollback and later supported retry preserve evidence | Named boundaries; no arbitrary WAL/disk/power-loss claim. |
+| SQLite writes | Real abort/deferred-FK COMMIT at proof/ACK; actual bounded FULL and writer contention controls | Atomic rollback and later supported retry preserve evidence | Named boundaries and rollback/retry; no arbitrary WAL corruption or physical power-loss claim. |
 | App receipts | Actual HA exchange rejects wrong UUID; never retries mutation | Honest recorded/unknown confirmation and readable status | Direct API coverage; charging recovery belongs to engine tests. |
-| App lifetime | Public setup/retry/reload/unload/remove reject obsolete callbacks | Second fault can notify at60s and dismiss on its own success | Disable/HA-stop and arbitrary core scheduler histories are not exhaustive. |
+| App lifetime | Public setup/retry/reload/unload/remove/disable reject obsolete callbacks | Second fault can notify at60s and dismiss on its own success | Twenty-two focused held-read/public-replacement/actual HA-stop histories per runtime; no cross-process HA restart claim. |
 | Qualification | Canonical input regeneration, complete roots, raw once-only phases and source/runtime pins | All events and full suffix in one complete attempt | Synthetic negative controls are never real execution receipts. |
 
 The machine matrix links exact tests for legacy state, source ownership, cutoff precedence and focused-only risks.
 No risk is marked universally covered. Real hardware/network behavior and unbounded repeated failures remain outside
 offline qualification. This work requires neither live charging nor deployment.
+
+Additional named regression tests cover actual Accepted-Start death before/after publication with a late genuine
+Start/Stop lifecycle, Return request/success commit death, and issued-unknown quarantine controls. Uncommitted current receipts become failed only with a verified Return to their prior selection; a new Pause revokes
+only an older uncertain Return. Unknown issued debt
+is deliberately retained: its safety-only negative controls do not claim functional recovery from missing evidence.
+The finite process families cover known no-dispatch recovery and current selection; they do not enumerate every
+socket write or arbitrary interpreter instruction.
+
+HTTP property checks cover every byte split of six valid messages and every incomplete prefix of two self-delimiting
+messages, plus invalid versions/chunk numerals through a real loopback reader. UTC normalization boundaries traverse
+real TLS for Start/Stop/Status/MeterValues, reject before durable effects, and permit a later genuine session.
+On each HA runtime,11 raw malformed response shapes cross status/mutation/receipt positions, enormous integers
+exercise age/current/progress fields, true first/reload failures recover, and every27 integer current service choices
+is exercised. These are named property/regression cases; inner loop iterations are not extra finite-model executions.
 
 ## Evidence contract
 

@@ -117,8 +117,8 @@ class ProxySensor(ProxyEntity, SensorEntity):
             or type(value.get("duration_seconds")) is not int
             or value["duration_seconds"] != 120
             or type(remaining) not in (int, float)
-            or not math.isfinite(remaining)
             or not 0 <= remaining <= 120
+            or not math.isfinite(remaining)
         ):
             return None
         return {key: value[key] for key in ("source", "state", "duration_seconds", "seconds_remaining")}

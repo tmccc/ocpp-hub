@@ -75,7 +75,7 @@ class OutageCase:
 def outage_candidates():
     return tuple(
         OutageCase(*seed, order)
-        for seed in product(("first", "reload"), ("reload", "unload", "remove"), (False, True))
+        for seed in product(("first", "reload"), ("reload", "unload", "remove", "disable"), (False, True))
         for order in permutations(("retry", "deadline", "stale", "lifecycle"))
     )
 

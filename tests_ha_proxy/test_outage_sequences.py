@@ -5,7 +5,7 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
 from homeassistant.setup import async_setup_component
 
 from tests_ha_proxy.test_client import TOKEN, setup
@@ -114,6 +114,11 @@ async def test_outage_lifecycle_sequences(actual_hass, peer, monkeypatch, record
                 assert await hass.config_entries.async_unload(entry.entry_id)
                 assert entry.state is ConfigEntryState.NOT_LOADED and not notice.active and notice.cancel_timer is None
                 terminal = True
+            elif case.lifecycle == "disable":
+                assert await hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+                assert entry.disabled_by is ConfigEntryDisabler.USER and entry.state is ConfigEntryState.NOT_LOADED
+                assert not notice.active and notice.cancel_timer is None
+                terminal = True
             else:
                 assert await hass.config_entries.async_remove(entry.entry_id)
                 assert hass.config_entries.async_get_entry(old_id) is None
@@ -138,6 +143,9 @@ async def test_outage_lifecycle_sequences(actual_hass, peer, monkeypatch, record
             assert entry.entry_id != old_id
         elif case.lifecycle == "unload":
             assert await hass.config_entries.async_setup(entry.entry_id)
+        elif case.lifecycle == "disable":
+            await hass.config_entries.async_set_disabled_by(entry.entry_id, None)
+            assert entry.disabled_by is None
         else:
             await retry(hass, entry)
         await hass.async_block_till_done()

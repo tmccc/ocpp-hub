@@ -14,9 +14,11 @@ from tests_model.control_cases import (
     stop_candidates,
     vendor_candidates,
 )
+from tests_model.deep_cases import current_domain_candidates, process_current_candidates, process_start_candidates
 from tests_model.ha_cases import outage_candidates, outage_exclusion, receipt_candidates, receipt_exclusion
 from tests_model.recovery_cases import start_candidates, start_exclusion
 from tests_model.schedule_cases import candidates, exclusion, source_candidates, source_exclusion
+from tests_model.storage_debt_cases import storage_fifo_candidates
 
 SCHEMA = 2
 
@@ -37,6 +39,54 @@ class Family:
 
 
 FAMILIES = (
+    Family(
+        "storage_fifo",
+        ("engine-model",),
+        "tests_model/test_storage_fifo_sequences.py::test_storage_fifo_sequences",
+        storage_fifo_candidates,
+        no_exclusion,
+        192,
+        192,
+        ("STORAGE-COMMIT", "STOP-ACK", "FIFO-DEBT", "REPEATED-FAILURE", "NEXT-SESSION"),
+        (
+            "storage_failures_observed",
+            "queued_pairs_verified",
+            "changed_reply_refused",
+            "two_fresh_lifecycles_complete",
+        ),
+    ),
+    Family(
+        "process_current",
+        ("engine-model",),
+        "tests/test_real_process_death.py::test_process_sigkill_current_selection",
+        process_current_candidates,
+        no_exclusion,
+        36,
+        36,
+        ("PROCESS-DEATH", "CURRENT-ROLLBACK", "DURABILITY", "NEXT-SESSION"),
+        ("actual_sigkill", "independent_durable_read", "peers_survived"),
+    ),
+    Family(
+        "process_start",
+        ("engine-model",),
+        "tests/test_real_process_death.py::test_process_sigkill_before_start_dispatch",
+        process_start_candidates,
+        no_exclusion,
+        36,
+        36,
+        ("PROCESS-DEATH", "START-DISPATCH", "DURABILITY", "NEXT-SESSION"),
+        ("actual_sigkill", "independent_durable_read", "peers_survived"),
+    ),
+    Family(
+        "current_domain",
+        ("engine-model",),
+        "tests_model/test_current_domain_sequences.py::test_current_domain_sequences",
+        current_domain_candidates,
+        no_exclusion,
+        2916,
+        2916,
+        ("CURRENT-DOMAIN", "CURRENT-IDEMPOTENCY", "NEXT-SESSION"),
+    ),
     Family(
         "two_receipt",
         ("engine-model",),
@@ -147,8 +197,8 @@ FAMILIES = (
         "tests_ha_proxy/test_outage_sequences.py::test_outage_lifecycle_sequences",
         outage_candidates,
         outage_exclusion,
-        288,
-        192,
+        384,
+        240,
         ("HA-SETUP", "HA-LIFETIME", "HA-STALE-CALLBACK", "HA-NOTICE"),
     ),
 )

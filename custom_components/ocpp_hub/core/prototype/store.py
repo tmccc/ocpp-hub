@@ -127,7 +127,8 @@ class Journal:
             yield
             self.db.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
             raise
 
     # Close the durable store and release its single-owner lock.

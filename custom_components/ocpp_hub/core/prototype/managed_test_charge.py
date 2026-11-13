@@ -189,6 +189,9 @@ class ManagedChargeTests:
     def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
         state, j = self.state(), self.journal
         local, receipt = state.get("local_transaction"), local_start_receipt(j)
+        # A real Accepted reply can commit before publication; a later exact lifecycle binds its durable receipt.
+        if local is None and receipt.get("request_id") == state.get("id"):
+            local = receipt.get("local")
         if (
             self.lease is not None
             or state.get("kind") != "normal"
@@ -237,6 +240,7 @@ class ManagedChargeTests:
                     **state,
                     "state": "completed",
                     "charging": False,
+                    "local_transaction": local,
                     "recovery_reason": "owned_session_closed_at_verified_zero",
                 },
             )

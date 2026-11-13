@@ -164,7 +164,7 @@ async def test_explicit_current_selection_uses_receipt_and_does_not_start(actual
 
 # Intent: valid boundary choices and ordinary whole values are transported as integers rather than floats.
 # Why: the management boundary rejects booleans/fractions and supports no current outside the approved range.
-@pytest.mark.parametrize("current", [6, 7, 32])
+@pytest.mark.parametrize("current", range(6, 33))
 async def test_valid_current_bounds_are_strict_integer_requests(actual_hass, current_peer, current):
     await setup(actual_hass, current_peer)
     await actual_hass.services.async_call(

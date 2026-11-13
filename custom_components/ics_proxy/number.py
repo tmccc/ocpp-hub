@@ -59,9 +59,9 @@ class ProxyCurrent(ProxyEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         if (
             type(value) not in (int, float)
+            or not 6 <= value <= 32
             or not math.isfinite(value)
             or not float(value).is_integer()
-            or not 6 <= value <= 32
         ):
             raise HomeAssistantError(translation_domain=DOMAIN, translation_key="invalid_current")
         if not self.available:

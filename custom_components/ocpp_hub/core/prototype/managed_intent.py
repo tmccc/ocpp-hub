@@ -114,10 +114,12 @@ class ManagedRequests:
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": current.revision + 1})
                 if on_pause is not None:
                     on_pause()
+                # A new restrictive intent revokes an old Return, including one whose reply was lost at replacement.
                 self.journal.db.execute(
                     "UPDATE managed_requests SET state='failed',result=? "
-                    "WHERE action='app_control' AND state IN ('accepted','running')",
-                    (json.dumps({"classification": "superseded_by_pause"}),),
+                    "WHERE action='app_control' AND (state IN ('accepted','running') "
+                    "OR state='uncertain' AND revision<=?)",
+                    (json.dumps({"classification": "superseded_by_pause"}), current.revision),
                 )
             self.journal.db.execute(
                 "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",

@@ -51,11 +51,16 @@ async def managed_bench(
     monkeypatch: pytest.MonkeyPatch,
     *,
     initial_history: list[dict[str, Any]] | None = None,
+    cli_route: bool = False,
 ) -> AsyncIterator[ConnectedBench]:
     monkeypatch.setattr(native_bench, "Bench", OwnerBench)
     async with connected_bench(directory, contexts, port, initial_history=initial_history) as rig:
         # Synthetic schedule identity is approved without changing private input files or production policy.
         rig.prepared.config = replace(rig.prepared.config, local_tags=frozenset({"NATIVE_TIMER"}))
+        if cli_route:
+            value = rig.spec.value()
+            value["trial_route"]["sURL"] = rig.prepared.config.charger_path.rsplit("/", 1)[0] + "/"
+            rig.spec = type(rig.spec).parse(value)
         yield rig
 
 

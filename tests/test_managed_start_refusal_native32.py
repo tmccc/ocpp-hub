@@ -26,8 +26,8 @@ pytestmark = pytest.mark.asyncio
 
 # Keep this synthetic peer or lifecycle helper independent of the engine under test.
 @asynccontextmanager
-async def commissioned(tmp_path, tls, port, monkeypatch, current, *, owner_tag=None):
-    async with paused_ready(tmp_path, tls, port, monkeypatch) as prior:
+async def commissioned(tmp_path, tls, port, monkeypatch, current, *, owner_tag=None, cli_route=False):
+    async with paused_ready(tmp_path, tls, port, monkeypatch, cli_route=cli_route) as prior:
         writes = []
         await prepare_current_capability(
             prior.session.journal,

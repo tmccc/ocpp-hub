@@ -179,7 +179,7 @@ class ManagedCurrentLimits:
             (change.get("id"),),
         ).fetchone()
         if (
-            change.get("state") == "uncertain"
+            change.get("state") in ("uncertain", "interrupted", "cancelled")
             and change.get("previous_a") == self.selected()
             and row is not None
             and row["action"] == "set_current"
@@ -189,6 +189,15 @@ class ManagedCurrentLimits:
             j.put(
                 "managed_current_change",
                 {**change, "state": "cancelled", "recovery_reason": "explicit_return_previous_selection"},
+            )
+            # The same verified Return transaction retires this exact unconfirmed target's request as failed.
+            j.db.execute(
+                "UPDATE managed_requests SET state='failed',result=? "
+                "WHERE id=? AND action='set_current' AND state='uncertain'",
+                (
+                    json.dumps({"classification": "superseded_by_verified_return", "current_a": self.selected()}),
+                    change["id"],
+                ),
             )
 
     # A correlated live current worker owns native verification until its accepted revision reaches an outcome.

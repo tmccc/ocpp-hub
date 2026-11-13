@@ -75,6 +75,8 @@ async def peer():
         control["requests"].append(copy.deepcopy(value))
         if command == "status":
             result = copy.deepcopy(state)
+            if control.get("response_gate") is not None:
+                await control["response_gate"](command, value, result)
             await asyncio.sleep(control["status_delay"])
             if control["status_failure"]:
                 await socket.close()
@@ -143,7 +145,12 @@ async def peer():
         if control.get("result_filter") is not None:
             result = control["result_filter"](command, value, result)
         try:
-            await socket.send_json({"id": value["id"], "ok": True, "result": result})
+            raw = control.get("raw_response")
+            response = raw(command, value, result) if raw is not None else None
+            if response is None:
+                await socket.send_json({"id": value["id"], "ok": True, "result": result})
+            else:
+                await socket.send_str(response)
         except ConnectionResetError:
             pass  # The independent client may already have timed out after durable command acceptance.
         await socket.close()

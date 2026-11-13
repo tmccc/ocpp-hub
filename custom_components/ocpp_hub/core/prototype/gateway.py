@@ -68,7 +68,10 @@ def timestamp(value: Any) -> datetime:
         raise DeniedError("invalid timestamp") from None
     if parsed.tzinfo is None:
         raise DeniedError("timestamp must have a timezone")
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError, ValueError:
+        raise DeniedError("timestamp is outside the supported UTC range") from None
 
 
 @dataclass(frozen=True)

@@ -51,10 +51,11 @@ async def ready(
     duration: float = 0.15,
     startup: float = 3,
     owner_tag: str | None = None,
+    cli_route: bool = False,
 ) -> AsyncIterator[ChargeRig]:
     monkeypatch.setattr(charge_tests, "DURATION", duration)
     monkeypatch.setattr(charge_tests, "STARTUP_BUDGET", startup)
-    async with managed_bench(directory, contexts, port, monkeypatch) as rig:
+    async with managed_bench(directory, contexts, port, monkeypatch, cli_route=cli_route) as rig:
         session = managed_session(rig)
         if owner_tag is not None:
             gateway = session.gateway

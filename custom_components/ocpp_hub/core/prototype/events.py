@@ -34,7 +34,10 @@ def event_time(value: Any) -> datetime:
         raise DeniedError("invalid event timestamp") from None
     if result.tzinfo is None:
         raise DeniedError("event timestamp requires a timezone")
-    return result.astimezone(UTC)
+    try:
+        return result.astimezone(UTC)
+    except OverflowError, ValueError:
+        raise DeniedError("event timestamp is outside the supported UTC range") from None
 
 
 # Prevent a malformed but acknowledged record from poisoning all subsequent cloud delivery.

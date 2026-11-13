@@ -41,7 +41,7 @@ class ProxyClient:
                 ) as connection:
                     await connection.send_json({"id": identifier, "command": command, **fields})
                     response = await connection.receive_json()
-        except aiohttp.ClientError, TimeoutError, ValueError, TypeError:
+        except aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError:
             raise ProxyError("The local charger proxy could not be reached or authenticated") from None
         if (
             not isinstance(response, dict)
