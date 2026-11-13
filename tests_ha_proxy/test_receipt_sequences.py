@@ -6,14 +6,21 @@ import pytest
 
 from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_client import setup
+from tests_ha_proxy.test_control_completion_progress import control_peer as control_peer
 from tests_model.catalog import input_digest
-from tests_model.ha_cases import receipt_candidates
+from tests_model.ha_cases import receipt_candidates, receipt_exclusion
 
 
 # Intent: unrelated, missing or malformed receipt identities never confirm another accepted physical command.
 # Why: the websocket envelope identifies this read, while result.id must still identify the original mutation.
-@pytest.mark.parametrize("case", receipt_candidates(), ids=lambda case: case.identifier)
-async def test_receipt_identity_sequences(actual_hass, peer, case, record_property):
+@pytest.mark.parametrize(
+    "case",
+    tuple(case for case in receipt_candidates() if receipt_exclusion(case) is None),
+    ids=lambda case: case.identifier,
+)
+async def test_receipt_identity_sequences(actual_hass, peer, control_peer, case, record_property):
+    peer = control_peer if case.action == "set_current" else peer
+    fields = {} if case.current_a is None else {"current_a": case.current_a}
     entry = await setup(actual_hass, peer)
     client = entry.runtime_data.client
     error = sys.modules["custom_components.ics_proxy.api"].ProxyError
@@ -24,6 +31,8 @@ async def test_receipt_identity_sequences(actual_hass, peer, case, record_proper
     def result_filter(command, request, result):
         nonlocal polls, identifier
         if command == case.action:
+            assert request.get("current_a") == case.current_a
+            assert ("current_a" in request) == (case.current_a is not None)
             identifier = request["id"]
             events.append("submit")
             position = 0
@@ -51,15 +60,17 @@ async def test_receipt_identity_sequences(actual_hass, peer, case, record_proper
     peer["result_filter"] = result_filter
     try:
         if case.identity == "matching" and case.terminal == "completed":
-            await client.command(case.action, peer["state"]["control_revision"])
+            await client.command(case.action, peer["state"]["control_revision"], **fields)
         else:
             message = (
-                "invalid command receipt" if case.boundary == 0 and case.identity != "matching"
-                else "physical confirmation is still pending" if case.identity != "matching"
+                "invalid command receipt"
+                if case.boundary == 0 and case.identity != "matching"
+                else "physical confirmation is still pending"
+                if case.identity != "matching"
                 else "could not confirm the requested control state"
             )
             with pytest.raises(error, match=message):
-                await client.command(case.action, peer["state"]["control_revision"])
+                await client.command(case.action, peer["state"]["control_revision"], **fields)
         assert peer["commands"].count(case.action) == 1 and polls == case.boundary
         assert (await client.request("status"))["api_version"] == 1
         suffix_complete = True

@@ -11,6 +11,7 @@ import pytest
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
 from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
+from tests.recovery_barriers import returned_to_app, witnessed_native_loss
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_stop_reply_recovery import ReplyBench, pause, reconcile, running
 from tests.test_managed_test_charge import ChargeRig, positive_flow
@@ -115,19 +116,13 @@ async def stop_suffix(b, case, historical_starts):
     from tests_model.test_start_recovery_sequences import close_daily
 
     c, rig = b.controller, b.rig
-    c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-    assert (await mp.healthy(c))["normal_start_ready"]
+    assert (await returned_to_app(b, 6))["normal_start_ready"]
     local = await positive_flow(
         b, "daily", call_id=uuid.uuid4().hex, meter_start=1100, timestamp="2026-01-01T00:02:00Z"
     )
     if not case.demand:
         rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
     await mp.healthy(c)
-    rig.peer.unavailable = True
-    await observe(c, 5)
-    assert rig.bench.firmware.effective_limit() == 0 and b.session.journal.active() == local
-    rig.peer.unavailable = False
-    await mp.healthy(c)
-    assert rig.bench.firmware.effective_limit() == 6
+    assert await witnessed_native_loss(b, 6, local) >= 3
     await close_daily(b, local, "ledger", timestamp="2026-01-01T00:03:00Z", meter_stop=1200)
     assert len(mp.starts(rig)) == historical_starts

@@ -25,6 +25,7 @@ from tests import conftest as _engine  # noqa: F401 - initialize standalone core
 from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
+from tests.recovery_barriers import returned_to_app, witnessed_native_loss
 from tests.test_managed_debt_reconciliation import strategy_file
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_start_refusal_native32 import commissioned
@@ -36,7 +37,7 @@ from tests_model.catalog import input_digest
 from tests_model.storage_debt_cases import storage_fifo_candidates
 from tests_model.test_schedule_sequences import listener_port, tls_for_case
 from tests_model.test_schedule_sequences import model_tls as model_tls
-from tests_model.test_start_recovery_sequences import close_daily, observe
+from tests_model.test_start_recovery_sequences import close_daily
 from tools import reconcile_managed_debt as operator
 
 FAULT_TRIGGER = "deep_storage_failure"
@@ -208,6 +209,52 @@ def proof_for(j, token):
     return matches[0]
 
 
+# Identify only an actual ACK transaction ending in rollback, excluding a prior reply-save COMMIT.
+def rolled_back_ack_transactions(trace, token):
+    target = "DELETE FROM outbox WHERE token=" + sql_literal(token)
+    active, matches = None, []
+    for statement in trace:
+        sql = statement.strip()
+        if sql == "BEGIN IMMEDIATE":
+            active = []
+        if active is not None:
+            active.append(sql)
+            if sql == "ROLLBACK":
+                if target in active:
+                    matches.append(tuple(active))
+                active = None
+    return tuple(matches)
+
+
+# A COMMIT trace is an attempt, so deferred-FK refusal must be followed by rollback in this same ACK.
+def require_ack_rollback(trace, token, sqlite_fault):
+    attempts = rolled_back_ack_transactions(trace, token)
+    assert attempts, "no rolled-back ACK transaction for the exact head"
+    assert all(("COMMIT" in attempt) == (sqlite_fault == "commit") for attempt in attempts)
+    return attempts
+
+
+# Protect the saved response separately from the ACK state that must roll back atomically.
+def require_saved_stop_reply(db, head, actual):
+    rows = [dict(row) for row in db.execute("SELECT * FROM delivery_replies ORDER BY token")]
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["token"], row["action"], row["payload"], row["local"]) == (
+        head["token"],
+        "StopTransaction",
+        head["payload"],
+        head["local"],
+    )
+    assert actual[0] == 3 and actual[1] == head["token"]
+    assert json.loads(row["answer"]) == actual
+    return row
+
+
+# Count actual socket requests independently of the gateway's saved delivery reply.
+def head_wires(bench, token):
+    return [frame for frame in bench.all_wires if frame[1] == token and frame[2] == "StopTransaction"]
+
+
 # Permit only independently delivered vendor mapping to fill historical rows.
 def same_original_transactions(before, after):
     # Only an actual Start wire reply may fill a previously missing vendor mapping.
@@ -267,7 +314,7 @@ async def head_is(s, token, status):
 
 # Verify two new positive sessions with distinct physical outage and recovery epochs.
 async def two_fresh_lifecycles(b, selected, events):
-    c, rig, fw = b.controller, b.rig, b.rig.bench.firmware
+    c, fw = b.controller, b.rig.bench.firmware
     for number in range(2):
         beginning = datetime(2026, 1, 1, 1, number * 2, tzinfo=UTC)
         local = await positive_flow(
@@ -279,12 +326,9 @@ async def two_fresh_lifecycles(b, selected, events):
         )
         assert (await mp.healthy(c))["current_a"] == selected and fw.current == selected
         events.append(f"lifecycle-{number + 1}")
-        rig.peer.unavailable = True
-        await observe(c, 5)
-        assert fw.effective_limit() == 0 and b.session.journal.active() == local
+        assert await witnessed_native_loss(b, selected, local) >= 3
         events.append(f"outage-{number + 1}")
-        rig.peer.unavailable = False
-        assert (await mp.healthy(c))["station_ceiling_a"] == selected and fw.current == selected
+        assert fw.current == selected
         await close_daily(
             b,
             local,
@@ -396,8 +440,12 @@ async def test_storage_fifo_sequences(tmp_path, model_tls, monkeypatch, capsys, 
                 else:
                     await fresh_proof(rig, tmp_path, capsys)
                     bench.stop_modes[head_token] = "valid"
+                    wire_before = len(head_wires(bench, head_token))
+                    replies_before = len([frame for frame in bench.stop_replies if frame[1] == head_token])
+                    saved_reply = None
                     for attempt in range(2):
-                        new_gate(bench, head_token)
+                        if attempt == 0:
+                            new_gate(bench, head_token)
                         async with running(rig, f"storage-ack-failure-{attempt}", release_on_exit=False) as (
                             s,
                             c,
@@ -405,27 +453,45 @@ async def test_storage_fifo_sequences(tmp_path, model_tls, monkeypatch, capsys, 
                         ):
                             await head_is(s, head_token, "inflight")
                             before = state(s.journal.db)
-                            replies = len(bench.stop_replies)
+                            head = before["outbox"][0]
                             trace = []
                             s.journal.db.set_trace_callback(trace.append)
-                            bench.stop_gates[head_token].set()
-                            await until(lambda: len(bench.stop_replies) > replies and s.runtime.status.delivery_blocked)
-                            assert state(s.journal.db) == before and not s.journal.db.in_transaction
-                            assert proof_for(s.journal, head_token)["proof"]["wire_ack"] is None
-                            assert any(sql == "ROLLBACK" for sql in trace)
-                            assert any(sql == "COMMIT" for sql in trace) == (case.sqlite_fault == "commit")
-                            s.journal.db.set_trace_callback(None)
+                            try:
+                                if attempt == 0:
+                                    bench.stop_gates[head_token].set()
+                                # Replacement retries the saved ACK; a new cloud reply is forbidden, not required.
+                                await until(lambda: bool(rolled_back_ack_transactions(trace, head_token)))
+                                require_ack_rollback(trace, head_token, case.sqlite_fault)
+                                assert s.runtime.status.delivery_blocked
+                                assert s.runtime.status.delivery_blocked_cause == "storage"
+                                assert state(s.journal.db) == before and not s.journal.db.in_transaction
+                                assert proof_for(s.journal, head_token)["proof"]["wire_ack"] is None
+                                actual = [frame for frame in bench.stop_replies if frame[1] == head_token]
+                                assert len(actual) == replies_before + 1
+                                assert len(head_wires(bench, head_token)) == wire_before + 1
+                                retained = require_saved_stop_reply(s.journal.db, head, actual[-1])
+                                if saved_reply is not None:
+                                    assert retained == saved_reply
+                                saved_reply = retained
+                                if case.sqlite_fault == "commit":
+                                    assert s.journal.db.execute(f"SELECT COUNT(*) FROM {CHILD}").fetchone()[0] == 0
+                            finally:
+                                s.journal.db.set_trace_callback(None)
                             failures += 1
                             events.append(f"failure-{failures}")
                 assert failures == 2
-                # Hold the next reply across all event orders without introducing another accidental failure.
-                new_gate(bench, head_token)
+                # A saved head ACK can settle immediately after repair. Hold the first tail response instead.
+                new_gate(bench, tokens[1])
+                if case.cut == "proof":
+                    new_gate(bench, head_token)
                 s, c, sock = await stack.enter_async_context(
                     running(rig, "storage-event-prefix", release_on_exit=False)
                 )
+                repaired = False
                 for event in case.order:
                     if event == "repair":
                         drop_failure(s.journal.db)
+                        repaired = True
                     elif event == "pause":
                         await pause(c)
                     else:
@@ -435,7 +501,35 @@ async def test_storage_fifo_sequences(tmp_path, model_tls, monkeypatch, capsys, 
                             running(rig, "storage-event-replacement", release_on_exit=False)
                         )
                     assert fw.effective_limit() == 0 and c.requests.intent().mode == "paused"
-                    assert s.journal.next_delivery().token == head_token
+                    if case.cut == "ack" and repaired:
+                        # Require autonomous cached-response settlement while the next real Stop is withheld.
+                        await head_is(s, tokens[1], "inflight")
+                        assert (
+                            s.journal.db.execute("SELECT 1 FROM outbox WHERE token=?", (head_token,)).fetchone() is None
+                        )
+                        assert (
+                            s.journal.db.execute(
+                                "SELECT 1 FROM delivery_replies WHERE token=?", (head_token,)
+                            ).fetchone()
+                            is None
+                        )
+                        settled_proof = proof_for(s.journal, head_token)["proof"]
+                        wire_ack = settled_proof["wire_ack"]
+                        assert wire_ack["delivery_token"] == head_token
+                        assert wire_ack["reply_digest"] == fingerprint(actual[-1][2])
+                        assert settled_proof["resolved"]["retained"] is False
+                        assert settled_proof["resolved"]["wire_ack"] == wire_ack
+                    else:
+                        assert s.journal.next_delivery().token == head_token
+                        if case.cut == "ack":
+                            assert proof_for(s.journal, head_token)["proof"]["wire_ack"] is None
+                            assert require_saved_stop_reply(s.journal.db, head, actual[-1]) == saved_reply
+                    if case.cut == "ack":
+                        assert len(head_wires(bench, head_token)) == wire_before + 1
+                        assert (
+                            len([frame for frame in bench.stop_replies if frame[1] == head_token]) == replies_before + 1
+                        )
+                    assert not any(frame[1] == tokens[1] for frame in bench.stop_replies)
                     assert fw.plans == original_plans and rig.peer.configuration == original_config
                     events.append(event)
                 await stack.aclose()
@@ -443,15 +537,20 @@ async def test_storage_fifo_sequences(tmp_path, model_tls, monkeypatch, capsys, 
                 if case.cut == "proof":
                     # Earlier evidence has an old control snapshot; inspect fresh after actual Pause/Boot events.
                     await fresh_proof(rig, tmp_path, capsys)
-                bench.stop_modes[head_token] = "valid"
-                new_gate(bench, head_token)
+                    bench.stop_modes[head_token] = "valid"
+                    new_gate(bench, head_token)
                 s, c, sock = await stack.enter_async_context(
                     running(rig, "storage-head-final-retry", release_on_exit=False)
                 )
-                await head_is(s, head_token, "inflight")
-                bench.stop_gates[head_token].set()
+                if case.cut == "proof":
+                    await head_is(s, head_token, "inflight")
+                    bench.stop_gates[head_token].set()
+                await head_is(s, tokens[1], "inflight")
+                if case.cut == "ack":
+                    assert len(head_wires(bench, head_token)) == wire_before + 1
+                bench.stop_gates[tokens[1]].set()
                 await head_is(s, tokens[1], "rejected")
-                events.append("head-ack")
+                events.append("head-settlement-verified")
                 records = s.journal.get(KEY)
                 head_records = [
                     e for e in records.values() if e["proof"]["attestation"]["delivery_token"] == head_token
@@ -513,8 +612,7 @@ async def test_storage_fifo_sequences(tmp_path, model_tls, monkeypatch, capsys, 
                             assert all(
                                 row["limit"] == 0 for row in profile["chargingSchedule"]["chargingSchedulePeriod"]
                             )
-                c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-                assert (await mp.healthy(c))["station_ceiling_a"] == case.selected
+                await returned_to_app(ChargeRig(rig, s, c, sock), case.selected)
                 events.append("return")
                 bench.default_stop_mode = "valid"
                 await two_fresh_lifecycles(ChargeRig(rig, s, c, sock), case.selected, events)

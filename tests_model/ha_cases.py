@@ -12,6 +12,7 @@ class ReceiptCase:
     boundary: int
     identity: str
     terminal: str
+    current_a: int | None = None
 
     # Every externally delivered response has its own event in the mandatory evidence sequence.
     @property
@@ -21,15 +22,16 @@ class ReceiptCase:
     # Namespace IDs across families so raw/excluded and executed rows can be reconciled exactly.
     @property
     def identifier(self):
-        return f"ha-receipt-{self.action}-{self.boundary}-{self.identity}-{self.terminal}"
+        current = f"-{self.current_a}A" if self.current_a is not None else ""
+        return f"ha-receipt-{self.action}{current}-{self.boundary}-{self.identity}-{self.terminal}"
 
 
-# Exhaust all four existing mutating controls and every response position through the third receipt poll.
+# Exhaust all five controls and every response position through the third receipt poll.
 def receipt_candidates():
     return tuple(
-        ReceiptCase(*seed)
-        for seed in product(
-            ("pause", "app_control", "start", "start_test"),
+        ReceiptCase(action, boundary, identity, terminal, 16 if action == "set_current" else None)
+        for action, boundary, identity, terminal in product(
+            ("pause", "app_control", "start", "start_test", "set_current"),
             range(4),
             ("matching", "different", "missing", "null", "malformed"),
             ("completed", "failed"),
@@ -37,8 +39,10 @@ def receipt_candidates():
     )
 
 
-# Every declared identity/terminal response combination is a causally deliverable independent peer input.
+# A bad identity is rejected before its terminal state is read; completed represents the false-success risk.
 def receipt_exclusion(case):
+    if case.identity != "matching" and case.terminal == "failed":
+        return "identity rejected before terminal read; completed represents this action, response position and shape"
     return None
 
 

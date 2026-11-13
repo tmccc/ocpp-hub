@@ -49,7 +49,7 @@ def manifest(path: Path, suite: str = "engine-model") -> dict:
         "runnable": accepted,
         "exclusions": dict(excluded),
         "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "scope": ("complete registered finite input families and causal exclusions; not arbitrary product histories"),
+        "scope": ("complete registered finite input families and declared exclusions; not arbitrary product histories"),
     }
 
 

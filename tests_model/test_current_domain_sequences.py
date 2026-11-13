@@ -1,4 +1,4 @@
-"""All supported integer current transitions retain real owner control and recover through two physical outages."""
+"""The declared current recovery cover retains owner control through two later sessions and physical outages."""
 
 import copy
 import os
@@ -12,19 +12,20 @@ from tests.test_managed_proxy import healthy
 from tests.test_managed_start_refusal_native32 import commissioned
 from tests_model.catalog import input_digest
 from tests_model.control_helpers import ordinary_recovery
-from tests_model.deep_cases import current_domain_candidates
+from tests_model.current_obligations import require_completed_current
+from tests_model.deep_cases import current_domain_candidates, current_domain_exclusion
 from tests_model.test_schedule_sequences import listener_port, tls_for_case
 from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # Explicit local development sampling is forbidden by the final qualification validator.
 def selected():
-    values = current_domain_candidates()
+    values = tuple(case for case in current_domain_candidates() if current_domain_exclusion(case) is None)
     return values[::243] if os.environ.get("MODEL_SMOKE") else values
 
 
-# Intent: all729 integer pairs work both paused and under app control, with zero-demand and charging controls.
-# Why: representative endpoints do not prove every advertised choice, same-value receipt or later recovery works.
+# Intent: every declared recovery obligation retains both intents and demands through two later sessions/outages.
+# Why: exhaustive literal transport is separate; these131 pairs are a scoped recovery cover, not all-pair equivalence.
 @pytest.mark.parametrize("case", selected(), ids=lambda case: case.identifier)
 async def test_current_domain_sequences(tmp_path, model_tls, monkeypatch, record_property, case):
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
@@ -54,9 +55,11 @@ async def test_current_domain_sequences(tmp_path, model_tls, monkeypatch, record
             assert b.rig.bench.device_calls == before
             assert duplicate == completed and c.requests.receipt(identifier) == completed
             assert receipt["id"] == identifier
+            require_completed_current(b, identifier, revision, case.target, case.intent)
             events.append("replay")
             await ordinary_recovery(b, case.target, case.demand)
             events.extend(case.events[2:])
+            assert c.requests.receipt(identifier) == completed
             assert c.current.selected() == case.target
             assert firmware.plans == plans and b.rig.peer.configuration == configuration
             complete = True

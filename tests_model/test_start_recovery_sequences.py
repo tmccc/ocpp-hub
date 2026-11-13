@@ -14,6 +14,7 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from tests import conftest as _engine  # noqa: F401 - initialize the HA-free package before importing it.
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
+from tests.recovery_barriers import returned_to_app, witnessed_native_loss
 from tests.test_managed_proxy import healthy, managed_session, starts
 from tests.test_managed_start_cap_failure import BeforeCapFailurePeer
 from tests.test_managed_start_refusal_native32 import commissioned
@@ -182,20 +183,15 @@ async def test_start_failure_recovery_sequences(tmp_path, model_tls, monkeypatch
                 await until(lambda: s.gateway.controls.ready)
                 c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
                 assert (await healthy(c))["local_hold_verified"]
-                c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-                status = await healthy(c)
-                assert status["normal_start_ready"] and firmware.effective_limit() == case.selected
                 daily = ChargeRig(rig, s, c, sock)
+                status = await returned_to_app(daily, case.selected)
+                assert status["normal_start_ready"] and firmware.effective_limit() == case.selected
                 local = await positive_flow(daily, "daily")
                 if not case.demand:
                     peer.permission_enabled = False
                     firmware.requested_current = 0
                 await healthy(c)
-                peer.unavailable = True
-                await observe(c, 5)
-                assert firmware.effective_limit() == 0
-                peer.unavailable = False
-                await healthy(c)
+                assert await witnessed_native_loss(daily, case.selected, local) >= 3
                 await sock.close()
                 await until(lambda: not s.runtime.status.charger_connected)
                 sock = await stack.enter_async_context(rig.charger(s))

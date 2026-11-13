@@ -4,6 +4,11 @@ Offline recovery verification is documented in the [coverage matrix](docs/recove
 safety/recovery obligations, finite input counts, explicit exclusions and limits. Full qualification requires four
 complete20-worker suites on one clean commit; declared coverage alone does not establish execution.
 
+The current test plan keeps every literal current-selection transition over actual local API/TLS connections and
+uses a declared obligation cover for repeated later-session recovery. Separate tests exercise the service and HA
+pollers without manual refresh, combine independent failures in both repair orders, and wait for exact command
+receipts and freshly observed native failures. The matrix documents the reduced scope and retained failure families.
+
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
 an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the

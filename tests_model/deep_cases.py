@@ -6,7 +6,7 @@ from itertools import permutations, product
 
 @dataclass(frozen=True)
 class CurrentDomainCase:
-    """Every integer choice is observed from every previous choice under both independent physical demands."""
+    """Raw pair/demand universe; declared recovery obligations select a transparent finite cover."""
 
     initial: int
     target: int
@@ -29,6 +29,42 @@ def current_domain_candidates():
     return tuple(
         CurrentDomainCase(*values) for values in product(range(6, 33), range(6, 33), ("app", "paused"), (False, True))
     )
+
+
+@dataclass(frozen=True)
+class CurrentTransportCase:
+    """One exact literal pair reaches the public API and actual wire under each idle intent."""
+
+    initial: int
+    target: int
+    intent: str
+
+    # Stable IDs retain all729 directed literal pairs separately under each intent.
+    @property
+    def identifier(self):
+        return f"transport-{self.initial}-{self.target}-{self.intent}"
+
+    # Each real reset precedes an accepted command, exact durable completion, retry and physical verification.
+    @property
+    def events(self):
+        prefix = ("reset", "choose", "receipt", "replay")
+        return (*prefix, "return", "physical") if self.intent == "paused" else (*prefix, "physical")
+
+
+# No value/pair sampling replaces the complete advertised scalar and wire domain.
+def current_transport_candidates():
+    return tuple(CurrentTransportCase(*v) for v in product(range(6, 33), range(6, 33), ("app", "paused")))
+
+
+# A representation exclusion narrows only repeated recovery suffixes; all pairs retain exact transport coverage.
+def current_domain_exclusion(case):
+    retained = (
+        case.initial == case.target
+        or case.initial in (6, 32)
+        or case.target in (6, 32)
+        or (case.initial, case.target) in ((7, 31), (31, 7))
+    )
+    return None if retained else "pair transport is exhaustive; repeated recovery uses declared obligation cover"
 
 
 @dataclass(frozen=True)

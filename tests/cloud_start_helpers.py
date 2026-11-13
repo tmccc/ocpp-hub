@@ -2,13 +2,15 @@
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from ocpp_hub_core.frames import build_call_error, build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 
 from tests import test_managed_proxy as mp
+from tests.recovery_barriers import fresh_daily_values, returned_to_app, witnessed_native_loss
 from tests.test_managed_test_charge import positive_flow
-from tests_model.test_start_recovery_sequences import close_daily, observe
+from tests_model.test_start_recovery_sequences import close_daily
 
 
 class StartReplyBench(mp.OwnerBench):
@@ -108,12 +110,15 @@ class StartReplyBench(mp.OwnerBench):
 # Finish two new genuine mapped sessions, including independent native outages, without issuing an owner Start.
 async def two_later_sessions(b, *, selected, original_starts, first_minute=10):
     c, rig, j = b.controller, b.rig, b.session.journal
-    if c.requests.intent().mode == "paused":
-        c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-    assert (await mp.healthy(c))["station_ceiling_a"] == selected
+    assert (await returned_to_app(b, selected))["station_ceiling_a"] == selected
     locals_seen = []
     for number, demand in enumerate((True, False)):
-        minute = first_minute + 2 * number
+        beginning, meter_start = fresh_daily_values(
+            rig,
+            not_before=datetime(2026, 1, 1, 0, first_minute + 2 * number, tzinfo=UTC),
+            meter_floor=1200 + 100 * number,
+        )
+        stamp = beginning.isoformat().replace("+00:00", "Z")
         # A previous explicit tag denial remains effective until an actual new cloud authorization permits it.
         authorized = await rig.bench.call(b.charger, uuid.uuid4().hex, "Authorize", {"idTag": "NATIVE_TIMER"})
         assert authorized[0] == 3 and authorized[2]["idTagInfo"]["status"] == "Accepted"
@@ -121,35 +126,27 @@ async def two_later_sessions(b, *, selected, original_starts, first_minute=10):
             b,
             "daily",
             call_id=uuid.uuid4().hex,
-            meter_start=1200 + 100 * number,
-            timestamp=f"2026-01-01T00:{minute:02d}:00Z",
+            meter_start=meter_start,
+            timestamp=stamp,
         )
         locals_seen.append(local)
         if not demand:
             rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
         await mp.healthy(c)
         assert rig.bench.firmware.current == (selected if demand else 0)
-        assert hasattr(rig.peer, "failed_reads"), "later-session outage needs the independent HTTP failure peer"
-        while not rig.peer.failed_reads.empty():
-            rig.peer.failed_reads.get_nowait()
-        rig.peer.unavailable = True
-        await observe(c, 5)
-        assert rig.bench.firmware.effective_limit() == 0 and j.active() == local
-        assert not rig.peer.failed_reads.empty()
-        rig.peer.unavailable = False
-        assert (await mp.healthy(c))["station_ceiling_a"] == selected
+        assert await witnessed_native_loss(b, selected, local) >= 3
         await close_daily(
-            b, local, "ledger", timestamp=f"2026-01-01T00:{minute + 1:02d}:00Z", meter_stop=1300 + 100 * number
+            b,
+            local,
+            "ledger",
+            timestamp=(beginning + timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+            meter_stop=meter_start + 100,
         )
         assert j.vendor_id(local) is not None and j.next_delivery() is None
         assert len(mp.starts(rig)) == original_starts
         if isinstance(rig.bench, StartReplyBench):
             assert not rig.bench.backend_errors
-            entry = next(
-                entry
-                for entry in rig.bench.backend_starts
-                if entry["body"]["timestamp"] == f"2026-01-01T00:{minute:02d}:00Z"
-            )
+            entry = next(entry for entry in rig.bench.backend_starts if entry["body"]["timestamp"] == stamp)
             assert entry["closed"] and entry["stop"]["body"]["transactionId"] == entry["answer"]["transactionId"]
         await asyncio.sleep(0)
     assert locals_seen[0] != locals_seen[1]

@@ -16,6 +16,8 @@ from tests_model.control_cases import (
 )
 from tests_model.deep_cases import (
     current_domain_candidates,
+    current_domain_exclusion,
+    current_transport_candidates,
     process_current_candidates,
     process_overlap_candidates,
     process_start_candidates,
@@ -36,7 +38,7 @@ SCHEMA = 2
 
 @dataclass(frozen=True)
 class Family:
-    """A declared input universe has a fixed scope, causal exclusions, denominator and owning test function."""
+    """A declared input universe has explicit exclusions, a denominator and an owning test function."""
 
     name: str
     suites: tuple[str, ...]
@@ -149,13 +151,31 @@ FAMILIES = (
         ("actual_sigkill", "independent_durable_read", "peers_survived"),
     ),
     Family(
+        "current_transport",
+        ("engine-model",),
+        "tests_model/test_current_transport_sequences.py::test_current_transport_sequences",
+        current_transport_candidates,
+        no_exclusion,
+        1458,
+        1458,
+        ("CURRENT-DOMAIN", "CURRENT-IDEMPOTENCY"),
+        (
+            "reset_verified",
+            "wire_value_verified",
+            "exact_receipt_verified",
+            "replay_no_effect",
+            "future_value_verified",
+            "physical_verified",
+        ),
+    ),
+    Family(
         "current_domain",
         ("engine-model",),
         "tests_model/test_current_domain_sequences.py::test_current_domain_sequences",
         current_domain_candidates,
-        no_exclusion,
+        current_domain_exclusion,
         2916,
-        2916,
+        524,
         ("CURRENT-DOMAIN", "CURRENT-IDEMPOTENCY", "NEXT-SESSION"),
     ),
     Family(
@@ -258,8 +278,8 @@ FAMILIES = (
         "tests_ha_proxy/test_receipt_sequences.py::test_receipt_identity_sequences",
         receipt_candidates,
         receipt_exclusion,
-        160,
-        160,
+        200,
+        120,
         ("HA-RECEIPT-IDENTITY",),
     ),
     Family(

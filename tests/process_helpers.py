@@ -148,6 +148,19 @@ class ServiceProcess:
                     return row
                 await asyncio.sleep(0.05)
 
+    # Wait for the exact accepted control receipt without driving a controller or trusting older published status.
+    async def completed_control(self, identifier):
+        async with asyncio.timeout(25):
+            while True:
+                result = await self.request("receipt", request_id=identifier)
+                assert result["ok"]
+                receipt = result["result"]
+                assert receipt.get("id") == identifier
+                if receipt["state"] == "completed":
+                    return receipt
+                assert receipt["state"] in ("accepted", "running", "uncertain"), receipt
+                await asyncio.sleep(0.1)
+
     # Four actual HTTP failures establish protective zero; fresh owner and physical evidence establish repair.
     async def native_outage(self, expected, demand):
         peer, firmware = self.rig.peer, self.rig.bench.firmware
@@ -174,10 +187,14 @@ class ServiceProcess:
     # Independent real charger reports and native power retain lifecycle supervision after process replacement.
     async def ordinary_recovery(self, expected, demand, *, start_minute=0):
         state = await self.status(lambda value: value.get("charger_connected") is True)
-        assert (await self.request("pause", revision=state["control_revision"]))["ok"]
+        paused = await self.request("pause", revision=state["control_revision"])
+        assert paused["ok"]
+        await self.completed_control(paused["result"]["id"])
         state = await self.status(lambda value: value.get("local_hold_verified") is True)
         assert self.rig.bench.firmware.effective_limit() == 0
-        assert (await self.request("app_control", revision=state["control_revision"]))["ok"]
+        returned = await self.request("app_control", revision=state["control_revision"])
+        assert returned["ok"]
+        await self.completed_control(returned["result"]["id"])
         await self.status(
             lambda value: value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == expected
         )

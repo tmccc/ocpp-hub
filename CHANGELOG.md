@@ -2,6 +2,15 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Exercise combined storage/native/charger failures under the actual service poller, and repeated HA outages under
+  its real scheduler. Require exact control completion and independently observed failed native reads in recovery
+  helpers; add pending physical Pause and lost-before-effect current checks.
+- Update storage/FIFO checks for saved cloud replies: witness the exact failed ACK transaction, preserve the reply
+  across replacement without retransmission, and hold later responses through every recovery order.
+- Keep all729 literal current pairs under both intents over authenticated API/TLS, while replacing repeated recovery
+  suffixes with an independently checked131-pair obligation cover. Add current selection to HA receipt permutations
+  and exclude only terminal outcomes rejected before being read. Retain failure-order and process-death families.
+
 - Retain exact received cloud replies across acknowledgement write/commit failure and replacement, without
   replaying a known outcome. Keep unknown Starts and real refusals under their existing restrictive recovery.
 - Bind every simultaneous recovery proof to the new Pause and retain each denied session's own Stop receipt.

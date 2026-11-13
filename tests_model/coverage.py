@@ -60,15 +60,25 @@ RISKS = (
     Risk(
         "CURRENT-DOMAIN",
         "Every advertised integer choice retains its exact observed physical ceiling or Pause zero.",
-        "All729 directed pairs support app/paused modes, two demands and two later ordinary outages.",
-        ("tests_ha_proxy/test_current.py",),
-        "Complete integer domain for successful transitions; failure orders retain representative6/16/32 currents.",
+        "All729 directed literal pairs reach authenticated API/wire/receipt/replay under both intents; "
+        "131 pairs retain both demands and two later outages.",
+        (
+            "tests_model/test_current_transport_sequences.py",
+            "tests/test_current_recovery_cover.py",
+            "tests_ha_proxy/test_current.py",
+        ),
+        "Recovery suffixes use a declared obligation cover, not all729 pair-specific recovery histories; "
+        "failure/process families remain unchanged.",
     ),
     Risk(
         "CURRENT-IDEMPOTENCY",
         "Replaying an exact current UUID cannot repeat physical changes.",
         "Same-value controls, abandoned-request retirement and later lifecycle/outage recovery remain functional.",
-        ("tests_model/test_current_domain_sequences.py", "tests/test_managed_current_retirement.py"),
+        (
+            "tests_model/test_current_transport_sequences.py",
+            "tests_model/test_current_domain_sequences.py",
+            "tests/test_managed_current_retirement.py",
+        ),
         "Exact same UUID/body; unrelated and changed-body conflicts retain focused coverage.",
     ),
     Risk(
@@ -227,6 +237,9 @@ RISKS = (
             "tests/test_ordinary_recovery.py",
             "tests/test_managed_normal_start.py",
             "tests/test_normal_source_recovery.py",
+            "tests/test_autonomous_cross_feature_recovery.py",
+            "tests/test_native_suffix_witness.py",
+            "tests/test_suffix_barrier_regression.py",
         ),
         "Start grammar reconnects open daily; Boot/current suffixes exercise two later sessions and native loss.",
     ),
@@ -235,6 +248,8 @@ RISKS = (
         "Failed writes publish neither half of proof/ACK/dequeue or exact receipt/metadata completion.",
         "Removing a real SQLite trigger permits supported retry while all retained evidence survives.",
         (
+            "tests/test_storage_fifo_witness.py",
+            "tests_model/test_storage_fifo_sequences.py",
             "tests/test_managed_stop_reply_recovery.py",
             "tests/test_managed_stop_replacement.py",
             "tests/test_vendor_reply_uncertainty.py",
@@ -246,8 +261,13 @@ RISKS = (
         "HA-RECEIPT-IDENTITY",
         "Every initial/polled receipt must match the exact submitted UUID; never retry mutation.",
         "Readable status remains available; physical recovery belongs to engine tests.",
-        ("tests_ha_proxy/test_client.py",),
-        "Four controls, response positions0..3, five identity shapes, two terminals.",
+        (
+            "tests_ha_proxy/test_client.py",
+            "tests_ha_proxy/test_receipt_sequences.py",
+            "tests_ha_proxy/test_control_completion_progress.py",
+        ),
+        "Five controls, positions0..3 and five identity shapes; both matching terminals; "
+        "invalid IDs reject before terminal read and retain completed false-success sentinels.",
     ),
     Risk(
         "HA-SETUP",
@@ -274,8 +294,25 @@ RISKS = (
         "HA-NOTICE",
         "Retries preserve the original60s deadline; no early or orphan notification.",
         "Fresh recovery dismisses once and the next independent outage can notify again.",
-        ("tests_ha_proxy/test_freshness_recovery.py", "tests_ha_proxy/test_setup_outage_notice.py"),
-        "Controlled integration clock plus a real short scheduler control; no system-clock manipulation.",
+        (
+            "tests_ha_proxy/test_freshness_recovery.py",
+            "tests_ha_proxy/test_setup_outage_notice.py",
+            "tests_ha_proxy/test_periodic_progress.py",
+        ),
+        "Controlled deadline tests plus actual periodic loss/recovery twice, including the production5s interval; "
+        "no system-clock manipulation.",
+    ),
+    Risk(
+        "AUTONOMOUS-PROGRESS",
+        "Pending controls and protective zero retain exact receipt ownership during combined failures.",
+        "The service and HA's own scheduled work observe repair and recover without helper ticks or refreshes.",
+        (
+            "tests/test_autonomous_cross_feature_recovery.py",
+            "tests_ha_proxy/test_periodic_progress.py",
+            "tests_ha_proxy/test_control_completion_progress.py",
+        ),
+        "Four service histories at6/32A and repeated HA polling episodes; not arbitrary fault combinations "
+        "or an end-to-end HA-to-charger test.",
     ),
     Risk(
         "QUALIFICATION",

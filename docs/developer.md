@@ -60,14 +60,19 @@ Repeat with the matching HA runtimes and suite names. `--runtime-mode image --ve
 matching virtualenv; `--readonly-mount HOST=CONTAINER` supplies any explicitly provisioned OpenSSL runtime needed by
 that image. Every attempt has its own directory; interrupted runs are retained and cannot be combined into one pass.
 Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
-must all pass the auditor. The source-pinned registry declares45,176 raw/17,336 runnable engine inputs and
-544 raw/400 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
+must all pass the auditor. The source-pinned registry declares46,634 raw/16,402 runnable engine inputs and
+584 raw/360 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
 source, including HA families, then verifies exact input/event/recovery evidence. See the
 [recovery coverage matrix](recovery-coverage.md) for scopes, focused-only risks and limits.
 CI derives the exact model collection from that registry across20 independent runner jobs and includes all HA suites.
 The model shard collector retains the complete `tests_model` root and adds exact registered engine test functions
 from other roots. Its structural regression checks the real collection against the canonical manifest, including
 process-death families, while excluding ordinary named tests from the model-only CI partition.
+
+Large targeted socket-test batches also need separate offline network environments. The Python loopback guard alone
+shares the host's connection tables; sustained parallel HTTP traffic has exhausted that table and caused unrelated
+peer startup timeouts. Use the same read-only source/runtime mounts and separate `--network none` containers as the
+full worker, with only each task's scratch writable. Retain failed attempts and investigate their evidence before rerun.
 
 The final qualification JSON contains `commit`, `source_digest` and a `phases` object mapping those four suite names
 to their absolute batch directories. `validate.py --qualification-report` requires all four, all20 workers, and the

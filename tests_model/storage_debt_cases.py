@@ -15,7 +15,7 @@ class StorageFifoCase:
     changed_reply: str
     order: tuple[str, ...]
 
-    # Record mandatory real failures, every competing order and the complete later physical recovery suffix.
+    # Record failure and verification milestones; cached head settlement may precede later prefix events.
     @property
     def events(self):
         return (
@@ -24,7 +24,7 @@ class StorageFifoCase:
             "failure-1",
             "failure-2",
             *self.order,
-            "head-ack",
+            "head-settlement-verified",
             "tails-reconciled",
             "pause",
             "return",
