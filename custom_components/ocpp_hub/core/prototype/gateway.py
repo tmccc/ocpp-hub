@@ -23,6 +23,7 @@ from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, known_write
 from .local_control import LocalControl
 from .managed_start_delivery import (
+    latch_start_delivery_fault,
     record_start_denial,
     record_start_error,
     record_start_wire_ack,
@@ -1088,6 +1089,9 @@ class Gateway:
                             current_head = self.journal.next_delivery()
                             assert current_head is not None
                             supersede_unknown_start_retry(self.journal, current_head)
+                    elif item.action == "StartTransaction":
+                        with self.journal.atomic():
+                            latch_start_delivery_fault(self.journal)
                     raise RecoveryRequiredError("cloud delivery requires explicit reconciliation")
                 if retry_deferred(self.journal, item, self._start_retry_waits):
                     return

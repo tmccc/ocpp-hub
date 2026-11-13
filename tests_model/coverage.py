@@ -26,7 +26,12 @@ RISKS = (
         "CLOUD-START-REFUSAL",
         "Explicit errors have a bounded persisted retry budget; denied authorization retains zero and real mapping.",
         "Genuine Stop ACK, new Pause and separate Return recover later sessions; unknown outcomes need exact evidence.",
-        ("tests/test_managed_start_delivery_recovery.py", "tests/test_managed_issued_start_recovery.py"),
+        (
+            "tests/test_managed_start_delivery_recovery.py",
+            "tests/test_managed_issued_start_recovery.py",
+            "tests/test_start_delivery_fault.py",
+            "tests/test_bound_owner_retirement.py",
+        ),
         "Named reply forms and repeated recovery failures; operator statements are an explicit independent input.",
     ),
     Risk(

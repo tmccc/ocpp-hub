@@ -18,6 +18,7 @@ through the full validator before attaching execution claims. Generated reports 
 
 | Family | Raw | Admitted per suite | Inputs and mandatory recovery |
 |---|---:|---:|---|
+| `bound_owner_delivery` | 24 | 24 engine | Both genuine unpublished SIGKILL boundaries, unknown/exhausted cloud delivery,6/16/32A and both later demand orders; exact local closure settles only its owner request, retaining unmapped cloud debt for independent attestation, actual Start/Stop acknowledgments and two later sessions/outages. |
 | `observation_retry` | 120 | 120 engine | Six observation classes, four actual reply/cloud cuts, same/replacement/process/new-Boot boundaries over real TLS; exact publication counts, preserved new untimed reports and two later mapped lifecycles. |
 | `cloud_start_recovery` | 432 | 432 engine | One/two cloud CALLERRORs and four denied authorization statuses; native/local,6/16/32A, both demands, every close/Pause/replacement order; genuine mapped Stop, fresh Pause/Return and two later sessions/outages. |
 | `issued_start_proof` | 36 | 36 engine | Three genuine SIGKILL issued/accepted-before-publication boundaries,6/16/32A, app/paused and both later demand orders; exact independent cancellation proof, terminal receipt before further controls and two later sessions/outages. |
@@ -38,7 +39,7 @@ through the full validator before attaching execution claims. Generated reports 
 | `ha_receipt` | 160 | 160 each HA runtime | Four controls, initial/first/second/third response, five identity shapes, two terminal results; exact UUID, one mutation, readable status. |
 | `ha_outage_lifecycle` | 384 | 240 each HA runtime | True first setup/failed reload, reload/unload/remove/disable-enable, stale healthy/fault callback, admitted retry/deadline/stale/lifecycle orders; recovery and second outage/deadline/recovery. |
 
-Engine totals: **45,152 raw / 17,312 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
+Engine totals: **45,176 raw / 17,336 admitted**. Each HA client runtime has **544 raw / 400 admitted**.
 Legacy HA has no registered finite family; its complete ordinary suite remains required. Ordinary functional tests
 are additional executions and are counted separately by collection. The generated registry must agree with these totals.
 
@@ -59,7 +60,7 @@ These controls model task/runtime/process death, not literal hardware power fail
 |---|---|---|---|
 | Observation retry | Durable CALL identity is distinct from equal message bodies; pending receipts cannot be evicted | BEGIN/statement/COMMIT refusal rolls back receipt, queue and local status; repaired retry and later sessions succeed | A bounded recent retry window; new untimed reports after a fresh replacement Boot remain distinct. |
 | Cloud Start reply | Explicit error retry, denied authorization and unknown delivery have different receipts | Retry budget survives restart; exact new proof after recovery itself fails; denied Start keeps mapping for real Stop | Three total transmissions with60/120-second linear waits; no automatic retry of an unknown outcome. |
-| Start dispatch | Prepared/unsent/rejected differs from issued/accepted unknown; exact request/tag binding | Exact closed mapped lifecycle and atomic receipt/metadata settlement at verified zero | Unknown/unbound debt still needs supported exact evidence. |
+| Start dispatch | Prepared/unsent/rejected differs from issued/accepted unknown; exact request/tag binding | Exact closed local lifecycle and atomic receipt/metadata settlement at verified zero; unmapped cloud debt remains separately blocked | Unknown/unbound debt still needs supported exact evidence. |
 | Current/native proof | Real503/EOF/bad JSON, profile/composite rejection, applied CALLERROR, excessive composite | Prior selection unless target fully confirmed before revocation; new Pause/Return | All integer pairs for successful selection/idempotency; failure-order grammar uses representative currents. |
 | Boot | Incomplete old proof cannot cross Boot | Fresh pair after incomplete proof; completed pair may survive identical metadata | Changed identity/configuration retains blocking focused tests. |
 | Stop delivery | Original token/body/history retained; proof and pre-ACK Pause cannot fabricate ACK | Exact evidence, genuine wire ACK, new Pause, separate Return | Head permutations plus192 real repeated-storage/FIFO histories with1/3 queued pairs. |

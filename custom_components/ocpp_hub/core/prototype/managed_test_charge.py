@@ -185,7 +185,7 @@ class ManagedChargeTests:
                 },
             )
 
-    # A genuinely closed, mapped owner session can finish its metadata while its separate Stop delivery stays retained.
+    # Exact local closure can finish its request at verified Pause zero while separate cloud delivery stays retained.
     def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
         state, j = self.state(), self.journal
         local, receipt = state.get("local_transaction"), local_start_receipt(j)
@@ -194,6 +194,7 @@ class ManagedChargeTests:
             local = receipt.get("local")
         if (
             self.lease is not None
+            and (not self.lease.normal or self.lease.source != "local" or self.lease.identifier != state.get("id"))
             or state.get("kind") != "normal"
             or state.get("source") != "local"
             or type(local) is not int
@@ -211,7 +212,7 @@ class ManagedChargeTests:
         ):
             return
         row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (local,)).fetchone()
-        if row is None or row["stop"] is None or row["vendor"] is None:
+        if row is None or row["stop"] is None:
             return
         if fingerprint(json.loads(row["start"])["idTag"].casefold()) != state.get("tag_digest"):
             return
@@ -250,6 +251,28 @@ class ManagedChargeTests:
                     "recovery_reason": "owned_session_closed_at_verified_zero",
                 },
             )
+        # Local command completion is separate from unresolved cloud delivery; its fault and FIFO remain intact.
+        self.lease = None
+        self.changed.set()
+
+    # Fault supervision still settles exact local closure; cloud delivery retains its independent recovery gate.
+    async def retire_closed_after_fault(self) -> None:
+        state = self.state()
+        if (
+            self.controller.stopping
+            or self.controller.requests.intent().mode != "paused"
+            or state.get("kind") != "normal"
+            or state.get("source") != "local"
+            or state.get("state") == "completed"
+            or local_start_receipt(self.journal).get("local") is None
+        ):
+            return
+        try:
+            native = await self.controller.native.read()
+            if not self.controller.stopping:
+                self.retire_closed_at_zero(native)
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+            return
 
     # Admission is conservative; the worker independently rechecks physical zero before Start.
     def available(self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False) -> bool:
@@ -688,6 +711,7 @@ class ManagedChargeTests:
                 await self.hold_expired()
             native = await c.native.read()
             self.retire_unissued_at_zero(native)
+            self.retire_closed_at_zero(native)
             local, owner = j.active(), local_start_receipt(j)
             if expected.mode == "app" and local is not None and self.independent_daily(native, local):
                 if g.controls.ready and g.controls.desired() == state["current_a"]:

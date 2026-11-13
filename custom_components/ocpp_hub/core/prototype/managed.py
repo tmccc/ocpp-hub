@@ -687,6 +687,7 @@ class ManagedController:
             return {**base, "state": "stopping", "owner_control_enabled": False}
         if j.get("managed_control_fault"):
             await self.hold_fault()
+            await self.tests.retire_closed_after_fault()
             try:
                 await reconcile_owner_release(self)
             except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:

@@ -22,7 +22,12 @@ from tests_model.deep_cases import (
 )
 from tests_model.ha_cases import outage_candidates, outage_exclusion, receipt_candidates, receipt_exclusion
 from tests_model.recovery_cases import start_candidates, start_exclusion
-from tests_model.review_cases import cloud_start_candidates, issued_start_candidates, observation_candidates
+from tests_model.review_cases import (
+    bound_owner_delivery_candidates,
+    cloud_start_candidates,
+    issued_start_candidates,
+    observation_candidates,
+)
 from tests_model.schedule_cases import candidates, exclusion, source_candidates, source_exclusion
 from tests_model.storage_debt_cases import storage_fifo_candidates
 
@@ -45,6 +50,17 @@ class Family:
 
 
 FAMILIES = (
+    Family(
+        "bound_owner_delivery",
+        ("engine-model",),
+        "tests_model/test_bound_owner_delivery_sequences.py::test_bound_owner_delivery_sequences",
+        bound_owner_delivery_candidates,
+        no_exclusion,
+        24,
+        24,
+        ("START-DISPATCH", "CLOUD-START-REFUSAL", "PROCESS-DEATH", "NEXT-SESSION"),
+        ("actual_sigkill", "independent_mapping"),
+    ),
     Family(
         "issued_start_proof",
         ("engine-model",),

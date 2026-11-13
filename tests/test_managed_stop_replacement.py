@@ -66,8 +66,8 @@ async def test_stop_rejection_replacement_retains_recovery(
             await return_after_ack(rig, s, c, expected_starts=int(origin.startswith("local")))
 
 
-# Intent: a real accepted Start reply after newer Pause can settle only its exact genuinely closed bound session.
-# Why: the protocol receipt commits before the worker publishes success; an unknown issued reply remains debt.
+# Intent: an exact genuinely closed bound session can settle locally while preserving the truthful RPC outcome.
+# Why: unbound unknown commands retain debt, while a real owned Start/Stop and fresh Pause prove local completion.
 @pytest.mark.parametrize("answer", ["accepted", "unknown"])
 @pytest.mark.parametrize("replace_process", [False, True])
 async def test_bound_lifecycle_before_start_success_publication(
@@ -119,21 +119,19 @@ async def test_bound_lifecycle_before_start_success_publication(
                 await verify_bound_result(rig, s, c, identifier, answer)
 
 
-# Require positive recovery only from a real accepted exact receipt; zero and closure cannot settle an unknown send.
+# Require the exact bound lifecycle at zero, preserving an issued unknown reply rather than inventing acceptance.
 async def verify_bound_result(rig, s, c, identifier, answer):
     await pause(c)
     for _ in range(4):
         await c.tick()
         await asyncio.sleep(0)
     assert rig.bench.firmware.effective_limit() == 0 and len(mp.starts(rig)) == 1
-    if answer == "accepted":
-        assert c.tests.state()["state"] == "completed"
-        assert c.requests.receipt(identifier)["state"] == "completed"
-        c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-        assert (await mp.healthy(c))["normal_start_ready"]
-    else:
-        assert c.requests.receipt(identifier)["state"] != "completed"
-        assert s.journal.get("local_start_receipt")["stage"] == "issued"
+    assert c.tests.state()["state"] == "completed"
+    assert c.requests.receipt(identifier)["state"] == "completed"
+    assert c.tests.state()["start_rpc_accepted"] is False
+    assert s.journal.get("local_start_receipt")["stage"] == ("accepted" if answer == "accepted" else "issued")
+    c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
+    assert (await mp.healthy(c))["normal_start_ready"]
 
 
 # Intent: journal failure commits neither half of exact closed-session recovery, and a later retry completes both.

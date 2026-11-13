@@ -9,7 +9,7 @@
   unresolved. Recovery attempts can themselves fail without disabling the next supported reconciliation.
 - Reconcile exactly identified issued and unpublished owner Starts with independently verified cancellation, and
   settle genuine late mapped lifecycles at verified zero. Preserve truthful original RPC outcomes.
-- Add588 finite cloud refusal, observation retry and real issued-command SIGKILL histories, with later-session
+- Add612 finite cloud refusal, observation retry and real issued-command/coupled cloud-delivery SIGKILL histories, with later-session
   recovery; add real SQLite rollback, ID-reuse and ordinary lost-reply controls. Check charger-specific diagnostics
   in the introduction test instead of a shared last-error field.
 - Add a source-linked recovery coverage matrix and finite Start, Boot, current, Stop, cloud-debt and actual HA

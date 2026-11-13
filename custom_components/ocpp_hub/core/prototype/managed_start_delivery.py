@@ -21,12 +21,25 @@ RETRY_INTERVAL = 60.0
 KIND = "start-delivery"
 
 
+# Quarantine must install its own recovery gate even when native reconciliation prevents a supervisor poll.
+def latch_start_delivery_fault(j: Journal) -> None:
+    if not j.db.in_transaction:
+        raise RecoveryRequiredError("Start delivery fault must share its quarantine transaction")
+    if j.get("managed_mode") is not None and not j.get("managed_control_fault"):
+        control = j.get("control", {})
+        j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+        j.put(
+            "managed_control_fault", {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()}
+        )
+
+
 # An interrupted approved retry needs new exact evidence; its old retry permission cannot block all later tooling.
 def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
     if not j.db.in_transaction:
         raise RecoveryRequiredError("unknown Start retry normalization must share its journal transition")
     if item.action != "StartTransaction" or item.state != "ambiguous":
         return
+    latch_start_delivery_fault(j)
     records, changed = j.get(PROOFS, {}), False
     for key, entry in records.items():
         proof = entry["proof"]
@@ -164,6 +177,7 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
                     "managed_control_fault",
                     {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
                 )
+            latch_start_delivery_fault(j)
     return exhausted
 
 

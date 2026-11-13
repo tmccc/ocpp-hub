@@ -98,3 +98,43 @@ def issued_start_candidates():
             (False, True),
         )
     )
+
+
+@dataclass(frozen=True)
+class BoundOwnerDeliveryCase:
+    """A real unpublished command later closes locally while its distinct cloud delivery remains unknown."""
+
+    phase: str
+    cloud: str
+    selected: int
+    demand: bool
+    events: tuple[str, ...] = (
+        "request",
+        "sigkill",
+        "late-start",
+        "cloud-quarantine",
+        "closed",
+        "local-settled",
+        "attest",
+        "drain",
+        "recover",
+        "two-lifecycles",
+    )
+
+    # The cross-fault inputs remain independent of whichever tool or runtime outcome is observed.
+    @property
+    def identifier(self):
+        return f"bound-owner-{self.phase}-{self.cloud}-{self.selected}-{int(self.demand)}"
+
+
+# Both real unpublished boundaries cross unknown/explicitly refused cloud delivery and both later demand orders.
+def bound_owner_delivery_candidates():
+    return tuple(
+        BoundOwnerDeliveryCase(*seed)
+        for seed in product(
+            ("before-accepted-commit", "after-accepted-commit"),
+            ("silent", "errors"),
+            (6, 16, 32),
+            (False, True),
+        )
+    )
