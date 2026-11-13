@@ -985,7 +985,7 @@ class Gateway:
         return await self.controls.start(tag)
 
     # A bounded management request must keep its grant and the existing static authorization valid at every send.
-    async def start_managed(self, tag: str, guard: Callable[[], None]) -> Frame:
+    async def start_managed(self, tag: str, guard: Callable[[], None], *, request_id: str | None = None) -> Frame:
         # Revocation or a newer Pause can invalidate authorization while native evidence is awaited.
         def check() -> None:
             guard()
@@ -993,7 +993,7 @@ class Gateway:
                 raise DeniedError("managed test tag authorization is no longer current")
 
         check()
-        return await self.controls.start_managed(tag, check)
+        return await self.controls.start_managed(tag, check, request_id=request_id)
 
     # A local stop installs a durable zero-current hold even when there is no known transaction to stop.
     async def stop(self) -> Frame:

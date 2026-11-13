@@ -32,6 +32,39 @@ class OrdinaryRecovery:
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
 
+    # A verified normal local Start may join ordinary supervision only after its exact request really completed.
+    def verified_normal(self) -> bool:
+        c, j = self.c, self.c.session.journal
+        state, receipt = c.tests.state(), local_start_receipt(j)
+        local = state.get("local_transaction")
+        if (
+            c.tests.lease is not None
+            or state.get("kind") != "normal"
+            or state.get("source") != "local"
+            or state.get("state") != "running"
+            or state.get("start_rpc_accepted") is not True
+            or type(local) is not int
+            or receipt.get("local") != local
+            or receipt.get("stage") != "accepted"
+            or receipt.get("digest") != state.get("tag_digest")
+            or receipt.get("request_id") not in (None, state.get("id"))
+            or j.get("control", {}).get("start_pending")
+        ):
+            return False
+        request = j.db.execute(
+            "SELECT revision,result FROM managed_requests WHERE id=? AND action='start' AND state='completed'",
+            (state.get("id"),),
+        ).fetchone()
+        transaction = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
+        if request is None or transaction is None or request["revision"] + 1 != state.get("revision"):
+            return False
+        result = json.loads(request["result"])
+        return (
+            result.get("local_session_verified") is True
+            and result.get("timed") is False
+            and fingerprint(json.loads(transaction["start"])["idTag"].casefold()) == state.get("tag_digest")
+        )
+
     # Timer/current/test state machines retain exclusive ownership of their own restoration obligations.
     def ordinary(self) -> bool:
         c, j = self.c, self.c.session.journal
@@ -45,7 +78,7 @@ class OrdinaryRecovery:
             )
             and not c.current.pending()
             and c.tests.lease is None
-            and c.tests.state().get("state") in (None, "completed")
+            and (c.tests.state().get("state") in (None, "completed") or self.verified_normal())
             and j.get("managed_current_change", {}).get("state") not in ("interrupted", "uncertain")
         )
 
@@ -77,6 +110,17 @@ class OrdinaryRecovery:
             return None
         tag = json.loads(row["start"])["idTag"].casefold()
         digest = fingerprint(tag)
+        state = self.c.tests.state()
+        local_source = (
+            state.get("native_source") if state.get("local_transaction") == local and self.verified_normal() else None
+        )
+        expected_source = {
+            "marker": native.session_plan_id,
+            "start": fingerprint(json.loads(row["start"])),
+            "schedule": self.c.native.spec.saved_schedule_digest,
+        }
+        if local_source is not None and local_source != expected_source:
+            return None
         grant = j.get("vendor_start_grant", {})
         attested = grant.get("native_source")
         if attested is not None and attested != {
@@ -88,6 +132,17 @@ class OrdinaryRecovery:
         for plan in (native.saved_schedule or {}).get("planList", []):
             if plan.get("planId") == native.session_plan_id and str(plan.get("idTag", "")).casefold() == tag:
                 return {"kind": "daily", "plan": plan["planId"], "tag": digest}
+        if (
+            local_source == expected_source
+            and state.get("local_transaction") == local
+            and not known_plan_source(j, native)
+        ):
+            return {
+                "kind": "local",
+                "tag": digest,
+                "request": state["id"],
+                "receipt": fingerprint(local_start_receipt(j)),
+            }
         if native.session_plan_id is not None and (known_plan_source(j, native) or attested is None):
             return None  # An unknown marker needs the exact command-source attestation made during binding.
         if (
@@ -125,6 +180,32 @@ class OrdinaryRecovery:
     def needed(self) -> bool:
         j = self.c.session.journal
         return self.ordinary() and (self.active() or j.get("trial_phase") == "recovering")
+
+    # Either channel can close a real mapped session first; disagreement grants only a zero-output restrictive wait.
+    def closure_gap(self, native: HandoverEvidence) -> bool:
+        j, physical = self.c.session.journal, native.physical
+        local, known = physical.native_transaction_id, j.active()
+        if (
+            not self.ordinary()
+            or physical.power_w != 0
+            or any(value != 0 for value in native.currents_a + native.powers_w)
+        ):
+            return False
+        if not physical.transaction_open and local is None and type(known) is int:
+            return (
+                j.db.execute(
+                    "SELECT 1 FROM transactions WHERE local=? AND stop IS NULL AND vendor IS NOT NULL", (known,)
+                ).fetchone()
+                is not None
+            )
+        if not physical.transaction_open or known is not None or type(local) is not int:
+            return False
+        return (
+            j.db.execute(
+                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL AND vendor IS NOT NULL", (local,)
+            ).fetchone()
+            is not None
+        )
 
     # Existing commissioned ownership and a current matching Boot permit only zero while native HTTP is unavailable.
     async def hold(self, reason: str) -> None:
@@ -377,6 +458,8 @@ class OrdinaryRecovery:
         await self.hold("restricted_introduction")
         native = await c.native.read()
         local = j.active()
+        if self.closure_gap(native):
+            raise RecoveryRequiredError("ordinary zero hold awaits exact native closure")
         self.confirm_zero_introduction(native, local)
         self.require_authority(local)
         if local is not None:

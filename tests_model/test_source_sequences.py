@@ -22,6 +22,7 @@ from tests.managed_scenario_helpers import (
 from tests.test_managed_proxy import introduced, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
+from tests_model.catalog import input_digest
 from tests_model.schedule_cases import source_cases
 from tests_model.test_schedule_sequences import Supervisor, listener_port, tls_for_case, turns
 from tests_model.test_schedule_sequences import model_tls as model_tls
@@ -108,5 +109,7 @@ async def test_source_proof_event_sequences(tmp_path, model_tls, monkeypatch, re
                 suffix_complete = True
             finally:
                 record_property("model_case", case.identifier)
+                record_property("model_family", "source_proof")
+                record_property("model_input_sha256", input_digest("source_proof", case))
                 record_property("completed_events", completed)
                 record_property("suffix_complete", suffix_complete)

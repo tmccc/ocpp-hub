@@ -6,6 +6,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 from ocpp_hub_core.frames import build_call_error, build_call_result
@@ -109,9 +110,14 @@ def statement(candidate):
 
 # Every round starts the actual service and charger socket, then crash-closes its journal for exclusive tooling.
 @asynccontextmanager
-async def running(rig, label):
+async def running(rig, label, *, owner_tag=None, release_on_exit=True):
     strategy_file(rig, rig.prepared.config.journal.parent)
     s = mp.managed_session(rig)
+    if owner_tag is not None:
+        s.gateway.policy = replace(
+            s.gateway.policy, allowed_tags=frozenset({owner_tag, *s.gateway.policy.allowed_tags})
+        )
+        s.gateway.controls.policy = s.gateway.policy
     await s.start()
     c = ManagedController(s)
     rig.route_to_trial()
@@ -120,7 +126,7 @@ async def running(rig, label):
             await mp.introduced(rig, s, charger, label)
             yield s, c, charger
         finally:
-            if getattr(rig.bench, "stop_gate", None) is not None:
+            if release_on_exit and getattr(rig.bench, "stop_gate", None) is not None:
                 rig.bench.stop_gate.set()
             await c.tests.close()
             if c.pause_task is not None:
@@ -142,12 +148,12 @@ async def reconcile(rig, tmp_path, capsys, kind="stop-delivery"):
 
 
 # Consume recovery with a new intent only after real delivery, then separately return authority without Start.
-async def return_after_ack(rig, s, c):
+async def return_after_ack(rig, s, c, *, expected_starts=0):
     await until(lambda: s.journal.next_delivery() is None)
     assert (await c.tick())["state"] == "attention"
     await pause(c)
     assert (await mp.healthy(c))["local_hold_verified"]
-    assert rig.bench.firmware.effective_limit() == 0 and not mp.starts(rig)
+    assert rig.bench.firmware.effective_limit() == 0 and len(mp.starts(rig)) == expected_starts
     c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
     assert (await mp.healthy(c))["station_ceiling_a"] == 6
 

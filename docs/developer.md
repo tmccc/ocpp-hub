@@ -60,8 +60,11 @@ Repeat with the matching HA runtimes and suite names. `--runtime-mode image --ve
 matching virtualenv; `--readonly-mount HOST=CONTAINER` supplies any explicitly provisioned OpenSSL runtime needed by
 that image. Every attempt has its own directory; interrupted runs are retained and cannot be combined into one pass.
 Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
-must all pass the auditor. The model denominator remains13,440 raw/7,200 runnable inputs, including6,240 two-receipt
-and960 source-proof cases. CI runs those runnable models as20 independent runner jobs and includes all HA suites.
+must all pass the auditor. The source-pinned registry declares41,376 raw/13,536 runnable engine inputs and
+448 raw/352 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
+source, including HA families, then verifies exact input/event/recovery evidence. See the
+[recovery coverage matrix](recovery-coverage.md) for scopes, focused-only risks and limits.
+CI derives the exact model collection from that registry across20 independent runner jobs and includes all HA suites.
 
 The final qualification JSON contains `commit`, `source_digest` and a `phases` object mapping those four suite names
 to their absolute batch directories. `validate.py --qualification-report` requires all four, all20 workers, and the

@@ -8,45 +8,48 @@ import hashlib
 import json
 import sys
 from collections import Counter
-from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tests_model.schedule_cases import candidates, exclusion, source_candidates, source_exclusion  # noqa: E402
+from tests_model.catalog import FAMILIES, SCHEMA, case_record  # noqa: E402
 
 
 # Make the finite coverage denominator independently inspectable before or after execution.
-def manifest(path: Path) -> dict:
+def manifest(path: Path, suite: str = "engine-model") -> dict:
     accepted = 0
     excluded = Counter()
     families = Counter()
     identifiers = set()
     with path.open("w") as output:
-        for family, inputs, excluding in (
-            ("two_receipt", candidates(), exclusion),
-            ("source_proof", source_candidates(), source_exclusion),
-        ):
-            for case in inputs:
-                reason = excluding(case)
+        for family in FAMILIES:
+            if suite not in family.suites:
+                continue
+            raw_count, admitted_count = 0, 0
+            for case in family.inputs():
+                raw_count += 1
+                reason = family.excluding(case)
                 assert case.identifier not in identifiers
                 identifiers.add(case.identifier)
-                row = {"id": case.identifier, "family": family, **asdict(case), "exclusion": reason}
+                row = case_record(family, case)
                 output.write(json.dumps(row, sort_keys=True) + "\n")
                 if reason:
                     excluded[reason] += 1
                 else:
                     accepted += 1
-                    families[family] += 1
+                    families[family.name] += 1
+                    admitted_count += 1
+            if (raw_count, admitted_count) != (family.raw, family.admitted):
+                raise ValueError("registered family denominator differs: " + family.name)
     return {
+        "schema": SCHEMA,
+        "suite": suite,
         "families": dict(families),
         "raw_candidates": len(identifiers),
         "runnable": accepted,
         "exclusions": dict(excluded),
         "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "scope": (
-            "all five-event permutations and declared finite seeds; not arbitrary histories or all read interleavings"
-        ),
+        "scope": ("complete registered finite input families and causal exclusions; not arbitrary product histories"),
     }
 
 
@@ -54,8 +57,11 @@ def manifest(path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--suite", choices=("engine-model", "ha-proxy", "ha-proxy-legacy", "ha-legacy"), default="engine-model"
+    )
     args = parser.parse_args()
-    result = manifest(args.output)
+    result = manifest(args.output, args.suite)
     args.output.with_suffix(".summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
     return 0

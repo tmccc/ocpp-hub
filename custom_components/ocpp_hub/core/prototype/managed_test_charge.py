@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
+from .managed_start_binding import known_plan_source
 from .managed_start_debt import preserved_start_debt
 from .policy import DeniedError
 from .rpc import UnavailableError
@@ -128,6 +129,14 @@ class ManagedChargeTests:
     # Only explicit request-specific provenance can retire a failure before entering the Start command path.
     def unissued_at_zero(self, native: HandoverEvidence) -> bool:
         state, j = self.state(), self.journal
+        receipt = local_start_receipt(j)
+        unissued = (
+            state.get("start_attempted") is False
+            or receipt.get("request_id") == state.get("id")
+            and receipt.get("digest") == state.get("tag_digest")
+            and receipt.get("local") is None
+            and receipt.get("stage") in ("unsent", "rejected")
+        )
         row = j.db.execute(
             "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
         ).fetchone()
@@ -135,7 +144,7 @@ class ManagedChargeTests:
             self.lease is not None
             or state.get("kind") != "normal"
             or state.get("source") != "local"
-            or state.get("start_attempted") is not False
+            or not unissued
             or state.get("start_rpc_accepted") is not False
             or state.get("local_transaction") is not None
             or row is None
@@ -149,6 +158,62 @@ class ManagedChargeTests:
         except SecurityError, DeniedError, RecoveryRequiredError:
             return False
         return True
+
+    # A genuinely closed, mapped owner session can finish its metadata while its separate Stop delivery stays retained.
+    def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
+        state, j = self.state(), self.journal
+        local, receipt = state.get("local_transaction"), local_start_receipt(j)
+        if (
+            self.lease is not None
+            or state.get("kind") != "normal"
+            or state.get("source") != "local"
+            or type(local) is not int
+            or not (state.get("start_rpc_accepted") is True or receipt.get("request_id") == state.get("id"))
+            or receipt.get("local") != local
+            or receipt.get("stage") != "accepted"
+            or receipt.get("digest") != state.get("tag_digest")
+            or j.get("control", {}).get("start_pending")
+        ):
+            return
+        row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (local,)).fetchone()
+        if row is None or row["stop"] is None or row["vendor"] is None:
+            return
+        if fingerprint(json.loads(row["start"])["idTag"].casefold()) != state.get("tag_digest"):
+            return
+        request = j.db.execute(
+            "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
+        ).fetchone()
+        if (
+            request is None
+            or request["action"] != "start"
+            or request["revision"] + int(state.get("start_rpc_accepted") is True) != state.get("revision")
+            or request["state"] not in ("accepted", "running", "uncertain", "completed", "failed")
+            or receipt.get("request_id") not in (None, state.get("id"))
+        ):
+            return
+        try:
+            self.controller.require_paused(native)
+        except SecurityError, DeniedError, RecoveryRequiredError:
+            return
+        with j.atomic():
+            j.db.execute(
+                "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action='start' AND revision=? "
+                "AND state IN ('accepted','running','uncertain')",
+                (
+                    json.dumps({"local_session_verified": True, "charging": False, "timed": False}, sort_keys=True),
+                    state["id"],
+                    request["revision"],
+                ),
+            )
+            j.put(
+                "managed_test_charge",
+                {
+                    **state,
+                    "state": "completed",
+                    "charging": False,
+                    "recovery_reason": "owned_session_closed_at_verified_zero",
+                },
+            )
 
     # Admission is conservative; the worker independently rechecks physical zero before Start.
     def available(self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False) -> bool:
@@ -324,7 +389,7 @@ class ManagedChargeTests:
             if lease.normal:
                 j.put("managed_test_charge", {**self.state(), "tag_digest": fingerprint(tag.casefold())})
             j.put("managed_test_charge", {**self.state(), "start_attempted": True})
-            await c.session.gateway.start_managed(tag, lambda: self.guard(lease))
+            await c.session.gateway.start_managed(tag, lambda: self.guard(lease), request_id=lease.identifier)
             self.guard(lease)
             with j.atomic():
                 self.guard(lease)
@@ -643,6 +708,7 @@ class ManagedChargeTests:
     # Positive flow must belong to the known transaction and the actually accepted local or vendor Start path.
     def observed(self, native: HandoverEvidence) -> None:
         self.retire_refused_unsent()
+        self.retire_closed_at_zero(native)
         lease, c = self.lease, self.controller
         state = self.state()
         if lease is not None and self.finish_closed_normal(lease):
@@ -699,7 +765,7 @@ class ManagedChargeTests:
             return
         if lease.normal and state.get("start_rpc_accepted"):
             local = state.get("local_transaction")
-            row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
+            row = self.journal.db.execute("SELECT start,stop FROM transactions WHERE local=?", (local,)).fetchone()
             closed = row is not None and row["stop"] is not None
             opened = (
                 local is not None
@@ -715,6 +781,17 @@ class ManagedChargeTests:
                         "local_transaction": local,
                         "session_started_at": time.time(),
                         "charging": opened and native.physical.power_w > 10,
+                        **(
+                            {
+                                "native_source": {
+                                    "marker": native.session_plan_id,
+                                    "start": fingerprint(json.loads(row["start"])),
+                                    "schedule": native.saved_schedule_digest,
+                                }
+                            }
+                            if opened and not known_plan_source(self.journal, native)
+                            else {}
+                        ),
                     },
                 )
                 c.requests.finish(

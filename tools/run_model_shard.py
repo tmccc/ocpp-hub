@@ -41,8 +41,22 @@ def main() -> int:
         return collected.returncode
     rows = [json.loads(line) for line in (args.output / "collection.jsonl").read_text().splitlines()]
     collections = [row["ids"] for row in rows if row.get("event") == "collection"]
-    if len(collections) != 1 or len(collections[0]) != 7200 or len(set(collections[0])) != 7200:
-        raise RuntimeError("full model collection differs from the declared7200 runnable cases")
+    generated = subprocess.run(
+        [sys.executable, "-B", "tools/schedule_sequence_manifest.py", str(args.output / "sequence-manifest.jsonl")],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (args.output / "manifest.log").write_text(generated.stdout + generated.stderr)
+    declared = {
+        row["node_id"]
+        for line in (args.output / "sequence-manifest.jsonl").read_text().splitlines()
+        if (row := json.loads(line))["exclusion"] is None
+    }
+    if len(collections) != 1 or set(collections[0]) != declared or len(collections[0]) != len(declared):
+        raise RuntimeError("full model collection differs from the exact registered finite universe")
     selected = collections[0][args.shard :: args.shards]
     (args.output / "assigned-ids.json").write_text(json.dumps(selected) + "\n")
     env["SCENARIO_RESULTS"] = str(args.output / "results.jsonl")
@@ -60,6 +74,29 @@ def main() -> int:
         for reports in phases.values()
     ):
         raise RuntimeError("model shard did not complete every assigned phase")
+    expected = {
+        row["node_id"]: row
+        for line in (args.output / "sequence-manifest.jsonl").read_text().splitlines()
+        if (row := json.loads(line))["exclusion"] is None
+    }
+    for identifier, reports in phases.items():
+        properties = next(row for row in reports if row["phase"] == "call").get("properties", {})
+        case = expected[identifier]
+        if properties.get("suffix_complete") is not True:
+            raise RuntimeError("model shard did not verify its full recovery suffix: " + identifier)
+        if any(properties.get(key) is not True for key in case.get("required_evidence", [])):
+            raise RuntimeError("model shard lacks required boundary evidence: " + identifier)
+        if any(
+            properties.get(key) != value
+            for key, value in {
+                "model_case": case["id"],
+                "model_family": case["family"],
+                "model_input_sha256": case["input_sha256"],
+                "completed_events": case["events"],
+                "suffix_complete": True,
+            }.items()
+        ):
+            raise RuntimeError("model shard lacks exact input, events or recovery suffix: " + identifier)
     return 0
 
 

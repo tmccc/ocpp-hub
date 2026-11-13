@@ -140,6 +140,8 @@ async def peer():
             result = receipts[value["request_id"]]
         else:
             raise AssertionError("unexpected client command")
+        if control.get("result_filter") is not None:
+            result = control["result_filter"](command, value, result)
         try:
             await socket.send_json({"id": value["id"], "ok": True, "result": result})
         except ConnectionResetError:

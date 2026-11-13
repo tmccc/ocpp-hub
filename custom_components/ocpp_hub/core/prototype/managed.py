@@ -159,6 +159,7 @@ class ManagedController:
             controls = self.session.gateway.controls
             if not native.physical.transaction_open and controls.ready and controls.desired() == 0:
                 self.require_paused(native)
+                self.tests.observed(native)
                 controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
                 return
             await self.session.gateway.stop()
@@ -614,6 +615,9 @@ class ManagedController:
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
             await self.schedule.await_closure_agreement(native)
+            if self.ordinary.closure_gap(native):
+                await self.ordinary.hold("native_closure_pending")
+                raise RecoveryRequiredError("ordinary zero hold awaits exact lifecycle closure")
             if (
                 native.physical.transaction_open
                 and native.physical.native_transaction_id != self.session.journal.active()

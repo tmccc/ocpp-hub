@@ -63,15 +63,21 @@ class ProxyClient:
 
     # Acceptance is separate from actual zero/release confirmation; a lost response never repeats the physical write.
     async def command(self, action: str, revision: int, **fields: Any) -> None:
-        receipt = await self.request(action, revision=revision, **fields)
-        if not isinstance(receipt.get("id"), str) or not re.fullmatch(r"[a-f0-9]{32}", receipt["id"]):
+        identifier = fields.pop("id", uuid.uuid4().hex)
+        receipt = await self.request(action, id=identifier, revision=revision, **fields)
+        if (
+            not isinstance(receipt.get("id"), str)
+            or not re.fullmatch(r"[a-f0-9]{32}", receipt["id"])
+            or receipt["id"] != identifier
+        ):
             raise ProxyError("The local charger proxy returned an invalid command receipt")
-        identifier = receipt["id"]
         try:
             async with asyncio.timeout(25):
                 while receipt.get("state") in ("accepted", "running"):
                     await asyncio.sleep(1)
                     receipt = await self.request("receipt", request_id=identifier)
+                    if receipt.get("id") != identifier:
+                        raise ProxyError("The local charger proxy returned another command's receipt")
         except TimeoutError, ProxyError:
             raise ProxyError("The request was recorded; physical confirmation is still pending") from None
         if receipt.get("state") != "completed":

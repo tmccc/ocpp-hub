@@ -2,6 +2,15 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add a source-linked recovery coverage matrix and finite Start, Boot, current, Stop, cloud-debt and actual HA
+  lifecycle/receipt permutations. Regenerate qualification inputs independently and require exact per-case recovery
+  evidence on both HA runtimes, with explicit exclusions and coverage limits.
+- Record managed Start provenance before positive-cap work, atomically settle exact genuinely closed local
+  receipt/lifecycle state at verified zero, and reject receipts for another HA command. Hold zero through exact
+  known native/ledger closure delays instead of creating a permanent authority fault.
+- Keep fully verified normal local sessions under native-outage zero supervision, with exact completed request,
+  accepted receipt and pinned native source required before continuation. Process replacement retains its Pause policy.
+
 - Restore ordinary-session supervision after proven unsent Start refusals and crash-interrupted zero cleanup.
   Clean up prepared local Start receipts when native pre-dispatch reads fail with a security error. Retry the full
   restrictive introduction proof after an identical overlapping Boot without reusing superseded acknowledgments.

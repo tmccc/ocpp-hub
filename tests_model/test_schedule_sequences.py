@@ -20,6 +20,7 @@ from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_native_history_archive import unassigned
 from tests.test_prototype import START
 from tests.worker_ports import listener_port_factory
+from tests_model.catalog import input_digest
 from tests_model.schedule_cases import SequenceCase, cases, smoke_cases
 
 
@@ -369,6 +370,8 @@ async def test_two_receipt_event_sequences(tmp_path, model_tls, monkeypatch, rec
                 suffix_complete = True
             finally:
                 record_property("model_case", case.identifier)
+                record_property("model_family", "two_receipt")
+                record_property("model_input_sha256", input_digest("two_receipt", case))
                 record_property("completed_events", completed)
                 record_property("suffix_complete", suffix_complete)
                 record_property("wire_command_count", len(ledger.commands))

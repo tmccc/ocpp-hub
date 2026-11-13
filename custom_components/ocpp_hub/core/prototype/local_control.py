@@ -405,13 +405,15 @@ class LocalControl:
         return await self._owned(self._start(tag))
 
     # A managed test supplies a live per-request guard without enabling the unrestricted local Start policy.
-    async def start_managed(self, tag: str, guard: Callable[[], None]) -> Frame:
+    async def start_managed(self, tag: str, guard: Callable[[], None], *, request_id: str | None = None) -> Frame:
         if self.policy.allow_local_start or not 6 <= self.policy.max_current_a <= 32:
             raise DeniedError("managed Start requires the restricted installation policy")
-        return await self._owned(self._start(tag, guard=guard, shared=True))
+        return await self._owned(self._start(tag, guard=guard, shared=True, request_id=request_id))
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
-    async def _start(self, tag: str, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
+    async def _start(
+        self, tag: str, *, guard: Callable[[], None] | None = None, shared: bool = False, request_id: str | None = None
+    ) -> Frame:
         if guard is not None:
             guard()
         if not self.policy.allow_local_start and guard is None:
@@ -426,7 +428,18 @@ class LocalControl:
             or self.journal.active() is not None
         ):
             raise DeniedError("tag is not allowed or a transaction is unresolved")
-        epoch, ticket = self._claim(previous.get("inhibit", False))
+        with self.journal.atomic():
+            epoch, ticket = self._claim(previous.get("inhibit", False))
+            self.journal.put(
+                "local_start_receipt",
+                {
+                    "ticket": ticket,
+                    "digest": fingerprint(tag.casefold()),
+                    "stage": "prepared",
+                    "local": None,
+                    "request_id": request_id,
+                },
+            )
 
         # The request generation is checked again after native validation and immediately before each actual send.
         def check() -> None:
@@ -458,15 +471,6 @@ class LocalControl:
                 if self.authorize is not None and not self.authorize(tag):
                     raise DeniedError("authorization changed before forwarding a local start")
                 with self.journal.atomic():
-                    self.journal.put(
-                        "local_start_receipt",
-                        {
-                            "ticket": ticket,
-                            "digest": fingerprint(tag.casefold()),
-                            "stage": "prepared",
-                            "local": None,
-                        },
-                    )
                     self._complete(ticket, inhibit=False, start_pending=True)
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":

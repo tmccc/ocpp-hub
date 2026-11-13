@@ -413,12 +413,12 @@ def main():
         if not ids or len(ids) != len(set(ids)):
             raise RuntimeError("Empty or duplicate full collection")
         write_json(ROOT / "collected-ids.json", ids)
-        if "tests_model" in config["specs"]:
+        if (SOURCE / "tests_model/catalog.py").is_file():
             # Generate the exact manifest under the same loopback audit hook as tests.
             manifest_code = (
                 "import runpy,sys; from tools.offline_validate import network_guard; "
                 "sys.addaudithook(network_guard); "
-                'sys.argv=["tools/schedule_sequence_manifest.py",sys.argv[1]]; '
+                'sys.argv=["tools/schedule_sequence_manifest.py",sys.argv[1],"--suite",sys.argv[2]]; '
                 'runpy.run_path("tools/schedule_sequence_manifest.py",run_name="__main__")'
             )
             with (ROOT / "manifest.log").open("w") as output:
@@ -432,6 +432,7 @@ def main():
                         "-c",
                         manifest_code,
                         str(ROOT / "sequence-manifest.jsonl"),
+                        config["suite"],
                     ],
                     cwd=SOURCE,
                     env=env,

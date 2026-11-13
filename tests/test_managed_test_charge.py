@@ -85,14 +85,25 @@ async def owner_start(test: ChargeRig) -> None:
 
 
 # Send a real charger lifecycle and let the independent native peer report genuine bounded power.
-async def positive_flow(test: ChargeRig, source: str = "local") -> int:
+async def positive_flow(
+    test: ChargeRig,
+    source: str = "local",
+    *,
+    call_id: str = "actual-test-start",
+    meter_start: int | None = None,
+    timestamp: str | None = None,
+) -> int:
     if source == "daily":
         tag = "NATIVE_TIMER"
     elif source == "local":
         tag = starts(test.rig)[-1][3]["idTag"]
     else:
         tag = "CLOUD_OWNER"
-    answer = await test.rig.bench.call(test.charger, "actual-test-start", "StartTransaction", START | {"idTag": tag})
+    payload = START | {"idTag": tag} | ({} if meter_start is None else {"meterStart": meter_start})
+    if timestamp is not None:
+        payload["timestamp"] = timestamp
+    answer = await test.rig.bench.call(test.charger, call_id, "StartTransaction", payload)
+    assert answer[0] == 3, answer
     assert answer[2]["idTagInfo"]["status"] == "Accepted"
     local = answer[2]["transactionId"]
     test.rig.peer.plan_session = (local, 9 if source == "daily" else 987654)

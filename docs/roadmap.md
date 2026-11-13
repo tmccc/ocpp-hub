@@ -21,6 +21,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 
 ## In progress
 
+- [~] Broader offline failure/recovery qualification (2026-11-13): source-linked matrix; complete finite
+  Start/Boot/current/Stop/cloud-debt and actual HA lifecycle/receipt families; explicit exclusions, real failure
+  injection and mandatory later recovery. Require all four complete20-worker suites on one clean commit.
+  This change performs no live charging tests or deployment.
+
 - [~] External-review recovery corrections (2026-11-12): preserve ordinary supervision after unsent local Start
   refusals and interrupted zero cleanup; complete safe introduction after identical overlapping Boot; retain HA
   outage notices through setup retries and failed unload. Add exact independent recovery for accepted unbound

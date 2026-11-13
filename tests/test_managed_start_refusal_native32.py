@@ -4,6 +4,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
@@ -25,7 +26,7 @@ pytestmark = pytest.mark.asyncio
 
 # Keep this synthetic peer or lifecycle helper independent of the engine under test.
 @asynccontextmanager
-async def commissioned(tmp_path, tls, port, monkeypatch, current):
+async def commissioned(tmp_path, tls, port, monkeypatch, current, *, owner_tag=None):
     async with paused_ready(tmp_path, tls, port, monkeypatch) as prior:
         writes = []
         await prepare_current_capability(
@@ -39,6 +40,11 @@ async def commissioned(tmp_path, tls, port, monkeypatch, current):
         await prior.controller.tests.close()
         await crash(prior.session)
         session = managed_session(prior.rig)
+        if owner_tag is not None:
+            session.gateway.policy = replace(
+                session.gateway.policy, allowed_tags=frozenset({owner_tag, *session.gateway.policy.allowed_tags})
+            )
+            session.gateway.controls.policy = session.gateway.policy
         await session.start()
         c = ManagedController(session)
         async with prior.rig.charger(session) as charger:

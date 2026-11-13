@@ -29,7 +29,7 @@ class OneShot503Peer(NativeVehiclePeer):
     # Keep this synthetic peer or lifecycle helper independent of the engine under test.
     async def handle(self, reader, writer):
         receipt = self.journal.get("local_start_receipt", {}) if self.journal is not None else {}
-        if not self.armed or receipt.get("stage") != "prepared":
+        if not self.armed or receipt.get("stage") != "prepared" or self.bench.firmware.effective_limit() == 0:
             await super().handle(reader, writer)
             return
         self.armed = False

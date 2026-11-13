@@ -8,6 +8,9 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -15,6 +18,31 @@ from pathlib import Path
 # Load optional result artifacts without manufacturing completed execution evidence.
 def read_json(path, default):
     return json.loads(path.read_text()) if path.exists() else default
+
+
+# Regenerate every declared input from the pinned source rather than trusting a run's copied denominator.
+def canonical_manifest(root, suite):
+    source = root / "source"
+    if not (source / "tests_model/catalog.py").is_file():
+        if suite == "engine-model":
+            raise ValueError("engine model registry is missing")
+        return [], None
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/home/tonym/codex")) as scratch:
+        output = Path(scratch) / "manifest.jsonl"
+        generated = subprocess.run(
+            [sys.executable, "-B", str(source / "tools/schedule_sequence_manifest.py"), str(output), "--suite", suite],
+            cwd=source,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if generated.returncode:
+            raise ValueError(
+                "pinned model registry could not generate its declared universe: " + generated.stderr[-500:]
+            )
+        return [json.loads(line) for line in output.read_text().splitlines()], read_json(
+            output.with_suffix(".summary.json"), None
+        )
 
 
 # Reconcile raw phase evidence against the exact collection, assignment, manifest and caller-pinned snapshot.
@@ -225,42 +253,44 @@ def main(argv=None):
         errors.append("pytest sessions not exactly once and zero")
     if len(statuses["passed"]) != len(selected):
         errors.append("not all selected IDs passed all three phases")
-    model_functions = {
-        "two_receipt": "tests_model/test_schedule_sequences.py::test_two_receipt_event_sequences",
-        "source_proof": "tests_model/test_source_sequences.py::test_source_proof_event_sequences",
-    }
     manifest = []
     manifest_path = root / "sequence-manifest.jsonl"
     if manifest_path.exists():
         manifest = [json.loads(line) for line in manifest_path.read_text().splitlines()]
-    admitted = [row for row in manifest if row["exclusion"] is None]
-    expected_model = {model_functions[row["family"]] + "[" + row["id"] + "]": row for row in admitted}
-    if "tests_model" in config.get("specs", []):
-        if (
-            len(manifest) != 13440
-            or len(expected_model) != 7200
-            or len({row["id"] for row in manifest}) != len(manifest)
-        ):
-            errors.append("manifest denominator/uniqueness differs from declared universe")
-        families = Counter(row["family"] for row in admitted)
-        if families != Counter({"two_receipt": 6240, "source_proof": 960}):
-            errors.append("manifest family totals differ")
-        if {identifier for identifier in collected if identifier.startswith("tests_model/")} != set(expected_model):
-            errors.append("full collection differs from exact manifest model IDs")
+    expected_model = {}
+    try:
+        canonical, summary = canonical_manifest(root, config.get("suite"))
+        if summary is not None:
+            if manifest != canonical or read_json(root / "sequence-manifest.summary.json", None) != summary:
+                errors.append("manifest inputs/denominators differ from independently regenerated pinned registry")
+            expected_model = {row["node_id"]: row for row in canonical if row["exclusion"] is None}
+            functions = {row["node_id"].split("[", 1)[0] for row in canonical}
+            collected_model = {
+                identifier
+                for identifier in collected
+                if identifier.startswith("tests_model/") or identifier.split("[", 1)[0] in functions
+            }
+            if collected_model != set(expected_model):
+                errors.append("full collection differs from exact registered model IDs")
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        errors.append("canonical model manifest failed: " + str(exc))
     invalid_model = []
     model_completed = Counter()
     for identifier in selected:
-        if not identifier.startswith("tests_model/"):
-            continue
         case = expected_model.get(identifier)
         calls = [row for row in evidence.get(identifier, []) if row["phase"] == "call"]
-        valid = case is not None and len(calls) == 1 and calls[0]["outcome"] == "passed"
         properties = calls[0].get("properties", {}) if calls else {}
+        if case is None and not identifier.startswith("tests_model/") and "model_case" not in properties:
+            continue
+        valid = case is not None and len(calls) == 1 and calls[0]["outcome"] == "passed"
         valid = (
             valid
             and properties.get("model_case") == case["id"]
+            and properties.get("model_family") == case["family"]
+            and properties.get("model_input_sha256") == case["input_sha256"]
             and properties.get("completed_events") == case["events"]
             and properties.get("suffix_complete") is True
+            and all(properties.get(key) is True for key in case.get("required_evidence", []))
         )
         if valid:
             model_completed[case["family"]] += 1

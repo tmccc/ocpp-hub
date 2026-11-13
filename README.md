@@ -1,5 +1,9 @@
 ## Standalone iCS proxy — commissioned 32 A installation and supervised trial record
 
+Offline recovery verification is documented in the [coverage matrix](docs/recovery-coverage.md), with separate
+safety/recovery obligations, finite input counts, explicit exclusions and limits. Full qualification requires four
+complete20-worker suites on one clean commit; declared coverage alone does not establish execution.
+
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
 an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the
