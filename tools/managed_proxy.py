@@ -22,12 +22,14 @@ from tools.trial_proxy import load_core  # noqa: E402
 load_core()
 from ocpp_hub_core.prototype.managed import ManagedController  # noqa: E402
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings  # noqa: E402
+from ocpp_hub_core.prototype.managed_diagnostics import snapshot as diagnostic_snapshot  # noqa: E402
 from ocpp_hub_core.prototype.managed_view import health_snapshot  # noqa: E402
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_private  # noqa: E402
 
+from tools.managed_reporting import Reporting  # noqa: E402
 from tools.trial_proxy import native_spec  # noqa: E402
 
 
@@ -126,7 +128,7 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     status_path = prepared.config.journal.with_suffix(".status.json")
     events_path = prepared.config.journal.with_suffix(".events.jsonl")
     started = time.time()
-    last_state: tuple[Any, ...] | None = None
+    reporting = Reporting(ROOT)
     published: dict[str, Any] = {"running": True, "state": "starting"}
     deadline: asyncio.Task[None] | None = None
     api: ManagementServer | None = None
@@ -146,14 +148,10 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
             status.update(pid=os.getpid(), started_at=started, certificate_remaining_seconds=remaining, running=True)
             if remaining <= 1800:
                 status.update(state="degraded", fault="listener_certificate_expiring")
-            published = status
-            save_private(status_path, status)
-            classification = status.get("state"), status.get("fault"), status.get("phase")
-            if classification != last_state:
-                event(events_path, {"at_epoch": time.time(), "state": classification[0], "fault": classification[1]})
-                print(json.dumps({"state": classification[0], "fault": classification[1]}), flush=True)
-                notify("STATUS=App/schedule control: " + str(classification[0]))
-                last_state = classification
+            status["diagnostics"] = diagnostic_snapshot(controller, status)
+            published = reporting.update(status)
+            if reporting.write(published, status_path, events_path, save_private, event):
+                notify("STATUS=App/schedule control: " + str(status.get("state")))
             try:
                 await asyncio.wait_for(stopped.wait(), 5)
             except TimeoutError:
@@ -176,9 +174,12 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
                     await asyncio.gather(controller.pause_task, return_exceptions=True)
             await session.close()
         finally:
-            save_private(
-                status_path, {"running": False, "state": "stopped", "checked_at": time.time(), "pid": os.getpid()}
-            )
+            try:
+                save_private(
+                    status_path, {"running": False, "state": "stopped", "checked_at": time.time(), "pid": os.getpid()}
+                )
+            except OSError, SecurityError:
+                pass  # Required session closure already completed; an old report continues to age visibly.
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.remove_signal_handler(sig)
     return 0

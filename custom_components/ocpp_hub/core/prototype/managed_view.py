@@ -60,12 +60,29 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
         and remaining is not None
         and remaining > 1800
     )
+    blockers = [
+        reason
+        for passed, reason in (
+            (0 <= age <= 45, "status_stale"),
+            (0 <= native_age <= 15, "native_stale"),
+            (value.get("running") is True, "service_not_running"),
+            (value.get("charger_connected") is True, "charger_disconnected"),
+            (value.get("boot_verified") is True, "boot_unverified"),
+            (bool(authority), "control_verification_pending"),
+            (remaining is not None and remaining > 1800, "certificate_validity_insufficient"),
+            (value.get("cloud_connected") is True, "cloud_disconnected"),
+        )
+        if not passed
+    ]
+    if not local_okay and not any(reason != "cloud_disconnected" for reason in blockers):
+        blockers.append("local_health_unverified")
     return {
         **value,
         "healthy": local_okay and value.get("cloud_connected") is True,
         "local_healthy": local_okay,
         "status_age_seconds": age if math.isfinite(age) else None,
         "native_age_seconds": native_age if math.isfinite(native_age) else None,
+        "health_blockers": blockers,
     }
 
 

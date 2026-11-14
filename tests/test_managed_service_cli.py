@@ -298,7 +298,9 @@ async def test_stop_request_fences_inflight_release_before_positive_send(
 
 # Intent: the actual managed runner handles a stop signal by retaining zero and writing a stopped report.
 # Why: systemd shutdown must retire both connections and the journal without clearing profiles or restoring32.
-@pytest.mark.parametrize("management_enabled", [False, True])
+@pytest.mark.parametrize(
+    "management_enabled,failed_output", [(False, None), (True, None), (True, "status"), (True, "events")]
+)
 async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
@@ -306,6 +308,7 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
     monkeypatch: Any,
     unused_tcp_port_factory: Any,
     management_enabled: bool,
+    failed_output: str | None,
 ) -> None:
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         value = rig.spec.value()
@@ -347,6 +350,12 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
             management_path = tmp_path / "management.json"
             save_private(secret, {"token": TOKEN})
             save_private(management_path, {"host": "127.0.0.1", "port": port, "token_file": str(secret)})
+        blocked = None
+        if failed_output is not None:
+            blocked = rig.prepared.config.journal.with_suffix(
+                ".status.json" if failed_output == "status" else ".events.jsonl"
+            )
+            blocked.mkdir()
         running = asyncio.create_task(managed_proxy.serve(tmp_path / "trial.json", spec_path, management_path))
         try:
             await until(lambda: bool(sessions) and sessions[0].started)
@@ -375,10 +384,24 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                                     break
                                 await asyncio.sleep(0.1)
                         assert rig.bench.firmware.effective_limit() == 0
+                        if failed_output is not None:
+                            before = (await call(socket, "status"))["result"]
+                            async with asyncio.timeout(12):
+                                while True:
+                                    latest = (await call(socket, "status"))["result"]
+                                    if latest["checked_at"] > before["checked_at"]:
+                                        break
+                                    await asyncio.sleep(0.1)
+                            assert latest["diagnostics"]["reporting_errors"] > 0
+                            assert latest["healthy"] and latest["local_hold_verified"]
+                            assert not running.done() and rig.bench.firmware.effective_limit() == 0
                 callbacks[signal.SIGTERM]()
                 assert await asyncio.wait_for(running, 8) == 0
-            report = json.loads(rig.prepared.config.journal.with_suffix(".status.json").read_text())
-            assert report["running"] is False and report["state"] == "stopped"
+            if failed_output == "status":
+                assert blocked.is_dir()
+            else:
+                report = json.loads(rig.prepared.config.journal.with_suffix(".status.json").read_text())
+                assert report["running"] is False and report["state"] == "stopped"
             assert set(removed) == {signal.SIGTERM, signal.SIGINT}
             assert "WATCHDOG=1" in notifications and any(n.startswith("STOPPING=1") for n in notifications)
             assert session.closed and rig.bench.firmware.effective_limit() == 0

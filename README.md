@@ -575,6 +575,25 @@ preserved resources, disabled local Start and sufficient validity of the certifi
 The event-loop watchdog reports process responsiveness independently of cloud/native health. Listener certificate
 renewal requires a controlled service restart; file replacement alone cannot falsely renew its reported validity.
 
+The active `ics_proxy` Home Assistant integration provides a **Download diagnostics** report from its integration
+entry. It uses cached status only, plus public installed software metadata; downloading never requests a charger
+reading, retries a control, or runs recovery. The control-mode entity's attributes and the existing delayed fault
+notification include a plain-English explanation. The report separates the retained original fault, current
+blockers, pending/uncertain receipts and worker activity. A strict native refusal or an interrupted audit remains
+blocked; these explanations grant no new recovery permission. Missing receipt timestamps remain unknown.
+
+The download includes at most five pending receipts and twenty recent transitions from the current proxy process.
+The existing rotated event file preserves transitions across replacements; the download explicitly labels its
+process-local scope. Unchanged polls do not add timeline entries. The file now includes phase and blocker changes.
+Optional status/event output failures are counted and cannot terminate the supervision loop. Existing stale files
+continue to age; cached measurements are not substituted for fresh zero proof. Credentials, endpoints, charger
+identifiers, raw native bodies and free-form error text are omitted from the download. Unsupported optional
+diagnostic schemas on an older proxy remain compatible with the existing health and control interface.
+
+Software metadata distinguishes the actual HA/client version and an available installed client `BUILD` stamp from
+source fingerprints. The proxy fingerprint covers the installed core Python sources and its managed/reporting/trial
+entry points; the client fingerprint covers its installed Python sources. A fingerprint is not a claimed Git commit.
+
 A bounded managed service was installed on 2026-11-09 in an isolated runtime with immutable code, private durable
 state, user-service boot linger/restart/watchdog and a separate minute health timer. The initial release was not
 confirmed and correctly retained zero; an independent closed-zero/owned0/empty-ledger reconciliation preceded

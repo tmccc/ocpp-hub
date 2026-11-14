@@ -11,6 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import ProxyEntry
 from .coordinator import ProxyCoordinator
+from .diagnostic_view import diagnostics, explanation
 from .entity import ProxyEntity
 
 VALUES = (
@@ -127,7 +128,21 @@ class ProxySensor(ProxyEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         if self.key == "control_mode":
-            return {"test_charge": self.charge_test_progress, "local_charge": self.local_charge_progress}
+            detail = diagnostics(self.coordinator.data.get("diagnostics"))
+            return {
+                "test_charge": self.charge_test_progress,
+                "local_charge": self.local_charge_progress,
+                "diagnostic_summary": explanation(
+                    self.coordinator.data,
+                    fresh=self.service_fresh and self.coordinator.last_update_success,
+                    native_fresh=self.native_fresh,
+                ),
+                "diagnostic_details": {
+                    key: detail[key]
+                    for key in ("available", "original_fault", "blockers", "recovery", "pending_command_count")
+                    if key in detail
+                },
+            }
         return (
             {
                 "charger_sessions": self.coordinator.data.get("charger_sessions", []),

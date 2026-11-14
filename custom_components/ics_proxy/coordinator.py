@@ -15,6 +15,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import ProxyClient, ProxyError
+from .diagnostic_view import explanation
 from .notification import notice_for
 
 DOMAIN = "ics_proxy"
@@ -96,8 +97,20 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # Short reading/cloud blips settle quietly; sustained trouble is visible without repeatedly creating alerts.
     @callback
-    def update_notification(self, okay: bool) -> None:
-        self.notice.update(okay, self.notice_generation)
+    def update_notification(self, okay: bool, data: dict[str, Any] | None = None, *, unavailable: bool = False) -> None:
+        current = self.data or {} if data is None else data
+        age = self.age("status_age_seconds") if data is None else data.get("status_age_seconds")
+        native_age = self.age("native_age_seconds") if data is None else data.get("native_age_seconds")
+        detail = explanation(
+            current,
+            fresh=not unavailable
+            and (data is not None or self.last_update_success)
+            and current.get("running") is True
+            and usable_age(age)
+            and 0 <= age <= 15,
+            native_fresh=usable_age(native_age) and 0 <= native_age <= 15,
+        )
+        self.notice.update(okay, self.notice_generation, detail)
 
     # API errors are classified before HA logs them; tokens and server payloads never appear in UpdateFailed.
     async def _async_update_data(self) -> dict[str, Any]:
@@ -105,7 +118,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             value = dict(await self.client.request("status"))
         except ProxyError:
-            self.update_notification(False)
+            self.update_notification(False, unavailable=True)
             raise UpdateFailed("The local charger proxy is unavailable") from None
         if not self.notice.active or self.notice.generation != self.notice_generation:
             raise UpdateFailed("The charger proxy status belongs to an inactive entry")
@@ -123,6 +136,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.update_notification(
             value.get("healthy") is True
             and len(remaining) == 2
-            and all(remaining_age >= 0 for remaining_age in remaining)
+            and all(remaining_age >= 0 for remaining_age in remaining),
+            value,
         )
         return value

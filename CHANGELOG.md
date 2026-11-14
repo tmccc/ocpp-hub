@@ -2,6 +2,9 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Explain retained faults, recovery blockers and pending/unknown controls through optional read-only diagnostics.
+  Add a bounded transition timeline and a redacted download for the active iCS Home Assistant client. Failed
+  status/event writes are counted without interrupting supervision; stale measurements remain unknown.
 - Settle failed current and Start work before optional diagnostic writes; publish fresh unknown/nonhealthy status
   while required physical or journal work remains pending. Bind failed current causes to their exact request.
 - Recover fully validated measured-only current/power trips through a fresh closed-zero Pause and separate Return.

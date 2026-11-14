@@ -24,6 +24,8 @@ class ProxyNotice:
         self.notification_id = "ics_proxy_" + entry.entry_id
         self.problem_since: float | None = None
         self.notified = False
+        self.detail: str | None = None
+        self.shown_detail: str | None = None
         self.cleanup_pending = True
         self.generation = 0
         self.active = False
@@ -37,6 +39,7 @@ class ProxyNotice:
         self.cancel_deadline()
         self.generation += 1
         self.active, self.clock = True, clock
+        self.detail = None
         self.cleanup_pending = True
         if self.problem_since is not None:
             self.arm()
@@ -95,21 +98,30 @@ class ProxyNotice:
             return
         self.arm()
 
+    # Changing the explanation updates the same visible notice without creating another outage or deadline.
+    def show(self) -> None:
+        persistent_notification.async_create(
+            self.hass,
+            "The local iCS charger proxy needs attention. Check its status on the iCS Charger dashboard. "
+            "The proxy retains its charging limits and any requested pause."
+            + (" Last reported: " + self.detail if self.detail else ""),
+            title="Charger proxy needs attention",
+            notification_id=self.notification_id,
+        )
+        self.notified, self.shown_detail = True, self.detail
+
     # A single timer reaches the original deadline; repeated failed refreshes cannot postpone it.
     def arm(self) -> None:
-        if self.problem_since is None or self.notified or not self.eligible():
+        if self.problem_since is None or not self.eligible():
+            return
+        if self.notified:
+            if self.detail != self.shown_detail:
+                self.show()
             return
         remaining = NOTICE_DELAY - (self.clock() - self.problem_since)
         if remaining <= 0:
             self.cancel_deadline()
-            persistent_notification.async_create(
-                self.hass,
-                "The local iCS charger proxy needs attention. Check its status on the iCS Charger dashboard. "
-                "The proxy retains its charging limits and any requested pause.",
-                title="Charger proxy needs attention",
-                notification_id=self.notification_id,
-            )
-            self.notified = True
+            self.show()
         elif self.cancel_timer is None:
             generation = self.generation
 
@@ -121,16 +133,18 @@ class ProxyNotice:
             self.cancel_timer = async_call_later(self.hass, remaining, fire)
 
     # Only the current coordinator can establish recovery or extend this entry's outage evidence.
-    def update(self, okay: bool, generation: int) -> None:
+    def update(self, okay: bool, generation: int, detail: str | None = None) -> None:
         if generation != self.generation or not self.active:
             return
         if okay:
+            self.detail = None
             self.problem_since = None
             self.cancel_deadline()
             if self.notified or self.cleanup_pending:
                 persistent_notification.async_dismiss(self.hass, self.notification_id)
                 self.notified, self.cleanup_pending = False, False
             return
+        self.detail = detail
         if self.problem_since is None:
             self.problem_since = self.clock()
         self.arm()

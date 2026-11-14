@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
+from ocpp_hub_core.prototype.managed_diagnostics import snapshot as diagnostic_snapshot
 
 from tests import test_managed_proxy as mp
 from tests.cloud_start_helpers import two_later_sessions
@@ -238,6 +239,12 @@ async def test_cancelled_outer_waits_for_real_shielded_unstarted_child(
             loop.set_task_factory(old_factory)
             assert c.tests.worker.cancelled() and len(children) == 1 and not children[0].done()
             assert children[0] in s.gateway.controls._operations
+            before_diagnostic = s.journal.db.total_changes, c.requests.intent(), list(rig.bench.device_calls)
+            diagnostic = diagnostic_snapshot(c, {"state": "reconciling", "fault": "start_operation_pending"})
+            assert diagnostic["available"] and diagnostic["workers"]["start"] == "cancelled"
+            assert diagnostic["workers"]["owned_io_pending"] is True
+            assert diagnostic["pending_commands"][0]["confirmation"] == "pending"
+            assert (s.journal.db.total_changes, c.requests.intent(), rig.bench.device_calls) == before_diagnostic
             assert c.tests.state()["start_attempted"] is False and s.journal.get("local_start_receipt") is None
             lease, state, row = c.tests.lease, copy.deepcopy(c.tests.state()), request_row(s.journal, identifier)
             for _ in range(2):

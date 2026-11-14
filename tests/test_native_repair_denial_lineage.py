@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import pytest
 from ocpp_hub_core.prototype.managed_debt_recovery import KEY
 from ocpp_hub_core.prototype.managed_denial_faults import current_operator_proof
+from ocpp_hub_core.prototype.managed_diagnostics import snapshot as diagnostic_snapshot
 from ocpp_hub_core.prototype.managed_native_repair import AUDITS, REVOCATIONS, repair_pending, repair_revoked
 from ocpp_hub_core.prototype.managed_release_recovery import release_evidence
 from ocpp_hub_core.prototype.managed_start_delivery import DENIALS, denied_start_evidence
@@ -111,6 +112,21 @@ async def test_real_stop_fault_bridge_retains_denial_native_repair_lineage(
             assert proof["prior"]["stop_wire_ack"] == wire
             assert denied_start_evidence(controller, installed)["fault"] == source
             assert (j.get(REVOCATIONS), j.get(AUDITS)) == original_markers
+            before_diagnostic = j.db.total_changes, controller.requests.intent(), list(rig.bench.device_calls)
+            diagnostic = diagnostic_snapshot(controller, {"state": "attention"})
+            assert diagnostic["available"]
+            assert diagnostic["original_fault"]["code"] == source["classification"]
+            assert diagnostic["original_fault"]["first_at"] == source["at_epoch"]
+            assert (
+                diagnostic["recovery"]
+                == {
+                    "strict": "strict_refusal",
+                    "interrupted": "audit_outcome_unknown",
+                    "interrupted-availability": "audit_outcome_unknown",
+                    "none-control": "not_assessed",
+                }[marker]
+            )
+            assert (j.db.total_changes, controller.requests.intent(), rig.bench.device_calls) == before_diagnostic
             assert j.next_delivery() is None and j.get(DENIALS)[str(ids[0])]["completed"] is None
             positive_limits = sum(limit > 0 for limit in rig.bench.received_limits)
             identifier, _ = await pause(controller)
