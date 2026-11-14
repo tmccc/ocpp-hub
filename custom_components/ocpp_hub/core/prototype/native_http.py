@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from .ics import unique_object
+from .native_faults import NativeContentError
 from .security import SecurityError
 from .store import encoded
 
@@ -31,12 +32,12 @@ async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
     status = await framing_line(reader)
     fields = status.split()
     if len(status) > 8192 or len(fields) < 2 or fields[0] not in (b"HTTP/1.0", b"HTTP/1.1"):
-        raise SecurityError("native reader received an invalid HTTP status line")
+        raise NativeContentError("content", "native reader received an invalid HTTP status line")
     code = fields[1]
     if code in (b"408", b"429") or len(code) == 3 and code.startswith(b"5") and code.isdigit():
         raise ConnectionError("native HTTP temporarily unavailable")
     if code != b"200":
-        raise SecurityError("native reader received a non-success HTTP response")
+        raise NativeContentError("content", "native reader received a non-success HTTP response")
     headers: dict[bytes, bytes] = {}
     total = 0
     for _ in range(64):
@@ -153,7 +154,7 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
     except OSError, asyncio.IncompleteReadError:
         raise NativeTransportUnavailableError("native HTTP observation was interrupted") from None
     except ValueError, KeyError, TypeError, RecursionError:
-        raise SecurityError("native trial observation was unavailable or malformed") from None
+        raise NativeContentError("content", "native trial observation was unavailable or malformed") from None
     finally:
         if writer is not None:
             writer.close()

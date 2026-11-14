@@ -2,6 +2,16 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Settle failed current and Start work before optional diagnostic writes; publish fresh unknown/nonhealthy status
+  while required physical or journal work remains pending. Bind failed current causes to their exact request.
+- Recover fully validated measured-only current/power trips through a fresh closed-zero Pause and separate Return.
+  Retain strict native refusals and interrupted audit outcomes through supported operator fault replacements.
+- Retire an exact cancelled, never-prepared Start without manufacturing Pause for an independent daily. Keep
+  issued uncertainty, prior command receipts and newer owner instructions under their existing proof requirements.
+- Keep management read connections usable after a journal-read failure; return no fabricated status/history/receipt.
+- Add actual diagnostic/statement/COMMIT, cancelled-task, native-cause/authority/lineage and later-session recovery
+  checks. Strengthen physical lost-ACK and independent cloud-mapping oracles; remove the obsolete local HA test helper.
+
 - Retain each denied lifecycle through later operator proofs and failed retries, including a new denied reply.
   A fresh Pause consumes the associated proofs together after the required independent evidence and actual
   lifecycle acknowledgements.

@@ -7,11 +7,16 @@ import sqlite3
 import uuid
 from contextlib import closing
 
+import pytest
+from ocpp_hub_core.frames import basic_auth_header
+from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError, read_native
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 from websockets.asyncio.client import connect
 
+from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
 from tests.test_managed_api import TOKEN, call
+from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_prototype import BOOT, START
 from tests.test_prototype_runtime import FAST, until
@@ -35,11 +40,13 @@ def waits_for_current_worker(task):
     return False
 
 
-# Intent: two real completion failures heal through the service's own poller and API, then real charging lifecycles.
-# Why: helper ticks cannot prove that a worker failing between five-second service polls is actually supervised.
+# Intent: persistent completion and diagnostic failures restrict zero while the real service still supervises HTTP.
+# Why: later SQL repair cannot excuse positive offers or a frozen status/native poll during the failure interval.
+@pytest.mark.parametrize("first_failure", ["statement", "commit"], ids=["statement-first", "commit-first"])
 async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
-    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch, first_failure
 ):
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 6, cli_route=True) as original:
         await original.controller.current.close()
         await original.controller.tests.close()
@@ -111,7 +118,9 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                     proxy=None,
                 ) as api:
                     local_ids = []
-                    for cycle, failure in enumerate(("statement", "commit")):
+                    for cycle, failure in enumerate(
+                        (first_failure, "commit" if first_failure == "statement" else "statement")
+                    ):
                         first = await published_after()
                         current = (await call(api, "status"))["result"]
                         if current["desired_control"] == "paused":
@@ -122,30 +131,145 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         assert first["station_ceiling_a"] == 6
                         j = session.journal
                         fail_boundary(j, "current", failure)
-                        reached, attempts = failing_cleanup(j, "managed_current_failure")
+                        _reached, attempts = failing_cleanup(j, "managed_current_failure")
                         identifier = uuid.uuid4().hex
-                        accepted = await call(
-                            api, "set_current", id=identifier, revision=first["control_revision"], current_a=16
+                        revision = first["control_revision"]
+                        before_limits = len(rig.bench.received_limits)
+                        accepted = await call(api, "set_current", id=identifier, revision=revision, current_a=16)
+                        assert accepted["ok"] and accepted["result"]["id"] == identifier
+                        assert accepted["result"]["state"] == "accepted", accepted
+                        await until(lambda: bool(attempts))
+                        assert rig.bench.received_limits[before_limits:].count(16) == 1
+                        change = j.get("managed_current_change")
+                        assert change["id"] == identifier and change["current_a"] == 16 and change["previous_a"] == 6
+                        assert (await call(api, "receipt", request_id=identifier))["result"]["state"] != "completed"
+                        assert rig.bench.firmware.current == 0 and j.active() is None
+
+                        # Prove actual HTTP503 independently; this identified observer probe is not engine progress.
+                        rig.peer.unavailable = True
+                        probe = {"review_probe": identifier}
+                        with pytest.raises(NativeTransportUnavailableError):
+                            await read_native(
+                                "127.0.0.1",
+                                rig.prepared.observer.port,
+                                basic_auth_header("admin", "NATIVE_TEST_SECRET")[1],
+                                "getConfig",
+                                probe,
+                            )
+                        engine_failed_reads = []
+                        probe_reads = []
+
+                        # Separate controller requests from the explicit observer probe using their real HTTP payloads.
+                        def take_failed_reads():
+                            while not rig.peer.failed_reads.empty():
+                                request = rig.peer.failed_reads.get_nowait()
+                                if request.get("data") == probe:
+                                    probe_reads.append(request)
+                                else:
+                                    engine_failed_reads.append(request)
+
+                        take_failed_reads()
+                        assert len(probe_reads) == 1 and probe_reads[0]["action"] == "getConfig"
+
+                        # Save physical and receipt facts before teardown can remove SQL failures or send zero.
+                        def witness(stage):
+                            take_failed_reads()
+                            row = j.db.execute(
+                                "SELECT id,action,revision,state FROM managed_requests WHERE id=?", (identifier,)
+                            ).fetchone()
+                            value = {
+                                "stage": stage,
+                                "failure": failure,
+                                "selected_before_a": 6,
+                                "target_a": 16,
+                                "effective_offer_a": rig.bench.firmware.effective_limit(),
+                                "physical_current_a": rig.bench.firmware.current,
+                                "native_meter": rig.peer.native("METER"),
+                                "request": dict(row),
+                                "change": j.get("managed_current_change"),
+                                "control": j.get("control"),
+                                "completion_and_diagnostic_triggers": [
+                                    r[0]
+                                    for r in j.db.execute(
+                                        "SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name IN "
+                                        "('review_worker_boundary','review_cleanup_unavailable') ORDER BY name"
+                                    )
+                                ],
+                                "diagnostic_refusals": len(attempts),
+                                "engine_failed_http": engine_failed_reads,
+                                "observer_failed_http": probe_reads,
+                                "previous_checked_at": first["checked_at"],
+                                "published_status": json.loads(status_path.read_text()),
+                                "service_waits_for_worker": waits_for_current_worker(service),
+                            }
+                            save_private(tmp_path / ("current-cleanup-" + failure + "-" + stage + ".json"), value)
+                            return value
+
+                        # Only autonomous service/worker tasks may reach zero; neither trigger is removed to help them.
+                        zero = False
+                        zero_deadline = asyncio.get_running_loop().time() + 7.5
+                        async with asyncio.timeout(8):
+                            while not zero:
+                                zero = (
+                                    rig.bench.firmware.effective_limit() == 0
+                                    and session.gateway.controls.ready
+                                    and session.gateway.controls.desired() == 0
+                                )
+                                if zero:
+                                    break
+                                if service.done():
+                                    await service
+                                await asyncio.sleep(0.02)
+                                if asyncio.get_running_loop().time() >= zero_deadline:
+                                    break
+                        state = witness("before-diagnostic-repair")
+                        assert (
+                            len(state["completion_and_diagnostic_triggers"]) == 2 and state["diagnostic_refusals"] > 0
                         )
-                        assert accepted["ok"] and accepted["result"]["state"] == "accepted", accepted
-                        await asyncio.wait_for(reached.wait(), 3)
-                        assert len(attempts) >= 2 and rig.bench.firmware.effective_limit() == 16
-                        with closing(sqlite3.connect(j.path.as_uri() + "?mode=ro", uri=True)) as db:
-                            assert (
-                                db.execute("SELECT state FROM managed_requests WHERE id=?", (identifier,)).fetchone()[0]
-                                == "accepted"
-                            )
-                            assert (
-                                json.loads(
-                                    db.execute("SELECT value FROM meta WHERE key='managed_current_change'").fetchone()[
-                                        0
-                                    ]
-                                )["state"]
-                                == "pending"
-                            )
-                        # The unchanged actual service must reach its next ordinary poll and await owned cleanup.
-                        await until(lambda: waits_for_current_worker(service), timeout=8)
-                        assert json.loads(status_path.read_text())["checked_at"] == first["checked_at"]
+                        assert state["request"]["id"] == identifier and state["request"]["action"] == "set_current"
+                        assert state["request"]["revision"] == revision
+                        assert zero, ("persistent diagnostic storage refusal must not delay protective zero", state)
+                        assert rig.bench.firmware.current == 0
+                        assert j.get("control")["resume_limit"] == 6
+
+                        # Require three engine HTTP failures and a fresh honest status with SQL still refused.
+                        async with asyncio.timeout(18):
+                            while True:
+                                take_failed_reads()
+                                status = json.loads(status_path.read_text())
+                                if (
+                                    len(engine_failed_reads) >= 3
+                                    and status.get("checked_at", 0) > first["checked_at"]
+                                    and status.get("state") not in ("healthy", "local_only")
+                                ):
+                                    break
+                                await asyncio.sleep(0.02)
+                        assert all(request["action"] == "getConfig" for request in engine_failed_reads)
+                        response = await call(api, "status")
+                        assert response["ok"] and response["result"]["healthy"] is False
+                        witness("native-unavailable-still-refused")
+
+                        # Recover HTTP while diagnostic storage still refuses writes, before repair or owner controls.
+                        rig.peer.unavailable = False
+                        await read_native(
+                            "127.0.0.1",
+                            rig.prepared.observer.port,
+                            basic_auth_header("admin", "NATIVE_TEST_SECRET")[1],
+                            "getConfig",
+                            probe,
+                        )
+                        reads = rig.peer.requests.count("getConfig")
+                        unavailable_checked = status["checked_at"]
+                        async with asyncio.timeout(12):
+                            while (
+                                rig.peer.requests.count("getConfig") <= reads
+                                or json.loads(status_path.read_text()).get("checked_at", 0) <= unavailable_checked
+                            ):
+                                await asyncio.sleep(0.02)
+                        assert rig.bench.firmware.effective_limit() == 0 and rig.bench.firmware.current == 0
+                        assert rig.bench.received_limits[before_limits:].count(16) == 1
+                        assert (await call(api, "receipt", request_id=identifier))["result"]["state"] != "completed"
+                        witness("native-recovered-still-refused")
                         j.db.execute("DROP TRIGGER review_worker_boundary")
                         j.db.execute("DROP TRIGGER review_cleanup_unavailable")
                         healed = await published_after(first["checked_at"])
@@ -237,6 +361,7 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         assert len(sessions) == 1 and not service.done() and not session.closed
                     assert len(set(local_ids)) == 2
         finally:
+            rig.peer.unavailable = False
             if sessions and not sessions[0].closed:
                 sessions[0].journal.db.execute("DROP TRIGGER IF EXISTS review_worker_boundary")
                 sessions[0].journal.db.execute("DROP TRIGGER IF EXISTS review_cleanup_unavailable")

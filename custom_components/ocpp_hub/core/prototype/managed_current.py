@@ -104,6 +104,37 @@ def require_current_session(g: Gateway, n: HandoverEvidence, local: int) -> None
         raise ReleaseDeferredError("current recovery awaits matching native and OCPP lifecycle evidence")
 
 
+# Prefer the exact modern request's cause; a malformed binding cannot borrow an older global diagnostic.
+def current_failure(j: Journal, change: dict[str, Any]) -> dict[str, Any] | None:
+    if "failure" not in change:
+        legacy = j.get("managed_current_failure")
+        return legacy if isinstance(legacy, dict) else None
+    cause = change["failure"]
+    if not isinstance(cause, dict) or set(cause) != {"id", "revision", "current_a", "type", "detail"}:
+        return None
+    row = j.db.execute(
+        "SELECT r.action,r.revision,c.current_a FROM managed_requests r "
+        "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
+        (change.get("id"),),
+    ).fetchone()
+    if (
+        row is None
+        or row["action"] != "set_current"
+        or cause["id"] != change.get("id")
+        or type(cause["revision"]) is not int
+        or cause["revision"] != row["revision"]
+        or type(cause["current_a"]) is not int
+        or cause["current_a"] != row["current_a"]
+        or cause["current_a"] != change.get("current_a")
+        or not isinstance(cause["type"], str)
+        or not 1 <= len(cause["type"]) <= 128
+        or not isinstance(cause["detail"], str)
+        or len(cause["detail"]) > 1024
+    ):
+        return None
+    return dict(cause)
+
+
 class ManagedCurrentLimits:
     """A current request persists its generation before a guarded profile write; Pause always takes precedence."""
 
@@ -422,12 +453,18 @@ class ManagedCurrentLimits:
         self, identifier: str, value: int, previous_value: int, mode: str, revision: int, error: Exception
     ) -> None:
         c, g, j = self.controller, self.controller.session.gateway, self.journal
+        cause = {
+            "id": identifier,
+            "revision": revision - 1,
+            "current_a": value,
+            "type": type(error).__name__,
+            "detail": str(error)[:1024],
+        }
         while not self._closing and not c.stopping:
             try:
                 change = j.get("managed_current_change", {})
                 if change.get("id") != identifier or change.get("state") != "pending":
                     return
-                j.put("managed_current_failure", {"type": type(error).__name__, "detail": str(error)[:1024]})
                 intent = c.requests.intent()
                 superseded = intent.mode != mode or intent.revision != revision
                 timer = j.get(KEY, {})
@@ -440,15 +477,17 @@ class ManagedCurrentLimits:
                         reason = "timer_retired"
                     elif active is not None or timer.get("unreported_native"):
                         reason = "session_opened"
-                    self.cancel_under_timer(identifier, value, previous_value, reason)
+                    self.cancel_under_timer(identifier, value, previous_value, reason, failure=cause)
                     await c.schedule.protect_station(j.get(KEY))
+                    self.record_failure_diagnostic(cause)
                     return
                 if not superseded and mode == "app" and overlap:
-                    self.cancel_overlap(identifier, previous_value, "session_opened")
+                    self.cancel_overlap(identifier, previous_value, "session_opened", failure=cause)
                     try:
                         await self.protect_overlap()
                     except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
                         pass  # Durable operation recovery retries zero; a lost acknowledgement never grants Stop.
+                    self.record_failure_diagnostic(cause)
                     return
                 with j.atomic():
                     if not superseded:
@@ -466,6 +505,7 @@ class ManagedCurrentLimits:
                             "previous_a": previous_value,
                             "mode": mode,
                             "state": "uncertain",
+                            "failure": cause,
                         },
                     )
                     c.requests.finish(
@@ -477,15 +517,29 @@ class ManagedCurrentLimits:
                             "previous_current_a": previous_value,
                         },
                     )
+                try:
+                    await c.ensure_pause_zero()
+                except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
+                    pass  # The durable hold remains pending; ordinary Pause supervision retries its zero.
                 if c.pause_task is None or c.pause_task.done():
                     c.pause_task = asyncio.create_task(c._stop_requested())
+                self.record_failure_diagnostic(cause)
                 return
             except sqlite3.Error:
                 # A later Pause is read again on every retry and retains its own revision and control ticket.
                 await asyncio.sleep(0.1)
 
+    # The cause is already durable with the restriction; a legacy diagnostic cannot delay zero or worker retirement.
+    def record_failure_diagnostic(self, cause: dict[str, Any]) -> None:
+        try:
+            self.journal.put("managed_current_failure", {key: cause[key] for key in ("type", "detail")})
+        except sqlite3.Error:
+            pass  # Optional compatibility metadata cannot undo the exact request-bound failure record.
+
     # Persist the failed operation's zero hold without manufacturing durable owner Pause intent or Stop authority.
-    def cancel_overlap(self, identifier: str, previous: int, reason: str) -> None:
+    def cancel_overlap(
+        self, identifier: str, previous: int, reason: str, *, failure: dict[str, Any] | None = None
+    ) -> None:
         c, j = self.controller, self.journal
         with j.atomic():
             change = j.get("managed_current_change")
@@ -497,6 +551,7 @@ class ManagedCurrentLimits:
                     "previous_a": previous,
                     "recovery_revision": c.requests.intent().revision,
                     "recovery_reason": reason,
+                    **({"failure": failure} if failure is not None else {}),
                 },
             )
             j.put("control", {**j.get("control", {}), "resume_limit": previous})
@@ -606,7 +661,9 @@ class ManagedCurrentLimits:
         return NativeStartReport(local, plan["planId"], None, accepted)
 
     # Restrict an interrupted selection without giving it owner Pause authority over a concurrent transaction.
-    def cancel_under_timer(self, identifier: str, value: int, previous: int, reason: str) -> None:
+    def cancel_under_timer(
+        self, identifier: str, value: int, previous: int, reason: str, *, failure: dict[str, Any] | None = None
+    ) -> None:
         c, j = self.controller, self.journal
         with j.atomic():
             timer, active = j.get(KEY), j.active()
@@ -619,13 +676,38 @@ class ManagedCurrentLimits:
             c.schedule.begin_hold(timer)
             j.put("control", {**j.get("control", {}), "resume_limit": previous})
             c.session.gateway.controls._claim(True, stopping=True)
-            j.put("managed_current_change", {"id": identifier, "current_a": value, "state": "cancelled"})
+            j.put(
+                "managed_current_change",
+                {
+                    **j.get("managed_current_change", {}),
+                    "id": identifier,
+                    "current_a": value,
+                    "state": "cancelled",
+                    **({"failure": failure} if failure is not None else {}),
+                },
+            )
             c.requests.finish(identifier, "failed", {"classification": reason})
 
     # Supervision observes the completed update instead of sampling through a legitimate profile replacement.
     async def settle(self) -> None:
         if self.worker is not None and not self.worker.cancelled():
             await asyncio.shield(self.worker)
+
+    # Publish pending work promptly without auditing through an unfinished physical or restrictive operation.
+    async def settle_for_poll(self) -> bool:
+        worker = self.worker
+        if worker is None:
+            return True
+        if not worker.done():
+            done, _ = await asyncio.wait((worker,), timeout=0.1)
+            if not done:
+                return False
+        if self.worker is not worker:
+            return False
+        if worker.cancelled():
+            raise RuntimeError("managed current worker was cancelled before its outcome was settled")
+        worker.result()
+        return True
 
     # Retire all owned current work before the single journal owner closes its database.
     async def close(self) -> None:

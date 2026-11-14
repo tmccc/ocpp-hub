@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_start_binding import known_plan_source
+from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
 from .policy import DeniedError
 from .rpc import UnavailableError
@@ -490,49 +491,73 @@ class ManagedChargeTests:
         ) as error:
             await self._failed_start(lease, error, effects)
 
-    # Keep cleanup owned until storage recovers; never repeat a positive Start sequence after its failure.
+    # Settle the exact failed operation before optional diagnostics; a newer restrictive winner remains intact.
     async def _failed_start(self, lease: TestLease, error: Exception, effects: bool) -> None:
         c, j = self.controller, self.journal
-        if isinstance(error, sqlite3.Error):
-            lease.deadline = min(lease.deadline, time.monotonic())
-            self.changed.set()
         while not self._closing and not c.stopping:
             try:
-                if self.state().get("id") != lease.identifier:
+                state = self.state()
+                row = j.db.execute(
+                    "SELECT action,revision,state FROM managed_requests WHERE id=?", (lease.identifier,)
+                ).fetchone()
+                if (
+                    state.get("id") != lease.identifier
+                    or state.get("source") != "local"
+                    or row is None
+                    or row["action"] != ("start" if lease.normal else "start_test")
+                ):
                     return
+                cause = {
+                    "id": lease.identifier,
+                    "action": row["action"],
+                    "revision": row["revision"],
+                    "type": type(error).__name__,
+                    "detail": str(error)[:1024],
+                    "at_epoch": time.time(),
+                    "effects_started": effects,
+                }
                 receipt = local_start_receipt(j)
                 if (
                     receipt.get("request_id") == lease.identifier
-                    and receipt.get("digest") == self.state().get("tag_digest")
+                    and receipt.get("digest") == state.get("tag_digest")
                     and receipt.get("stage") == "prepared"
                     and receipt.get("local") is None
                 ):
                     retire_unsent_local_start(j, receipt.get("ticket"))
-                j.put(
-                    "managed_test_failure",
-                    {
-                        "type": type(error).__name__,
-                        "detail": str(error)[:1024],
-                        "at_epoch": time.time(),
-                        "effects_started": effects,
-                    },
-                )
+                if (
+                    self.lease is not lease
+                    or state.get("state") not in ACTIVE
+                    or state.get("state") == "stopping"
+                    or row["state"] in ("completed", "failed")
+                ):
+                    self.record_failure_diagnostic(cause)
+                    return  # A deadline or later proof already owns the state and immutable terminal receipt.
                 if not effects:
-                    c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
-                    if self.state().get("id") == lease.identifier:
-                        j.put("managed_test_charge", {**self.state(), "state": "failed"})
+                    with j.atomic():
+                        c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
+                        j.put("managed_test_charge", {**self.state(), "state": "failed", "failure": cause})
                     self.lease = None
-                    self.retire_refused_unsent()
                     self.changed.set()
-                    return
-                c.requests.finish(lease.identifier, "uncertain", {"classification": "start_not_confirmed"})
-                self.stop(lease, "start_not_confirmed")
+                    self.retire_refused_unsent()
+                else:
+                    self.stop(lease, "start_not_confirmed", failure=cause)
+                self.record_failure_diagnostic(cause)
                 return
             except sqlite3.Error:
-                # Only failed cleanup is retried; the independent deadline still owns restrictive zero.
+                # Genuine critical storage failure retains the separate deadline's existing zero/Stop authority.
                 lease.deadline = min(lease.deadline, time.monotonic())
                 self.changed.set()
                 await asyncio.sleep(0.1)
+
+    # Compatibility diagnostics cannot keep a settled worker alive or undo its request-bound durable cause.
+    def record_failure_diagnostic(self, cause: dict[str, Any]) -> None:
+        try:
+            self.journal.put(
+                "managed_test_failure",
+                {key: cause[key] for key in ("type", "detail", "at_epoch", "effects_started")},
+            )
+        except sqlite3.Error:
+            pass  # The critical state already records this operation's failure, or a newer outcome won.
 
     # Bind an actual accepted Start inside its ledger transaction, including sessions ending between native polls.
     def started(self, local: int, payload: dict[str, Any]) -> None:
@@ -812,6 +837,31 @@ class ManagedChargeTests:
         if self.worker is not None and not self.worker.cancelled():
             await asyncio.shield(self.worker)
 
+    # A poll leaves physical work owned; cancelled-task recovery still needs fresh source and exact outcome evidence.
+    async def settle_for_poll(self) -> bool:
+        worker = self.worker
+        if worker is None:
+            return True
+        if not worker.done():
+            done, _ = await asyncio.wait((worker,), timeout=0.1)
+            if not done:
+                return False
+        if self.worker is not worker:
+            return False
+        if worker.cancelled():
+            g = self.controller.session.gateway
+            if g.controls._operations or g.charger._pending:
+                return False  # A shielded child still owns physical work even after its outer task disappeared.
+        if worker.cancelled() and self.lease is not None:
+            try:
+                if retire_cancelled_start(self, self.lease) is CancellationRetirement.PENDING:
+                    return False
+            except sqlite3.Error, RecoveryRequiredError:
+                return False  # Required settlement is pending; no old deadline gains authority over another session.
+        elif not worker.cancelled():
+            worker.result()
+        return True
+
     # Positive flow must belong to the known transaction and the actually accepted local or vendor Start path.
     def observed(self, native: HandoverEvidence) -> None:
         self.retire_refused_unsent()
@@ -953,7 +1003,7 @@ class ManagedChargeTests:
             self.changed.set()
 
     # Normal expiry retains separate reporting debt; only an explicit Pause can Stop an independent daily.
-    def stop(self, lease: TestLease, reason: str) -> None:
+    def stop(self, lease: TestLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
         if self.lease is not lease or self.state().get("state") == "stopping":
             return
         c, j = self.controller, self.journal
@@ -982,6 +1032,7 @@ class ManagedChargeTests:
                     "state": "expired" if preserve else "stopping",
                     "stop_reason": reason,
                     "expired_normal": lease.normal,
+                    **({"failure": failure} if failure is not None else {}),
                 },
             )
             c.requests.finish(lease.identifier, "uncertain", {"classification": reason})
@@ -993,23 +1044,29 @@ class ManagedChargeTests:
 
     # A monotonic deadline owns Stop independently of HA, the initiating socket, native reads and service polling.
     async def _deadline(self, lease: TestLease) -> None:
-        while self.lease is lease and self.state().get("state") != "stopping":
-            self.changed.clear()
-            remaining = lease.deadline - time.monotonic()
-            if remaining <= 0:
-                try:
+        while self.lease is lease:
+            try:
+                if self.state().get("state") == "stopping":
+                    return
+                self.changed.clear()
+                remaining = lease.deadline - time.monotonic()
+                if remaining <= 0:
+                    cancellation = retire_cancelled_start(self, lease)
+                    if cancellation is CancellationRetirement.RETIRED:
+                        return
+                    if cancellation is CancellationRetirement.PENDING:
+                        await asyncio.sleep(0.1)
+                        continue
                     if self.finish_closed_normal(lease):
                         return
                     self.stop(lease, "deadline")
                     return
-                except sqlite3.Error, RecoveryRequiredError, DeniedError:
-                    # Retain an expired grant and retry the atomic hold if storage/control changes were transient.
-                    await asyncio.sleep(0.1)
-                    continue
-            try:
                 await asyncio.wait_for(self.changed.wait(), remaining)
             except TimeoutError:
                 continue
+            except sqlite3.Error, RecoveryRequiredError, DeniedError:
+                # Failed no-dispatch settlement and restrictive claims retry without inventing another outcome.
+                await asyncio.sleep(0.1)
 
     # Public timing is descriptive and redacted; it is never authority to repeat a historical Start.
     def summary(self) -> dict[str, Any] | None:

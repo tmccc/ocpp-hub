@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .ics import is_safe_transaction_query
 from .managed_occurrences import occurrences
+from .native_faults import NativeContentError
 from .policy import DeniedError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
@@ -141,17 +143,23 @@ class ResourceBook:
         if self.original_profile_count:
             raise SecurityError("existing original profiles block trial writes until selective cleanup is proven")
 
-    # Freeze unexplained owned/unknown inventory changes without reclassifying them as original-resource loss.
+    # Freeze a proved inventory contradiction before diagnostic SQL, so storage failure cannot erase its typed cause.
     def _inventory_failure(self, reason: str, key: str | None = None) -> None:
-        if not self.journal.get("trial_inventory_fault"):
-            self.journal.put("trial_inventory_fault", {"reason": reason, "resource": key})
-        self.journal.db.execute(
-            "UPDATE trial_resources SET state='uncertain' WHERE key=? AND state!='absent_verified'",
-            (key or "profile:" + str(HUB_PROFILE_ID),),
+        error = NativeContentError(
+            "resources", "native inventory fault: " + reason + "; independent reconciliation is required"
         )
-        if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
-            self.journal.put("trial_phase", "blocked")
-        raise SecurityError("native inventory fault: " + reason + "; independent reconciliation is required")
+        try:
+            if not self.journal.get("trial_inventory_fault"):
+                self.journal.put("trial_inventory_fault", {"reason": reason, "resource": key})
+            self.journal.db.execute(
+                "UPDATE trial_resources SET state='uncertain' WHERE key=? AND state!='absent_verified'",
+                (key or "profile:" + str(HUB_PROFILE_ID),),
+            )
+            if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
+                self.journal.put("trial_phase", "blocked")
+        except sqlite3.Error as failure:
+            raise error from failure
+        raise error
 
     # An existing hold may be lowered to zero, but verified absence must never authorize recreating it after cleanup.
     def _safety_write(self, action: str, payload: dict[str, Any]) -> bool:
@@ -173,10 +181,10 @@ class ResourceBook:
             and receipt["state"] != "absent_verified"
         )
 
-    # Preserve every original resource, including adopted plans and inactive transaction-specific profiles.
-    def check_originals(self, evidence: Evidence) -> None:
+    # Compute original-resource contradictions before any diagnostic or absence publication.
+    def _original_delta(self, evidence: Evidence) -> tuple[list[str], list[str]]:
         if evidence.identity_digest != self.baseline.identity_digest:
-            raise SecurityError("native evidence belongs to another charger")
+            raise NativeContentError("identity", "native evidence belongs to another charger")
         current = {r.key: r for r in evidence.resources}
         missing = [resource.key for resource in self.baseline.resources if resource.key not in current]
         changed = [
@@ -184,14 +192,28 @@ class ResourceBook:
             for resource in self.baseline.resources
             if resource.key in current and current[resource.key].digest != resource.digest
         ]
+        return missing, changed
+
+    # Preserve originals and their typed refusal even when persisting the diagnostic itself fails.
+    def check_originals(self, evidence: Evidence) -> None:
+        missing, changed = self._original_delta(evidence)
         fault = self.journal.get("trial_preservation_fault")
-        if not fault and (missing or changed):
-            fault = {"missing": missing, "changed": changed, "observed_at": evidence.observed_at}
-            self.journal.put("trial_preservation_fault", fault)
-        if fault:
+        if not fault and not (missing or changed):
+            return
+        error = NativeContentError(
+            "resources", "original resource preservation failed; independent reconciliation is required"
+        )
+        try:
+            if not fault:
+                self.journal.put(
+                    "trial_preservation_fault",
+                    {"missing": missing, "changed": changed, "observed_at": evidence.observed_at},
+                )
             if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
                 self.journal.put("trial_phase", "blocked")
-            raise SecurityError("original resource preservation failed; independent reconciliation is required")
+        except sqlite3.Error as failure:
+            raise error from failure
+        raise error
 
     # Arm only a fresh independently observed station with a genuinely empty lifecycle and outbox.
     def activate(self, evidence: Evidence) -> None:
@@ -334,21 +356,9 @@ class ResourceBook:
         else:
             self.journal.db.execute("UPDATE trial_resources SET state='uncertain' WHERE key=?", (key,))
 
-    # Independent complete inventory reconciles a lost ACK without blindly replaying its physical mutation.
-    def owned_present(self, evidence: Evidence) -> list[Resource]:
-        evidence.require_fresh(self.journal.identity)
-        current = {r.key: r for r in evidence.resources}
+    # Inspect every owned-resource contradiction before publishing unrelated absence/confirmation observations.
+    def _owned_conflict(self, current: dict[str, Resource], rows: list[Any]) -> tuple[str, str | None] | None:
         originals = {r.key for r in self.baseline.resources}
-        rows = self.journal.db.execute("SELECT * FROM trial_resources").fetchall()
-        # Record observed owned absence even when a separate original-resource loss keeps rollback incomplete.
-        for row in rows:
-            if row["key"] not in current:
-                self.journal.db.execute(
-                    "UPDATE trial_resources SET state='absent_verified',observed_digest=NULL WHERE key=?", (row["key"],)
-                )
-        self.check_originals(evidence)
-        if self.journal.get("trial_inventory_fault"):
-            raise SecurityError("native inventory reconciliation is still required")
         temporary: set[str] = set()
         for lease in occurrences(self.journal).values():
             if lease.get("state") in ("installing", "armed", "clearing"):
@@ -357,21 +367,82 @@ class ResourceBook:
                 if key in current and current[key].digest == fingerprint(expected) and key not in originals:
                     temporary.add(key)
         if set(current) - originals - {row["key"] for row in rows} - temporary:
-            self._inventory_failure("unexpected_resources")
-        result = []
+            return "unexpected_resources", None
         for row in rows:
             resource = current.get(row["key"])
             if resource is None:
                 continue
             if row["state"] == "absent_verified":
-                self._inventory_failure("resource_reappeared", resource.key)
+                return "resource_reappeared", resource.key
             possible = [json.loads(row[key]) for key in ("desired", "confirmed") if row[key] is not None]
             if resource.canonical not in possible:
-                self._inventory_failure("owned_profile_changed", resource.key)
+                return "owned_profile_changed", resource.key
             if row["observed_digest"] is not None and row["observed_digest"] != resource.digest:
-                self._inventory_failure("owned_profile_bytes_changed", resource.key)
-            self.journal.db.execute(
-                "UPDATE trial_resources SET observed_digest=? WHERE key=?", (resource.digest, resource.key)
+                return "owned_profile_bytes_changed", resource.key
+        return None
+
+    # Compare resource content without writes before any native audit diagnostic can mask a contradiction.
+    def native_conflict(self, evidence: Evidence, *, owned: bool) -> NativeContentError | None:
+        evidence.require_fresh(self.journal.identity)
+        missing, changed = self._original_delta(evidence)
+        if self.journal.get("trial_preservation_fault") or missing or changed:
+            return NativeContentError(
+                "resources", "original resource preservation failed; independent reconciliation is required"
             )
-            result.append(resource)
+        if not owned:
+            return None
+        if self.journal.get("trial_inventory_fault"):
+            return NativeContentError("resources", "native inventory reconciliation is still required")
+        current = {resource.key: resource for resource in evidence.resources}
+        rows = self.journal.db.execute("SELECT * FROM trial_resources").fetchall()
+        conflict = self._owned_conflict(current, rows)
+        if conflict is not None:
+            return NativeContentError(
+                "resources", "native inventory fault: " + conflict[0] + "; independent reconciliation is required"
+            )
+        return None
+
+    # Complete inventory may settle lost ACKs, but diagnostic SQL cannot hide an already proved contradiction.
+    def owned_present(self, evidence: Evidence) -> list[Resource]:
+        evidence.require_fresh(self.journal.identity)
+        current = {r.key: r for r in evidence.resources}
+        rows = self.journal.db.execute("SELECT * FROM trial_resources").fetchall()
+        missing, changed = self._original_delta(evidence)
+        conflict = self._owned_conflict(current, rows)
+        strict: NativeContentError | None = None
+        if self.journal.get("trial_preservation_fault") or missing or changed:
+            strict = NativeContentError(
+                "resources", "original resource preservation failed; independent reconciliation is required"
+            )
+        elif self.journal.get("trial_inventory_fault"):
+            strict = NativeContentError("resources", "native inventory reconciliation is still required")
+        elif conflict is not None:
+            strict = NativeContentError(
+                "resources", "native inventory fault: " + conflict[0] + "; independent reconciliation is required"
+            )
+        try:
+            # Keep the existing observed-absence accounting even if an independent original fault remains latched.
+            for row in rows:
+                if row["key"] not in current:
+                    self.journal.db.execute(
+                        "UPDATE trial_resources SET state='absent_verified',observed_digest=NULL WHERE key=?",
+                        (row["key"],),
+                    )
+            self.check_originals(evidence)
+            if self.journal.get("trial_inventory_fault"):
+                raise NativeContentError("resources", "native inventory reconciliation is still required")
+            if conflict is not None:
+                self._inventory_failure(*conflict)
+            result = []
+            for row in rows:
+                resource = current.get(row["key"])
+                if resource is not None:
+                    self.journal.db.execute(
+                        "UPDATE trial_resources SET observed_digest=? WHERE key=?", (resource.digest, resource.key)
+                    )
+                    result.append(resource)
+        except sqlite3.Error as failure:
+            if strict is not None:
+                raise strict from failure
+            raise
         return sorted(result, key=lambda r: (r.identifier == HUB_PROFILE_ID, r.key))

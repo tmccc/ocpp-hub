@@ -332,8 +332,8 @@ composite confirmation, local hold and blocked history delivery. The service als
 A timer expiry or shutdown attempts a zero-current hold and known-session Stop, retains uncertainty if either cannot
 be confirmed, and leaves its journal intact. It does not automatically restore the manufacturer's connection.
 
-The trial permits only constant ampere profiles, an explicit Relative/Absolute station choice, and the metadata/Fast/delayed-stop
-commands. Plan editing and Eco/EcoPlus changes remain disabled in this narrower trial path. New profiles cannot replace
+The trial permits only constant ampere profiles, an explicit Relative/Absolute station choice, and the bounded
+metadata, Fast/Eco/EcoPlus and delayed-stop commands described below. Plan editing remains disabled in this trial path. New profiles cannot replace
 any original connector/purpose scope, including a different transaction at that scope: actual iCS captures showed that
 setting a new TxProfile can replace an older one. The existing offline codecs and tests still cover those wider app
 shapes; enabling them live requires independently proven restoration semantics.
@@ -697,14 +697,40 @@ lifecycle, command or mutation debt. Successful reconciliation completes Pause a
 recover an older native-authority fault with a matching recorded transport/stale-evidence diagnostic. Changed native
 identity, configuration, history or ownership does not qualify for this transport recovery.
 
-An accepted current update owns its pending native verification, so a concurrent health observation defers until
-the worker finishes. If an app current update fails, the proxy keeps zero and the previous verified selection.
+Three consecutive fully validated over-bound current or power samples have a separate measured-only fault. A new
+**Pause charging** can reconcile that exact cause after genuine lifecycle acknowledgements, current Boot, unchanged
+configuration/history/resources and independently confirmed closed all-phase zero under the owned station0 profile.
+Pause remains at zero; a separate **Return to app/schedule** restores the selected ceiling. Mixed strict and measured
+failures retain their stricter refusal. Old generic faults are not automatically reclassified as measured faults.
+
+A strict native contradiction observed during an otherwise eligible recovery revokes that fault's recovery
+permission, including a supported operator workflow that retains the original fault. Restoring the old peer data or
+pressing Pause again does not erase the refusal. If a process disappears before an audit outcome becomes durable,
+the unresolved audit remains at attention/zero and withholds recovery proof. It is recorded separately from an
+observed strict contradiction; ordinary Pause, Boot or normal readings do not waive that unknown outcome. There is
+no additional automatic reconciliation path for such interrupted audits.
+
+An accepted current update owns its pending native verification. Unfinished physical or required journal work
+publishes fresh, nonhealthy status with unknown native measurements; cached readings never become a new zero proof.
+A diagnostic-only storage failure cannot delay restrictive cleanup, request settlement or later native supervision.
+Failed app current updates retain the previous verified selection and require independent confirmation of their hold.
 The failed target remains in its receipt for diagnosis. An older journal fault from the current/health collision
 requires a new explicit Pause, its exact failed-request diagnostic and full closed-zero/settled-journal proof.
 If the old process stopped before recording the failure, startup preserves that exact accepted request for the
 same acknowledgement instead of inventing an outcome.
 Recovery retains zero and restores the previous completed selection, or commissioned 6 A if none was recorded.
 A separate Return is still required.
+
+Failed managed Start work settles its exact receipt and restrictive state before an optional diagnostic write.
+A cancelled worker can retire as failed without changing owner intent only when the exact current request proves
+that Start preparation never occurred and all owned work is quiescent. This does not claim that no earlier zero
+operation occurred. For that proven unprepared request, required settlement SQL or outstanding owned work remains
+pending; the deadline cannot acquire Pause or Stop authority over an independent daily while waiting. Prepared/issued
+uncertainty keeps its existing actual-lifecycle and closed-zero proof requirements. A cancelled task never supplies a successful Start result.
+
+Management status, history and receipt reads return `not_ready` when their journal read is unavailable. They keep
+the same connection available for recovery and return no guessed result. This read-only classification does not
+change the unknown-outcome handling of a sent control; clients still never resend mutations automatically.
 
 The deadline watchdog can also retain the existing owned zero profile while a fault remains latched, independently
 of health polling. This restrictive path grants no Start, Stop, cleanup or positive-current authority and preserves
@@ -1511,13 +1537,22 @@ Two diagnostic sensors per charger, `_mirror_status` and `_mirror_queue`, show t
 
 ## Contributing
 
-Issues and pull requests are welcome. See [docs/developer.md](docs/developer.md) for the layout of the code and how to
-run the checks:
+Issues and pull requests are welcome. See [docs/developer.md](docs/developer.md) for the layout and complete offline
+qualification procedure. Set up the pinned Python 3.14 environment and run static checks with:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install pytest pytest-asyncio pyyaml voluptuous websockets ruff==0.16.4 mypy==1.15.0
-.venv/bin/python tools/validate.py
+python3.14 -m venv .venv
+.venv/bin/pip install -r requirements-offline.txt
+.venv/bin/python -B tools/validate.py --quick
+```
+
+Full validation requires reports from all four suites, each run with 20 workers on the same exact commit, and a
+trusted collection executor map:
+
+```bash
+.venv/bin/python -B tools/validate.py \
+  --qualification-report /absolute/task/qualification-bundle.json \
+  --collection-executors /absolute/task/collection-executors.json
 ```
 
 The engine in `custom_components/ocpp_hub/core/` imports nothing from Home Assistant and is tested on its own against

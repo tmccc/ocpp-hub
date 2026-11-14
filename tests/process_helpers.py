@@ -242,7 +242,28 @@ class ServiceProcess:
             )
             assert stop[0] == 3
             self.rig.peer.permission_enabled = False
-            await self.delivered(local, closed=True)
+            row = await self.delivered(local, closed=True)
+            # Correlate the actual cloud's allocation and final Stop with the independently read durable mapping.
+            cloud = self.rig.bench
+            start_calls = [
+                frame for frame in cloud.calls
+                if frame[0] == 2 and frame[2] == "StartTransaction"
+                and frame[3]["timestamp"] == f"2026-01-01T00:{start_minute + epoch * 2:02}:00Z"
+                and frame[3]["meterStart"] == 2000 + epoch * 100
+            ]
+            tokens = {frame[1] for frame in start_calls}
+            assert len(tokens) == 1
+            allocations = {
+                frame[2]["transactionId"] for frame in cloud.sent_vendor_replies
+                if frame[0] == 3 and frame[1] in tokens
+            }
+            assert allocations == {row["vendor"]}
+            assert any(
+                frame[0] == 2 and frame[2] == "StopTransaction"
+                and frame[3]["transactionId"] == row["vendor"]
+                and frame[3]["timestamp"] == f"2026-01-01T00:{start_minute + epoch * 2 + 1:02}:00Z"
+                for frame in cloud.calls
+            )
             await self.status(lambda value: value.get("can_start") is True)
         assert len(locals_seen) == len(set(locals_seen)) == 2
         return locals_seen

@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .native_faults import NativeContentError
 from .native_start_attempts import split_attempts
 from .policy import integer
 from .security import SecurityError, StaleEvidenceError
@@ -60,8 +61,10 @@ def observe_history(value: Any, identity: str, hardware: str, observed_at: float
         return HistoryObservation(
             fingerprint(identity), fingerprint(hardware), observed_at, fingerprint(value), len(value), floor
         )
+    except SecurityError as error:
+        raise NativeContentError("history", str(error)) from error
     except ValueError, KeyError, TypeError, OverflowError:
-        raise SecurityError("complete native transaction history is invalid or exhausted") from None
+        raise NativeContentError("history", "complete native transaction history is invalid or exhausted") from None
 
 
 # A fresh trial may reserve numbers once; existing counters and accepted facts are never reset from rolling history.

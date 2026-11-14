@@ -132,7 +132,7 @@ When you build or change how the hub handles a charger, read how [lbbrhzn/ocpp](
 
 ## Fixtures
 
-Recorded charger sessions go in `tests/fixtures/` byte for byte, with a note of where and when they were captured. Raw local captures (`capture_*.jsonl`) can hold card ids and serial numbers, so they stay out of git. Do not trim a capture to the frames that look relevant; the frames you leave out are where bugs hide.
+Recorded charger sessions go in `tests/fixtures/` with their stored bytes and complete frame sequences preserved, with a note of where and when they were captured. Sanitised, reserialised derivatives must declare that provenance; they are not original wire bytes. Raw local captures (`capture_*.jsonl`) can hold card ids and serial numbers, so they stay out of git. Do not trim a capture to the frames that look relevant; the frames you leave out are where bugs hide.
 
 ## Deploying to a Home Assistant server
 

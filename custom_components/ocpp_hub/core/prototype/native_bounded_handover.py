@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -14,6 +15,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
 from .managed_current import managed_current_ceiling, record_current_source, require_current_session
+from .managed_native_repair import NativeRepairAudits
 from .managed_occurrences import KEY
 from .managed_recovery import local_recovery_binding
 from .managed_schedule import (
@@ -28,8 +30,9 @@ from .managed_schedule import (
     require_continuing_session,
     supervised_timer,
 )
-from .native_bounded import NativeBoundedSpec
-from .native_history import audit_history
+from .native_bounded import NativeBoundedSpec, _require_ready
+from .native_faults import MeasuredValues, NativeContentError, _NativeMeasurementError
+from .native_history import audit_history, inspect_history
 from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
 from .rpc import IntroductionDeferredError, UnavailableError
@@ -71,6 +74,7 @@ class NativeBoundedHandover:
         self.ordinary_source_observer: Callable[[HandoverEvidence], None] | None = None
         self.schedule_changed: Callable[[], None] | None = None
         self.allow_unplugged = allow_unplugged
+        self.repair_audits: NativeRepairAudits | None = None
         self.lock = asyncio.Lock()
         self.last_verified_at = 0.0
         self.read_sequence = 0
@@ -144,17 +148,26 @@ class NativeBoundedHandover:
             }
         )
 
-    # Read current rich native evidence and preserve every original history body without adopting later sessions.
+    # Read rich native evidence under current authority; eligible repair audits are fenced before observation.
     async def read(self, route: str = "trial", closed: bool = False) -> HandoverEvidence:
         self.read_sequence += 1
-        sequence = self.read_sequence
-        before = self.authority()
+        sequence, before = self.read_sequence, self.authority()
+        repair, gateway = self.repair_audits, self.gateway
+        attempt = (
+            repair.begin(before, sequence, gateway._charger_epoch, gateway.boot_observation, gateway.controls._revision)
+            if repair is not None
+            else None
+        )
+        content_current = False
+        strict_complete = False
+        resource_error: NativeContentError | None = None
 
-        # A newer observation may finish first while this read waits on the independent HTTP channel.
-        def resolve() -> None:
+        # Resolve failed or complete reads without letting an older HTTP result publish newer authority.
+        def current() -> bool:
             if sequence < self.last_resolved_read:
-                raise AuditSupersededError("a newer native observation superseded this read")
+                return False
             self.last_resolved_read = sequence
+            return before == self.authority()
 
         try:
             try:
@@ -162,14 +175,21 @@ class NativeBoundedHandover:
                     native = await self.observe()
             except TimeoutError as error:
                 raise NativeTransportUnavailableError("complete native observation exceeded its deadline") from error
-            resolve()
-            if before != self.authority():
+            if not current():
                 raise AuditSupersededError("native bounded audit was superseded by local authority")
-            self.require(native, route=route)
-            audit_history(
-                self.gateway.journal, self.spec.digest, list(native.history), self.gateway.policy.allow_local_start
-            )
+            content_current = True
+            measured = self._inspect(native, route=route)
+            inspect_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
+            if attempt is not None and (gateway.controls._operations or gateway.charger._pending):
+                raise RecoveryRequiredError("native repair awaits settled resource operations")
+            resource_error = self.book.native_conflict(native.physical, owned=attempt is not None)
+            strict_complete = True
             self.book.check_originals(native.physical)
+            if attempt is not None:
+                self.book.owned_present(native.physical)
+            if resource_error is not None:
+                raise resource_error
+            audit_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
             previous_timer = self.gateway.journal.get(KEY, {})
             try:
                 if native.physical.connection == "Unplug":
@@ -183,9 +203,31 @@ class NativeBoundedHandover:
                     self.schedule_changed()
             if self.ordinary_source_observer is not None:
                 self.ordinary_source_observer(native)
-        except (NativeTransportUnavailableError, StaleEvidenceError) as error:
-            resolve()
+            _require_ready(native, False, self.allow_unplugged, self._closing_local(native))
+            if measured.exceeded:
+                raise _NativeMeasurementError(native, measured, self.authority(), sequence)
+        except NativeContentError as error:
             self.last_verified_at = 0
+            # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
+            if not content_current and not current():
+                if repair is not None:
+                    repair.finish(attempt, "superseded")
+                raise AuditSupersededError("native content refusal was superseded by local authority") from error
+            if repair is not None:
+                repair.finish(attempt, "strict", error)
+            raise
+        except _NativeMeasurementError:
+            self.last_verified_at = 0
+            if repair is not None:
+                repair.finish(attempt, "measurement")
+            raise
+        except (NativeTransportUnavailableError, StaleEvidenceError) as error:
+            self.last_verified_at = 0
+            applicable = current()
+            if repair is not None:
+                repair.finish(attempt, "availability" if applicable else "superseded")
+            if not applicable:
+                raise AuditSupersededError("native availability result was superseded") from error
             timer = self.gateway.journal.get("managed_temporary_schedule", {})
             if supervised_timer(timer) and (
                 "hold_since" in timer or self.gateway.journal.get("managed_control_intent", {}).get("mode") == "paused"
@@ -198,59 +240,89 @@ class NativeBoundedHandover:
             if ordinary.get("state") == "holding" and intent == {"mode": "app", "revision": ordinary.get("revision")}:
                 raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
             raise
-        except SecurityError, UnavailableError, TimeoutError:
-            resolve()
+        except SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError:
             self.last_verified_at = 0
+            applicable = current()
+            if repair is not None:
+                repair.finish(attempt, "readiness" if applicable else "superseded")
             raise
+        except sqlite3.Error as error:
+            self.last_verified_at = 0
+            # Pure content comparisons precede publication; a proved resource refusal cannot become a storage wait.
+            if repair is not None and resource_error is not None:
+                repair.defer(attempt, "strict", resource_error)
+                raise resource_error from error
+            if repair is not None and strict_complete:
+                repair.defer(attempt, "readiness")
+            # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
+            raise
+        except asyncio.CancelledError:
+            self.last_verified_at = 0
+            if repair is not None:
+                repair.finish(attempt, "availability")
+            raise
+        if repair is not None:
+            repair.finish(attempt, "validated")
         self.last_verified_at = native.physical.observed_at
         if self.observation_listener is not None:
             self.observation_listener(native)
-        # A verified open source stays fresh even if this particular operation needs the station idle.
+        # A valid open source remains fresh while this particular operation awaits a closed station.
         if closed:
             self.require(native, route=route, closed=True)
         return native
 
-    # The explicit managed capability broadens only its native ceiling; selected-current enforcement stays independent.
-    def require(self, native: HandoverEvidence, *, route: str = "trial", closed: bool = False) -> None:
+    # The exact known closure exception never adopts a new native transaction.
+    def _closing_local(self, native: HandoverEvidence) -> int | None:
+        j = self.gateway.journal
+        lease = j.get("managed_temporary_schedule", {})
+        closing = j.active() if supervised_timer(lease) else None
+        if (
+            closing is None
+            and native.physical.transaction_open
+            and (known_timer_closure_gap(j, native) or recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest))
+        ):
+            closing = native.physical.native_transaction_id
+        return closing
+
+    # Compose immutable checks before a private measured verdict; it is never usable positive authority.
+    def _inspect(self, native: HandoverEvidence, *, route: str = "trial") -> MeasuredValues:
         j = self.gateway.journal
         if managed_current_ceiling(j, self.spec) == 32:
             if route != "trial":
-                raise SecurityError("managed current capability must be retired before backend restoration")
-            lease = j.get("managed_temporary_schedule", {})
-            closing_local = j.active() if supervised_timer(lease) else None
-            if (
-                closing_local is None
-                and native.physical.transaction_open
-                and (
-                    known_timer_closure_gap(j, native)
-                    or recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest)
+                raise NativeContentError(
+                    "configuration", "managed current capability must be retired before backend restoration"
                 )
-            ):
-                # A zero-output unplugged observation can maintain the restrictive hold without adopting the native ID.
-                closing_local = native.physical.native_transaction_id
-            self.spec.require_managed(
+            return self.spec._inspect_managed(
                 native,
                 j.identity,
-                closed=closed,
                 allow_unplugged=self.allow_unplugged,
-                closing_local=closing_local,
+                closing_local=self._closing_local(native),
                 temporary_schedule_digest=installed_variant(
                     j, self.spec.saved_schedule_digest, native.saved_schedule_digest
                 ),
             )
-        else:
-            self.spec.require(native, j.identity, route, closed=closed, allow_unplugged=self.allow_unplugged)
+        return self.spec._inspect(native, j.identity, route, allow_unplugged=self.allow_unplugged)
 
-    # Measured selected-limit enforcement gates health and positive work, while absolute-bound reads still permit Stop.
-    def require_selected(self, native: HandoverEvidence) -> None:
+    # Every public native validator still enforces all bounds and its original closed-zero readiness.
+    def require(self, native: HandoverEvidence, *, route: str = "trial", closed: bool = False) -> None:
+        self._inspect(native, route=route).require()
+        _require_ready(native, closed, self.allow_unplugged, self._closing_local(native))
+
+    # A private verdict retains selected-meter facts while the controller completes nonmeasurement checks.
+    def _selected_measurements(self, native: HandoverEvidence, measured: MeasuredValues) -> MeasuredValues:
         j = self.gateway.journal
         if managed_current_ceiling(j, self.spec) == 32:
-            selected = self.gateway.controls.policy.max_current_a
-            selected = j.get("control", {}).get("resume_limit", selected)
+            selected = j.get("control", {}).get("resume_limit", self.gateway.controls.policy.max_current_a)
             if type(selected) not in (int, float) or not 6 <= selected <= 32:
                 raise SecurityError("managed selected current is malformed")
-            if max(native.currents_a) > selected + 0.5 or max(native.powers_w) > min(8500, selected * 270 + 100):
-                raise SecurityError("actual native power exceeds the selected managed current")
+            return measured.selected(selected)
+        return measured
+
+    # Selected-limit enforcement gates every existing positive caller without any opt-out flag.
+    def require_selected(self, native: HandoverEvidence) -> None:
+        measured = self._selected_measurements(native, self._inspect(native))
+        if measured.exceeded:
+            raise SecurityError("actual native power exceeds the selected managed current")
 
     # Only a copy of the already validated USER scalar is normalized; original admission bytes are never rewritten.
     def binding_digest(self, native: HandoverEvidence) -> str:

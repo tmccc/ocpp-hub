@@ -110,6 +110,8 @@ async def test_n08_physical_mutation_recovery(
             work = asyncio.create_task(b.c.tick())
             try:
                 await asyncio.wait_for(entered.wait(), 5)
+                if operation == "restore" and lost_ack:
+                    assert b.device.effective_limit() == 32
                 if operation == "clear":
                     assert b.device.effective_limit() == 0
                 status = await asyncio.wait_for(work, 12)

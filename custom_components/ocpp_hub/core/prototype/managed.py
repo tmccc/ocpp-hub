@@ -16,7 +16,8 @@ from .managed_current import (
 )
 from .managed_current_recovery import capture_interrupted_collision
 from .managed_intent import ControlIntent, ManagedRequests
-from .managed_release_recovery import reconcile_owner_release, record_release_pause
+from .managed_native_repair import NativeRepairAudits
+from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
 from .managed_release_wait import awaiting_known_stops
 from .managed_schedule import (
     KEY,
@@ -30,6 +31,13 @@ from .managed_schedule import (
 from .managed_start_binding import ManagedStartBinding
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import summarize_charger_history
+from .native_bounded_handover import AuditSupersededError
+from .native_faults import (
+    MEASURED_FAULT,
+    MeasuredOutputLimitError,
+    _NativeMeasurementError,
+    diagnostic_type,
+)
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
@@ -55,6 +63,7 @@ class ManagedController:
         self.native = session.native_bounded
         self.released_epoch: int | None = None
         self.failures = 0
+        self.strict_failure_seen = False
         self.native_unavailable = 0
         self.fault_zero_retry: dict[str, float] = {}
         self.stopping = False
@@ -79,6 +88,9 @@ class ManagedController:
         binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest)
         session.gateway.defer_command_binding = binding.defer
         self.native.command_source_observer = binding.observe
+        self.native.repair_audits = NativeRepairAudits(
+            session.journal, lambda fault: release_evidence(self, fault) is not None
+        )
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
@@ -265,11 +277,15 @@ class ManagedController:
         self.session.gateway.controls._claim(True, stopping=True)
 
     # A persistent failed restoration cannot be silently undone by another poll or a process restart.
-    def fault(self, reason: str) -> None:
+    def fault(self, reason: str, *, diagnostic: dict[str, Any] | None = None) -> None:
         journal = self.session.journal
         if not journal.get("managed_control_fault"):
             with journal.atomic():
-                journal.put("managed_control_fault", {"classification": reason, "at_epoch": time.time()})
+                fault: dict[str, Any] = {"classification": reason, "at_epoch": time.time()}
+                if diagnostic is not None:
+                    journal.put("managed_native_failure", diagnostic)
+                    fault["native_failure_digest"] = fingerprint(diagnostic)
+                journal.put("managed_control_fault", fault)
                 control = journal.get("control", {})
                 journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
                 if journal.get("trial_phase") in ("active", "recovering", "blocked"):
@@ -613,11 +629,20 @@ class ManagedController:
                 await asyncio.sleep(0.02)
         if self.current.applying():
             raise RecoveryRequiredError("current application owns the pending native verification")
-        native = await self.native.read()
+        try:
+            native = await self.native.read()
+            measured = self.native._selected_measurements(native, self.native._inspect(native))
+            authority, sequence = self.native.authority(), self.native.last_resolved_read
+        except _NativeMeasurementError as candidate:
+            native = candidate.native
+            measured = self.native._selected_measurements(native, candidate.measured)
+            authority, sequence = candidate.authority, candidate.sequence
         async with asyncio.timeout(15):
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
             await self.schedule.await_closure_agreement(native)
+            if authority != self.native.authority() or sequence != self.native.last_resolved_read:
+                raise AuditSupersededError("settled native evidence crossed a newer authority or observation")
             if self.ordinary.closure_gap(native):
                 await self.ordinary.hold("native_closure_pending")
                 raise RecoveryRequiredError("ordinary zero hold awaits exact lifecycle closure")
@@ -631,7 +656,6 @@ class ManagedController:
                     raise RecoveryRequiredError("timer holds zero awaiting the genuine transaction or native closure")
                 raise SecurityError("managed native transaction has no exact accepted local counterpart")
             self.native.require_known_session(native)
-            self.native.require_selected(native)
             present = self.session.book.owned_present(native.physical)
             row = self.session.journal.db.execute(
                 "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
@@ -646,6 +670,9 @@ class ManagedController:
                 )
             ):
                 raise SecurityError("managed local station ceiling is absent or unconfirmed")
+            native.physical.require_fresh(self.session.journal.identity, 5)
+            if measured.exceeded:
+                raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
             return native
 
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
@@ -658,8 +685,28 @@ class ManagedController:
 
     # Retain ordinary recovery and owner-control supervision while schedule alarms are reported separately.
     async def _tick(self) -> dict[str, Any]:
-        await self.current.settle()
-        await self.tests.settle()
+        pending = None
+        if not await self.current.settle_for_poll():
+            pending = "current_update_pending"
+        elif not await self.tests.settle_for_poll():
+            pending = "start_operation_pending"
+        if pending is not None:
+            self.latest_native = None
+            return {
+                "checked_at": time.time(),
+                "mode": "app_schedule",
+                "state": "stopping" if self.stopping else "reconciling",
+                "fault": pending,
+                "owner_control_enabled": False,
+                "local_hold_verified": False,
+                "native_observed_at": None,
+                "native_limit_a": None,
+                "current_a": None,
+                "power_w": None,
+                "station_ceiling_a": None,
+                "charging_session_open": None,
+                "vehicle_drawing_power": None,
+            }
         s, g, j = self.session, self.session.gateway, self.session.journal
         base = {
             "checked_at": time.time(),
@@ -685,6 +732,7 @@ class ManagedController:
             "desired_control": self.requests.intent().mode,
             "control_revision": self.requests.intent().revision,
             "local_hold_verified": False,
+            "owner_control_enabled": False,
         }
         if self.stopping:
             return {**base, "state": "stopping", "owner_control_enabled": False}
@@ -781,6 +829,7 @@ class ManagedController:
                 verified_pause = True
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
             self.failures = 0
+            self.strict_failure_seen = False
             self.native_unavailable += 1
             j.put(
                 "managed_native_failure",
@@ -805,7 +854,7 @@ class ManagedController:
                         j.put(
                             "managed_native_failure",
                             {
-                                "type": type(failure).__name__,
+                                "type": diagnostic_type(failure),
                                 "detail": str(failure)[:1024],
                                 "at_epoch": time.time(),
                             },
@@ -831,16 +880,29 @@ class ManagedController:
         except (SecurityError, DeniedError) as error:
             if self.stopping:
                 return {**base, "state": "stopping", "owner_control_enabled": False}
-            # Keep exact diagnostic details private, including transient failures which recover before a minute check.
-            j.put(
-                "managed_native_failure",
-                {"type": type(error).__name__, "detail": str(error)[:1024], "at_epoch": time.time()},
-            )
+            # Only a fully settled typed measurement can make this entire hard-failure run recoverable.
+            measured_only = isinstance(error, MeasuredOutputLimitError)
+            self.strict_failure_seen = self.strict_failure_seen or not measured_only
+            diagnostic: dict[str, Any] = {
+                "type": diagnostic_type(error),
+                "detail": str(error)[:1024],
+                "at_epoch": time.time(),
+            }
+            if isinstance(error, MeasuredOutputLimitError):
+                diagnostic["cause"] = error.cause
             self.failures += 1
+            classification = (
+                MEASURED_FAULT
+                if measured_only and not self.strict_failure_seen
+                else ("native_authority_or_preservation_failed")
+            )
             if self.failures >= 3:
-                self.fault("native_authority_or_preservation_failed")
-            return {**base, "state": "degraded", "fault": "native_authority_or_preservation_failed"}
+                self.fault(classification, diagnostic=diagnostic)
+            else:
+                j.put("managed_native_failure", diagnostic)
+            return {**base, "state": "degraded", "fault": classification}
         self.failures = 0
+        self.strict_failure_seen = False
         self.native_unavailable = 0
         self.latest_native = native
         previous_intent = self.requests.intent()

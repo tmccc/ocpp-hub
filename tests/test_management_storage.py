@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import ssl
 import uuid
 from pathlib import Path
@@ -64,11 +65,13 @@ def test_native_history_is_redacted_bounded_and_validated() -> None:
 
 # Intent: a failed hold-claim commit rolls back both the Pause intent and command acceptance.
 # Why: a recorded user pause must not coexist with a silently unchanged shared positive authority after a DB failure.
+@pytest.mark.parametrize("failure", ["statement", "commit"])
 async def test_pause_and_hold_claim_are_atomic(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
         session = managed_session(rig)
@@ -78,18 +81,28 @@ async def test_pause_and_hold_claim_are_atomic(
         async with rig.charger(session) as charger:
             await introduced(rig, session, charger, "storage-boot")
             await healthy(controller)
-            actual = session.gateway.controls._claim
-
-            # Fail only the commit boundary, without replacing the real controller, protocol or physical peer.
-            def fail_claim(*args, **kwargs):
-                raise OSError("synthetic storage failure")
-
-            monkeypatch.setattr(session.gateway.controls, "_claim", fail_claim)
+            j = session.journal
+            before = j.get("control"), controller.requests.intent(), list(rig.bench.device_calls)
+            if failure == "statement":
+                effect = "SELECT RAISE(ABORT,'hold claim unavailable');"
+            else:
+                j.db.execute("CREATE TABLE review_claim_parent(id INTEGER PRIMARY KEY)")
+                j.db.execute(
+                    "CREATE TABLE review_claim_child("
+                    "id REFERENCES review_claim_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+                )
+                effect = "INSERT INTO review_claim_child VALUES(123);"
+            j.db.execute(
+                "CREATE TEMP TRIGGER review_hold_claim BEFORE INSERT ON meta "
+                "WHEN NEW.key='control' AND json_extract(NEW.value,'$.owner')='local' "
+                "AND json_extract(NEW.value,'$.inhibit')=1 BEGIN " + effect + " END"
+            )
             request = uuid.uuid4().hex
-            with pytest.raises(OSError):
+            with pytest.raises(sqlite3.IntegrityError):
                 controller.command(request, "pause", 0)
-            assert controller.requests.intent().mode == "app"
+            assert (j.get("control"), controller.requests.intent(), rig.bench.device_calls) == before
             assert controller.requests.receipt(request)["state"] == "not_found"
-            monkeypatch.setattr(session.gateway.controls, "_claim", actual)
+            assert j.get("managed_owner_pause") is None and controller.pause_task is None
+            j.db.execute("DROP TRIGGER review_hold_claim")
             controller.command(request, "pause", 0)
             assert (await healthy(controller))["local_hold_verified"]

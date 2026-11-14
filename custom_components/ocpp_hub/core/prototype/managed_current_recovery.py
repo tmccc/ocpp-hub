@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from .managed_current import managed_current_ceiling
+from .managed_current import current_failure, managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
 from .store import Journal
 
@@ -86,7 +86,7 @@ def interrupted_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[st
         return None
     return {
         "change": change,
-        "failure": j.get("managed_current_failure"),
+        "failure": current_failure(j, change),
         "request": dict(row),
         "previous_a": saved["previous_a"],
         "interrupted": saved,
@@ -99,9 +99,11 @@ def legacy_current_evidence(c: ManagedController, fault: dict[str, Any]) -> dict
     if managed_current_ceiling(j, c.native.spec) == 32:
         if saved := interrupted_evidence(c, fault):
             return saved
-    change, failure = j.get("managed_current_change", {}), j.get("managed_current_failure", {})
+    change = j.get("managed_current_change", {})
+    failure = current_failure(j, change)
     if (
         fault.get("classification") != FAULT
+        or failure is None
         or managed_current_ceiling(j, c.native.spec) != 32
         or change.get("state") != "uncertain"
         or type(change.get("current_a")) is not int

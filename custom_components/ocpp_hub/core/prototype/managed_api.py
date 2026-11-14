@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import re
+import sqlite3
 import time
 from collections import deque
 from collections.abc import Callable
@@ -105,9 +106,37 @@ class ManagementServer:
             raise SecurityError("management identifier is invalid")
         command = value.get("command")
         if command in ("status", "history") and set(value) == {"id", "command"}:
-            if command == "history":
-                result: Any = {"sessions": session_history(self.controller.session.journal)}
-            else:
+            return self.read_only(value["id"], command)
+        if command == "receipt" and set(value) == {"id", "command", "request_id"}:
+            identifier = value["request_id"]
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
+                raise SecurityError("management receipt identifier is invalid")
+            return self.read_only(value["id"], command, request_id=identifier)
+        if command == "temporary_schedule" and set(value) == {"id", "command", "revision", "start_epoch"}:
+            result = self.controller.schedule.accept(value["id"], value["revision"], value["start_epoch"])
+            return {"id": value["id"], "ok": True, "result": result}
+        if command == "set_current" and set(value) == {"id", "command", "revision", "current_a"}:
+            result = self.controller.command(value["id"], command, value["revision"], current_a=value["current_a"])
+            return {"id": value["id"], "ok": True, "result": result}
+        if command in ("pause", "app_control", "start", "start_test", "arm_cloud_test") and set(value) == {
+            "id",
+            "command",
+            "revision",
+        }:
+            result = self.controller.command(value["id"], command, value["revision"])
+            return {"id": value["id"], "ok": True, "result": result}
+        raise SecurityError("management command is not supported")
+
+    # A failed journal read returns no guessed state; sent controls retain their separate unknown-outcome handling.
+    def read_only(self, identifier: str, command: str, *, request_id: str | None = None) -> dict[str, Any]:
+        try:
+            if command == "receipt":
+                if request_id is None:
+                    raise SecurityError("management receipt identifier is missing")
+                result: Any = self.controller.requests.receipt(request_id)
+            elif command == "history":
+                result = {"sessions": session_history(self.controller.session.journal)}
+            elif command == "status":
                 result = dict(self.status())
                 intent = self.controller.requests.intent()
                 if (
@@ -138,26 +167,11 @@ class ManagementServer:
                     and self.controller.requests.has_capacity()
                 )
                 result["sessions"] = session_history(self.controller.session.journal)
-            return {"id": value["id"], "ok": True, "result": result}
-        if command == "receipt" and set(value) == {"id", "command", "request_id"}:
-            identifier = value["request_id"]
-            if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
-                raise SecurityError("management receipt identifier is invalid")
-            return {"id": value["id"], "ok": True, "result": self.controller.requests.receipt(identifier)}
-        if command == "temporary_schedule" and set(value) == {"id", "command", "revision", "start_epoch"}:
-            result = self.controller.schedule.accept(value["id"], value["revision"], value["start_epoch"])
-            return {"id": value["id"], "ok": True, "result": result}
-        if command == "set_current" and set(value) == {"id", "command", "revision", "current_a"}:
-            result = self.controller.command(value["id"], command, value["revision"], current_a=value["current_a"])
-            return {"id": value["id"], "ok": True, "result": result}
-        if command in ("pause", "app_control", "start", "start_test", "arm_cloud_test") and set(value) == {
-            "id",
-            "command",
-            "revision",
-        }:
-            result = self.controller.command(value["id"], command, value["revision"])
-            return {"id": value["id"], "ok": True, "result": result}
-        raise SecurityError("management command is not supported")
+            else:
+                raise SecurityError("management read is not supported")
+        except sqlite3.Error:
+            raise UnavailableError("management journal read is temporarily unavailable") from None
+        return {"id": identifier, "ok": True, "result": result}
 
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:

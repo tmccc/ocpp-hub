@@ -17,14 +17,14 @@ from tests.test_prototype_tls import tls as tls
 
 
 # An actual SQLite trigger records separate cleanup attempts before refusing that write; no result is mocked.
-def failing_cleanup(j, key):
+def failing_cleanup(j, key, *, minimum_attempts=2):
     reached = asyncio.Event()
     attempts = []
 
     # Observe a genuine trigger execution without changing its real SQLite failure.
     def observed():
         attempts.append(len(attempts) + 1)
-        if len(attempts) >= 2:
+        if len(attempts) >= minimum_attempts:
             reached.set()
         return 0
 
@@ -56,8 +56,8 @@ def fail_boundary(j, boundary, failure):
     j.db.execute("CREATE TEMP TRIGGER review_worker_boundary " + target + " BEGIN " + effect + " END")
 
 
-# Intent: actual prepared-to-issued failure stays unsent and retries cleanup while storage is still refused.
-# Why: a finished worker or a foreground wait must not require replacement to complete later Pause/Return.
+# Intent: prepared-to-issued failure stays unsent and restricts zero before its optional diagnostic is repaired.
+# Why: a diagnostic write cannot occupy the worker or foreground poll after critical settlement succeeds.
 @pytest.mark.parametrize("tick_awaits", [False, True])
 async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unused_tcp_port, monkeypatch, tick_awaits):
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
@@ -66,15 +66,17 @@ async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unus
         original_session = b.session
         for cycle, failure in enumerate(("statement", "commit")):
             fail_boundary(j, "start", failure)
-            reached, attempts = failing_cleanup(j, "managed_test_failure")
+            reached, attempts = failing_cleanup(j, "managed_test_failure", minimum_attempts=1)
             identifier = uuid.uuid4().hex
             c.command(identifier, "start", c.requests.intent().revision)
             tick = asyncio.create_task(c.tick()) if tick_awaits else None
             await asyncio.wait_for(reached.wait(), 3)
-            assert len(attempts) >= 2 and c.tests.worker is not None and not c.tests.worker.done()
+            assert attempts and c.tests.worker is not None
+            await asyncio.wait_for(asyncio.shield(c.tests.worker), 3)
+            assert c.tests.state()["failure"]["id"] == identifier
             assert starts(b.rig) == []
             assert j.get("local_start_receipt")["stage"] in ("prepared", "unsent")
-            # Only the real independent deadline/Stop task drives zero while failure cleanup remains refused.
+            # Real restrictive tasks drive zero while the diagnostic write remains continuously refused.
             await until(lambda: b.rig.bench.firmware.effective_limit() == 0)
             j.db.execute("DROP TRIGGER review_worker_boundary")
             j.db.execute("DROP TRIGGER review_cleanup_unavailable")
@@ -95,8 +97,8 @@ async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unus
             assert b.session is original_session and not b.session.closed and j.next_delivery() is None
 
 
-# Intent: completion rollback is retried as restrictive failure settlement, never as another positive profile write.
-# Why: both already-finished and concurrently awaited worker orderings must restore ordinary later operation.
+# Intent: completion rollback restricts zero before an optional diagnostic can be repaired or another tick waits.
+# Why: a diagnostic outage cannot leave the failed positive offer active or require replacement for later operation.
 @pytest.mark.parametrize("tick_awaits", [False, True])
 async def test_current_completion_eventually_recovers_same_service(
     tmp_path, tls, unused_tcp_port, monkeypatch, tick_awaits
@@ -107,16 +109,18 @@ async def test_current_completion_eventually_recovers_same_service(
         original_session = b.session
         for cycle, failure in enumerate(("statement", "commit")):
             fail_boundary(j, "current", failure)
-            reached, attempts = failing_cleanup(j, "managed_current_failure")
+            reached, attempts = failing_cleanup(j, "managed_current_failure", minimum_attempts=1)
             identifier = uuid.uuid4().hex
             before = len(b.rig.bench.device_calls)
             c.command(identifier, "set_current", c.requests.intent().revision, current_a=16)
             tick = asyncio.create_task(c.tick()) if tick_awaits else None
             await asyncio.wait_for(reached.wait(), 3)
-            assert len(attempts) >= 2 and c.current.worker is not None and not c.current.worker.done()
-            assert c.requests.receipt(identifier)["state"] == "accepted"
-            assert j.get("managed_current_change")["state"] == "pending"
-            assert b.rig.bench.firmware.effective_limit() == 16
+            assert attempts and c.current.worker is not None
+            await asyncio.wait_for(asyncio.shield(c.current.worker), 3)
+            assert c.requests.receipt(identifier)["state"] == "uncertain"
+            change = j.get("managed_current_change")
+            assert change["state"] == "uncertain" and change["failure"]["id"] == identifier
+            assert b.rig.bench.firmware.effective_limit() == 0
             actual_positive = [
                 f
                 for f in b.rig.bench.device_calls[before:]

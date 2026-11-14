@@ -1,6 +1,7 @@
 """New owner Pause and actual charger replacement retain their authority while failed cleanup waits for storage."""
 
 import asyncio
+import sqlite3
 import uuid
 from contextlib import AsyncExitStack
 
@@ -15,7 +16,44 @@ from tests.test_managed_proxy import healthy, introduced, starts
 from tests.test_managed_test_charge import ChargeRig
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
-from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
+from tests.test_worker_storage_recovery import fail_boundary
+
+
+# Refuse the real restrictive settlement transaction while leaving a newer owner's Pause writes available.
+def critical_settlement_unavailable(j, operation, failure="statement"):
+    reached, attempts = asyncio.Event(), []
+
+    # Count actual failed SQLite statements rather than suspending the engine's decision code.
+    def observed():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) >= 2:
+            reached.set()
+        return 0
+
+    j.db.create_function("review_current_settlement", 0, observed)
+    effect = "SELECT RAISE(ABORT,'current settlement unavailable');"
+    if failure == "commit":
+        j.db.execute("CREATE TABLE review_settlement_parent(id INTEGER PRIMARY KEY)")
+        j.db.execute(
+            "CREATE TABLE review_settlement_child("
+            "id REFERENCES review_settlement_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+        )
+        effect = "INSERT INTO review_settlement_child VALUES(123);"
+    target = (
+        "NEW.key='managed_current_change' AND json_extract(NEW.value,'$.state')='uncertain'"
+        if operation == "current"
+        else "NEW.key='managed_test_charge' AND json_extract(NEW.value,'$.state') IN ('stopping','expired')"
+    )
+    j.db.execute(
+        "CREATE TEMP TRIGGER review_cleanup_unavailable BEFORE INSERT ON meta "
+        "WHEN " + target + " BEGIN SELECT review_current_settlement(); " + effect + " END"
+    )
+    return reached, attempts
+
+
+# Keep the current-specific poll fixture bound to the genuine restrictive state transition.
+def current_settlement_unavailable(j, failure="statement"):
+    return critical_settlement_unavailable(j, "current", failure)
 
 
 # Intent: later owner authority survives every cleanup retry, including a genuine new connection and Boot.
@@ -35,9 +73,7 @@ async def test_storage_cleanup_preserves_new_pause_and_boot(
         c, s, rig = b.controller, b.session, b.rig
         j, sock = s.journal, b.charger
         fail_boundary(j, operation, "statement")
-        reached, attempts = failing_cleanup(
-            j, "managed_test_failure" if operation == "start" else "managed_current_failure"
-        )
+        reached, attempts = critical_settlement_unavailable(j, operation)
         identifier = uuid.uuid4().hex
         c.command(
             identifier,
@@ -60,7 +96,10 @@ async def test_storage_cleanup_preserves_new_pause_and_boot(
             new_pause = uuid.uuid4().hex
             c.command(new_pause, "pause", c.requests.intent().revision)
             if c.pause_task is not None:
-                await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+                try:
+                    await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+                except sqlite3.IntegrityError:
+                    assert operation == "start"  # Zero can succeed before the deliberately refused Start settlement.
             latest_intent = c.requests.intent()
             latest_ticket = j.get("control")["ticket"]
             latest_epoch, latest_boot = s.gateway._charger_epoch, s.gateway.boot_observation

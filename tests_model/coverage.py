@@ -93,9 +93,15 @@ RISKS = (
             "tests/test_worker_storage_recovery.py",
             "tests/test_worker_storage_supersession.py",
             "tests/test_worker_storage_serve.py",
+            "tests/test_current_poll_storage.py",
+            "tests/test_start_diagnostic_progress.py",
+            "tests/test_start_cancel_hardening.py",
+            "tests/test_management_storage.py",
+            "tests/test_management_read_storage.py",
             "tests/test_disconnect_storage_recovery.py",
         ),
-        "ABORT and deferred-FK integration cuts; actual FULL and writer-BUSY transaction controls.",
+        "ABORT and deferred-FK integration cuts, actual SQL read refusal, FULL and writer-BUSY controls; "
+        "unavailable physical proof stays unknown rather than becoming a cached zero claim.",
     ),
     Risk(
         "FIFO-DEBT",
@@ -147,9 +153,15 @@ RISKS = (
     Risk(
         "SOURCE-REVOCATION",
         "Lost or contradicted source cannot authorize continuation.",
-        "Restoration uses a fresh source and current Boot with the same verified ceiling.",
-        ("tests/test_ordinary_daily_report_recovery.py",),
-        "Finite source-loss grammar; no unbounded outage durations.",
+        "Eligible source-loss recovery uses a fresh source and current Boot; strict or unknown audits remain blocked.",
+        (
+            "tests/test_ordinary_daily_report_recovery.py",
+            "tests/test_measured_current_recovery.py",
+            "tests/test_native_measurement_mixed.py",
+            "tests/test_native_repair_strict_conflict.py",
+            "tests/test_native_repair_denial_lineage.py",
+        ),
+        "Finite source-loss and exact fault-repair histories; no ordinary Pause waiver for interrupted unknown audits.",
     ),
     Risk(
         "START-DISPATCH",
@@ -158,6 +170,9 @@ RISKS = (
         (
             "tests/test_managed_start_cap_failure.py",
             "tests/test_managed_start_scheduling_loss.py",
+            "tests/test_managed_start_cancelled_outer.py",
+            "tests/test_start_worker_outcomes.py",
+            "tests/test_start_cancel_hardening.py",
             "tests/test_managed_start_debt_recovery.py",
             "tests/test_managed_stop_replacement.py",
         ),
@@ -167,7 +182,7 @@ RISKS = (
         "BOOT-PROOF",
         "Incomplete old proof cannot cross Boot; a completed zero pair can survive identical metadata.",
         "A fresh correlated proof or valid completed pair permits restrictive convergence then explicit Return.",
-        ("tests/test_managed_boot_supersession.py",),
+        ("tests/test_managed_boot_supersession.py", "tests/test_native_repair_authority.py"),
         "Identical Boot races; foreign identities/configuration retain separate refusal tests.",
     ),
     Risk(
@@ -193,6 +208,7 @@ RISKS = (
             "tests/test_managed_current_legacy_recovery.py",
             "tests/test_managed_current_retirement.py",
             "tests/test_managed_current_overlap.py",
+            "tests/test_current_failure_binding.py",
         ),
         "Directed6/16/32 pairs; process loss at native boundaries, not arbitrary in-flight shielded RPC kills.",
     ),
@@ -238,6 +254,7 @@ RISKS = (
             "tests/test_managed_normal_start.py",
             "tests/test_normal_source_recovery.py",
             "tests/test_autonomous_cross_feature_recovery.py",
+            "tests/test_worker_storage_serve.py",
             "tests/test_native_suffix_witness.py",
             "tests/test_suffix_barrier_regression.py",
         ),
@@ -254,6 +271,9 @@ RISKS = (
             "tests/test_managed_stop_replacement.py",
             "tests/test_vendor_reply_uncertainty.py",
             "tests/test_managed_debt_reconciliation.py",
+            "tests/test_native_repair_storage.py",
+            "tests/test_native_repair_wait_controls.py",
+            "tests/test_native_repair_sources.py",
         ),
         "Named SQLite commit boundaries; no exhaustive disk-full, WAL corruption or power-failure simulation.",
     ),
@@ -308,10 +328,12 @@ RISKS = (
         "The service and HA's own scheduled work observe repair and recover without helper ticks or refreshes.",
         (
             "tests/test_autonomous_cross_feature_recovery.py",
+            "tests/test_worker_storage_serve.py",
             "tests_ha_proxy/test_periodic_progress.py",
             "tests_ha_proxy/test_control_completion_progress.py",
         ),
-        "Four service histories at6/32A and repeated HA polling episodes; not arbitrary fault combinations "
+        "Declared combined6/32A service histories, real current-cleanup supervision and repeated HA polling; "
+        "not arbitrary fault combinations "
         "or an end-to-end HA-to-charger test.",
     ),
     Risk(

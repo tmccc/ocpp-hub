@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Self
 
+from .native_faults import MeasuredValues, NativeContentError
 from .policy import integer, number
 from .security import SecurityError, StaleEvidenceError
 from .store import encoded, fingerprint
@@ -53,8 +54,8 @@ def require_original(configuration: dict[str, Any], hardware: str) -> None:
     require_route({key: configuration.get(key) for key in ROUTE_FIELDS})
 
 
-# Check direct native values independently of the proxy's desired profile, vendor availability or car permission.
-def require_native(
+# Inspect immutable native content completely before classifying a measured-bound excess.
+def _inspect_native(
     native: HandoverEvidence,
     identity: str,
     hardware: str,
@@ -64,7 +65,7 @@ def require_native(
     allow_unplugged: bool = False,
     allow_full_current: bool = False,
     closing_local: int | None = None,
-) -> None:
+) -> MeasuredValues:
     try:
         physical = native.physical
         if type(user_a) is not int or user_a not in {6, 32} or type(allow_unplugged) is not bool:
@@ -108,27 +109,18 @@ def require_native(
         if physical.native_transaction_id is not None:
             integer(physical.native_transaction_id, 1)
         for current in native.currents_a:
-            number(current, current_max)
+            number(current, 1000)
         for power in native.powers_w:
-            number(power, power_max)
+            number(power, 1000000)
         number(native.output_limit_a, user_a)
         number(native.offered_current_a, 32)
         if (
-            number(physical.current_a, current_max) != max(native.currents_a)
-            or number(physical.power_w, power_max) != max(native.powers_w)
+            number(physical.current_a, 1000) != max(native.currents_a)
+            or number(physical.power_w, 1000000) != max(native.powers_w)
             or any(value != 0 for value in native.currents_a[1:])
             or any(value != 0 for value in native.powers_w[1:3])
         ):
             raise ValueError
-        if (closed or unplugged) and (
-            physical.cp != "B"
-            and not unplugged
-            or physical.transaction_open
-            and (closed or physical.native_transaction_id != closing_local)
-            or native.output_limit_a != 0
-            or any(value != 0 for value in native.currents_a + native.powers_w)
-        ):
-            raise SecurityError("native bounded admission or release requires actual closed zero-output evidence")
         if not physical.transaction_open and any(value != 0 for value in native.currents_a + native.powers_w):
             raise ValueError
         if physical.history is None:
@@ -137,10 +129,60 @@ def require_native(
         observed = observe_history(list(native.history), identity, hardware, physical.observed_at)
         if physical.history != observed:
             raise ValueError
+        return MeasuredValues(max(native.currents_a), max(native.powers_w), current_max, power_max)
     except StaleEvidenceError:
         raise
+    except SecurityError as error:
+        if isinstance(error, NativeContentError):
+            raise
+        raise NativeContentError("content", str(error)) from error
     except ValueError, TypeError, KeyError, IndexError, OverflowError:
-        raise SecurityError("fresh complete independent native current-limit evidence is required") from None
+        raise NativeContentError(
+            "content", "fresh complete independent native current-limit evidence is required"
+        ) from None
+
+
+# Public validation always enforces the original bounds; private inspection never changes the evidence.
+def require_native(
+    native: HandoverEvidence,
+    identity: str,
+    hardware: str,
+    user_a: int,
+    closed: bool,
+    *,
+    allow_unplugged: bool = False,
+    allow_full_current: bool = False,
+    closing_local: int | None = None,
+) -> None:
+    measured = _inspect_native(
+        native,
+        identity,
+        hardware,
+        user_a,
+        False,
+        allow_unplugged=allow_unplugged,
+        allow_full_current=allow_full_current,
+        closing_local=closing_local,
+    )
+    measured.require()
+    _require_ready(native, closed, allow_unplugged, closing_local)
+
+
+# Closed/zero is an operation prerequisite, not proof of a new immutable native contradiction.
+def _require_ready(
+    native: HandoverEvidence, closed: bool, allow_unplugged: bool, closing_local: int | None = None
+) -> None:
+    physical = native.physical
+    unplugged = allow_unplugged and physical.cp == "A" and physical.connection == "Unplug"
+    if (closed or unplugged) and (
+        physical.cp != "B"
+        and not unplugged
+        or physical.transaction_open
+        and (closed or physical.native_transaction_id != closing_local)
+        or native.output_limit_a != 0
+        or any(value != 0 for value in native.currents_a + native.powers_w)
+    ):
+        raise SecurityError("native bounded admission or release requires actual closed zero-output evidence")
 
 
 @dataclass(frozen=True, repr=False, init=False)
@@ -226,16 +268,34 @@ class NativeBoundedSpec:
         expected = self.configuration(route, user_a)
         if identity != expected["Id"]:
             raise SecurityError("native bounded specification belongs to another charger")
-        require_native(
+        measured = self._inspect(native, identity, route, user_a, allow_unplugged=allow_unplugged)
+        measured.require()
+        _require_ready(native, closed or user_a == 32, allow_unplugged and route == "trial" and user_a == 6)
+
+    # Full configuration equality must win even when the independent measured current is excessive.
+    def _inspect(
+        self,
+        native: HandoverEvidence,
+        identity: str,
+        route: str,
+        user_a: int = 6,
+        *,
+        allow_unplugged: bool = False,
+    ) -> MeasuredValues:
+        expected = self.configuration(route, user_a)
+        if identity != expected["Id"]:
+            raise NativeContentError("identity", "native bounded specification belongs to another charger")
+        measured = _inspect_native(
             native,
             identity,
             self.hardware_identity,
             user_a,
-            closed or user_a == 32,
+            False,
             allow_unplugged=allow_unplugged and route == "trial" and user_a == 6,
         )
         if native.configuration != expected or native.saved_schedule_digest != self.saved_schedule_digest:
-            raise SecurityError("native bounded configuration or saved schedule changed")
+            raise NativeContentError("configuration", "native bounded configuration or saved schedule changed")
+        return measured
 
     # Separately commissioned managed operation keeps the original installation ceiling and full route/config binding.
     def require_managed(
@@ -248,15 +308,35 @@ class NativeBoundedSpec:
         temporary_schedule_digest: str | None = None,
         closing_local: int | None = None,
     ) -> None:
+        measured = self._inspect_managed(
+            native,
+            identity,
+            allow_unplugged=allow_unplugged,
+            temporary_schedule_digest=temporary_schedule_digest,
+            closing_local=closing_local,
+        )
+        measured.require()
+        _require_ready(native, closed, allow_unplugged, closing_local)
+
+    # Keep full managed commissioning/configuration checks independent of later closed-zero readiness.
+    def _inspect_managed(
+        self,
+        native: HandoverEvidence,
+        identity: str,
+        *,
+        allow_unplugged: bool = False,
+        temporary_schedule_digest: str | None = None,
+        closing_local: int | None = None,
+    ) -> MeasuredValues:
         expected = self.original_configuration | self.trial_route | {"AmpLmt": "32"}
         if identity != expected["Id"]:
-            raise SecurityError("managed current evidence belongs to another charger")
-        require_native(
+            raise NativeContentError("identity", "managed current evidence belongs to another charger")
+        measured = _inspect_native(
             native,
             identity,
             self.hardware_identity,
             32,
-            closed,
+            False,
             allow_unplugged=allow_unplugged,
             allow_full_current=True,
             closing_local=closing_local,
@@ -264,7 +344,8 @@ class NativeBoundedSpec:
         if native.configuration != expected or native.saved_schedule_digest != (
             temporary_schedule_digest or self.saved_schedule_digest
         ):
-            raise SecurityError("managed full configuration or saved schedule changed")
+            raise NativeContentError("configuration", "managed full configuration or saved schedule changed")
+        return measured
 
     # Connected admission is stricter than bounded monitoring and cannot start from another open native session.
     def require_admission(self, native: HandoverEvidence, identity: str, route: str = "trial") -> None:

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .native_faults import NativeContentError
 from .native_http import read_native
 from .policy import DeniedError, integer, number
 from .security import SecurityError, StaleEvidenceError
@@ -164,13 +165,15 @@ class Evidence:
     # Validate identity, freshness and inventory uniqueness independently of whether a supervised session is active.
     def require_fresh(self, identity: str, max_age: float = 30) -> None:
         age = time.time() - self.observed_at
-        if self.identity_digest != fingerprint(identity) or not math.isfinite(age) or age < 0:
-            raise SecurityError("trial requires fresh matching physical evidence")
+        if self.identity_digest != fingerprint(identity):
+            raise NativeContentError("identity", "trial requires fresh matching physical evidence")
+        if not math.isfinite(age) or age < 0:
+            raise StaleEvidenceError("native observation exceeded its freshness limit")
         if age > max_age:
             raise StaleEvidenceError("native observation exceeded its freshness limit")
         keys = [resource.key for resource in self.resources]
         if len(keys) != len(set(keys)):
-            raise SecurityError("native inventory contains duplicate resource identifiers")
+            raise NativeContentError("resources", "native inventory contains duplicate resource identifiers")
 
     # Reject incomplete, stale, contradictory and non-finite physical evidence before removing a safety hold.
     def require_unplugged(self, identity: str, max_age: float = 30) -> None:
@@ -229,13 +232,13 @@ class NativeObserver:
                 or config.get("Id") != self.config.identity
                 or config.get("bPSN") != self.config.hardware_identity
             ):
-                raise SecurityError("connected native identities do not match the configured charger")
+                raise NativeContentError("identity", "connected native identities do not match the configured charger")
             values = {}
             for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP", "STATE"):
                 values[name] = await self._read("statistics", name)
             values["TRANSACTIONS"] = await self._read("getTransaction", {})
             if await self._read("getConfig") != config:
-                raise SecurityError("native configuration changed during the connected audit")
+                raise NativeContentError("configuration", "native configuration changed during the connected audit")
             return handover_evidence(config, values, started)
 
     # Recheck native identity and configuration around one complete bounded physical snapshot.
@@ -248,7 +251,9 @@ class NativeObserver:
                 or config.get("Id") != self.config.identity
                 or config.get("bPSN") != self.config.hardware_identity
             ):
-                raise SecurityError("native OCPP and physical identities must both match the configured charger")
+                raise NativeContentError(
+                    "identity", "native OCPP and physical identities must both match the configured charger"
+                )
             self.configuration_snapshot = config
             values = {}
             for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP"):
@@ -256,7 +261,7 @@ class NativeObserver:
             if include_history:
                 values["TRANSACTIONS"] = await self._read("getTransaction", {})
             if await self._read("getConfig") != config:
-                raise SecurityError("native configuration changed during the history audit")
+                raise NativeContentError("configuration", "native configuration changed during the history audit")
             return native_evidence(config, values, started)
 
     # The explicit command-line baseline capture owns its loop; websocket runtime always uses observe directly.
@@ -325,4 +330,4 @@ def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> 
             else None,
         )
     except ValueError, KeyError, TypeError, IndexError:
-        raise SecurityError("complete native trial inventory could not be validated") from None
+        raise NativeContentError("content", "complete native trial inventory could not be validated") from None

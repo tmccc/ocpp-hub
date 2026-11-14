@@ -10,8 +10,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from .native_faults import NativeContentError
 from .native_start_attempts import split_attempts
-from .security import SecurityError
 from .store import Journal, encoded, fingerprint
 
 
@@ -59,7 +59,46 @@ def indexed(records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
             result[identifier] = record
         return result
     except ValueError, TypeError, KeyError, RecursionError:
-        raise SecurityError("native history requires complete unique well-typed records") from None
+        raise NativeContentError("history", "native history requires complete unique well-typed records") from None
+
+
+# Validate original/archive preservation completely before any archive constructor or publication writes.
+def _archive_view(
+    journal: Journal, original: list[dict[str, Any]], current: list[dict[str, Any]], allow_missing: bool
+) -> tuple[
+    dict[int, dict[str, Any]],
+    dict[int, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+]:
+    if type(allow_missing) is not bool:
+        raise NativeContentError("history", "native history retention permission must be explicit")
+    original_rows, admitted_attempts = split_attempts(original)
+    current_rows, attempts = split_attempts(current)
+    originals, present = indexed(original_rows), indexed(current_rows)
+    if any(
+        isinstance(row.get("filename"), str) and row["filename"] in admitted_attempts for row in current_rows
+    ) or any(isinstance(row.get("filename"), str) and row["filename"] in attempts for row in original_rows):
+        raise NativeContentError("history", "an original filename changed between assigned and unassigned history")
+    for name, body in admitted_attempts.items():
+        if name in attempts and encoded(attempts[name]) != encoded(body) or name not in attempts and not allow_missing:
+            raise NativeContentError(
+                "history", "an original unassigned start record changed or is required by strict policy"
+            )
+    binding = {"identity": fingerprint(journal.identity), "original": fingerprint(original)}
+    saved = journal.get("native_history_archive_binding")
+    if saved is not None and saved != binding:
+        raise NativeContentError("history", "native history archive admission binding changed")
+    if any(
+        identifier in present
+        and encoded(record) != encoded(present[identifier])
+        or identifier not in present
+        and not allow_missing
+        for identifier, record in originals.items()
+    ):
+        raise NativeContentError("history", "an original native history body changed or is required by strict policy")
+    return originals, present, admitted_attempts, attempts, binding
 
 
 class NativeHistoryArchive:
@@ -90,35 +129,9 @@ class NativeHistoryArchive:
     def observe(
         self, original: list[dict[str, Any]], current: list[dict[str, Any]], *, allow_missing: bool
     ) -> dict[str, int]:
-        if type(allow_missing) is not bool:
-            raise SecurityError("native history retention permission must be explicit")
-        original_rows, admitted_attempts = split_attempts(original)
-        current_rows, attempts = split_attempts(current)
-        originals, present = indexed(original_rows), indexed(current_rows)
-        if any(
-            isinstance(row.get("filename"), str) and row["filename"] in admitted_attempts for row in current_rows
-        ) or any(isinstance(row.get("filename"), str) and row["filename"] in attempts for row in original_rows):
-            raise SecurityError("an original filename changed between assigned and unassigned history")
-        for name, body in admitted_attempts.items():
-            if (
-                name in attempts
-                and encoded(attempts[name]) != encoded(body)
-                or name not in attempts
-                and not allow_missing
-            ):
-                raise SecurityError("an original unassigned start record changed or is required by strict policy")
-        binding = {"identity": fingerprint(self.journal.identity), "original": fingerprint(original)}
-        saved = self.journal.get("native_history_archive_binding")
-        if saved is not None and saved != binding:
-            raise SecurityError("native history archive admission binding changed")
-        if any(
-            identifier in present
-            and encoded(record) != encoded(present[identifier])
-            or identifier not in present
-            and not allow_missing
-            for identifier, record in originals.items()
-        ):
-            raise SecurityError("an original native history body changed or is required by strict policy")
+        originals, present, admitted_attempts, attempts, binding = _archive_view(
+            self.journal, original, current, allow_missing
+        )
         with history_savepoint(self.journal):
             self.journal.put("native_history_archive_binding", binding)
             self.retain_attempts(admitted_attempts | attempts)
@@ -143,7 +156,7 @@ def history_policy(journal: Journal, spec_digest: str) -> dict[str, Any]:
     managed = {"mode": "app_schedule", "spec_digest": spec_digest, "local_start": False}
     original = journal.get("native_bounded_handover", {}).get("original_history")
     if journal.get("managed_mode") != managed or not isinstance(original, list):
-        raise SecurityError("missing-history tolerance requires its exact admitted managed policy")
+        raise NativeContentError("history", "missing-history tolerance requires its exact admitted managed policy")
     return {
         "version": 1,
         "mode": "archive_missing",
@@ -151,6 +164,39 @@ def history_policy(journal: Journal, spec_digest: str) -> dict[str, Any]:
         "spec_digest": spec_digest,
         "original_history_digest": fingerprint(original),
     }
+
+
+# Finish pure history/policy comparisons before native observation side effects can fail in SQLite.
+def inspect_history(journal: Journal, spec_digest: str, current: list[dict[str, Any]], local_start: bool) -> None:
+    original = journal.get("native_bounded_handover", {}).get("original_history", [])
+    saved = journal.get("native_history_policy")
+    if saved is not None:
+        receipt = journal.get("native_history_policy_acknowledgement", {})
+        at = receipt.get("at_epoch")
+        if (
+            local_start
+            or saved != history_policy(journal, spec_digest)
+            or receipt.get("policy") != saved
+            or receipt.get("charging_started") is not False
+            or type(at) not in (int, float)
+            or not math.isfinite(at)
+            or at <= 0
+            or not isinstance(receipt.get("native_digest"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", receipt["native_digest"])
+        ):
+            raise NativeContentError("history", "native history retention policy changed or local Start is enabled")
+        _archive_view(journal, original, current, True)
+        return
+    original, admitted_attempts = split_attempts(original)
+    current, attempts = split_attempts(current)
+    if any(name not in attempts or encoded(attempts[name]) != encoded(row) for name, row in admitted_attempts.items()):
+        raise NativeContentError("history", "native bounded handover must preserve every original history record")
+    present = {row["transactionId"]: row for row in current}
+    if any(
+        row["transactionId"] not in present or encoded(present[row["transactionId"]]) != encoded(row)
+        for row in original
+    ):
+        raise NativeContentError("history", "native bounded handover must preserve every original history record")
 
 
 # An explicit persisted operator decision changes retention handling without changing any electrical authority.
@@ -171,19 +217,19 @@ def audit_history(journal: Journal, spec_digest: str, current: list[dict[str, An
             or not isinstance(receipt.get("native_digest"), str)
             or not re.fullmatch(r"[a-f0-9]{64}", receipt["native_digest"])
         ):
-            raise SecurityError("native history retention policy changed or local Start is enabled")
+            raise NativeContentError("history", "native history retention policy changed or local Start is enabled")
         NativeHistoryArchive(journal).observe(original, current, allow_missing=True)
         return
     original, admitted_attempts = split_attempts(original)
     current, attempts = split_attempts(current)
     if any(name not in attempts or encoded(attempts[name]) != encoded(row) for name, row in admitted_attempts.items()):
-        raise SecurityError("native bounded handover must preserve every original history record")
+        raise NativeContentError("history", "native bounded handover must preserve every original history record")
     present = {row["transactionId"]: row for row in current}
     if any(
         row["transactionId"] not in present or encoded(present[row["transactionId"]]) != encoded(row)
         for row in original
     ):
-        raise SecurityError("native bounded handover must preserve every original history record")
+        raise NativeContentError("history", "native bounded handover must preserve every original history record")
     if attempts:
         with history_savepoint(journal):
             NativeHistoryArchive(journal).retain_attempts(attempts)

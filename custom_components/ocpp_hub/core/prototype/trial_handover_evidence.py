@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .native_faults import NativeContentError
 from .policy import integer, number
 from .security import SecurityError
 from .store import fingerprint
@@ -241,4 +242,4 @@ def handover_evidence(config: Any, values: dict[str, Any], observed_at: float) -
             plan_id if type(plan_id) is int else None,
         )
     except KeyError, TypeError, ValueError, IndexError:
-        raise SecurityError("complete connected-handover native evidence is required") from None
+        raise NativeContentError("content", "complete connected-handover native evidence is required") from None

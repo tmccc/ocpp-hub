@@ -56,5 +56,5 @@ What this hub does differently on purpose: the engine in `core/` imports nothing
 ## Testing
 
 - The engine is tested with a fake charger over a real websocket against the real engine, no mocks of the engine itself.
-- Real sessions are recorded as fixtures (`tests/fixtures/`), byte for byte, with a provenance note. Do not trim a capture to the frames that look relevant.
+- Real-session fixtures (`tests/fixtures/`) include sanitised, reserialised derivatives with provenance notes. Preserve their stored bytes and complete frame sequences; they are not original wire bytes. Do not trim a capture to the frames that look relevant.
 - Mutate-check small pure modules with `tools/mutation_check.py`; a surviving mutant is a missing test.

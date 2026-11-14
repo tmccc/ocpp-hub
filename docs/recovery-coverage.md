@@ -132,6 +132,20 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
   consistently omit an ordinary parameter or file while retaining every model case; the independent denominator
   rejects them. Filtering, executor selection and configured mount boundaries have separate negative controls.
 
+- `test_worker_storage_serve.py` keeps failed-completion and optional diagnostic SQL refusal active while the
+  actual service reaches zero, observes real native HTTP loss, heals and completes two later sessions. The bounded
+  current/Start polling and management read tests separately retain honest unknown status and real read failures.
+- The measured-current, mixed-cause and native-repair tests separate fully validated measurement excess from
+  configuration/history/resource/wire contradictions and ordinary unavailable/stale/closure waits. Real SQL refusal,
+  replacement, newer Pause/Boot and an actual stop-fault operator bridge retain exact fault lineage. An interrupted
+  unknown audit has no ordinary Pause waiver; attention/zero is not a claim of automatic recovery.
+- `test_managed_start_cancelled_outer.py` cancels the actual outer task before its first instruction, then admits a
+  genuine mapped original-plan daily at6/16/32A with both demands. Task disappearance cannot create Pause or lose
+  the next session's outage supervision. Issued cancellation, real initial preflight refusal, atomic no-dispatch
+  settlement and an earlier genuine owner receipt retain separate tests and their distinct outcomes.
+- Process recovery checks compare the actual cloud Start allocation and final Stop with the independently read
+  durable mapping. These are additional assertions in existing histories, not another count of the same cases.
+
 These checks cover the specified histories and interfaces; they do not establish all possible combinations.
 
 Additional named regression tests cover actual Accepted-Start death before/after publication with a late genuine

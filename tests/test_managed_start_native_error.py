@@ -51,8 +51,6 @@ class OneShot503Peer(NativeVehiclePeer):
 
 # Intent: a genuine fast HTTP503 before dispatch must retire an unsent Start and let a new Pause complete.
 # Why: errors injected at validate_send alone do not establish reachability through the real native boundary.
-# Intent: preserve a valid lifecycle across this independently injected failure and its control.
-# Why: a refused or unsent Start must not strand later supervision, Pause or owner readiness.
 @pytest.mark.parametrize("fail", [False, True])
 async def test_real_native503_before_remote_start(tmp_path, tls, unused_tcp_port, monkeypatch, fail):
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneShot503Peer)

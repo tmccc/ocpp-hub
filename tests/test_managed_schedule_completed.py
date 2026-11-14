@@ -14,7 +14,7 @@ from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_managed_schedule_idle_cutoff import early_cleanup
-from tests.test_managed_start_overlap import owner_tag
+from tests.test_managed_start_overlap import close_in_order, delayed_owner, owner_tag
 from tests.test_prototype import BOOT, START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
@@ -142,8 +142,8 @@ async def test_unused_departure_keeps_cutoff(tmp_path, tls, unused_tcp_port, mon
         assert not b.stops() and not starts(b.rig)
 
 
-# Intent: reconnect preserves an independently identified daily transaction.
-# Why: startup recovery owns zero while it establishes source, without borrowing an owner Stop.
+# Intent: replacement before Start expiry preserves the independent daily and the separate late owner debt.
+# Why: startup's zero hold cannot turn the missing owner lifecycle into authority to Stop a different charge.
 @pytest.mark.parametrize("demand", [False, True])
 async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
@@ -159,11 +159,30 @@ async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port,
         b.session = managed_session(b.rig)
         await b.session.start()
         b.c = ManagedController(b.session)
+        owner_tag(b)
         async with b.rig.charger(b.session) as b.sock:
             await introduced(b.rig, b.session, b.sock, "restart-before-start-expiry")
+            assert b.device.effective_limit() == 0
             for _ in range(4):
                 await b.c.tick()
             assert daily not in b.stops()
+            status = await healthy(b.c)
+            assert status["station_ceiling_a"] == b.device.effective_limit() == 6
+            assert status["current_a"] == (6 if demand else 0)
+            assert b.c.requests.intent().mode == "app"
+            assert b.session.journal.get("control")["start_pending"] is True
+            assert b.session.journal.get("local_start_receipt")["local"] is None
+            await b.close_transaction(daily)
+            await healthy(b.c)
+            owner = await delayed_owner(b)
+            for _ in range(3):
+                await b.c.tick()
+            assert set(b.stops()) == {owner} and b.device.effective_limit() == 0
+            await close_in_order(b, owner, "native" if demand else "ledger")
+            assert (await healthy(b.c))["station_ceiling_a"] == 6
+            following = await b.advance_idle_to(NEXT)
+            assert following not in (None, daily, owner) and (await healthy(b.c))["current_a"] == 6
+            assert set(b.stops()) == {owner} and len(starts(b.rig)) == 1
 
 
 # Intent: reconnect preserves an independently identified daily transaction.
@@ -194,6 +213,8 @@ async def test_reconnect_following_daily(tmp_path, tls, unused_tcp_port, monkeyp
             states = []
             for _ in range(6):
                 states.append(await b.c.tick())
+            assert all(status["state"] not in ("attention", "stopping") for status in states)
+            assert states[-1]["state"] == "healthy" and states[-1]["station_ceiling_a"] == 6
             assert daily not in b.stops()
             assert b.device.effective_limit() == 6 and b.device.plans == {9: original}
 

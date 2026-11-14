@@ -8,12 +8,15 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .managed_current import managed_current_ceiling
 from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
 from .managed_cutoffs import supervised_timer
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
 from .managed_delivery_recovery import complete_delivery_recovery, delivery_recovery_evidence
+from .managed_native_repair import repair_pending, repair_revoked
 from .managed_occurrences import occurrences
 from .managed_start_delivery import DENIALS, complete_denied_start, denial_faults, denied_start_evidence
+from .native_faults import MEASURED_FAULT, measurement_cause
 from .store import RecoveryRequiredError, fingerprint
 from .trial_rollback import require_lifecycle_idle
 
@@ -27,6 +30,8 @@ FAULT = "owner_release_unconfirmed"
 
 # Capture every applicable proof together; selecting one cannot acknowledge another proof on the same fault.
 def release_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
+    if repair_revoked(c.session.journal, fault):
+        return None
     evidence: dict[str, Any] = {}
     operator = operator_recovery_evidence(c, fault)
     active = [
@@ -57,6 +62,20 @@ def release_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, A
             evidence[key] = fingerprint(proof)
     if evidence or fault.get("classification") == FAULT:
         return evidence
+    if fault.get("classification") == MEASURED_FAULT:
+        failure = c.session.journal.get("managed_native_failure", {})
+        if (
+            failure.get("type") == "MeasuredOutputLimitError"
+            and fault.get("native_failure_digest") == fingerprint(failure)
+            and measurement_cause(
+                failure.get("cause"),
+                c.native.spec.digest,
+                c.current.selected(),
+                managed_current_ceiling(c.session.journal, c.native.spec),
+            )
+        ):
+            return {"native_failure": failure}
+        return None
     if fault.get("classification") != "native_authority_or_preservation_failed":
         return None
     failure = c.session.journal.get("managed_native_failure", {})
@@ -104,6 +123,8 @@ def acknowledged_evidence(c: ManagedController, fault: dict[str, Any], ack: dict
 # Prove only this fault is recoverable; never clear vendor uncertainty or release positive current here.
 async def reconcile_owner_release(c: ManagedController) -> bool:
     s, j, g = c.session, c.session.journal, c.session.gateway
+    if c.native.repair_audits is not None:
+        c.native.repair_audits.flush()
     fault = j.get("managed_control_fault", {})
     ack = j.get(ACK, {})
     intent = c.requests.intent()
@@ -137,6 +158,8 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
         control = j.get("control", {})
         if (
             c.stopping
+            or repair_pending(j, fault)
+            or repair_revoked(j, fault)
             or c.requests.intent() != intent
             or j.get(ACK) != ack
             or j.get("managed_control_fault") != fault
