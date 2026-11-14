@@ -110,6 +110,7 @@ def decoded_native_json(raw: bytes | str) -> Any:
 # The whole request has one deadline; closing the stream on cancellation does not leave a background reader running.
 async def read_native(host: str, port: int, authorization: str, action: str, data: str | dict[str, Any] | None) -> Any:
     writer: asyncio.StreamWriter | None = None
+    content_refusal: NativeContentError | None = None
     payload: dict[str, Any] = {"action": action}
     if data is not None:
         payload["data"] = data
@@ -154,12 +155,15 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
     except OSError, asyncio.IncompleteReadError:
         raise NativeTransportUnavailableError("native HTTP observation was interrupted") from None
     except ValueError, KeyError, TypeError, RecursionError:
-        raise NativeContentError("content", "native trial observation was unavailable or malformed") from None
+        content_refusal = NativeContentError("content", "native trial observation was unavailable or malformed")
+        raise content_refusal from None
     finally:
         if writer is not None:
             writer.close()
-            try:
-                async with asyncio.timeout(1):
-                    await writer.wait_closed()
-            except OSError, TimeoutError:
-                pass
+            # Let an already classified refusal reach its caller before another await can replace it.
+            if content_refusal is None:
+                try:
+                    async with asyncio.timeout(1):
+                        await writer.wait_closed()
+                except OSError, TimeoutError:
+                    pass
