@@ -6,6 +6,7 @@ import json
 import uuid
 
 import pytest
+from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError, read_native
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
@@ -143,18 +144,26 @@ WIRE_CASES = (
     ("missing-data", reply(b'{"code":200}'), NativeTransportUnavailableError),
     ("encoded-bad-json", reply(b'{"code":200,"data":"{"}'), NativeTransportUnavailableError),
     ("http503-control", b"HTTP/1.0 503 Unavailable\r\nContent-Length: 0\r\n\r\n", NativeTransportUnavailableError),
-    ("duplicate-key", reply(b'{"code":200,"code":200,"data":{}}'), SecurityError),
-    ("duplicate-data-key", reply(b'{"code":200,"data":{"id":1,"id":2}}'), SecurityError),
-    ("nonfinite-data", reply(b'{"code":200,"data":{"value":NaN}}'), SecurityError),
-    ("unauthorized", reply(b"{}", status=b"HTTP/1.0 401 Denied"), SecurityError),
-    ("invalid-status-version", reply(b'{"code":200,"data":{}}', status=b"HTTP/9.9 200 OK"), SecurityError),
-    ("duplicate-content-length", reply(b"{}", headers=b"Content-Length: 2\r\nContent-Length: 2\r\n"), SecurityError),
-    ("ambiguous-framing", reply(b"{}", headers=b"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n"), SecurityError),
+    ("duplicate-key", reply(b'{"code":200,"code":200,"data":{}}'), NativeContentError),
+    ("duplicate-data-key", reply(b'{"code":200,"data":{"id":1,"id":2}}'), NativeContentError),
+    ("nonfinite-data", reply(b'{"code":200,"data":{"value":NaN}}'), NativeContentError),
+    ("unauthorized", reply(b"{}", status=b"HTTP/1.0 401 Denied"), NativeContentError),
+    ("invalid-status-version", reply(b'{"code":200,"data":{}}', status=b"HTTP/9.9 200 OK"), NativeContentError),
+    (
+        "duplicate-content-length",
+        reply(b"{}", headers=b"Content-Length: 2\r\nContent-Length: 2\r\n"),
+        NativeContentError,
+    ),
+    (
+        "ambiguous-framing",
+        reply(b"{}", headers=b"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n"),
+        NativeContentError,
+    ),
 )
 
 
-# Intent: framing, duplicate keys and nonfinite content retain their exact security error classification.
-# Why: the availability class subclasses SecurityError, so broad raises(SecurityError) checks are insufficient.
+# Intent: strict framing and content retain their exact typed refusal, separate from temporary unavailability.
+# Why: both classes inherit SecurityError, so a broad raises(SecurityError) assertion cannot distinguish them.
 @pytest.mark.parametrize("name,raw,expected", [pytest.param(*row, id=row[0]) for row in WIRE_CASES])
 async def test_native_response_failure_class_is_exact(name, raw, expected):
     # Serve only received literal-loopback requests and the independent wire case selected above.
@@ -178,6 +187,8 @@ async def test_native_response_failure_class_is_exact(name, raw, expected):
         with pytest.raises(SecurityError) as error:
             await read_native("127.0.0.1", server.sockets[0].getsockname()[1], "Basic synthetic", "getConfig", None)
         assert type(error.value) is expected
+        if expected is NativeContentError:
+            assert error.value.stage == "content"
     finally:
         server.close()
         await server.wait_closed()
