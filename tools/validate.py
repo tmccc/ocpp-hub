@@ -129,7 +129,9 @@ def run_ha_layer_tests(expression: str, results: dict[str, bool], skipped: list[
 
 
 # Re-audit raw evidence against the exact clean source; a saved green boolean cannot establish qualification.
-def run_full_qualification(path: Path | None, python: str, results: dict[str, bool]) -> None:
+def run_full_qualification(
+    path: Path | None, python: str, results: dict[str, bool], collection_executors: Path | None = None
+) -> None:
     if path is None:
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
         results["full qualification"] = False
@@ -160,6 +162,7 @@ def run_full_qualification(path: Path | None, python: str, results: dict[str, bo
                     metadata["commit"],
                     "--expected-source-digest",
                     metadata["source_digest"],
+                    *(["--collection-executors", str(collection_executors)] if collection_executors else []),
                 ],
                 results,
             )
@@ -188,6 +191,9 @@ def main() -> int:
     parser.add_argument("--tests-only", action="store_true", help="run only pytest")
     parser.add_argument("-k", dest="expression", default="", help="pytest -k expression")
     parser.add_argument("--qualification-report", type=Path, default=os.environ.get("OCPP_QUALIFICATION_REPORT"))
+    parser.add_argument(
+        "--collection-executors", type=Path, help="explicit trusted source-pinned collection executor map"
+    )
     args = parser.parse_args()
     python = venv_python()
     results: dict[str, bool] = {}
@@ -215,7 +221,7 @@ def main() -> int:
             print(f"  NEW FAILURE: {item}")
         run_ha_layer_tests(args.expression, results, skipped)
     elif not args.quick:
-        run_full_qualification(args.qualification_report, python, results)
+        run_full_qualification(args.qualification_report, python, results, args.collection_executors)
 
     print("\nSummary")
     for name, ok in results.items():

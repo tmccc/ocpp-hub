@@ -205,6 +205,9 @@ class ManagedController:
         ):
             await self._stop_requested()
             raise RecoveryRequiredError("requested pause awaits actual physical closure")
+        g = self.session.gateway
+        if (self.native.introduced_epoch, self.native.introduced_revision) != (g._charger_epoch, g.controls._revision):
+            self.native.confirm_paused_introduction(native)
         if self.schedule.awaiting_start() and self.schedule.revoked(self.session.journal.get(KEY, {})):
             self.require_paused(native, timer_cleanup=True)
             await self.schedule.observe(native)

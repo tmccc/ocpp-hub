@@ -15,6 +15,7 @@ from .managed_combined_start_recovery import combined_candidate, combined_resolu
 from .managed_cutoffs import supervised_timer
 from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
+from .managed_denial_faults import current_operator_proof, proof_headers_match
 from .managed_occurrences import occurrences
 from .managed_recovery_zero import require_original_zero
 from .managed_start_delivery import KIND as START_KIND
@@ -606,6 +607,8 @@ def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> d
             return None
         identifier, entry = matches[0]
     elif fault.get("classification") == FAULT:
+        if current_operator_proof(j, fault) is None:
+            return None
         identifier = fault.get("proof")
         entry = records.get(identifier)
     else:
@@ -613,7 +616,9 @@ def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> d
     if not entry or entry.get("completed") is not None or entry.get("superseded"):
         return None
     proof: dict[str, Any] = entry["proof"]
-    if identifier != fingerprint(proof["attestation"]):
+    if not isinstance(identifier, str) or not proof_headers_match(proof, identifier):
+        return None
+    if proof["kind"] == COMBINED_KIND and proof["prior"].get("fault") != fault:
         return None
     if (
         proof["kind"] in (*STOP_KINDS, COMBINED_KIND)

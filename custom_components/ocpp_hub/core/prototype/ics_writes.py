@@ -82,7 +82,7 @@ def validate_write(payload: dict[str, Any], policy: Policy) -> Any:
     if message == "delayStop":
         if not isinstance(data, dict) or set(data) not in ({"transactionId"}, {"transactionId", "stopTime"}):
             raise DeniedError("unobserved delayed-stop fields")
-        integer(data["transactionId"], 1)
+        integer(data["transactionId"], 0)
         if "stopTime" in data:
             utc_time(data["stopTime"])
         return data
@@ -90,7 +90,7 @@ def validate_write(payload: dict[str, Any], policy: Policy) -> Any:
     if not isinstance(data, dict) or set(data) != keys:
         raise DeniedError("unobserved iCS command fields")
     if message == "setTransaction":
-        integer(data["transactionId"], 1)
+        integer(data["transactionId"], 0)
         if not isinstance(data["eco"], str) or data["eco"] not in MODES:
             raise DeniedError("unobserved transaction eco mode")
         return data

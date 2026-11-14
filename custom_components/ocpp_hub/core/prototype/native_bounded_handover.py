@@ -284,8 +284,9 @@ class NativeBoundedHandover:
         if not gateway.current_boot_seen(epoch) or fingerprint(journal.get("boot")) != self.spec.boot_digest:
             raise SecurityError("native bounded introduction requires the commissioned actual Boot")
         binding = journal.get("trial_binding")
+        first_zero = binding is None or bool(journal.get("trial_starting"))
         try:
-            native = await self.read(closed=binding is None)
+            native = await self.read(closed=first_zero)
         except (NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError) as error:
             # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
             raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
@@ -321,9 +322,27 @@ class NativeBoundedHandover:
         if binding is not None or journal.get("control", {}).get("uncertain"):
             control = journal.get("control", {})
             journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
-            if binding is None:
-                # A first zero needs its ordinary write-ahead receipt before existing-resource recovery can own it.
-                await gateway.controls.ensure_ceiling()
+            if first_zero:
+                # Stay in initial admission until its first zero succeeds, including a genuinely unapplied refusal.
+                ticket = journal.get("control", {}).get("ticket")
+                intent = journal.get("managed_control_intent", {})
+                try:
+                    await gateway.controls.ensure_ceiling()
+                except (UnavailableError, TimeoutError) as error:
+                    # Only this zero may have been sent; reread the binding and owned receipt before retrying.
+                    raise IntroductionDeferredError("initial introduction awaits its restrictive zero") from error
+                except DeniedError as error:
+                    latest, control = journal.get("managed_control_intent", {}), journal.get("control", {})
+                    if (
+                        latest.get("mode") != "paused"
+                        or latest.get("revision", 0) <= intent.get("revision", 0)
+                        or control.get("ticket") == ticket
+                        or control.get("owner") != "local"
+                        or control.get("inhibit") is not True
+                        or gateway.controls.desired() != 0
+                    ):
+                        raise
+                    raise IntroductionDeferredError("initial zero was superseded by a newer owner Pause") from error
                 gateway._require_epoch("charger", epoch)
             journal.put("trial_phase", "recovering")
         self.introduced_epoch = epoch
@@ -385,6 +404,43 @@ class NativeBoundedHandover:
             raise UnavailableError("the verified charger introduction was superseded")
         self.introduced_revision = verified_revision
         return native
+
+    # Finish a paused introduction only from a fresh complete closed-zero proof, never a failed RPC or marker alone.
+    def confirm_paused_introduction(self, native: HandoverEvidence) -> None:
+        g, j = self.gateway, self.gateway.journal
+        epoch, revision = g._charger_epoch, g.controls._revision
+        self.require(native, closed=True)
+        self.require_known_session(native)
+        present = self.book.owned_present(native.physical)
+        binding = {
+            "configuration_digest": self.binding_digest(native),
+            "station": self.choice.value(),
+            "boot_digest": self.spec.boot_digest,
+        }
+        if (
+            self.introduced_epoch != epoch
+            or j.get("trial_starting")
+            or j.get("trial_phase") not in ("active", "recovering")
+            or j.get("native_bounded_handover", {}).get("stage") != "admitted"
+            or j.get("trial_binding") != binding
+            or j.get("managed_control_intent", {}).get("mode") != "paused"
+            or j.get("managed_control_fault")
+            or not g.current_boot_seen(epoch)
+            or fingerprint(j.get("boot")) != self.spec.boot_digest
+            or g.charger.sender is None
+            or not g.controls.ready
+            or g.controls.desired() != 0
+            or j.get("control", {}).get("owner") != "local"
+            or not j.get("control", {}).get("inhibit")
+            or j.get("control", {}).get("start_pending")
+            or j.get("uncertain_vendor_command")
+            or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
+            or g.charger._pending
+            or g.controls._operations
+        ):
+            raise RecoveryRequiredError("paused introduction awaits current independently confirmed closed zero")
+        # An earlier HTTP audit must finish its own initial claim; only its later failed restrictive RPC is resumable.
+        self.introduced_epoch, self.introduced_revision = epoch, revision
 
     # An unknown native transaction is external activity, never a proxy-created Start or inferred Stop.
     def require_known_session(self, native: HandoverEvidence) -> None:

@@ -10,6 +10,35 @@ from pathlib import Path
 
 import pytest
 
+RAW_ITEMS = []
+DESELECTED = []
+COLLECTION_ERRORS = []
+EFFECTIVE_SETTINGS = None
+
+
+# Qualification instrumentation rejects effective filters before any selected test can run.
+def pytest_configure(config):
+    global EFFECTIVE_SETTINGS
+    from tools.qualification_collection import effective_settings
+
+    EFFECTIVE_SETTINGS = effective_settings(config)
+
+
+# Record every generated item before pytest or a hook can remove it from session.items.
+def pytest_itemcollected(item):
+    RAW_ITEMS.append(item.nodeid)
+
+
+# Deselected input remains explicit evidence rather than disappearing from the denominator.
+def pytest_deselected(items):
+    DESELECTED.extend(item.nodeid for item in items)
+
+
+# A failed file import is never accepted as a shorter complete collection.
+def pytest_collectreport(report):
+    if report.failed:
+        COLLECTION_ERRORS.append(report.nodeid)
+
 
 # Record the actual interpreter and assert explicitly provisioned package versions inside each container.
 def runtime_identity():
@@ -49,7 +78,19 @@ def pytest_sessionstart(session):
 
 # Machine-readable collection prevents text formatting or root-prefix parsing from silently omitting cases.
 def pytest_collection_finish(session):
-    emit({"event": "collection", "ids": [item.nodeid for item in session.items]})
+    from tools.qualification_collection import effective_settings
+
+    effective = effective_settings(session.config)
+    emit(
+        {
+            "event": "collection",
+            "ids": [item.nodeid for item in session.items],
+            "raw_ids": RAW_ITEMS,
+            "deselected": DESELECTED,
+            "collection_errors": COLLECTION_ERRORS,
+            "effective_settings": effective,
+        }
+    )
 
 
 # Append one process-local evidence row; every worker has its own file.

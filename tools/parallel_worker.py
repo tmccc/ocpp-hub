@@ -52,6 +52,9 @@ def select(ids, config):
 
 # Build a network-isolated container with only its own scratch writable and explicit read-only runtime inputs.
 def container_command(config, directory, cpu, name, env):
+    from tools.qualification_collection import validate_readonly_mounts
+
+    validate_readonly_mounts(config, ROOT, directory)
     command = [
         "docker",
         "run",
@@ -94,6 +97,8 @@ def container_command(config, directory, cpu, name, env):
             "MODEL_WORKER_INDEX",
             "QUALIFICATION_EXPECTED_PACKAGES",
             "XDG_CACHE_HOME",
+            "PYTEST_ADDOPTS",
+            "PYTEST_PLUGINS",
         ):
             command += ["--env", key + "=" + value]
     return command + [
@@ -175,7 +180,7 @@ def container_identity(item, table):
     if item.get("container_id"):
         return
     template = (
-        '[{{json .Id}},{{json .State.Pid}},{{json .HostConfig.NetworkMode}},{{json .HostConfig.CpusetCpus}},'
+        "[{{json .Id}},{{json .State.Pid}},{{json .HostConfig.NetworkMode}},{{json .HostConfig.CpusetCpus}},"
         '{{json (index .Config.Labels "codex.qualification.owner")}}]'
     )
     try:
@@ -352,6 +357,9 @@ def main():
                 or hashlib.sha256((SOURCE / "tools" / filename).read_bytes()).hexdigest() != expected
             ):
                 raise RuntimeError("Frozen harness differs from committed source")
+        if os.environ.get("PYTEST_ADDOPTS") or os.environ.get("PYTEST_PLUGINS"):
+            raise RuntimeError("full qualification forbids inherited pytest filters/plugins")
+        sys.path.insert(0, str(SOURCE))
         summary["runtime_digest_before"] = runtime_digest(config)
         cpus = sorted(os.sched_getaffinity(0))
         if len(cpus) < config["workers"] + 4:
@@ -365,6 +373,8 @@ def main():
             "PYTHONPATH": str(ROOT),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PYTEST_ADDOPTS": "",
+            "PYTEST_PLUGINS": "",
         }
         env.pop("MODEL_SMOKE", None)
         env.pop("MODEL_CASE_LIMIT", None)

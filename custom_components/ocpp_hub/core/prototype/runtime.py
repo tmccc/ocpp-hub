@@ -306,20 +306,20 @@ class ConnectionRuntime:
     async def _vendor_runner(self) -> None:
         delay = self.settings.retry_min
         while not self._closing:
-            if (
-                not self.vendor_enabled()
-                or self._charger is None
-                or not self.gateway.current_boot_seen(self.gateway._charger_epoch)
-            ):
-                await asyncio.sleep(self.settings.pump_interval)
-                continue
             fault_count = self.status.vendor_fault.count
             attempted_charger_epoch = self.gateway._charger_epoch
-            attempted_boot = self.gateway.journal.get("boot")
-            attempted_boot_revision = self.gateway.boot_metadata_revision
             stage = "opening"
-            self.status.vendor_attempts += 1
             try:
+                if (
+                    not self.vendor_enabled()
+                    or self._charger is None
+                    or not self.gateway.current_boot_seen(self.gateway._charger_epoch)
+                ):
+                    await asyncio.sleep(self.settings.pump_interval)
+                    continue
+                attempted_boot = self.gateway.journal.get("boot")
+                attempted_boot_revision = self.gateway.boot_metadata_revision
+                self.status.vendor_attempts += 1
                 async with self.transport.connect() as connection:
                     if (
                         not self.vendor_enabled()
@@ -328,10 +328,12 @@ class ConnectionRuntime:
                         or self.gateway.boot_metadata_revision != attempted_boot_revision
                     ):
                         raise UnavailableError("vendor introduction changed while its connection was opening")
-                    self.status.vendor_connected = True
-                    self.status.reconnects += 1
-                    epoch = self.gateway.attach_vendor(self._sender(connection))
+                    # Attachment may fail after advancing its epoch but before installing the sender.
+                    epoch = self.gateway._vendor_epoch + 1
                     try:
+                        epoch = self.gateway.attach_vendor(self._sender(connection))
+                        self.status.vendor_connected = True
+                        self.status.reconnects += 1
                         await self._vendor_session(connection, epoch)
                     finally:
                         stage = self._vendor_stage()
@@ -339,6 +341,9 @@ class ConnectionRuntime:
                             delay = self.settings.retry_min
                         self.gateway.detach_vendor(epoch)
                         self.status.vendor_connected = False
+            except sqlite3.Error as error:
+                # Local storage refusal is not evidence of a failed cloud introduction or response.
+                self.status.last_failure = type(error).__name__
             except (OSError, ConnectionClosed, InvalidHandshake, UnavailableError, DeniedError) as error:
                 self.status.last_failure = type(error).__name__
                 if self.status.vendor_fault.count == fault_count:

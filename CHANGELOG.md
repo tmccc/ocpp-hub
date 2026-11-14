@@ -2,6 +2,22 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Retain each denied lifecycle through later operator proofs and failed retries, including a new denied reply.
+  A fresh Pause consumes the associated proofs together after the required independent evidence and actual
+  lifecycle acknowledgements.
+- Recover repeated undecodable native responses without a permanent preservation fault, while retaining strict
+  checks on validated content and HTTP framing. Resume partial paused introductions only from fresh closed zero;
+  unfinished initial admission can retry its restrictive zero without replaying a Start or an unknown Stop.
+- Independently regenerate complete ordinary and model collection in each pinned runtime before qualification
+  passes. Record filtering and deselection, bind explicit collection executors and prevent provisioned mounts from
+  replacing the source or runtime used to establish that denominator.
+- Retry cloud attachment after temporary receipt-retirement or preparation-read storage failures, without treating
+  a local database error as evidence that a cloud introduction failed.
+- Roll back failed native-history commits before protective shutdown writes, retaining enclosing recovery
+  transactions and the original failure when nested cleanup itself fails.
+- Accept cloud transaction ID0 for Fast and delayed-stop set/cancel commands, translating only its current open
+  mapping to a positive local ID; retain rejection of unknown or closed mappings and preserve plan-ID rules.
+
 - Register the same reserved listener-port fixtures for model and HA proxy test collection, preventing
   unbound process-test ports from colliding with automatic loopback allocations during qualification.
 

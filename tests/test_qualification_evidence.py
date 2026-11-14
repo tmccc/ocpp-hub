@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.qualification_test_helpers import synthetic_collection_row, synthetic_source_recollection
 from tools import audit_parallel_qualification as audit
 from tools.qualification_snapshot import freeze
 
@@ -80,7 +81,8 @@ def test_snapshot_requires_clean_ordinary_committed_blobs(tmp_path):
 
 # Construct a small synthetic HA-scope input for the auditor, explicitly not a real qualification receipt.
 @pytest.fixture
-def audit_fixture(tmp_path):
+def audit_fixture(tmp_path, monkeypatch):
+    monkeypatch.setattr(audit, "canonical_collection", synthetic_source_recollection)
     harness = ("parallel_worker.py", "qualification_evidence.py", "audit_parallel_qualification.py")
     files = {"tools/" + name: "# synthetic auditor-input fixture\n" for name in harness}
     files["requirements-ha-proxy.txt"] = "homeassistant==2026.11.0\n"
@@ -88,6 +90,7 @@ def audit_fixture(tmp_path):
     source = project(tmp_path / "repo", files)
     batch = tmp_path / "batch"
     batch.mkdir()
+    (batch / "SYNTHETIC-NOT-QUALIFICATION.txt").write_text("Synthetic unit inputs; no workers ran.\n")
     metadata = freeze(source, batch / "source")
     config = {
         "mode": "full",
@@ -129,7 +132,7 @@ def audit_fixture(tmp_path):
         ("transport-result.json", {"returncode": 0}),
     ):
         write_json(batch / name, value)
-    collection = [{"event": "worker_namespace", "runtime": runtime}, {"event": "collection", "ids": ids}]
+    collection = [{"event": "worker_namespace", "runtime": runtime}, synthetic_collection_row(ids)]
     path = batch / "collection/results.jsonl"
     path.parent.mkdir()
     path.write_text("".join(json.dumps(row) + "\n" for row in collection))
@@ -142,7 +145,7 @@ def audit_fixture(tmp_path):
                 "cpu_affinity": [index],
                 "network_namespace": f"net:[{index}]",
             },
-            {"event": "collection", "ids": [identifier]},
+            synthetic_collection_row([identifier]),
             {"event": "start", "id": identifier},
         ]
         rows += [

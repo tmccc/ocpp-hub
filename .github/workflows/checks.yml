@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# Selection belongs to the committed commands; inherited runner variables must never filter a suite.
+env:
+  PYTEST_ADDOPTS: ""
+  PYTEST_PLUGINS: ""
+
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -39,6 +44,7 @@ jobs:
       - name: Test
         run: |
           mkdir -p "${RUNNER_TEMP}/engine"
+          TMPDIR="${RUNNER_TEMP}/engine" python tools/qualification_collection.py --source "$PWD" --suite engine-model --output "${RUNNER_TEMP}/engine/complete-collection.json"
           TMPDIR="${RUNNER_TEMP}/engine" python tools/offline_validate.py tests/ --junitxml=pytest-report.xml
 
       - name: Compile
@@ -62,12 +68,15 @@ jobs:
       matrix:
         include:
           - suite: legacy-hub
+            collection_suite: ha-legacy
             requirements: requirements-ha-legacy.txt
             arguments: "--legacy-ha tests_ha/"
           - suite: proxy-ha10
+            collection_suite: ha-proxy-legacy
             requirements: requirements-ha-legacy.txt
             arguments: "tests_ha_proxy/"
           - suite: proxy-ha11
+            collection_suite: ha-proxy
             requirements: requirements-ha-proxy.txt
             arguments: "tests_ha_proxy/"
     steps:
@@ -82,6 +91,7 @@ jobs:
       - name: Test the Home Assistant layer
         run: |
           mkdir -p "${RUNNER_TEMP}/ha"
+          TMPDIR="${RUNNER_TEMP}/ha" python tools/qualification_collection.py --source "$PWD" --suite "${{ matrix.collection_suite }}" --output "${RUNNER_TEMP}/ha/complete-collection.json"
           TMPDIR="${RUNNER_TEMP}/ha" python tools/offline_ha_validate.py ${{ matrix.arguments }}
 
   model:

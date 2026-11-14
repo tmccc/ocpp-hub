@@ -194,8 +194,11 @@ def ssh_command(
 
 # Run the CI-equivalent checks and abort the deploy when they fail.
 # A failing tree must never reach the server; one command gives the same answer as CI.
-def run_checks(root: Path = ROOT) -> None:
-    result = subprocess.run([sys.executable, str(root / "tools" / "validate.py")], cwd=root)
+def run_checks(root: Path = ROOT, collection_executors: Path | None = None) -> None:
+    command = [sys.executable, str(root / "tools" / "validate.py")]
+    if collection_executors is not None:
+        command += ["--collection-executors", str(collection_executors)]
+    result = subprocess.run(command, cwd=root)
     if result.returncode:
         raise SystemExit("Checks failed; nothing was deployed. Fix them (or use --skip-checks if you know why).")
 
@@ -322,6 +325,9 @@ def main() -> int:
     parser.add_argument("--domain", choices=("ocpp_hub", "ics_proxy"), default="ocpp_hub")
     parser.add_argument("--container", help="use an explicit local Docker container instead of SSH")
     parser.add_argument("--ha-api-config", type=Path, help="private existing hass_url/token_file configuration")
+    parser.add_argument(
+        "--collection-executors", type=Path, help="explicit trusted qualification collection executor map"
+    )
     args = parser.parse_args()
     env = parse_env((ROOT / ".env").read_text()) if (ROOT / ".env").exists() else {}
     if args.container:
@@ -333,7 +339,7 @@ def main() -> int:
             print(f"Dry run: {args.domain}, container {args.container}, {len(files)} files; no changes")
             return 0
         if not args.skip_checks:
-            run_checks()
+            run_checks(collection_executors=args.collection_executors)
         print(f"Build {write_build_stamp(integration=integration)}")
         data = io.BytesIO()
         with tarfile.open(fileobj=data, mode="w") as package:
@@ -372,7 +378,7 @@ def main() -> int:
         print("Dry run: would run the checks, back up, deploy and verify. Nothing was changed.")
         return 0
     if not args.skip_checks:
-        run_checks()
+        run_checks(collection_executors=args.collection_executors)
     print(f"Build {write_build_stamp()}")
     with tempfile.TemporaryDirectory() as tmp:
         deploy(target, files, os.path.join(tmp, "ssh-%C"), args.batch)

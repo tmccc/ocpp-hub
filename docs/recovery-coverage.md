@@ -109,6 +109,31 @@ The machine matrix links exact tests for legacy state, source ownership, cutoff 
 No risk is marked universally covered. Real hardware/network behavior and unbounded repeated failures remain outside
 offline qualification. This work requires neither live charging nor deployment.
 
+## Additional focused failure boundaries
+
+The ordinary suites also retain explicit recovery checks outside the finite model families:
+
+- `test_denial_operator_composition.py` combines an acknowledged earlier denial with another closed Start awaiting
+  independent nonacceptance evidence. Real tool inspection/reconciliation, actual subsequent Start/Stop replies and
+  one fresh Pause complete both proofs. Repeated lost replies, exhausted refusals, Stop refusal and a new denied
+  reply retain the association; later sessions and native outages remain usable. The boundary tests bind immutable
+  prior state, preserve valid proofs without a prior fault, and roll back joint proof/denial completion on SQL failure.
+- `test_storage_runtime_boundaries.py` fails real vendor receipt retirement and preparation reads, then requires
+  autonomous reconnection and later lifecycles. It distinguishes local storage failures from genuine cloud failure
+  evidence. Actual outer commits, nested releases and cleanup refusal retain their correct transaction boundaries.
+- `test_history_service_shutdown_storage.py` drives the real service at32A through an actual history-commit refusal,
+  protective zero/Stop, durable remaining uncertainty, process replacement and later sessions/outages.
+- The native-observation and introduction tests repeat malformed application responses, lose or refuse restrictive
+  RPC replies, and supersede the initial zero with a newer Pause. Readiness still needs fresh validated content,
+  current Boot/binding and confirmed closed zero. Validated content changes and HTTP framing remain restrictive.
+- `test_managed_cloud_zero_controls.py` sends Fast and delayed-stop set/cancel through real managed TLS with cloud
+  numbers0/1, exact positive local IDs, closed/unknown mappings and sequential reuse.
+- `test_qualification_collection.py` expands real dynamic parameters without running test bodies. Full-mode controls
+  consistently omit an ordinary parameter or file while retaining every model case; the independent denominator
+  rejects them. Filtering, executor selection and configured mount boundaries have separate negative controls.
+
+These checks cover the specified histories and interfaces; they do not establish all possible combinations.
+
 Additional named regression tests cover actual Accepted-Start death before/after publication with a late genuine
 Start/Stop lifecycle, Return request/success commit death, and issued-unknown quarantine controls. Uncommitted current receipts become failed only with verified restoration to their prior selection through explicit Return or exact automatic original-session recovery; a new Pause revokes
 only an older uncertain Return. Unknown issued debt

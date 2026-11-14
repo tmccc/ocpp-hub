@@ -189,8 +189,28 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                 repair_ack_commit(path)
                 repaired = True
             await child.delivered(local, closed=True)
-            old_return = await receipt(child, return_id)
-            assert old_return["state"] in ("accepted", "running", "uncertain", "completed")
+            # Bind the receipt to its intent in one committed snapshot; scheduling may legitimately choose either order.
+            before_pause = child.durable()
+            row = next(item for item in before_pause["requests"] if item["id"] == return_id)
+            assert row["revision"] == early_return_revision
+            old_return = {key: row[key] for key in ("id", "action", "state")}
+            old_return["result"] = json.loads(row["result"])
+            assert old_return["id"] == return_id and old_return["action"] == "app_control"
+            if old_return["state"] == "completed":
+                assert old_return["result"] == {"app_control_enabled": True, "charging_started": False}
+                assert before_pause["metadata"]["managed_control_intent"] == {
+                    "mode": "app",
+                    "revision": early_return_revision + 1,
+                }
+                assert firmware.effective_limit() == selected
+            else:
+                assert old_return["state"] in ("accepted", "running", "uncertain")
+                assert before_pause["metadata"]["managed_control_intent"] == {
+                    "mode": "paused",
+                    "revision": early_return_revision,
+                }
+                if old_return["state"] == "uncertain":
+                    assert old_return["result"] == {"classification": "return_not_confirmed"}
             current = (await child.request("status"))["result"]
             newer_pause = await child.request("pause", revision=current["control_revision"])
             assert newer_pause["ok"]

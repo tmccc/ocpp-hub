@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -45,12 +47,113 @@ def canonical_manifest(root, suite):
         )
 
 
+# Raw item generation and effective arguments expose filters even when downstream selected/evidence lists agree.
+def valid_collection_contract(row):
+    settings = row.get("effective_settings", {})
+    environment = settings.get("environment")
+    filters = settings.get("filters")
+    return (
+        row.get("raw_ids") == row.get("ids")
+        and row.get("deselected") == []
+        and row.get("collection_errors") == []
+        and environment == {"PYTEST_ADDOPTS": "", "PYTEST_PLUGINS": ""}
+        and isinstance(filters, dict)
+        and set(filters) == {"keyword", "markexpr", "deselect", "ignore", "ignore_glob", "pyargs", "noconftest"}
+        and not any(filters.values())
+        and settings.get("addopts") == []
+        and settings.get("python_files") == ["test_*.py", "*_test.py"]
+        and settings.get("python_functions") == ["test"]
+        and settings.get("python_classes") == ["Test"]
+        and isinstance(settings.get("arguments"), list)
+        and bool(settings["arguments"])
+    )
+
+
+# Regenerate complete dynamic pytest IDs under an explicitly selected pinned local or SSH runtime, never a cached list.
+def canonical_collection(root, config, commit, checksum, executors=None):
+    source = root / "source"
+    helper = source / "tools/qualification_collection.py"
+    helper_sha = hashlib.sha256(helper.read_bytes()).hexdigest()
+    arguments = ["--replay-batch", str(root), "--commit", commit, "--source-digest", checksum]
+    expected_batch = str(root)
+    command = [sys.executable, "-B", str(helper), *arguments]
+    if executors is not None:
+        selected = json.loads(executors.read_text())
+        if selected.get("commit") != commit or selected.get("source_digest") != checksum:
+            raise ValueError("explicit collection executors differ from caller source pins")
+        executor = selected.get("executors", {}).get(config.get("suite"))
+        if executor is None:
+            raise ValueError("explicit collection executor missing suite")
+        if executor.get("kind") == "ssh":
+            host, python, batch = (executor.get(key, "") for key in ("host", "supervisor_python", "batch"))
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", host)
+                or not Path(python).is_absolute()
+                or not Path(batch).is_absolute()
+            ):
+                raise ValueError("invalid explicitly chosen collection executor")
+            expected_batch = batch
+            remote_helper = str(Path(batch) / "source/tools/qualification_collection.py")
+            bootstrap = (
+                "import hashlib,pathlib,runpy,sys; p=pathlib.Path(sys.argv[1]); "
+                "assert hashlib.sha256(p.read_bytes()).hexdigest()==sys.argv[2], 'pinned collector helper changed'; "
+                "sys.argv=[str(p),*sys.argv[3:]]; runpy.run_path(str(p),run_name='__main__')"
+            )
+            remote = [
+                python,
+                "-B",
+                "-c",
+                bootstrap,
+                remote_helper,
+                helper_sha,
+                "--replay-batch",
+                batch,
+                "--commit",
+                commit,
+                "--source-digest",
+                checksum,
+            ]
+            command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, shlex.join(remote)]
+        elif executor.get("kind") == "local" and executor.get("batch") != str(root):
+            raise ValueError("explicit local collection executor batch differs")
+        elif executor.get("kind") != "local":
+            raise ValueError("unsupported explicitly chosen collection executor")
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=240, check=False)
+    if completed.returncode:
+        raise ValueError("fresh pinned-runtime collection unavailable/failed: " + completed.stderr[-1000:])
+    payload = json.loads(completed.stdout)
+    if (
+        payload.get("schema") != 1
+        or payload.get("suite") != config.get("suite")
+        or payload.get("errors")
+        or payload.get("commit") != commit
+        or payload.get("source_digest") != checksum
+        or payload.get("batch") != expected_batch
+    ):
+        raise ValueError("controlled collection did not establish complete source discovery")
+    if not valid_collection_contract(payload) or payload.get("test_bodies_executed") is not False:
+        raise ValueError("controlled recollection contains filtering or test execution")
+    metadata = json.loads((root / "snapshot.json").read_text())
+    expected_files = {
+        row["path"]: row["sha256"]
+        for row in metadata["files"]
+        if any(row["path"].startswith(name + "/") for name in config["specs"])
+        and any(fnmatch.fnmatchcase(Path(row["path"]).name, pattern) for pattern in ("test_*.py", "*_test.py"))
+    }
+    if payload.get("source_files") != expected_files or payload.get("missing_source_definitions") != []:
+        raise ValueError("controlled recollection omits pinned source files or definitions")
+    return payload
+
+
 # Reconcile raw phase evidence against the exact collection, assignment, manifest and caller-pinned snapshot.
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("batch", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-source-digest", required=True)
+    parser.add_argument(
+        "--collection-executors", type=Path, help="explicit trusted source-pinned local/SSH executor map"
+    )
     args = parser.parse_args(argv)
     root = args.batch.resolve()
     config = read_json(root / "config.json", {})
@@ -118,7 +221,10 @@ def main(argv=None):
     collection_path = root / "collection/results.jsonl"
     if collection_path.exists():
         collection_rows = [json.loads(line) for line in collection_path.read_text().splitlines()]
-    actual_collections = [row["ids"] for row in collection_rows if row.get("event") == "collection"]
+    collection_events = [row for row in collection_rows if row.get("event") == "collection"]
+    actual_collections = [row["ids"] for row in collection_events]
+    if len(collection_events) != 1 or not all(valid_collection_contract(row) for row in collection_events):
+        errors.append("initial collection lacks unfiltered effective-argument/raw-item evidence")
     collection_runtime = [row["runtime"] for row in collection_rows if row.get("event") == "worker_namespace"]
     if actual_collections != [collected] or len(collection_runtime) != 1:
         errors.append("missing/mismatched independent collection evidence")
@@ -191,6 +297,10 @@ def main(argv=None):
                 namespaces.setdefault(index, []).append(row)
             elif row.get("event") == "collection":
                 worker_collections.setdefault(index, []).append(row["ids"])
+                if not valid_collection_contract(row):
+                    errors.append(
+                        "worker collection filtered or lacks raw-item/effective-argument evidence: " + str(index)
+                    )
             elif row.get("event") == "session_finish":
                 sessions.setdefault(index, []).append(row["exitstatus"])
                 runtime_ends.setdefault(index, []).append(row.get("runtime"))
@@ -274,6 +384,21 @@ def main(argv=None):
                 errors.append("full collection differs from exact registered model IDs")
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         errors.append("canonical model manifest failed: " + str(exc))
+    independently_collected = None
+    try:
+        if snapshot_bad or digest.hexdigest() != args.expected_source_digest or actual_files != expected_files:
+            raise ValueError("source snapshot rejected; no recollection helper executed")
+        independently_collected = canonical_collection(
+            root, config, args.expected_commit, args.expected_source_digest, args.collection_executors
+        )
+        if independently_collected["ids"] != collected:
+            errors.append("full collection differs from independently regenerated pinned-source pytest denominator")
+        if collection_runtime and independently_collected.get("runtime") != collection_runtime[0]:
+            errors.append("controlled recollection runtime differs from original collection")
+        if independently_collected.get("runtime_digest") != result.get("runtime_digest_after"):
+            errors.append("controlled recollection mounted runtime differs from qualification")
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        errors.append("independent complete collection failed: " + str(exc))
     invalid_model = []
     model_completed = Counter()
     for identifier in selected:
@@ -324,6 +449,7 @@ def main(argv=None):
         "source_digest": args.expected_source_digest,
         "actual_source_digest": digest.hexdigest(),
         "collected_cases": len(collected),
+        "independent_collection_cases": len(independently_collected["ids"]) if independently_collected else None,
         "selected_cases": len(selected),
         "status_counts": {key: len(value) for key, value in statuses.items()},
         "model_manifest_raw": len(manifest),
@@ -336,6 +462,8 @@ def main(argv=None):
         "malformed_evidence": malformed,
         "scope": "One complete suite with immutable source and raw phases; finite model grammars where applicable.",
     }
+    if independently_collected is not None:
+        (root / "independent-collection.json").write_text(json.dumps(independently_collected, indent=2) + "\n")
     (root / "execution-accounting.json").write_text(
         json.dumps({"statuses": statuses, "failure_durations": failure_durations}, indent=2) + "\n"
     )

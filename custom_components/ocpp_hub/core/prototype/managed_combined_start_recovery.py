@@ -106,15 +106,6 @@ def combined_resolution(j: Journal, evidence: dict[str, Any], wire_ack: dict[str
     }
 
 
-# A failed composite Stop cannot detach another genuinely denied lifecycle from its original fault.
-def retains_denial_fault(j: Journal, proof: dict[str, Any]) -> bool:
-    fault = proof.get("installed_fault")
-    return proof.get("kind") == KIND and any(
-        denial.get("fault") == fault and denial.get("completed") is None
-        for denial in j.get("managed_start_denials", {}).values()
-    )
-
-
 # No foreign Stop, even under the same fault, can complete or supersede this composite proof.
 def combined_stop_matches(proof: dict[str, Any], identity: dict[str, Any]) -> bool:
     e = proof["attestation"]

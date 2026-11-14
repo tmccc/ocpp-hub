@@ -9,6 +9,19 @@ uses a declared obligation cover for repeated later-session recovery. Separate t
 pollers without manual refresh, combine independent failures in both repair orders, and wait for exact command
 receipts and freshly observed native failures. The matrix documents the reduced scope and retained failure families.
 
+Qualification independently collects every ordinary and model case from the frozen source in its pinned runtime.
+Fresh auditing needs that runtime, using an explicitly selected executor when it is remote; it runs no test bodies.
+The audit checks original collection against this independent denominator and rejects filtering or omitted files.
+
+Recovery retains the association between an earlier denied session and a later operator proof, including failures
+during the approved retry. Every associated denial keeps its own genuine Stop acknowledgement and fresh Pause
+completion. Temporary database failures during cloud attachment retry without claiming that the cloud refused an
+introduction. Native-history observation uses the journal's transaction rollback before unrelated protective
+shutdown work.
+Repeated undecodable native responses revoke readiness until valid evidence returns; a paused introduction finishes
+only after independently confirmed closed zero. Cloud transaction number0 remains valid for Fast and delayed-stop
+controls through its exact current local mapping.
+
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
 an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the

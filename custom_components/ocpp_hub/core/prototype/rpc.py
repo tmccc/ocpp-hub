@@ -22,7 +22,7 @@ class UnavailableError(RuntimeError):
 
 
 class IntroductionDeferredError(UnavailableError):
-    """The read-only introduction lacks fresh evidence. No recovery command has been sent."""
+    """Introduction needs fresh evidence or its first restrictive zero; no Stop or positive command was sent."""
 
 
 class RegistrationDeferredError(UnavailableError):

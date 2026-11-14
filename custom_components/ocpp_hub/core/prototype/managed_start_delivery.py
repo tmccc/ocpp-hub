@@ -8,6 +8,13 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
+from .managed_denial_faults import (
+    current_operator_proof,
+    denial_source_fault,
+    proof_denial_member,
+    retained_denial_fault,
+    start_denial_fault,
+)
 from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -41,6 +48,7 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
         return
     latch_start_delivery_fault(j)
     records, changed = j.get(PROOFS, {}), False
+    retained_fault = None
     for key, entry in records.items():
         proof = entry["proof"]
         evidence = proof["attestation"]
@@ -54,6 +62,7 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
             and evidence["local_transaction_id"] == item.transaction
             and evidence["payload_digest"] == fingerprint(item.payload)
         ):
+            retained_fault = retained_denial_fault(j, proof) or retained_fault
             records[key] = {
                 **entry,
                 "superseded": {"reason": "approved_start_retry_outcome_unknown", "at_epoch": time.time()},
@@ -62,7 +71,8 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
     if changed:
         j.put(PROOFS, records)
         j.put(
-            "managed_control_fault", {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()}
+            "managed_control_fault",
+            retained_fault or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
         )
 
 
@@ -161,21 +171,25 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
         j.db.execute("UPDATE outbox SET state=? WHERE token=?", ("rejected" if exhausted else "queued", item.token))
         if exhausted:
             proofs, changed = j.get(PROOFS, {}), False
+            retained_fault = None
             for key, entry in proofs.items():
                 proof = entry["proof"]
                 if (
                     proof["kind"] == KIND
                     and entry.get("completed") is None
                     and not entry.get("superseded")
+                    and j.get("managed_control_fault") == proof["installed_fault"]
                     and proof["attestation"]["delivery_token"] == item.token
                 ):
+                    retained_fault = retained_denial_fault(j, proof) or retained_fault
                     proofs[key] = {**entry, "superseded": {"reply_digest": record["reply_digest"]}}
                     changed = True
             if changed:
                 j.put(PROOFS, proofs)
                 j.put(
                     "managed_control_fault",
-                    {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
+                    retained_fault
+                    or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
                 )
             latch_start_delivery_fault(j)
     return exhausted
@@ -207,7 +221,7 @@ def record_start_denial(j: Journal, item: Delivery, response: dict[str, Any]) ->
                 "reply_digest": fingerprint(response),
                 "denied_at": time.time(),
                 "completed": None,
-                "fault": fault if fault.get("classification") == "owner_control_or_delivery_uncertain" else None,
+                "fault": start_denial_fault(j, item, fault),
             },
         },
     )
@@ -215,27 +229,10 @@ def record_start_denial(j: Journal, item: Delivery, response: dict[str, Any]) ->
     j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
 
 
-# Only the active exact Stop-tool proof can bridge its original generic fault; no native or historic null row qualifies.
+# Every supported active operator proof may retain its exact original generic fault; readiness stays separate.
 def denial_faults(j: Journal, fault: dict[str, Any]) -> list[dict[str, Any]]:
-    if fault.get("classification") == "owner_control_or_delivery_uncertain":
-        return [fault]
-    if fault.get("classification") != "operator_debt_reconciled_at_zero":
-        return []
-    identifier = fault.get("proof")
-    entry = j.get(PROOFS, {}).get(identifier)
-    if not entry or entry.get("completed") is not None or entry.get("superseded"):
-        return []
-    proof = entry["proof"]
-    prior = proof.get("prior", {}).get("fault")
-    if (
-        proof.get("installed_fault") != fault
-        or proof.get("kind") not in ("stop-delivery", "stop-fault")
-        or fingerprint(proof.get("attestation")) != identifier
-        or not isinstance(prior, dict)
-        or prior.get("classification") != "owner_control_or_delivery_uncertain"
-    ):
-        return []
-    return [prior]
+    source = denial_source_fault(j, fault)
+    return [source] if source is not None else []
 
 
 # Each associated denial needs its own genuine Stop; the legacy singleton can identify only one exact session.
@@ -253,11 +250,14 @@ def denied_start_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[s
         if operator is None:
             return None
         bridged["operator_reconciliation"] = fingerprint(operator)
+    operator_proof = current_operator_proof(j, fault)
     fault = sources[0]
     members = []
     for denial in sorted(j.get(DENIALS, {}).values(), key=lambda value: value["local"]):
         if denial.get("fault") != fault or denial.get("completed") is not None:
             continue
+        if operator_proof is not None and not proof_denial_member(operator_proof, denial):
+            return None
         wire = denial.get("wire_ack") or j.get("managed_stop_wire_acknowledgment", {})
         row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (denial["local"],)).fetchone()
         if (

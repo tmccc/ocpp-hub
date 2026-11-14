@@ -59,6 +59,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qualification-report", type=Path)
+    parser.add_argument(
+        "--collection-executors", type=Path, help="explicit trusted source-pinned collection executor map"
+    )
     args = parser.parse_args()
     report = matrix()
     if args.qualification_report:
@@ -70,6 +73,7 @@ def main():
                 "--tests-only",
                 "--qualification-report",
                 str(args.qualification_report),
+                *(["--collection-executors", str(args.collection_executors)] if args.collection_executors else []),
             ],
             cwd=ROOT,
             check=True,

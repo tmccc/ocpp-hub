@@ -58,7 +58,15 @@ python3.14 tools/parallel_qualify.py --source "$REPOSITORY" --output "$TASK_OUTP
 
 Repeat with the matching HA runtimes and suite names. `--runtime-mode image --venv-target /venv` selects an image's
 matching virtualenv; `--readonly-mount HOST=CONTAINER` supplies any explicitly provisioned OpenSSL runtime needed by
-that image. Every attempt has its own directory; interrupted runs are retained and cannot be combined into one pass.
+that image. Configured auxiliary mounts have a deliberately narrow contract: image-mode `/usr/bin/openssl` requires
+an actual regular file with no symlink, and `/task/openssl-runtime` requires a directory. Other auxiliary destinations
+are unsupported. No auxiliary target may equal, contain or sit inside the concrete batch (source and harness), evidence
+scratch, venv or interpreter, or protected system code roots; the exact image-mode OpenSSL file is the sole system-file
+exception. A configurable primary venv target must also remain separate from source/evidence. Paths with parent
+traversal and duplicate targets fail. The launcher checks final destinations before dispatch; the worker and fresh
+collector independently repeat the checks and verify source types on their actual executor. New runtime assets require
+an explicit policy update, not an overlay of pinned code. Every attempt has its own directory; interrupted runs are
+retained and cannot be combined into one pass.
 Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
 must all pass the auditor. The source-pinned registry declares46,634 raw/16,402 runnable engine inputs and
 584 raw/360 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
@@ -78,6 +86,36 @@ The final qualification JSON contains `commit`, `source_digest` and a `phases` o
 to their absolute batch directories. `validate.py --qualification-report` requires all four, all20 workers, and the
 same source identity, and re-runs the raw auditor for each. Missing, skipped, changed-source or failed phases fail
 validation. `OCPP_QUALIFICATION_REPORT` can supply the same path to deployment checks.
+
+Full auditing also performs a fresh **collection-only** pass over every test file in the frozen source, using that
+suite's exact pinned Docker runtime. Pytest expands real parameter generators; the auditor compares every resulting
+ordinary and model ID with the original run. No test bodies run during this pass. Source definition/file inventories,
+raw generated items, effective arguments and deselections are retained. Filters, ignore settings, project omission
+hooks and inherited `PYTEST_ADDOPTS`/`PYTEST_PLUGINS` cannot silently shorten the universe. Host filter variables are
+rejected and Docker workers explicitly override image-level pytest selection variables.
+
+A fresh audit therefore needs access to the provisioned runtime and Docker executor. The default is local collection;
+a missing local runtime fails rather than trusting `independent-collection.json` or choosing SSH from raw evidence.
+For remote runtimes, explicitly pass a trusted executor map:
+
+```bash
+python tools/validate.py --qualification-report "$QUALIFICATION_BUNDLE" \
+  --collection-executors "$TRUSTED_COLLECTION_EXECUTORS"
+python tools/recovery_coverage.py --output "$MATRIX_OUTPUT" --qualification-report "$QUALIFICATION_BUNDLE" \
+  --collection-executors "$TRUSTED_COLLECTION_EXECUTORS"
+```
+
+The caller-supplied JSON pins `commit` and `source_digest` and maps every suite under `executors` to either
+`{"kind":"local","batch":"/absolute/local/batch"}` or an explicit
+`{"kind":"ssh","host":"WORKER_ALIAS","supervisor_python":"/absolute/worker/python","batch":"/absolute/remote/batch"}`.
+Use the actual batch for each of `engine-model`, `ha-proxy`, `ha-proxy-legacy` and `ha-legacy`. The descriptor is never
+automatically loaded from a run's evidence; source pins, chosen suite/batch and the remotely executed helper hash are
+checked before collection. SSH and collection have bounded timeouts and no cached-denominator fallback.
+`parallel_qualify.py` forwards its explicitly chosen worker settings to its immediate audit. Later validator,
+coverage-matrix and deployment-gate invocations must pass their intended trusted executor map themselves.
+The supported `deploy_ha.py --collection-executors` option forwards the same caller-selected map to its validation gate.
+CI performs the same controlled discovery before its ordinary and HA jobs; this does not replace the separate
+four-suite twenty-worker qualification.
 
 ## Rules for code
 

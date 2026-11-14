@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from tools.qualification_collection import validate_readonly_mounts  # noqa: E402
 from tools.qualification_snapshot import freeze  # noqa: E402
 
 HARNESS = ("parallel_worker.py", "qualification_evidence.py", "audit_parallel_qualification.py")
@@ -53,6 +54,8 @@ def arguments() -> argparse.Namespace:
         parser.error("scratch/runtime paths must be absolute and timeout must be between1and10800 seconds")
     if args.worker_host and (args.worker_root is None or not args.worker_root.is_absolute() or not args.worker_python):
         parser.error("SSH execution requires --worker-root and --worker-python")
+    if os.environ.get("PYTEST_ADDOPTS") or os.environ.get("PYTEST_PLUGINS"):
+        parser.error("full qualification forbids inherited pytest filters/plugins")
     if os.environ.get("MODEL_SMOKE") or os.environ.get("MODEL_CASE_LIMIT"):
         parser.error("full qualification forbids model sampling switches")
     return args
@@ -117,6 +120,8 @@ def main() -> int:
         "timeout_seconds": args.timeout_seconds,
         "created_epoch": time.time(),
     }
+    batch_path = args.worker_root / "batches" / label if args.worker_host else local
+    validate_readonly_mounts(config, batch_path, batch_path / "collection", check_sources=not bool(args.worker_host))
     config["harness_hashes"] = {}
     for filename in HARNESS:
         source = local / "source/tools" / filename
@@ -203,6 +208,23 @@ def main() -> int:
                 [python, "-B", str(local / "parallel_worker.py")], stdout=output, stderr=subprocess.STDOUT
             )
     (local / "transport-result.json").write_text(json.dumps({"returncode": result.returncode}) + "\n")
+    audit_executor_arguments = []
+    if args.worker_host:
+        executors = {
+            "commit": metadata["commit"],
+            "source_digest": metadata["source_digest"],
+            "executors": {
+                args.suite: {
+                    "kind": "ssh",
+                    "host": args.worker_host,
+                    "supervisor_python": args.worker_python,
+                    "batch": str(remote),
+                }
+            },
+        }
+        executor_path = local / "collection-executors.json"
+        executor_path.write_text(json.dumps(executors, indent=2) + "\n")
+        audit_executor_arguments = ["--collection-executors", str(executor_path)]
     audit = subprocess.run(
         [
             sys.executable,
@@ -213,6 +235,7 @@ def main() -> int:
             metadata["commit"],
             "--expected-source-digest",
             metadata["source_digest"],
+            *audit_executor_arguments,
         ]
     )
     return result.returncode or audit.returncode

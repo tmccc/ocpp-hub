@@ -8,7 +8,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .managed_combined_start_recovery import KIND as COMBINED_KIND
-from .managed_combined_start_recovery import combined_stop_matches, record_combined_stop_ack, retains_denial_fault
+from .managed_combined_start_recovery import combined_stop_matches, record_combined_stop_ack
+from .managed_denial_faults import retained_denial_fault
 from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 
 REJECTION = "managed_stop_reply_rejection"
@@ -94,15 +95,16 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
                     is None
                 )
             ):
+                retained_fault = retained_denial_fault(j, proof)
                 records[key] = {
                     **entry,
                     "superseded": {"reply_digest": rejection["reply_digest"], "at_epoch": time.time()},
                 }
-                if not retains_denial_fault(j, proof):
-                    j.put(
-                        "managed_control_fault",
-                        {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
-                    )
+                j.put(
+                    "managed_control_fault",
+                    retained_fault
+                    or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
+                )
                 changed = True
         if changed:
             j.put(PROOFS, records)

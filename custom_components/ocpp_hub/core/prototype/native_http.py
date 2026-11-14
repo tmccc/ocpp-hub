@@ -15,7 +15,7 @@ MAXIMUM = 2 * 1024 * 1024
 
 
 class NativeTransportUnavailableError(SecurityError):
-    """A missing or interrupted HTTP response provides no new native evidence."""
+    """An absent or undecodable native response provides no new validated installation evidence."""
 
 
 # A stream ending partway through any framing line supplies no complete HTTP response.
@@ -98,6 +98,14 @@ async def response_body(reader: asyncio.StreamReader) -> bytes:
     return body
 
 
+# Bad JSON supplies no native facts; duplicate keys and nonfinite/invalid validated content remain strict errors.
+def decoded_native_json(raw: bytes | str) -> Any:
+    try:
+        return json.loads(raw, object_pairs_hook=unique_object)
+    except json.JSONDecodeError, UnicodeDecodeError:
+        raise NativeTransportUnavailableError("native response JSON is unavailable or incomplete") from None
+
+
 # The whole request has one deadline; closing the stream on cancellation does not leave a background reader running.
 async def read_native(host: str, port: int, authorization: str, action: str, data: str | dict[str, Any] | None) -> Any:
     writer: asyncio.StreamWriter | None = None
@@ -116,13 +124,8 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
             ).encode("ascii") + body
             writer.write(request)
             await writer.drain()
-            raw, close_delimited = await framed_body(reader)
-            try:
-                value = json.loads(raw, object_pairs_hook=unique_object)
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                if close_delimited:
-                    raise asyncio.IncompleteReadError(raw, None) from error
-                raise
+            raw, _ = await framed_body(reader)
+            value = decoded_native_json(raw)
             encoded(value)
             if (
                 action == "statistics"
@@ -133,13 +136,20 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
             ):
                 # This exact firmware reply means it has not yet created its backend-status file after restart.
                 return {"online": False}
-            if not isinstance(value, dict) or type(value.get("code")) is not int or value["code"] != 200:
-                raise ValueError("native envelope is invalid")
+            if (
+                not isinstance(value, dict)
+                or type(value.get("code")) is not int
+                or value["code"] != 200
+                or "data" not in value
+            ):
+                raise NativeTransportUnavailableError("native response envelope is unavailable or invalid")
             result = value["data"]
             if isinstance(result, str):
-                result = json.loads(result, object_pairs_hook=unique_object)
+                result = decoded_native_json(result)
             encoded(result)
             return result
+    except NativeTransportUnavailableError:
+        raise  # This subclass is a ValueError too; application unavailability must survive the strict outer boundary.
     except OSError, asyncio.IncompleteReadError:
         raise NativeTransportUnavailableError("native HTTP observation was interrupted") from None
     except ValueError, KeyError, TypeError, RecursionError:

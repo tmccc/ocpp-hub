@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,14 +18,24 @@ from .store import Journal, encoded, fingerprint
 # Audits run both standalone and inside the operator's recovery transaction.
 @contextmanager
 def history_savepoint(journal: Journal) -> Iterator[None]:
+    if not journal.db.in_transaction:
+        with journal.atomic():
+            yield
+        return
     journal.db.execute("SAVEPOINT native_history_observation")
     try:
         yield
-    except BaseException:
-        journal.db.execute("ROLLBACK TO native_history_observation")
-        raise
-    finally:
         journal.db.execute("RELEASE native_history_observation")
+    except BaseException as error:
+        # Keep the enclosing recovery transaction; SQLite may already have rolled back the whole transaction.
+        if journal.db.in_transaction:
+            try:
+                journal.db.execute("ROLLBACK TO native_history_observation")
+                journal.db.execute("RELEASE native_history_observation")
+            except sqlite3.Error as cleanup_error:
+                # Keep the original failure primary and expose failed cleanup to the enclosing transaction owner.
+                raise error from cleanup_error
+        raise
 
 
 # Preserve JSON numeric types and every nested field; Python equality alone conflates integers and floats.
