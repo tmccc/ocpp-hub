@@ -22,6 +22,7 @@ from tests.test_prototype_tls import tls as tls
 
 # Deny only the real vendor receipt retirement statement and retain the exact attempts for independent assertions.
 def refuse_retirement(journal, failures):
+    # Record actual receipt retirement attempts and refuse only their DELETE statement.
     def authorizer(action, table, column, database, trigger):
         if action == sqlite3.SQLITE_DELETE and table == "inbound_receipts":
             failures.append((action, table))
