@@ -25,6 +25,96 @@ from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
 from tools import managed_proxy
 
 
+# A real outage can interrupt any admitted read, while writes, extra fields and observer probes remain excluded.
+def failed_native_read(request):
+    return request in ({"action": "getConfig"}, {"action": "getTransaction", "data": {}}) or (
+        isinstance(request, dict)
+        and set(request) == {"action", "data"}
+        and request["action"] == "statistics"
+        and request["data"] in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP", "STATE")
+    )
+
+
+class BetweenReadOutagePeer(InterruptedNativePeer):
+    """Serve one selected admitted read normally, then refuse the next actual request."""
+
+    # The one-shot boundary is inactive during ordinary fixture admission and commissioning.
+    def __init__(self, bench):
+        super().__init__(bench)
+        self.outage_after_read = None
+
+    # The normal HTTP branch already owns this response; changing availability affects only its successor.
+    def native(self, key):
+        value = super().native(key)
+        if key == self.outage_after_read:
+            self.outage_after_read = None
+            self.unavailable = True
+        return value
+
+
+# Intent: an outage between successful reads fails the next statistics/history read and recovers without a fault latch.
+# Why: read-only outage evidence is not restricted to the first endpoint of an independently validated native sequence.
+@pytest.mark.parametrize(
+    "after,failed_request",
+    [
+        ("config", {"action": "statistics", "data": "SMART"}),
+        ("STATE", {"action": "getTransaction", "data": {}}),
+    ],
+)
+async def test_native_outage_between_successful_reads_remains_observable(
+    tmp_path, tls, unused_tcp_port, monkeypatch, after, failed_request
+):
+    from tests.test_managed_current import adjustable
+    from tests.test_managed_proxy import healthy, starts
+
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BetweenReadOutagePeer)
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, peer, j = b.controller, b.rig.peer, b.session.journal
+        before = await healthy(c)
+        intent, offer = c.requests.intent(), b.rig.bench.firmware.effective_limit()
+        peer.outage_after_read = after
+        status = await c.tick()
+        failed = peer.failed_reads.get_nowait()
+        save_private(
+            tmp_path / "between-read-outage.json",
+            {
+                "last_successful_read": after,
+                "actual_failed_http": failed,
+                "old_getConfig_only_oracle": failed.get("action") == "getConfig",
+                "actual_control_intent": {"mode": c.requests.intent().mode, "revision": c.requests.intent().revision},
+                "effective_offer_a": b.rig.bench.firmware.effective_limit(),
+                "published_status": status,
+            },
+        )
+        assert failed == failed_request and failed_native_read(failed)
+        assert peer.requests[-1] == ("getConfig" if after == "config" else "statistics")
+        assert peer.outage_after_read is None
+        assert status["fault"] == "native_observation_unavailable" and status["state"] == "degraded"
+        assert status["checked_at"] > before["checked_at"] and not j.get("managed_control_fault")
+        assert c.requests.intent() == intent and b.rig.bench.firmware.effective_limit() == offer and not starts(b.rig)
+        peer.unavailable = False
+        assert (await healthy(c))["station_ceiling_a"] == offer
+        assert c.requests.intent() == intent and not starts(b.rig)
+
+
+# Intent: broader read-sequence coverage still refuses writes, malformed getters and the independent observer probe.
+# Why: replacing a brittle endpoint assertion must not weaken the actual engine-only, read-only failure evidence.
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "setConfig"},
+        {"action": "setPlan", "data": {}},
+        {"action": "getConfig", "data": {"review_probe": "synthetic"}},
+        {"action": "getTransaction"},
+        {"action": "getTransaction", "data": "SMART"},
+        {"action": "statistics", "data": "UNKNOWN"},
+        {"action": "statistics", "data": "SMART", "extra": True},
+    ],
+)
+def test_failed_native_read_oracle_rejects_non_engine_read_shapes(payload):
+    assert failed_native_read(payload) is False
+
+
 # Observe the actual service's awaited poll stack; this cannot advance the controller or manufacture an outcome.
 def waits_for_current_worker(task):
     coroutine = task.get_coro()
@@ -244,10 +334,12 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                                 ):
                                     break
                                 await asyncio.sleep(0.02)
-                        assert all(request["action"] == "getConfig" for request in engine_failed_reads)
+                        # Keep the actual differing request before an assertion can trigger teardown.
+                        state = witness("native-unavailable-still-refused")
+                        assert len(engine_failed_reads) >= 3
+                        assert all(failed_native_read(request) for request in engine_failed_reads), state
                         response = await call(api, "status")
                         assert response["ok"] and response["result"]["healthy"] is False
-                        witness("native-unavailable-still-refused")
 
                         # Recover HTTP while diagnostic storage still refuses writes, before repair or owner controls.
                         rig.peer.unavailable = False
