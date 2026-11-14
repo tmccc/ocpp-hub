@@ -11,6 +11,8 @@
 - Independently regenerate complete ordinary and model collection in each pinned runtime before qualification
   passes. Record filtering and deselection, bind explicit collection executors and prevent provisioned mounts from
   replacing the source or runtime used to establish that denominator.
+- Load the instrumentation's shared collection helper directly from the frozen source so an installed `tools`
+  package cannot hide it in Home Assistant runtimes. Cover the original worker and independent collector paths.
 - Retry cloud attachment after temporary receipt-retirement or preparation-read storage failures, without treating
   a local database error as evidence that a cloud introduction failed.
 - Roll back failed native-history commits before protective shutdown writes, retaining enclosing recovery

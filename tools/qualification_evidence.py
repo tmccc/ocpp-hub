@@ -4,6 +4,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import runpy
 import sys
 import time
 from pathlib import Path
@@ -16,12 +17,17 @@ COLLECTION_ERRORS = []
 EFFECTIVE_SETTINGS = None
 
 
+# Resolve the reviewed helper by source path, independent of installed tools packages or copied plugin locations.
+def collection_settings(config):
+    helper = Path(config.rootpath).resolve() / "tools/qualification_collection.py"
+    effective = runpy.run_path(str(helper))["effective_settings"]
+    return effective(config)
+
+
 # Qualification instrumentation rejects effective filters before any selected test can run.
 def pytest_configure(config):
     global EFFECTIVE_SETTINGS
-    from tools.qualification_collection import effective_settings
-
-    EFFECTIVE_SETTINGS = effective_settings(config)
+    EFFECTIVE_SETTINGS = collection_settings(config)
 
 
 # Record every generated item before pytest or a hook can remove it from session.items.
@@ -78,9 +84,7 @@ def pytest_sessionstart(session):
 
 # Machine-readable collection prevents text formatting or root-prefix parsing from silently omitting cases.
 def pytest_collection_finish(session):
-    from tools.qualification_collection import effective_settings
-
-    effective = effective_settings(session.config)
+    effective = collection_settings(session.config)
     emit(
         {
             "event": "collection",
