@@ -162,6 +162,11 @@ class NativeBoundedHandover:
         strict_complete = False
         resource_error: NativeContentError | None = None
 
+        # Only the newest resolved read may invalidate freshness; an older outcome cannot erase its successor.
+        def invalidate() -> None:
+            if sequence >= self.last_resolved_read:
+                self.last_verified_at = 0
+
         # Resolve failed or complete reads without letting an older HTTP result publish newer authority.
         def current() -> bool:
             if sequence < self.last_resolved_read:
@@ -207,7 +212,7 @@ class NativeBoundedHandover:
             if measured.exceeded:
                 raise _NativeMeasurementError(native, measured, self.authority(), sequence)
         except NativeContentError as error:
-            self.last_verified_at = 0
+            invalidate()
             # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
             if not content_current and not current():
                 if repair is not None:
@@ -217,12 +222,12 @@ class NativeBoundedHandover:
                 repair.finish(attempt, "strict", error)
             raise
         except _NativeMeasurementError:
-            self.last_verified_at = 0
+            invalidate()
             if repair is not None:
                 repair.finish(attempt, "measurement")
             raise
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
-            self.last_verified_at = 0
+            invalidate()
             applicable = current()
             if repair is not None:
                 repair.finish(attempt, "availability" if applicable else "superseded")
@@ -241,13 +246,13 @@ class NativeBoundedHandover:
                 raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
             raise
         except SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError:
-            self.last_verified_at = 0
+            invalidate()
             applicable = current()
             if repair is not None:
                 repair.finish(attempt, "readiness" if applicable else "superseded")
             raise
         except sqlite3.Error as error:
-            self.last_verified_at = 0
+            invalidate()
             # Pure content comparisons precede publication; a proved resource refusal cannot become a storage wait.
             if repair is not None and resource_error is not None:
                 repair.defer(attempt, "strict", resource_error)
@@ -257,7 +262,7 @@ class NativeBoundedHandover:
             # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
             raise
         except asyncio.CancelledError:
-            self.last_verified_at = 0
+            invalidate()
             if repair is not None:
                 repair.finish(attempt, "availability")
             raise
