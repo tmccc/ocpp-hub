@@ -10,6 +10,8 @@
   after cancellation of a proven unprepared Start's exact initial zero hold, without issuing a Start or a new Pause.
 - Preserve cloud-wait, cleanup, protocol and temporary-schedule diagnostic labels. Report pending Start/current
   work and uncertain command delivery honestly; expand real-service, storage, Boot and intermediate-zero checks.
+- Verify an exact failed idle-current zero hold after native HTTP recovers, retaining its uncertain update receipt.
+  Make the real-service regression force the first verification failure and reject borrowed request/Boot bindings.
 
 - Explain retained faults, recovery blockers and pending/unknown controls through optional read-only diagnostics.
   Add a bounded transition timeline and a redacted download for the active iCS Home Assistant client. Failed

@@ -135,6 +135,9 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
 - `test_worker_storage_serve.py` keeps failed-completion and optional diagnostic SQL refusal active while the
   actual service reaches zero, observes real native HTTP loss, heals and completes two later sessions. The bounded
   current/Start polling and management read tests separately retain honest unknown status and real read failures.
+- Its current-update case refuses native HTTP at the first real diagnostic SQL failure, before automatic Pause
+  verification can run. `test_current_failed_idle_hold.py` rejects23 altered request/cause/Boot/control bindings;
+  fresh closed-zero verification preserves the failed current receipt and issues no Start or Stop.
 - The measured-current, mixed-cause and native-repair tests separate fully validated measurement excess from
   configuration/history/resource/wire contradictions and ordinary unavailable/stale/closure waits. Real SQL refusal,
   replacement, newer Pause/Boot and an actual stop-fault operator bridge retain exact fault lineage. An interrupted

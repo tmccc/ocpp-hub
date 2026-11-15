@@ -269,6 +269,10 @@ class ManagedController:
             await self.schedule.observe(native)
         self.require_paused(native)
         g, j = self.session.gateway, self.session.journal
+        if self.current.failed_idle_hold():
+            # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
+            g.controls._complete(j.get("control")["ticket"], uncertain=False)
+            raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
         if j.get("trial_phase") == "recovering":
             cloud = self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"
             if not cloud:

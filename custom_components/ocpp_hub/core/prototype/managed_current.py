@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
 from .gateway import NativeStartReport
+from .local_control import local_start_receipt
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
@@ -201,6 +203,68 @@ class ManagedCurrentLimits:
     # A pending update blocks Start, Return and another update until its physical outcome has been established.
     def pending(self) -> bool:
         return bool(self.journal.get("managed_current_change", {}).get("state") in ("pending", "recovering"))
+
+    # Retry only the closed zero hold of this exact failed idle update; its current receipt stays uncertain.
+    def failed_idle_hold(self) -> bool:
+        c, j = self.controller, self.journal
+        g, change, control = c.session.gateway, j.get("managed_current_change", {}), j.get("control", {})
+        row = j.db.execute(
+            "SELECT r.action,r.state,r.revision,r.result,c.current_a FROM managed_requests r "
+            "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
+            (change.get("id"),),
+        ).fetchone()
+        receipt = local_start_receipt(j)
+        return bool(
+            not c.stopping
+            and (self.worker is None or self.worker.done())
+            and change.get("state") == "uncertain"
+            and change.get("mode") == "app"
+            and change.get("native_open") is False
+            and change.get("observed_open") is False
+            and "failure" in change
+            and current_failure(j, change) is not None
+            and row is not None
+            and row["action"] == "set_current"
+            and row["state"] == "uncertain"
+            and row["current_a"] == change.get("current_a")
+            and json.loads(row["result"])
+            == {
+                "classification": "current_unconfirmed",
+                "requested_current_a": change.get("current_a"),
+                "previous_current_a": change.get("previous_a"),
+            }
+            and j.get("managed_control_intent") == {"mode": "paused", "revision": row["revision"] + 2}
+            and type(change.get("previous_a")) is int
+            and change["previous_a"] == self.selected() == control.get("resume_limit")
+            and g.boot_observation is not None
+            and change.get("source_boot") == g.boot_observation
+            and g.current_boot_seen(g._charger_epoch)
+            and j.active() is None
+            and control.get("owner") == "local"
+            and control.get("inhibit") is True
+            and control.get("uncertain") is True
+            and isinstance(control.get("ticket"), str)
+            and re.fullmatch(r"[a-f0-9]{32}", control["ticket"]) is not None
+            and not control.get("start_pending")
+            and not j.get("managed_control_fault")
+            and not j.get("vendor_start_grant")
+            and not j.get("uncertain_vendor_command")
+            and not c.requests.return_in_progress()
+            and c.tests.lease is None
+            and c.tests.state().get("state") in (None, "completed", "failed", "cancelled")
+            and j.get(KEY, {}).get("state") not in OBSERVABLE
+            and receipt.get("stage") not in ("prepared", "issued")
+            and (
+                receipt.get("stage") != "accepted"
+                or j.db.execute(
+                    "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (receipt.get("local"),)
+                ).fetchone()
+            )
+            and not j.db.execute(
+                "SELECT 1 FROM outbox WHERE action IN ('StartTransaction','StopTransaction') LIMIT 1"
+            ).fetchone()
+            and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
+        )
 
     # Verified restoration retires only its exact abandoned target, in the caller's authority transaction.
     def returned_to_previous(self, *, recovery: dict[str, Any] | None = None) -> None:

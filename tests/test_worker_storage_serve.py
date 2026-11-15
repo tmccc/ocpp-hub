@@ -221,7 +221,12 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         assert first["station_ceiling_a"] == 6
                         j = session.journal
                         fail_boundary(j, "current", failure)
-                        _reached, attempts = failing_cleanup(j, "managed_current_failure")
+                        # Refuse the first automatic Pause proof before its scheduled task can win the race.
+                        _reached, attempts = failing_cleanup(
+                            j,
+                            "managed_current_failure",
+                            on_first_attempt=lambda: setattr(rig.peer, "unavailable", True),
+                        )
                         identifier = uuid.uuid4().hex
                         revision = first["control_revision"]
                         before_limits = len(rig.bench.received_limits)

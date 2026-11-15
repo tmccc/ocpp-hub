@@ -17,13 +17,15 @@ from tests.test_prototype_tls import tls as tls
 
 
 # An actual SQLite trigger records separate cleanup attempts before refusing that write; no result is mocked.
-def failing_cleanup(j, key, *, minimum_attempts=2):
+def failing_cleanup(j, key, *, minimum_attempts=2, on_first_attempt=None):
     reached = asyncio.Event()
     attempts = []
 
     # Observe a genuine trigger execution without changing its real SQLite failure.
     def observed():
         attempts.append(len(attempts) + 1)
+        if len(attempts) == 1 and on_first_attempt is not None:
+            on_first_attempt()
         if len(attempts) >= minimum_attempts:
             reached.set()
         return 0

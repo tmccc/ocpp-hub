@@ -739,6 +739,9 @@ no additional automatic reconciliation path for such interrupted audits.
 An accepted current update owns its pending native verification. Unfinished physical or required journal work
 publishes fresh, nonhealthy status with unknown native measurements; cached readings never become a new zero proof.
 A diagnostic-only storage failure cannot delay restrictive cleanup, request settlement or later native supervision.
+If an idle current update fails and its first zero-hold verification loses native HTTP, supervision can verify that
+same hold when HTTP recovers. The failed current receipt stays uncertain until a separate owner Pause/Return;
+verification neither sends Stop nor restores a positive ceiling.
 Failed app current updates retain the previous verified selection and require independent confirmation of their hold.
 The failed target remains in its receipt for diagnosis. An older journal fault from the current/health collision
 requires a new explicit Pause, its exact failed-request diagnostic and full closed-zero/settled-journal proof.
