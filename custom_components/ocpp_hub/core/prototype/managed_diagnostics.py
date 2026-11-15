@@ -26,6 +26,9 @@ FAULTS = frozenset(
         "current_update_pending",
         "start_operation_pending",
         "listener_certificate_expiring",
+        "temporary_schedule_cleanup_unconfirmed",
+        "temporary_schedule_awaiting_start_report",
+        "temporary_schedule_stop_unconfirmed",
     }
 )
 ACTIONS = frozenset(

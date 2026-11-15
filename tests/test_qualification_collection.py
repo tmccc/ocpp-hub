@@ -141,6 +141,72 @@ def test_controlled_collection_rejects_omission_inputs(collector_project, tmp_pa
     assert payload is None or payload["errors"]
 
 
+# Intent: distinct source/discovery omissions fail actual collection instead of establishing a shorter denominator.
+# Why: matching worker counts cannot reveal tests suppressed before the ordinary item ledger exists.
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "function-pattern",
+        "class-pattern",
+        "ignore-glob",
+        "module-disabled",
+        "class-disabled",
+        "module-skipped",
+        "import-error",
+        "duplicate-definition",
+        "imported-omission-hook",
+    ],
+)
+def test_controlled_collection_refuses_hidden_source_cases(collector_project, tmp_path, problem):
+    conftest = collector_project / "tests/conftest.py"
+    hidden = collector_project / "tests/test_hidden.py"
+    if problem in ("function-pattern", "class-pattern"):
+        with (collector_project / "pyproject.toml").open("a") as stream:
+            stream.write(
+                'python_functions=["test_plain"]\n' if problem == "function-pattern" else 'python_classes=["Spec"]\n'
+            )
+        expected = "discovery setting differs"
+    elif problem == "ignore-glob":
+        with conftest.open("a") as stream:
+            stream.write('collect_ignore_glob=["test_hidden.py"]\n')
+        expected = "omission/plugin setting forbidden"
+    elif problem == "module-disabled":
+        hidden.write_text('__test__=False\ndef test_hidden(): raise AssertionError("body executed")\n')
+        expected = "missing_source_definitions"
+    elif problem == "class-disabled":
+        hidden.write_text(
+            'class TestHidden:\n __test__=False\n def test_hidden(self): raise AssertionError("body executed")\n'
+        )
+        expected = "missing_source_definitions"
+    elif problem == "module-skipped":
+        hidden.write_text(
+            'import pytest\npytest.skip("synthetic module skip",allow_module_level=True)\n'
+            'def test_hidden(): raise AssertionError("body executed")\n'
+        )
+        expected = "missing_source_definitions"
+    elif problem == "import-error":
+        hidden.write_text(
+            'raise ImportError("synthetic collection failure")\n'
+            'def test_hidden(): raise AssertionError("body executed")\n'
+        )
+        expected = "synthetic collection failure"
+    elif problem == "duplicate-definition":
+        with hidden.open("a") as stream:
+            stream.write('def test_hidden(): raise AssertionError("body executed")\n')
+        expected = "duplicate source test definition"
+    else:
+        (collector_project / "hidden_plugin.py").write_text("def pytest_collection_modifyitems(items): items.pop()\n")
+        with conftest.open("a") as stream:
+            stream.write("from hidden_plugin import pytest_collection_modifyitems\n")
+        expected = "omission hook forbidden"
+    result, payload = collect(collector_project, tmp_path)
+    assert result.returncode != 0, "hidden source established a shorter green universe"
+    evidence = result.stdout + result.stderr + json.dumps(payload)
+    assert expected in evidence, evidence
+    assert "body executed" not in result.stdout and "test body must not run" not in result.stdout
+    assert payload is None or payload["errors"] or payload.get("missing_source_definitions")
+
+
 # Intent: no cached selected-list result substitutes for a missing pinned runtime.
 # Why: later audits must fail clearly when their explicitly chosen runtime cannot perform independent recollection.
 def test_collection_replay_refuses_unavailable_runtime(tmp_path):

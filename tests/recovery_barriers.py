@@ -5,6 +5,16 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 
+# Prove zero from independent physical state and every station-profile period sent since the confirmed hold.
+def require_zero_held(rig, mark):
+    assert rig.bench.firmware.effective_limit() == 0
+    assert rig.bench.firmware.current == 0
+    for frame in rig.bench.device_calls[mark:]:
+        if frame[2] == "SetChargingProfile" and frame[3]["csChargingProfiles"]["chargingProfileId"] == 7001:
+            periods = frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+            assert periods and all(period["limit"] == 0 for period in periods), frame
+
+
 # Wait for one named request's durable result; generic healthy paused state is not a completed Return.
 async def completed_control(b, identifier, *, mode, revision, ceiling):
     c, firmware = b.controller, b.rig.bench.firmware

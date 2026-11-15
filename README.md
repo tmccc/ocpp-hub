@@ -590,6 +590,13 @@ continue to age; cached measurements are not substituted for fresh zero proof. C
 identifiers, raw native bodies and free-form error text are omitted from the download. Unsupported optional
 diagnostic schemas on an older proxy remain compatible with the existing health and control interface.
 
+Pending current and Start operations retain their own labels and current intent/revision while physical
+measurements remain unknown. Missing connection facts remain unknown rather than being labelled disconnected.
+The timeline retains cloud-wait and cleanup phases, protocol details retain Boot-probe and completed-RPC labels,
+and temporary-schedule alarms retain their specific cause. A control whose send or reply fails is reported as
+possibly sent with an unknown outcome; the client does not retry it. Optional native observation notes can fail
+without terminating supervision. Required atomic fault proof and command settlement retain their storage checks.
+
 Software metadata distinguishes the actual HA/client version and an available installed client `BUILD` stamp from
 source fingerprints. The proxy fingerprint covers the installed core Python sources and its managed/reporting/trial
 entry points; the client fingerprint covers its installed Python sources. A fingerprint is not a claimed Git commit.
@@ -746,6 +753,19 @@ that Start preparation never occurred and all owned work is quiescent. This does
 operation occurred. For that proven unprepared request, required settlement SQL or outstanding owned work remains
 pending; the deadline cannot acquire Pause or Stop authority over an independent daily while waiting. Prepared/issued
 uncertainty keeps its existing actual-lifecycle and closed-zero proof requirements. A cancelled task never supplies a successful Start result.
+
+If that exact unprepared request already claimed its initial zero hold, retirement also records restrictive
+ordinary recovery in the same transaction. Fresh zero, native source and current Boot proof may then restore the
+unchanged original app intent; this emits no Start. A newer Pause, Boot or control claim cannot inherit that
+restoration. A pending explicit Pause can retry its exact known-session Stop after native availability recovers,
+including when a fully validated sample fails only its measured output bound. A fault alone grants no Stop.
+An accepted Stop waits for its genuine closure report; a new Boot invalidates reuse of its old acknowledgement.
+
+Unanswered inflight cloud reports and Stops can retry after cleanup storage recovers, using their original
+delivery identity. Cancellation retains its original outcome even if the best-effort cleanup write fails.
+An unknown Start remains quarantined, and a saved Stop response must settle normally before any operator retry.
+Temporary SQL failure in the initial native-introduction observation uses the existing bounded retry on the same
+connection; later Stop-capable introduction work and interrupted audit outcomes keep their existing proof rules.
 
 Management status, history and receipt reads return `not_ready` when their journal read is unavailable. They keep
 the same connection available for recovery and return no guessed result. This read-only classification does not

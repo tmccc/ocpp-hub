@@ -38,12 +38,38 @@ FAULTS = {
     "current_update_pending": REASONS["current_update_pending"],
     "start_operation_pending": REASONS["start_operation_pending"],
     "listener_certificate_expiring": REASONS["certificate_validity_insufficient"],
+    "temporary_schedule_cleanup_unconfirmed": "Temporary-schedule cleanup has not been confirmed.",
+    "temporary_schedule_awaiting_start_report": "The temporary schedule is awaiting its actual session report.",
+    "temporary_schedule_stop_unconfirmed": "The temporary schedule's Stop has not been confirmed.",
     "other_fault": "Another recorded fault requires review.",
 }
 STATES = frozenset(
-    {"starting", "healthy", "local_only", "degraded", "attention", "reconciling", "pausing", "stopping", "stopped"}
+    {
+        "starting",
+        "healthy",
+        "local_only",
+        "degraded",
+        "attention",
+        "reconciling",
+        "pausing",
+        "stopping",
+        "stopped",
+        "waiting_for_cloud",
+    }
 )
-PHASES = frozenset({"active", "recovering", "blocked", "complete", "ready", "prepared", "admitted"})
+PHASES = frozenset(
+    {
+        "active",
+        "recovering",
+        "blocked",
+        "complete",
+        "ready",
+        "prepared",
+        "admitted",
+        "rollback",
+        "backend_restore_pending",
+    }
+)
 ACTIONS = frozenset(
     {"pause", "app_control", "start", "start_test", "arm_cloud_test", "set_current", "temporary_schedule", "other"}
 )
@@ -69,7 +95,7 @@ RPC_ACTIONS = frozenset(
         "TriggerMessage",
     }
 )
-RPC_PHASES = frozenset({"idle", "sending", "awaiting_reply", "reply_received", "unconfirmed"})
+RPC_PHASES = frozenset({"idle", "sending", "awaiting_reply", "reply_received", "unconfirmed", "complete"})
 
 
 # Bound before arithmetic, accepting neither booleans nor enormous JSON integers as numeric observations.
@@ -151,6 +177,7 @@ def protocol(value: Any) -> dict[str, Any]:
                         "charger_receive",
                         "charger_retirement",
                         "boot_or_ceiling",
+                        "boot_probe",
                     },
                 ),
                 **{

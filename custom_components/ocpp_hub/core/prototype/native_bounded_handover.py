@@ -364,7 +364,13 @@ class NativeBoundedHandover:
         first_zero = binding is None or bool(journal.get("trial_starting"))
         try:
             native = await self.read(closed=first_zero)
-        except (NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError) as error:
+        except (
+            NativeTransportUnavailableError,
+            StaleEvidenceError,
+            UnavailableError,
+            TimeoutError,
+            sqlite3.Error,
+        ) as error:
             # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
             raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
         gateway._require_epoch("charger", epoch)

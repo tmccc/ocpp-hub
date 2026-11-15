@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from typing import Any
 
@@ -158,6 +159,13 @@ class ManagedController:
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
             return  # A failed zero acknowledgement still permits Stop if independent native verification succeeds.
 
+    # Optional observation notes cannot interrupt supervision; required fault proof still commits atomically in fault().
+    def record_optional_native_failure(self, diagnostic: dict[str, Any]) -> None:
+        try:
+            self.session.journal.put("managed_native_failure", diagnostic)
+        except sqlite3.Error:
+            pass  # Counters and conservative status remain authoritative even when this optional note cannot persist.
+
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
         if self.tests.scoped_normal_stop():
@@ -165,16 +173,52 @@ class ManagedController:
             return
         await self.ensure_pause_zero()
         try:
-            native = await self.native.read()
+            g, j = self.session.gateway, self.session.journal
+            intent, epoch, boot, revision = (
+                self.requests.intent(),
+                g._charger_epoch,
+                g.boot_observation,
+                g.controls._revision,
+            )
+            local = j.active()
+
+            # A restrictive Stop still belongs to one current owner request and one known local session.
+            def guard() -> None:
+                if (
+                    self.stopping
+                    or intent.mode != "paused"
+                    or self.requests.intent() != intent
+                    or g._charger_epoch != epoch
+                    or g.boot_observation != boot
+                    or g.controls._revision != revision
+                    or not g.current_boot_seen(epoch)
+                    or fingerprint(j.get("boot")) != self.native.spec.boot_digest
+                    or j.active() != local
+                ):
+                    raise RecoveryRequiredError("owner Stop awaits the current Pause and known session")
+
+            try:
+                native = await self.native.read()
+            except _NativeMeasurementError as candidate:
+                if (
+                    candidate.authority != self.native.authority()
+                    or candidate.sequence != self.native.last_resolved_read
+                ):
+                    raise AuditSupersededError("owner Stop measurement crossed a newer authority or observation")
+                # Only measured excess may be ignored for Stop; identity, history and resources already passed.
+                native = candidate.native
+            guard()
+            native.physical.require_fresh(j.identity, 5)
             self.native.require_known_session(native)
             self.session.book.owned_present(native.physical)
-            controls = self.session.gateway.controls
+            controls = g.controls
             if not native.physical.transaction_open and controls.ready and controls.desired() == 0:
                 self.require_paused(native)
                 self.tests.observed(native)
                 controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
                 return
-            await self.session.gateway.stop()
+            if not controls.stop_acknowledged(local):
+                await controls.stop(expected_local=local, guard=guard)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
@@ -692,11 +736,19 @@ class ManagedController:
             pending = "start_operation_pending"
         if pending is not None:
             self.latest_native = None
+            intent = self.requests.intent()
+            g, runtime = self.session.gateway, self.session.runtime.status
             return {
                 "checked_at": time.time(),
                 "mode": "app_schedule",
                 "state": "stopping" if self.stopping else "reconciling",
                 "fault": pending,
+                "desired_control": intent.mode,
+                "control_revision": intent.revision,
+                "local_start_disabled": not g.policy.allow_local_start,
+                "charger_connected": runtime.charger_connected,
+                "cloud_connected": runtime.vendor_connected and g.vendor_registration == "Accepted",
+                "boot_verified": g.current_boot_seen(g._charger_epoch),
                 "owner_control_enabled": False,
                 "local_hold_verified": False,
                 "native_observed_at": None,
@@ -738,6 +790,13 @@ class ManagedController:
             return {**base, "state": "stopping", "owner_control_enabled": False}
         if j.get("managed_control_fault"):
             await self.hold_fault()
+            if (
+                self.requests.pending_pause()
+                and (self.pause_task is None or self.pause_task.done())
+                and not g.controls._operations
+                and not g.charger._pending
+            ):
+                await self._stop_requested()
             await self.tests.retire_closed_after_fault()
             try:
                 await reconcile_owner_release(self)
@@ -831,8 +890,7 @@ class ManagedController:
             self.failures = 0
             self.strict_failure_seen = False
             self.native_unavailable += 1
-            j.put(
-                "managed_native_failure",
+            self.record_optional_native_failure(
                 {
                     "type": type(error).__name__,
                     "detail": str(error)[:1024],
@@ -899,7 +957,7 @@ class ManagedController:
             if self.failures >= 3:
                 self.fault(classification, diagnostic=diagnostic)
             else:
-                j.put("managed_native_failure", diagnostic)
+                self.record_optional_native_failure(diagnostic)
             return {**base, "state": "degraded", "fault": classification}
         self.failures = 0
         self.strict_failure_seen = False

@@ -142,6 +142,18 @@ class ManagedRequests:
         ).fetchone()
         return (row["id"], row["revision"]) if row is not None else None
 
+    # Retry Stop only for the still-current explicit Pause, including its replacement-uncertain receipt.
+    def pending_pause(self) -> bool:
+        intent = self.intent()
+        return (
+            intent.mode == "paused"
+            and self.journal.get("managed_owner_pause", {}).get("revision") == intent.revision
+            and self.journal.db.execute(
+                "SELECT 1 FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
     # Admission remains exclusive after the selected Return starts awaiting real charger evidence.
     def return_in_progress(self) -> bool:
         return (

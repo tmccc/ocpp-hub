@@ -66,11 +66,11 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
             (0 <= age <= 45, "status_stale"),
             (0 <= native_age <= 15, "native_stale"),
             (value.get("running") is True, "service_not_running"),
-            (value.get("charger_connected") is True, "charger_disconnected"),
-            (value.get("boot_verified") is True, "boot_unverified"),
+            (value.get("charger_connected") is not False, "charger_disconnected"),
+            (value.get("boot_verified") is not False, "boot_unverified"),
             (bool(authority), "control_verification_pending"),
             (remaining is not None and remaining > 1800, "certificate_validity_insufficient"),
-            (value.get("cloud_connected") is True, "cloud_disconnected"),
+            (value.get("cloud_connected") is not False, "cloud_disconnected"),
         )
         if not passed
     ]

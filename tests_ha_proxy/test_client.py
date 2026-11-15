@@ -7,7 +7,7 @@ import copy
 import time
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientConnectionError, ClientWebSocketResponse, WSMsgType, web
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.setup import async_setup_component
@@ -69,7 +69,10 @@ async def peer():
             raise web.HTTPUnauthorized()
         socket = web.WebSocketResponse(protocols=["ics-proxy.v1"])
         await socket.prepare(request)
-        value = await socket.receive_json()
+        message = await socket.receive()
+        if message.type != WSMsgType.TEXT:
+            return socket
+        value = message.json()
         command = value["command"]
         control["commands"].append(command)
         control["requests"].append(copy.deepcopy(value))
@@ -264,11 +267,76 @@ async def test_lost_pause_reply_does_not_retry_control(actual_hass, peer):
     hass = actual_hass
     entry = await setup(hass, peer)
     peer["lose_reply"] = True
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(HomeAssistantError, match="outcome is unknown"):
         await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
     await entry.runtime_data.async_refresh()
     assert peer["commands"].count("pause") == 1
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
+
+
+# Intent: a transport failure during sending reports an unknown outcome and never claims definite delivery or retries.
+# Why: send_json can fail before sending any bytes or after the complete request reached the real local peer.
+@pytest.mark.parametrize("after_send", [False, True])
+@pytest.mark.parametrize("command", ["pause", "start", "start_test"])
+async def test_send_failure_uses_uncertain_delivery_wording(actual_hass, peer, monkeypatch, after_send, command):
+    entry = await setup(actual_hass, peer)
+    client = entry.runtime_data.client
+    from custom_components.ics_proxy.api import ProxyError
+
+    original, attempts = ClientWebSocketResponse.send_json, []
+
+    # Fail only the actual client transport boundary; the real HA client and server still own their protocol state.
+    async def failed_send(connection, value, *args, **kwargs):
+        if value.get("command") != command:
+            return await original(connection, value, *args, **kwargs)
+        attempts.append(value)
+        if after_send:
+            await original(connection, value, *args, **kwargs)
+        raise ClientConnectionError("synthetic send interruption")
+
+    monkeypatch.setattr(ClientWebSocketResponse, "send_json", failed_send)
+    with pytest.raises(ProxyError, match="may have been sent; its outcome is unknown"):
+        await client.command(command, 0)
+    assert len(attempts) == 1
+    await actual_hass.async_block_till_done()
+    if after_send:
+        async with asyncio.timeout(2):
+            while peer["commands"].count(command) == 0:
+                await asyncio.sleep(0.01)
+    assert peer["commands"].count(command) == int(after_send)
+    assert "receipt" not in peer["commands"]
+
+
+# Intent: pending Start and current work retain their actual operation label under both app and paused intent.
+# Why: a persisted paused intent does not mean a newly pending Start is a new Pause or a completed physical hold.
+@pytest.mark.parametrize("mode", ["app", "paused"])
+@pytest.mark.parametrize(
+    "fault,label",
+    [
+        ("start_operation_pending", "Start pending"),
+        ("current_update_pending", "Updating current"),
+    ],
+)
+async def test_pending_operation_label_does_not_invent_pause(actual_hass, peer, mode, fault, label):
+    peer["state"].update(
+        healthy=False,
+        local_healthy=False,
+        state="reconciling",
+        fault=fault,
+        desired_control=mode,
+        owner_control_enabled=False,
+        local_hold_verified=False,
+        can_start=False,
+        can_start_test=False,
+        current_a=None,
+        native_age_seconds=None,
+        power_w=None,
+        station_ceiling_a=None,
+    )
+    await setup(actual_hass, peer)
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == label
+    assert actual_hass.states.get("button.ics_proxy_start").state == "unavailable"
+    assert actual_hass.states.get("sensor.ics_proxy_current").state == "unavailable"
 
 
 # Intent: the config flow rejects invalid credentials without sending controls or printing their content.
@@ -350,7 +418,7 @@ async def test_lost_normal_start_reply_does_not_retry(actual_hass, peer):
     hass = actual_hass
     entry = await setup(hass, peer)
     peer["lose_reply"] = True
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(HomeAssistantError, match="outcome is unknown"):
         await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
     await entry.runtime_data.async_refresh()
     assert peer["commands"].count("start") == 1 and set(peer["commands"]) <= {"status", "start"}
@@ -449,7 +517,7 @@ async def test_lost_test_start_reply_never_retries_or_rearms(actual_hass, peer):
     hass = actual_hass
     entry = await setup(hass, peer)
     peer["lose_reply"] = True
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(HomeAssistantError, match="outcome is unknown"):
         await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start_test"}, blocking=True)
     await entry.runtime_data.async_refresh()
     assert peer["commands"].count("start_test") == 1

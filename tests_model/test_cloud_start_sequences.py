@@ -12,6 +12,7 @@ from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.handover_helpers import crash
+from tests.recovery_barriers import require_zero_held
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_managed_stop_reply_recovery import pause
@@ -77,6 +78,7 @@ async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, 
                 )
                 assert rig.bench.firmware.effective_limit() == 0 and s.journal.get("managed_control_fault")
                 assert s.journal.get("managed_control_fault") == fault
+            zero_mark = len(rig.bench.device_calls)
             for event in case.events:
                 if event == "close":
                     rig.peer.permission_enabled = False
@@ -108,6 +110,8 @@ async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, 
                     sock = await stack.enter_async_context(rig.charger(s))
                     assert (await rig.bench.call(sock, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
                     await until(lambda: s.gateway.controls.ready and s.gateway.vendor_registration == "Accepted")
+                if not case.fault.startswith("error-"):
+                    require_zero_held(rig, zero_mark)
                 events.append(event)
                 assert c.current.selected() == case.selected
                 assert rig.bench.firmware.plans == original_plans and rig.peer.configuration == original_config
@@ -116,6 +120,8 @@ async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, 
             await pause(c)
             assert (await mp.healthy(c))["local_hold_verified"]
             assert s.journal.get("managed_control_fault") is None
+            if not case.fault.startswith("error-"):
+                require_zero_held(rig, zero_mark)
             rig.bench.fixed_vendor = None
             await two_later_sessions(
                 ChargeRig(rig, s, c, sock), selected=case.selected, original_starts=expected_starts

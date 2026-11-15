@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
-from .store import Journal, RecoveryRequiredError, encoded
+from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
     from .managed_test_charge import ManagedChargeTests, TestLease
@@ -93,7 +93,37 @@ def unprepared_start(j: Journal, lease: TestLease) -> UnpreparedStart | None:
     )
 
 
-# Settle only an actually cancelled, quiescent no-dispatch request; this changes no physical or owner authority.
+# Only the exact initial zero may request ordinary re-verification of the still-current original app authority.
+def initial_zero_recovery(owner: ManagedChargeTests, lease: TestLease) -> bool:
+    c, j, g = owner.controller, owner.journal, owner.controller.session.gateway
+    control, intent = j.get("control", {}), c.requests.intent()
+    return (
+        lease.initial_zero_ticket is not None
+        and control.get("ticket") == lease.initial_zero_ticket
+        and control.get("stop_epoch") == lease.initial_zero_stop_epoch
+        and control.get("owner") == "local"
+        and control.get("inhibit") is True
+        and not control.get("start_pending")
+        and lease.mode == intent.mode == "app"
+        and lease.revision == intent.revision
+        and g._charger_epoch == lease.epoch
+        and g.controls._revision == lease.control_revision
+        and g.boot_observation == lease.initial_zero_boot
+        and g.current_boot_seen(lease.epoch)
+        and fingerprint(j.identity) == lease.identity
+        and c.native.spec.digest == lease.spec
+        and c.current.selected() == lease.current_a
+        and not c.current.pending()
+        and not c.stopping
+        and not c.requests.return_in_progress()
+        and j.get("trial_phase") == "active"
+        and not j.get("managed_control_fault")
+        and not j.get("uncertain_vendor_command")
+        and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
+    )
+
+
+# Settle an actually cancelled no-dispatch request; any initial zero requires fresh ordinary recovery before release.
 def retire_cancelled_start(owner: ManagedChargeTests, lease: TestLease) -> CancellationRetirement:
     worker = owner.worker
     if worker is None or not worker.done() or not worker.cancelled() or owner.lease is not lease:
@@ -134,6 +164,11 @@ def retire_cancelled_start(owner: ManagedChargeTests, lease: TestLease) -> Cance
                 "recovery_reason": "cancelled_before_start_dispatch",
             },
         )
+        recover = initial_zero_recovery(owner, lease)
+        if recover:
+            j.put("trial_phase", "recovering")
+    if recover:
+        owner.controller.released_epoch = None
     owner.lease = None
     owner.changed.set()
     return CancellationRetirement.RETIRED

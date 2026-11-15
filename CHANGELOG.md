@@ -2,6 +2,15 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Recover unanswered non-Start cloud events after failed retry storage without losing cancellation or replaying
+  unknown Starts. Preserve saved Stop replies for ordinary settlement before operator retry.
+- Retry an initial native-introduction read after temporary SQL failure; keep pending owner Pause able to stop its
+  exact known session after native recovery or validated measured excess. Bind accepted Stop replies to their Boot.
+- Keep optional native diagnostic storage failures from exiting supervision. Re-verify original app authority
+  after cancellation of a proven unprepared Start's exact initial zero hold, without issuing a Start or a new Pause.
+- Preserve cloud-wait, cleanup, protocol and temporary-schedule diagnostic labels. Report pending Start/current
+  work and uncertain command delivery honestly; expand real-service, storage, Boot and intermediate-zero checks.
+
 - Explain retained faults, recovery blockers and pending/unknown controls through optional read-only diagnostics.
   Add a bounded transition timeline and a redacted download for the active iCS Home Assistant client. Failed
   status/event writes are counted without interrupting supervision; stale measurements remain unknown.

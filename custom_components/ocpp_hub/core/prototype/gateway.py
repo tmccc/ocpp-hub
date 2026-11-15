@@ -422,6 +422,7 @@ class Gateway:
                 self.boot_metadata_revision += 1
             self._boot_charger_epoch = self._charger_epoch
             self.boot_observation = uuid.uuid4().hex
+            self.controls.forget_stop_ack()
             self._boot_seen.set()
             if self.boot_observer is not None:
                 self.boot_observer()
@@ -1105,6 +1106,20 @@ class Gateway:
                     )
                 if self._delivery_reply is not None:
                     self._delivery_reply.require(item)
+                elif item.state == "inflight" and item.action != "StartTransaction":
+                    # A failed cleanup write can retain an unanswered retryable head in this process too.
+                    with self.journal.atomic():
+                        if (
+                            self.journal.next_delivery() != item
+                            or self.journal.db.execute(
+                                "SELECT 1 FROM delivery_replies WHERE token=?", (item.token,)
+                            ).fetchone()
+                        ):
+                            raise RecoveryRequiredError("cloud retry no longer owns the exact unanswered head")
+                        self.journal.db.execute("UPDATE outbox SET state='queued' WHERE token=?", (item.token,))
+                        current_head = self.journal.next_delivery()
+                        assert current_head is not None
+                        item = current_head
                 elif item.state in ("ambiguous", "inflight", "rejected"):
                     if item.action == "StartTransaction" and item.state in ("ambiguous", "inflight"):
                         self.delivery_outcome_uncertain = True
@@ -1141,14 +1156,18 @@ class Gateway:
                         answer = await self.vendor.call(item.action, payload, token=item.token, before_send=before_send)
                     except UnavailableError, asyncio.CancelledError:
                         if sent:
-                            with self.journal.atomic():
-                                self.journal.db.execute(
-                                    "UPDATE outbox SET state=? WHERE token=?",
-                                    ("ambiguous" if item.action == "StartTransaction" else "queued", item.token),
-                                )
-                                current_head = self.journal.next_delivery()
-                                if current_head is not None:
-                                    supersede_unknown_start_retry(self.journal, current_head)
+                            try:
+                                with self.journal.atomic():
+                                    self.journal.db.execute(
+                                        "UPDATE outbox SET state=? WHERE token=?",
+                                        ("ambiguous" if item.action == "StartTransaction" else "queued", item.token),
+                                    )
+                                    current_head = self.journal.next_delivery()
+                                    if current_head is not None:
+                                        supersede_unknown_start_retry(self.journal, current_head)
+                            except sqlite3.Error:
+                                # Preserve cancellation/peer failure; recover the unanswered head on the next flush.
+                                pass
                         raise
                     self._delivery_reply = DeliveryReply.received(item, answer)
                     self.delivery_outcome_uncertain = not self._delivery_reply.storage_only(self.journal)

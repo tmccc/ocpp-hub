@@ -96,6 +96,7 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
         rig.bench.before_reply = hold_reply
         loop.set_task_factory(observe_task)
         request = uuid.uuid4().hex
+        original_intent = c.requests.intent()
         try:
             c.command(request, "start", c.requests.intent().revision)
             await asyncio.wait_for(captured.wait(), 3)
@@ -111,6 +112,12 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
             rig.bench.before_reply = None
         assert c.tests.state()["start_attempted"] is issued
         assert c.tests.state()["start_rpc_accepted"] is False
+        if not issued:
+            status = await c.tick()
+            assert status["state"] == "healthy" and status["station_ceiling_a"] == 6
+            assert c.requests.intent() == original_intent and not s.journal.get("managed_control_fault")
+            assert c.requests.receipt(request)["state"] == "failed" and c.tests.lease is None
+            assert not starts(rig) and not rig.bench.remote_stop.is_set()
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         await asyncio.wait_for(c.tick(), 3)
         if c.pause_task is not None:

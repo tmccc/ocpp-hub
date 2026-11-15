@@ -56,6 +56,10 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def native_value(self) -> Any:
         data = self.coordinator.data
         if self.key == "control_mode":
+            if data.get("fault") == "current_update_pending":
+                return "Updating current"
+            if data.get("fault") == "start_operation_pending":
+                return "Start pending"
             local = data.get("local_charge")
             if isinstance(local, dict) and local.get("state") in (
                 "starting",

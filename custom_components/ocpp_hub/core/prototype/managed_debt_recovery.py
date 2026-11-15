@@ -251,6 +251,8 @@ def stop_candidate(j: Journal, snapshot: dict[str, Any], kind: str) -> dict[str,
         item = j.next_delivery()
         if item is None or item.action != "StopTransaction" or item.state not in ("queued", "inflight", "rejected"):
             raise RecoveryRequiredError("Stop retry requires the exact retained closed lifecycle head")
+        if j.db.execute("SELECT 1 FROM delivery_replies WHERE token=?", (item.token,)).fetchone():
+            raise RecoveryRequiredError("Stop retry requires ordinary settlement of its saved reply first")
         identity = stop_identity(j, item)
         require_stop_tail(j, item)
         rejection = snapshot["stop_rejection"] or {}

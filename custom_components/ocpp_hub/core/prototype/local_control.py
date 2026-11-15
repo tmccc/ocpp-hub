@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,6 +21,17 @@ from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
+
+
+@dataclass(frozen=True)
+class StopAcknowledgement:
+    """An actual accepted Stop remains tied to its exact live control claim and local session."""
+
+    epoch: int
+    revision: int
+    ticket: str
+    local: int
+    generation: int
 
 
 # Older managed normal Starts saved their tag with the owner's request before dispatching the physical command.
@@ -98,6 +110,8 @@ class LocalControl:
         self._operations: set[asyncio.Task[Any]] = set()
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
+        self._stop_ack: StopAcknowledgement | None = None
+        self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
         self.prepare_station: Callable[[Call, int], Awaitable[StationChoice]] | None = None
 
@@ -349,6 +363,24 @@ class LocalControl:
         self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
         return answer
 
+    # Every actual Boot retires Stop acknowledgements even when its metadata is unchanged.
+    def forget_stop_ack(self) -> None:
+        self._stop_generation += 1
+        self._stop_ack = None
+
+    # An accepted known-session Stop waits for its genuine closure instead of repeating after each native poll.
+    def stop_acknowledged(self, local: int | None) -> bool:
+        ack = self._stop_ack
+        return (
+            ack is not None
+            and local is not None
+            and ack.local == local
+            and ack.epoch == self.epoch()
+            and ack.revision == self._revision
+            and ack.generation == self._stop_generation
+            and ack.ticket == self.journal.get("control", {}).get("ticket")
+        )
+
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
     async def stop(self, *, expected_local: int | None = None, guard: Callable[[], None] | None = None) -> Frame:
         if guard is not None:
@@ -359,6 +391,8 @@ class LocalControl:
         if self._stopping is None or self._stopping.done() or previous.get("ticket") != self._stop_ticket:
             epoch, ticket = self._claim(True, stopping=True)
             self._stop_ticket = ticket
+            if guard is not None:
+                guard()  # Bind the exact claim even if the owned child is cancelled before its first instruction.
             self._stopping = self._launch(
                 self._stop(epoch, ticket, previous.get("start_pending", False), expected_local, guard)
             )
@@ -373,6 +407,8 @@ class LocalControl:
         expected_local: int | None = None,
         guard: Callable[[], None] | None = None,
     ) -> Frame:
+        revision, generation = self._revision, self._stop_generation
+
         # Recheck generation and optional scoped authority at each physical RPC.
         def check() -> None:
             self._check(epoch, ticket)
@@ -395,6 +431,8 @@ class LocalControl:
                 answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":
                     raise UnavailableError("transaction stop was not confirmed")
+                check()
+                self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
             if cap_error is not None:
                 raise cap_error
         self._complete(ticket, uncertain=bool(pending_start))

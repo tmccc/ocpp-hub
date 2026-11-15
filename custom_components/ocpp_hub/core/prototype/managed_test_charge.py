@@ -46,6 +46,9 @@ class TestLease:
     mode: str = "app"
     normal: bool = False
     current_a: int = 6
+    initial_zero_ticket: str | None = None
+    initial_zero_boot: str | None = None
+    initial_zero_stop_epoch: int | None = None
 
 
 class ManagedChargeTests:
@@ -430,7 +433,26 @@ class ManagedChargeTests:
                 raise DeniedError("test requires a freshly connected idle vehicle")
             self.guard(lease)
             effects = True
-            await c.session.gateway.stop()
+
+            # Capture this exact restrictive claim even if the outer worker is cancelled while its child finishes.
+            def initial_zero_guard() -> None:
+                self.guard(lease, stopping=True)
+                control, g = j.get("control", {}), c.session.gateway
+                if lease.initial_zero_ticket is None and control.get("stop_epoch", 0) == lease.stop_epoch:
+                    return  # LocalControl checks once before synchronously making its own claim.
+                if (
+                    control.get("stop_epoch") != lease.stop_epoch + 1
+                    or control.get("owner") != "local"
+                    or control.get("inhibit") is not True
+                    or not isinstance(control.get("ticket"), str)
+                    or lease.initial_zero_ticket not in (None, control["ticket"])
+                    or lease.initial_zero_boot not in (None, g.boot_observation)
+                ):
+                    raise DeniedError("initial Start hold was superseded")
+                lease.initial_zero_ticket, lease.initial_zero_boot = control["ticket"], g.boot_observation
+                lease.initial_zero_stop_epoch = control["stop_epoch"]
+
+            await c.session.gateway.controls.stop(guard=initial_zero_guard)
             self.guard(lease, stopping=True)
             lease.stop_epoch = j.get("control", {}).get("stop_epoch", 0)
             async with asyncio.timeout(15):

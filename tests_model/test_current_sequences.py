@@ -12,6 +12,7 @@ from ocpp_hub_core.prototype.gateway import decode
 
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
 from tests import test_native_bounded_session as native_bench
+from tests.recovery_barriers import require_zero_held
 from tests.test_managed_current_tick_race import waiting_locals
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy
@@ -94,6 +95,7 @@ async def test_current_resolution_sequences(tmp_path, model_tls, monkeypatch, re
         if case.boundary == "paused-native":
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
             await healthy(c)
+        zero_mark = len(rig.bench.device_calls)
         send, actual, held, entered = sock.send, firmware.answer, [], asyncio.Event()
         profile_seen = False
         peer.outcome = case.outcome
@@ -165,11 +167,15 @@ async def test_current_resolution_sequences(tmp_path, model_tls, monkeypatch, re
                     assert (await rig.bench.call(sock, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
                 events.append(event)
                 await asyncio.sleep(0)
+                if case.boundary == "paused-native":
+                    require_zero_held(rig, zero_mark)
                 assert 0 <= firmware.effective_limit() <= max(case.initial, case.target)
             confirmed = case.outcome == "valid" and case.events.index("resolve") < case.events.index("pause")
             if "native" in case.boundary and case.events.index("boot") < case.events.index("resolve"):
                 confirmed = False
             expected = case.target if confirmed else case.initial
+            if case.boundary == "paused-native":
+                require_zero_held(rig, zero_mark)
             await ordinary_recovery(b, expected, case.demand, first_close="ledger")
             assert c.current.selected() == expected
             assert firmware.plans == plan and peer.configuration == config

@@ -139,11 +139,13 @@ class ManagementServer:
             elif command == "status":
                 result = dict(self.status())
                 intent = self.controller.requests.intent()
-                if (
-                    result.get("desired_control", "app") != intent.mode
-                    or result.get("control_revision", 0) != intent.revision
-                ):
-                    result.update(state="pausing", local_hold_verified=False, owner_control_enabled=False)
+                if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
+                    pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
+                    result.update(
+                        state="pausing" if intent.mode == "paused" and not pending else "reconciling",
+                        local_hold_verified=False,
+                        owner_control_enabled=False,
+                    )
                 result.update(desired_control=intent.mode, control_revision=intent.revision)
                 result["api_version"] = 1
                 result = health_snapshot(result)

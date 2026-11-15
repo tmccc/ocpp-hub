@@ -57,6 +57,7 @@ class Reporting:
                 "pausing",
                 "stopping",
                 "stopped",
+                "waiting_for_cloud",
             }
             else "other",
             "fault": fault
@@ -66,7 +67,18 @@ class Reporting:
             else None,
             "phase": phase
             if isinstance(phase, str)
-            and phase in {"active", "recovering", "blocked", "complete", "ready", "prepared", "admitted"}
+            and phase
+            in {
+                "active",
+                "recovering",
+                "blocked",
+                "complete",
+                "ready",
+                "prepared",
+                "admitted",
+                "rollback",
+                "backend_restore_pending",
+            }
             else None,
             "desired_control": status.get("desired_control"),
             "control_revision": status.get("control_revision"),

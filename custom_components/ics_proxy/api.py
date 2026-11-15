@@ -31,6 +31,7 @@ class ProxyClient:
     # One bounded websocket exchange has no reconnect or retry path and authenticates outside the message body.
     async def request(self, command: str, **fields: Any) -> dict[str, Any]:
         identifier = fields.pop("id", uuid.uuid4().hex)
+        sending = False
         try:
             async with asyncio.timeout(10):
                 async with self.session.ws_connect(
@@ -39,9 +40,14 @@ class ProxyClient:
                     protocols=["ics-proxy.v1"],
                     max_msg_size=65536,
                 ) as connection:
+                    sending = True
                     await connection.send_json({"id": identifier, "command": command, **fields})
                     response = await connection.receive_json()
         except aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError:
+            if sending and command not in ("status", "history", "receipt"):
+                raise ProxyError(
+                    "The request may have been sent; its outcome is unknown. Check the charger status"
+                ) from None
             raise ProxyError("The local charger proxy could not be reached or authenticated") from None
         if (
             not isinstance(response, dict)

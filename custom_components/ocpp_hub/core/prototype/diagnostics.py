@@ -35,6 +35,7 @@ STAGES = frozenset(
         "charger_receive",
         "charger_retirement",
         "boot_or_ceiling",
+        "boot_probe",
     }
 )
 

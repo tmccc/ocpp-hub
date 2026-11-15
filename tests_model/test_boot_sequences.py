@@ -11,6 +11,7 @@ from ocpp_hub_core.prototype.gateway import decode
 
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
 from tests import test_native_bounded_session as native_bench
+from tests.recovery_barriers import require_zero_held
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_start_refusal_native32 import commissioned
@@ -47,6 +48,7 @@ async def sequence(tmp_path, model_tls, monkeypatch, record_property, case, fami
         if case.intent == "paused":
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
             await healthy(c)
+        zero_mark = len(rig.bench.device_calls)
         await b.charger.close()
         await until(lambda: not s.runtime.status.charger_connected)
         if case.boundary == "native503":
@@ -104,12 +106,16 @@ async def sequence(tmp_path, model_tls, monkeypatch, record_property, case, fami
                     else:
                         rig.peer.unavailable = False
                     await asyncio.sleep(0)
+                    if case.intent == "paused":
+                        require_zero_held(rig, zero_mark)
                     events.append(event)
                     assert not starts(rig) and 0 <= rig.bench.firmware.effective_limit() <= case.selected
                 assert (await healthy(c))["local_hold_verified"]
                 if not reusable_zero:
                     fresh_zero(rig.bench.device_calls[after_boot:])
                     fresh_zero(forwarded[after_boot_replies:])
+                if case.intent == "paused":
+                    require_zero_held(rig, zero_mark)
                 await ordinary_recovery(ChargeRig(rig, s, c, sock), case.selected, case.demand)
                 assert rig.bench.firmware.plans == plan and rig.peer.configuration == config
                 assert events == list(case.events)
