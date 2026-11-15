@@ -7,6 +7,14 @@ description: "Use when working on OCPP 1.6J messages, the central-system engine 
 
 Hard rules and hard-won facts for this repository. Check them before changing `custom_components/ocpp_hub/core/`.
 
+## Current runtime scope
+
+Read [the code navigation guide](../../../docs/code-navigation.md) first. The standalone iCS service loads `core/`
+by path as `ocpp_hub_core`; `core/prototype/` is current implementation code despite its name. Follow shared imports
+outside that directory too. The older `ocpp_hub` HA integration and the thin `ics_proxy` HA client are separate.
+The Raedian observations below apply to their named device/firmware, not automatically to iCS.
+The iCS service permits supported owner-app commands and guarded managed Start; its legacy unscoped Start is disabled.
+
 ## Protocol rules
 
 - Frames are JSON arrays: `[2, id, action, payload]` (CALL), `[3, id, payload]` (CALLRESULT), `[4, id, code, description, details]` (CALLERROR). Build them with `core/frames.py`, never by hand.
@@ -45,7 +53,11 @@ gh api -H "Accept: application/vnd.github.raw" repos/lbbrhzn/ocpp/contents/custo
 - `api.py`: `on_connect` (identity from the last path segment, one charge point per identity, what happens when the same charger reconnects).
 - `config_flow.py`, `const.py`: how it splits central and per-charger settings.
 
-What this hub does differently on purpose: the engine in `core/` imports nothing from Home Assistant, nothing writes to a charger without the owner's approval for that action, the vendor backend is mirrored read-only, and per-charger state lives in a snapshot instead of a metrics table. Where this hub differs from the reference without such a reason, assume the reference learned it from a real charger and check before deviating. Adapted code keeps its MIT notice in `NOTICE`.
+What the older hub does differently on purpose: its engine imports nothing from Home Assistant, writes require the
+owner's approval, and the vendor is mirrored read-only by default. The standalone iCS service uses its durable
+journal and configured managed-control policy; follow that runtime rather than applying older mirror restrictions
+to it. Check unexplained differences from the reference against actual device evidence. Adapted code keeps its MIT
+notice in `NOTICE`.
 
 ## Safety rules
 

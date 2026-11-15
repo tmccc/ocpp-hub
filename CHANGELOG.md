@@ -2,6 +2,11 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Add a code navigation guide for the active proxy, shared imports, control/recovery paths, test support and review
+  checkpoints. Separate current README controls from historical trials and the older Raedian HA integration.
+- Update agent language/runtime guidance, developer layout, release commands and roadmap status for the standalone
+  service and thin HA client. Documentation review does not run qualification or change the deployed installation.
+
 - Recover unanswered non-Start cloud events after failed retry storage without losing cancellation or replaying
   unknown Starts. Preserve saved Stop replies for ordinary settlement before operator retry.
 - Retry an initial native-introduction read after temporary SQL failure; keep pending owner Pause able to stop its

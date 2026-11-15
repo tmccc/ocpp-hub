@@ -1,3 +1,22 @@
+# OCPP Hub and standalone iCS proxy
+
+The current iCS installation uses an independent Python service and the thin `ics_proxy` Home Assistant client.
+The older Raedian `ocpp_hub` HA integration is a separate deployment domain; both use shared core code.
+
+| Start here | What it covers |
+| --- | --- |
+| [Code navigation and review](docs/code-navigation.md) | Runtime entry points, shared imports, module/test map and review checkpoints. |
+| [Current iCS controls and 32 A operation](#current-ics-controls-and-32-a-operation) | Managed Start/Pause/Return, idle current selection and commissioning limits. |
+| [Current iCS diagnostics](#current-ics-diagnostics) | Pending/unknown outcomes, local/cloud health and the HA diagnostic download. |
+| [Home Assistant client](#home-assistant-client-and-initial-deployment) | Thin-client boundary and its initial deployment evidence. |
+| [Recovery coverage](docs/recovery-coverage.md) | Finite input families, failure/recovery obligations and explicit exclusions. |
+| [Developer guide](docs/developer.md) / [release process](docs/release-process.md) | Verification, qualification evidence and separate service/client deployment procedures. |
+| [Older Raedian integration](#ocpp-hub) | Its HACS installation, entities and vendor mirror. |
+
+The dated trial sections preserve earlier 6 A operation and restrictions that were later extended. Read the current
+control section before using historical commands or interpreting old test counts. Historical observations remain
+evidence for their original source and conditions; they are not a current release qualification.
+
 ## Standalone iCS proxy — commissioned 32 A installation and supervised trial record
 
 Offline recovery verification is documented in the [coverage matrix](docs/recovery-coverage.md), with separate
@@ -28,6 +47,8 @@ an independently verified zero hold. Explicit HA Start, Pause and Return use the
 legacy unscoped Start path stays disabled. Fresh local readings and native history supply dashboard evidence.
 Deliberately disabled EV/reserve automations remain off. The chronological notes below include earlier 6 A trials;
 the later management sections describe the commissioned installation and the limits of its physical evidence.
+
+### Historical supervised trials — 8 November 2026
 
 Seven authorised trials connected the charger temporarily on 8 November 2026. The fifth included real charging through
 the proxy and Android app. It verified app Start/Stop/restart, local Stop with a zero-current hold, release back to app
@@ -546,6 +567,12 @@ the charger. `capture-bounded-baseline` is a separate read-only action for the o
 `run` still requires independently verified native6 before admission and explicit external route/configuration steps.
 The native strategy and `--car-pause-config` are mutually exclusive.
 
+## Standalone service and initial 6 A commissioning
+
+This section records the initial service configuration and its 6 A/no-managed-Start restrictions. Later
+[current controls](#current-ics-controls-and-32-a-operation) extend it with guarded managed Start and selected current.
+The disabled legacy unscoped Start remains distinct from those managed actions.
+
 `tools/managed_proxy.py` provides a persistent, bounded `app_schedule` mode with explicit `check`, `serve` and
 read-only `health` actions. It uses the same private configuration/native specification and durable journal as
 the commissioning engine. Only `serve` opens connections. Deploy it as a dedicated user service with boot linger,
@@ -575,6 +602,8 @@ preserved resources, disabled local Start and sufficient validity of the certifi
 The event-loop watchdog reports process responsiveness independently of cloud/native health. Listener certificate
 renewal requires a controlled service restart; file replacement alone cannot falsely renew its reported validity.
 
+## Current iCS diagnostics
+
 The active `ics_proxy` Home Assistant integration provides a **Download diagnostics** report from its integration
 entry. It uses cached status only, plus public installed software metadata; downloading never requests a charger
 reading, retries a control, or runs recovery. The control-mode entity's attributes and the existing delayed fault
@@ -600,6 +629,8 @@ without terminating supervision. Required atomic fault proof and command settlem
 Software metadata distinguishes the actual HA/client version and an available installed client `BUILD` stamp from
 source fingerprints. The proxy fingerprint covers the installed core Python sources and its managed/reporting/trial
 entry points; the client fingerprint covers its installed Python sources. A fingerprint is not a claimed Git commit.
+
+## Historical service commissioning — 9–10 November 2026
 
 A bounded managed service was installed on 2026-11-09 in an isolated runtime with immutable code, private durable
 state, user-service boot linger/restart/watchdog and a separate minute health timer. The initial release was not
@@ -636,6 +667,11 @@ positive minute reading was 03:51:46 and the first zero 03:52:46; the session st
 The reason for earlier zero draw is not established. All 445 minute checks before 07:25 were healthy; three brief alerts recovered
 automatically with no service restart or persistent fault. The owner accepts overnight scheduling as complete and
 does not require another active-load 06:00 cutoff test.
+
+## Home Assistant client and initial deployment
+
+The initial deployment below exposed Pause/Return under the then-commissioned 6 A limit. The later
+[current controls](#current-ics-controls-and-32-a-operation) add regular managed Start and idle current selection.
 
 Home Assistant now uses a separately authenticated management connection to this existing durable service for
 measured status/history, fault notifications, an intentional local Stop hold and explicit return to app control.
@@ -697,6 +733,8 @@ record presented as current when its source expires. The existing local 24-hour 
 template rendering and dashboard readback verified the 5.614 kWh latest session and a continuous history table.
 All 21 functional automations retained their original on/off states, including all five deliberately disabled ones.
 Final native and health checks passed at zero power with no unexpected client error; the planned outage is logged.
+
+## Native history and recovery
 
 Managed operation also supports an explicitly acknowledged historical-retention policy. Missing old records no
 longer block charging: full admitted bodies and every observed completed-record version are retained in the private
@@ -849,6 +887,8 @@ cases. Final independent native/ledger/HA checks verified app/schedule restorati
 unchanged full configuration/saved schedule/all21 functional automation states and no fault. Native history returned
 26 records against29 archived, with three older admitted records omitted and all complete original bodies retained.
 The timed test button and fresh progress are published on the charger dashboard; unrestricted Start remains disabled.
+
+## Current iCS controls and 32 A operation
 
 Home Assistant also exposes **Start charging** for a regular locally issued session at the selected current. Legacy
 six-ampere operation remains the default until the explicit current capability below is commissioned. Start can run
@@ -1061,6 +1101,10 @@ and Home Assistant/permanent service setup remained unchanged. Longer unattended
 ---
 
 ## Offline iCS coexistence prototype — this branch
+
+This is the original offline prototype record. Its trial restrictions and test counts are historical; the
+[current service controls](#current-ics-controls-and-32-a-operation) and [navigation guide](docs/code-navigation.md)
+describe the commissioned installation and its active source paths.
 
 This branch builds on OCPP Hub 0.2.1 (`1229028b4b56cb474b04686e5fdf71f079a0888f`) with an isolated durable gateway
 and an offline connection supervisor in `custom_components/ocpp_hub/core/prototype/`.
@@ -1373,7 +1417,11 @@ Original upstream documentation follows.
   <a href="LICENSE"><img src="https://img.shields.io/github/license/MarkBovee/ocpp-hub" alt="License"></a>
 </p>
 
-# OCPP Hub
+## OCPP Hub
+
+The remainder describes the older Raedian HA integration and its vendor mirror. Installing it is separate from
+deploying the standalone iCS service or `ics_proxy` client described above. Shared engine modules under `core/`
+remain relevant to the current service; see the [runtime boundaries](docs/code-navigation.md#runtime-boundaries).
 
 OCPP Hub turns Home Assistant into the local OCPP 1.6 backend of your EV charger. Home Assistant sees and controls the
 charger directly, and the manufacturer's cloud can still get a copy of everything the charger says, so the vendor app
@@ -1387,7 +1435,7 @@ Home Assistant, and the hub keeps the vendor's backend informed on the side.
 > standard parts (status, metering, limits, start and stop), but have not been tried. The [changelog](CHANGELOG.md)
 > says what each release really does, and [docs/roadmap.md](docs/roadmap.md) what is proven and what is not yet.
 
-## Features
+### Features
 
 - **Local OCPP 1.6J server** on a port you choose. No cloud service of ours is involved.
 - **Live entities** for status, power, energy, current and voltage per phase, offered current, plugged in, charging,
@@ -1400,7 +1448,7 @@ Home Assistant, and the hub keeps the vendor's backend informed on the side.
   charger online with its sessions. Commands from the vendor are refused unless you allow them, and then always under
   your ceiling.
 
-## Supported chargers
+### Supported chargers
 
 | Charger | Status |
 |---------|--------|
@@ -1409,9 +1457,9 @@ Home Assistant, and the hub keeps the vendor's backend informed on the side.
 
 OCPP 2.0.1 is not supported.
 
-## Install
+### Install
 
-### HACS (recommended)
+#### HACS (recommended)
 
 [![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=MarkBovee&repository=ocpp-hub&category=integration)
 
@@ -1422,13 +1470,13 @@ OCPP 2.0.1 is not supported.
 
 [![Open your Home Assistant instance and start setting up OCPP Hub.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=ocpp_hub)
 
-### Manual
+#### Manual
 
 Copy `custom_components/ocpp_hub` into the `custom_components` folder of your Home Assistant configuration and restart.
 
 Home Assistant 2026.10 or newer is required.
 
-## Connect a charger
+### Connect a charger
 
 In the charger's OCPP settings, set the backend address to `ws://<Home Assistant IP>:<port>`. Most chargers add their
 own id to that address. The port has no authentication, so keep it on a trusted network and never forward it to the
@@ -1440,7 +1488,7 @@ for certified installers.
 When the charger connects, Home Assistant creates a device with its entities and shows a notification with the
 manufacturer, model, firmware and serial number.
 
-## Entities
+### Entities
 
 Entity ids are fixed by a key, not by the language of your instance. `<id>` is the charger's id in lower case.
 
@@ -1465,7 +1513,7 @@ its sensors are unavailable and `_connected` is off.
 
 A ready dashboard is in [docs/dashboard.md](docs/dashboard.md).
 
-## Control and safety
+### Control and safety
 
 - **Ceiling.** The options hold a current ceiling (default 16 A). Nothing the hub or the vendor sends goes above it.
   Set it at or below what your installer configured; the hub never raises the charger's own hardware limit.
@@ -1480,7 +1528,7 @@ A ready dashboard is in [docs/dashboard.md](docs/dashboard.md).
 
 Every write to the charger is logged with the prefix `[write]`.
 
-## Charge sessions
+### Charge sessions
 
 A charge runs from the charger's `StartTransaction` to its `StopTransaction`. `_current_session` shows the energy of
 the running charge with its start, duration, tag, peak and average power and limits as attributes. `_last_session`
@@ -1490,12 +1538,12 @@ Every finished charge is kept in Home Assistant's storage without limit (about 3
 `ocpp_hub.get_sessions` returns the history, newest first, optionally for one `charger_id` and up to `limit`. A charge
 that was running while Home Assistant restarted is not recorded.
 
-## Schedules and the charging plan
+### Schedules and the charging plan
 
 There are three ways to tell the charger when it may charge. All of them write one recurring OCPP profile that the
 charger keeps on its own, so the plan works even while Home Assistant is down.
 
-### The charging plan
+#### The charging plan
 
 The plan is a list of windows per weekday. Inside a window the charger gets *Limit inside the blocks* (your ceiling
 unless set), outside them *Limit outside the blocks* (a pause unless set). Both are in the options.
@@ -1512,7 +1560,7 @@ An empty list removes the hub's profile. The plan shows in `_app_plan` and in th
 `calendar.ocpp_hub_<id>_charging_plan`, which you can open from the Calendar panel or use in automations. The calendar
 is read-only.
 
-### With the Raedian app
+#### With the Raedian app
 
 With *Commands from the backend* set to *Pass them on to the charger*, the Raedian app and Home Assistant share the same
 plan:
@@ -1528,7 +1576,7 @@ part of it; the layout was worked out from captured traffic and is documented in
 This part is **experimental**: the charger also has a planning of its own that the hub does not write to, and whether
 the firmware enforces it next to the hub's profile is not known yet.
 
-### A daily schedule, or a schedule helper
+#### A daily schedule, or a schedule helper
 
 - `ocpp_hub.set_schedule` sets a daily schedule as a list of a time and the limit from then on, for example
   `[{time: "00:00", limit: 6}, {time: "07:00", limit: 16}]`.
@@ -1541,7 +1589,7 @@ written wins. When a limit or schedule replaces the plan, the plan is emptied in
 longer follows. The charger counts recurring profiles from a fixed point in UTC, so the change between summer and
 winter time moves a schedule by an hour until it is written again.
 
-## Vendor mirror
+### Vendor mirror
 
 Open the integration's options and fill in:
 
@@ -1565,7 +1613,7 @@ What the mirror does:
 
 Two diagnostic sensors per charger, `_mirror_status` and `_mirror_queue`, show the state of the link.
 
-## Troubleshooting
+### Troubleshooting
 
 - **The charger does not connect.** Check the address in the charger (`ws://`, not `wss://`, and the port you chose)
   and that nothing else listens on that port.
@@ -1577,7 +1625,7 @@ Two diagnostic sensors per charger, `_mirror_status` and `_mirror_queue`, show t
 - **Read the Raedian app's messages.** `python tools/raedian_frames.py home-assistant.log` lists the protocol frames in
   a log and marks the commands the hub does not decode yet.
 
-## Contributing
+### Contributing
 
 Issues and pull requests are welcome. See [docs/developer.md](docs/developer.md) for the layout and complete offline
 qualification procedure. Set up the pinned Python 3.14 environment and run static checks with:
@@ -1603,13 +1651,13 @@ a fake charger over a real websocket.
 Do not post logs with id tags, serial numbers, addresses or credentials in issues. Security problems go through
 [SECURITY.md](SECURITY.md).
 
-## Disclaimer
+### Disclaimer
 
 OCPP Hub is an independent project. It is not made, endorsed or supported by Raedian or by any charger manufacturer,
 and not by Home Assistant. Product names are used only to say what the integration works with. Writing to a charger
 changes how it charges; use it within the limits of your installation, at your own risk.
 
-## License
+### License
 
 Apache-2.0. Parts of the design follow [ha-ocpp-relay](https://github.com/michael-adler/ha-ocpp-relay) (MIT) and the
 behaviour of [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) (MIT); see [NOTICE](NOTICE).

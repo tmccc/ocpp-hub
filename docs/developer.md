@@ -1,14 +1,22 @@
 # Developer guide
 
+Start with the [code navigation guide](code-navigation.md) for the active service, its shared imports, control flows,
+test ownership and review checkpoints. The two HA integration domains have different runtime and deployment roles.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `custom_components/ocpp_hub/core/` | The OCPP engine. Pure Python, no Home Assistant imports, `mypy --strict` clean. |
-| `custom_components/ocpp_hub/` | The Home Assistant layer: config flow, setup, entities, services. Thin; it holds no protocol logic. |
+| `tools/managed_proxy.py`, `tools/managed_reporting.py`, `tools/trial_proxy.py` | Persistent iCS service, status output and HA-free core loader/preflight. |
+| `custom_components/ocpp_hub/core/prototype/` | Current iCS protocol, native observation, managed controls, persistence and recovery. The directory name is historical. |
+| `custom_components/ocpp_hub/core/` | Shared engine modules, loaded as `ocpp_hub_core` by the standalone service. No Home Assistant imports. |
+| `custom_components/ics_proxy/` | Active thin HA client: management API, polling, entities, notifications and diagnostics. |
+| `custom_components/ocpp_hub/` outside `core/` | Older Raedian HA integration, with its own listener, entities and services. Separate from the iCS client. |
 | `tests/` | Engine tests (plain pytest, no Home Assistant). `conftest.py` loads the core by path as `ocpp_hub_core`; `fake_charger.py` and `fake_vendor.py` are real websocket peers. |
-| `tests_ha/` | Tests of the Home Assistant layer: config flow, setup, entities, diagnostics, the mirror options. They need the Home Assistant test plugin, so they run in `.venv-ha`. |
-| `tools/` | `validate.py` (CI parity in one command), `version.py`, `check_translations.py`, `deploy_ha.py`, `release_gate.py`, `mutation_check.py`. |
+| `tests_model/` | Finite input registry, parameter generators, recovery obligations and model tests. Some registered families also live in `tests/`. |
+| `tests_ha_proxy/` | Actual-core tests of the active iCS client on both supported HA runtimes. |
+| `tests_ha/` | Tests of the older `ocpp_hub` integration, using the pinned HA test plugin. |
+| `tools/` | Service/admin entry points, validation, qualification/evidence auditing, HA deployment and release helpers. |
 | `.agents/skills/` | Skills for coding agents: `ocpp-expert` and `home-assistant`. |
 
 ## Setup and checks
@@ -25,6 +33,8 @@ integrations, version/translation/YAML checks and `git diff --check`. The line l
 Full validation re-audits raw execution evidence against the current clean commit; it never treats a report's own
 success flag as proof or silently launches the combined suite in a single process. An explicit `--tests-only -k`
 selection is useful for development and is labelled targeted, with the remaining suites outside that result.
+Documentation-only changes need link/path/symbol checks and `git diff --check`, without executing qualification.
+Code review begins with static reading; a review prompt is not permission to run tests or deployment commands.
 
 The Home Assistant layer tests need their own virtualenv. Pin the plugin to the Home Assistant version of the server you deploy to (the plugin release pins it):
 
@@ -136,9 +146,19 @@ Recorded charger sessions go in `tests/fixtures/` with their stored bytes and co
 
 ## Deploying to a Home Assistant server
 
+Follow [the release process](release-process.md) after the owner requests deployment. For the current thin client,
+select both its domain and the existing HA container explicitly:
+
 ```bash
-python tools/deploy_ha.py --dry-run     # shows the target and the files, changes nothing
-python tools/deploy_ha.py --batch       # checks, back up, deploy, verify by sha256
+python tools/deploy_ha.py --domain ics_proxy --container "$HA_CONTAINER" --dry-run
+OCPP_QUALIFICATION_REPORT="$QUALIFICATION_BUNDLE" python tools/deploy_ha.py \
+  --domain ics_proxy --container "$HA_CONTAINER" --batch \
+  --collection-executors "$TRUSTED_COLLECTION_EXECUTORS"
 ```
 
-It reads `HA_HOST`, `HA_SSH_USER` and `HA_SSH_KEY` (a path) from the git-ignored `.env`, never a password. Restarting Home Assistant is a separate step.
+Use the caller-selected executor map appropriate to the evidence. A restart requires its own authorization and the
+documented restart options. This installs only the HA client, leaving the standalone service under its own supervisor.
+
+For the older Raedian integration, use `--domain ocpp_hub`. Without `--container`, the helper uses the SSH target from
+`HA_HOST`, `HA_SSH_USER` and `HA_SSH_KEY` in the git-ignored `.env`. The default domain is `ocpp_hub`; omitting the
+domain does not select the iCS client. Neither transport installs or replaces the standalone proxy service.

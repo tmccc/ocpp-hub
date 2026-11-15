@@ -4,9 +4,28 @@ The one place that says how far the project is. Update it in the same change tha
 
 ## Goal
 
-Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows it as entities, and keeps the vendor backend informed through a read-only mirror, replacing the `lbbrhzn/ocpp` integration.
+The repository has two deployment domains: the standalone iCS proxy with its thin `ics_proxy` HA client, and the
+older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
+Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
-## Done
+## Current iCS implementation — 15 November 2026
+
+- [x] Recovery and diagnostic corrections through implementation `71710af` are committed, pushed and deployed to
+  the standalone service and HA client. Coverage includes interrupted work, native/storage recovery, saved Stop
+  acknowledgements, Boot binding and truthful pending/unknown diagnostics. See the changelog and coverage matrix.
+- [x] Qualification evidence is recorded with its actual provenance: retained engine results at `52ce581` and fresh
+  HA results at `71710af`, under the owner's instruction not to rerun engine qualification. The latter commit changes
+  one HA test body; this is composed evidence, not a new four-suite same-commit qualification.
+- [x] This installation's 32 A commissioning handover is closed. Managed Start/Pause/Return and idle-only current
+  selection are implemented. The earlier trial notes do not redefine today's supported control path.
+- [ ] Resolve the vendor cloud connection failure first observed on 14 November. As of the 15 November investigation,
+  local control remained healthy at paused zero while cloud openings were refused on both configured server nodes,
+  including through a different public IP. No internal vendor cause or wider outage was established.
+
+The dated entries below retain historical observations and physical limits. The Raedian-specific open items remain
+separate from the delivered iCS installation.
+
+## Verified Raedian milestones
 
 - [x] Engine in `core/`: frames, charger session, central system, commands, transaction-id map. No Home Assistant imports, `mypy --strict`, tested over a real websocket with a fake charger (PR 2).
 - [x] Vendor mirror in `core/`: store-and-forward queue, replay of boot and status, transaction-id pairing, vendor commands refused, Basic auth only when configured (PR 2).
@@ -19,7 +38,10 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 
 - [x] First real charge with a car (2026-10-21): the NEO obeyed a 6 A station profile (5.9 A per phase, about 4.05 kW), reported preparing, charging, suspended by the car, finishing and available, and the charge was stored with its numbers (5.0 kWh in 84 minutes, stopped by the car being unplugged).
 
-## In progress
+## Historical implementation and commissioning milestones
+
+These dated checkboxes retain the evidence state recorded at each milestone. The current iCS summary above
+supersedes older deployment restrictions; `[~]` here does not mean that the current service is awaiting deployment.
 
 - [~] Broader offline failure/recovery qualification (2026-11-13): source-linked matrix; complete finite
   Start/Boot/current/Stop/cloud-debt and actual HA lifecycle/receipt families; explicit exclusions, real failure
@@ -190,7 +212,7 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 - [~] Control: a charge limit `number` (0 to the ceiling, default 16 A, under 6 A pauses) and a start/stop `switch`, through one guarded write path in `core/control.py`. Tested with a fake charger; whether the NEO obeys a charging profile is unproven.
 - [~] Passing the vendor's commands on to the charger (option, off by default): everything except Reset, firmware and diagnostics, under the current ceiling, with transaction ids translated. Tested against a fake vendor and charger; not yet tried with the real vendor.
 
-## Open
+## Open Raedian and older-integration work
 
 - [ ] Prove the charging plan on the charger and in the app: the app's reading of the plan shows the hub's windows (the format of a filled answer was assumed equal to a write; the first answer of the charger seeds the plan), and the charger follows the recurring profile. What the Raedian planning on the charger itself does is unknown; the hub no longer writes to it.
 
@@ -200,11 +222,11 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 - [ ] Prove that the NEO follows a recurring daily schedule (set one, watch the first change of period). The service and the read-back exist.
 - [ ] Persist the mirror queue and a charge that is running across a restart of Home Assistant (today both are lost; documented in the README).
 - [ ] Optional username default for the vendor: use the charger's serial when only a password is given. Build only if the vendor answers HTTP 401.
-- [ ] Make the repository public, switch on HACS validation, tag a release. Version and changelog are still `0.1.0` / unreleased.
+- [ ] Complete the older integration's public/HACS release work. Use `pyproject.toml` and both manifests for the current version, and the changelog for unreleased work; this milestone does not describe the standalone service deployment.
 - [ ] Remove the unused add-on copy on the Home Assistant server (needs the owner's yes).
 - [ ] Option to switch off the connect notification.
 
-## Known small follow-ups (P2)
+## Recorded older-integration follow-ups (P2)
 
 - A vendor can send many `TriggerMessage` requests; the answers are not rate limited.
 - A vendor transaction id the mirror cannot map is logged on every frame.
@@ -214,7 +236,7 @@ Home Assistant is the real local OCPP 1.6 backend of a Raedian NEO 22 kW, shows 
 
 ## Decisions that differ from the first plan
 
-- One integration, no add-on and no MQTT; the hub listens on port 9000 directly, without the trial run on 9001.
+- The original Raedian design used one HA integration without an add-on or MQTT. The later iCS deployment uses an independent service and thin HA client; it does not install that older HA listener.
 - `ClearChargingProfile` from the vendor is answered `Unknown`, not `Rejected`.
 - The mirror sensors are per charger, not one for the whole hub.
 - Configuration is read one key per request, and the hub asks for a boot and a status with `TriggerMessage`, because the NEO answers only one key at a time and sends neither after a hub restart.
