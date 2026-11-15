@@ -130,6 +130,7 @@ def malformed_reply(shape, identifier, result):
 @pytest.mark.parametrize("position", ["status", "pause", "receipt"])
 async def test_raw_reply_failures_never_retry_and_later_recover(actual_hass, peer, shape, position):
     entry = await setup(actual_hass, peer)
+    revision = peer["state"]["control_revision"]
     peer["pending_receipt"] = position == "receipt"
 
     # Change only one class of actual peer response; every other management exchange uses its ordinary contract.
@@ -143,15 +144,23 @@ async def test_raw_reply_failures_never_retry_and_later_recover(actual_hass, pee
         assert entry.runtime_data.problem_since is not None
         assert set(peer["commands"]) == {"status"}
     else:
-        message = (
-            "request was recorded; physical confirmation is still pending"
-            if position == "receipt"
-            else "could not be reached or authenticated|could not confirm|invalid command receipt"
-        )
-        with pytest.raises(HomeAssistantError, match=message):
+        if position == "receipt":
+            messages = ("The request was recorded; physical confirmation is still pending",)
+        elif shape == "recursive":
+            # The pinned decoders differ: depth refusal and a parsed invalid array are both valid refusals.
+            messages = (
+                "The request may have been sent; its outcome is unknown. Check the charger status",
+                "The local charger proxy could not confirm this request",
+            )
+        elif shape in ("empty", "truncated", "oversized"):
+            messages = ("The request may have been sent; its outcome is unknown. Check the charger status",)
+        else:
+            messages = ("The local charger proxy could not confirm this request",)
+        with pytest.raises(HomeAssistantError) as raised:
             await actual_hass.services.async_call(
                 "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
             )
+        assert str(raised.value) in messages
         assert peer["commands"].count("pause") == 1
         assert peer["commands"].count("receipt") == int(position == "receipt")
         assert peer["state"]["desired_control"] == "paused"
@@ -160,6 +169,14 @@ async def test_raw_reply_failures_never_retry_and_later_recover(actual_hass, pee
     await entry.runtime_data.async_refresh()
     assert entry.runtime_data.last_update_success and entry.runtime_data.fresh_healthy
     assert entry.runtime_data.problem_since is None
+    if position != "status":
+        assert peer["commands"].count("pause") == 1
+        assert peer["commands"].count("receipt") == int(position == "receipt")
+        assert peer["state"]["desired_control"] == "paused"
+        assert peer["state"]["control_revision"] == revision + 1
+        assert peer["state"]["station_ceiling_a"] == 0
+        assert peer["state"]["local_hold_verified"] is True
+        assert peer["state"]["owner_control_enabled"] is False
 
 
 # Intent: a valid padded reply below the actual transport bound remains usable at all three exchange positions.
