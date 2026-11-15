@@ -2,13 +2,13 @@
 
 import copy
 import json
-import sys
 import uuid
 
 import pytest
 from ocpp_hub_core.control import HUB_PROFILE_ID
+from ocpp_hub_core.prototype.managed_native_repair import AUDITS, REVOCATIONS
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, PROOF, recoverable_fault
-from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.store import fingerprint
 
 from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_release_recovery import explicit_release_pause, release_bench
@@ -69,40 +69,28 @@ async def test_legacy_native_repair_retains_strict_refusal_after_original_conten
         else:
             b.rig.bench.history[0]["original_record"]["preserve"].append(4)
             expected = "native bounded handover must preserve every original history record"
-        observed_errors = []
-        previous_trace = sys.gettrace()
-
-        # Observe actual propagated exceptions at the repair caller without replacing any engine decision or result.
-        def trace_refusal(frame, event, argument):
-            if (
-                event == "exception"
-                and frame.f_code.co_name == "reconcile_owner_release"
-                and frame.f_code.co_filename.endswith("/managed_release_recovery.py")
-            ):
-                _, error, _ = argument
-                observed_errors.append(
-                    {
-                        "type": type(error).__name__,
-                        "detail": str(error),
-                        "security_error": isinstance(error, SecurityError),
-                    }
-                )
-            return trace_refusal
-
-        sequence, requests = c.native.read_sequence, len(b.rig.peer.requests)
+        sequence, requests, revision = c.native.read_sequence, len(b.rig.peer.requests), g.controls._revision
         try:
-            sys.settrace(trace_refusal)
             for _ in range(3):
                 assert (await c.tick())["state"] == "attention"
                 if not recoverable_fault(c, j.get("managed_control_fault", {})):
                     break
         finally:
-            sys.settrace(previous_trace)
             b.rig.peer.configuration = original_configuration
             b.rig.bench.history = original_history
-        strict_errors = [row for row in observed_errors if row["security_error"] and row["detail"] == expected]
-        assert strict_errors, observed_errors
-        assert c.native.read_sequence >= sequence + len(strict_errors) and len(b.rig.peer.requests) > requests
+        # The durable typed refusal is the contract, whichever restrictive caller first observed the real content.
+        refusal = copy.deepcopy(j.get(REVOCATIONS, {}).get(fingerprint(fault)))
+        assert refusal is not None
+        assert refusal["typed_refusal"] == {
+            "stage": "configuration" if conflict == "configuration" else "history",
+            "detail": expected,
+        }
+        assert refusal["fault"] == fault and refusal["epoch"] == epoch and refusal["boot"] == boot
+        assert refusal["acknowledgement"] == acknowledgement
+        assert refusal["original_native_failure"] == original_diagnostic and refusal["revision"] == revision
+        assert sequence < refusal["sequence"] <= c.native.read_sequence
+        assert len(b.rig.peer.requests) > requests
+        assert fingerprint(fault) not in j.get(AUDITS, {}) and j.get(ACK) is None
         after_refusal = {
             "fault_unchanged": j.get("managed_control_fault") == fault,
             "ack_unchanged": j.get(ACK) == acknowledgement,
@@ -118,7 +106,7 @@ async def test_legacy_native_repair_retains_strict_refusal_after_original_conten
                 {
                     "legacy_input": kind,
                     "peer_conflict": conflict,
-                    "observed_reconciliation_exceptions": strict_errors,
+                    "observed_durable_native_refusal": refusal,
                     "after_refusal_before_restore": after_refusal,
                     "after_restore": {
                         "fault": j.get("managed_control_fault"),
@@ -139,7 +127,11 @@ async def test_legacy_native_repair_retains_strict_refusal_after_original_conten
             )
             + "\n"
         )
-        print(json.dumps({"kind": kind, "conflict": conflict, "strict_reads": len(strict_errors), **after_refusal}))
+        print(
+            json.dumps(
+                {"kind": kind, "conflict": conflict, "strict_audit_sequence": refusal["sequence"], **after_refusal}
+            )
+        )
         assert j.get("managed_control_fault") is not None, (
             "restored peer data erased an actually observed strict refusal through the old availability Pause proof",
             after_refusal,
