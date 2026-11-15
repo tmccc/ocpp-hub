@@ -216,7 +216,8 @@ class ManagedController:
                     raise RecoveryRequiredError("owner Stop claim was superseded")
                 if stop_ticket is None:
                     stop_ticket = control["ticket"]
-                    j.put("managed_owner_pause", {"ticket": stop_ticket, "revision": intent.revision})
+                    # Preserve the original Pause identity used by Return and historical Start recovery.
+                    j.put("managed_owner_stop", {"ticket": stop_ticket, "revision": intent.revision})
 
             try:
                 native = await self.native.read()
@@ -308,6 +309,8 @@ class ManagedController:
         receipt = local_start_receipt(j)
         if control.get("uncertain") and (
             j.get("managed_owner_pause")
+            == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
+            or j.get("managed_owner_stop")
             == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
             or receipt.get("stage") == "unsent"
             and receipt.get("settled_ticket") == control.get("ticket")
@@ -653,6 +656,18 @@ class ManagedController:
             return
         j = self.session.journal
         control = j.get("control", {})
+        if control.get("uncertain") and j.get("managed_owner_stop") == {
+            "ticket": control.get("ticket"),
+            "revision": expected.revision,
+        }:
+            # Verify this exact protective Stop before treating Return as a positive release attempt.
+            try:
+                await self.maintain_pause()
+            except RecoveryRequiredError, UnavailableError, TimeoutError:
+                return  # Closed zero and selective cleanup can finish while the same Return remains accepted.
+            control = j.get("control", {})
+            if self.requests.intent() != expected or control.get("uncertain"):
+                return
         receipt = local_start_receipt(j)
         if (
             control.get("start_pending")

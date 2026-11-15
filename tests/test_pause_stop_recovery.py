@@ -170,8 +170,9 @@ async def test_faulted_pause_persistent_meter_witness(tmp_path, tls, unused_tcp_
 # Intent: one clean owner Pause settles its exact failed Stop claim after independent genuine closed zero.
 # Why: replacing the original Pause ticket must not strand uncertainty when its ordinary session really closes.
 @pytest.mark.parametrize("failure", ["rejected", "unanswered"])
+@pytest.mark.parametrize("return_before_tick", [False, True])
 async def test_clean_pause_settles_failed_stop_after_genuine_closure(
-    tmp_path, tls, unused_tcp_port, monkeypatch, failure
+    tmp_path, tls, unused_tcp_port, monkeypatch, failure, return_before_tick
 ):
     async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
         c, j, rig, controls = b.c, b.session.journal, b.rig, b.session.gateway.controls
@@ -208,19 +209,32 @@ async def test_clean_pause_settles_failed_stop_after_genuine_closure(
         assert failed == [{"transactionId": local}]
         control = j.get("control")
         assert control["ticket"] != original_pause["ticket"] and control["uncertain"]
+        assert j.get("managed_owner_pause") == original_pause
+        assert j.get("managed_owner_stop") == {"ticket": control["ticket"], "revision": revision}
         assert j.active() == local and not controls.stop_acknowledged(local)
         assert rig.bench.firmware.current == rig.bench.firmware.effective_limit() == 0
         assert not j.get("managed_control_fault")
 
         # A real charger lifecycle closes the session independently of whether its Stop command was accepted.
         await genuine_stop(b, local)
-        status = await c.tick()
-        assert status["local_hold_verified"] and c.requests.receipt(request)["state"] == "completed"
+        returning = uuid.uuid4().hex
+        if return_before_tick:
+            c.command(returning, "app_control", revision)
+        for _ in range(3):
+            status = await c.tick()
+        assert c.requests.receipt(request)["state"] == "completed"
         assert not j.get("control")["uncertain"]
         assert status["local_healthy"] and status["normal_start_ready"]
-        assert c.requests.intent().mode == "paused" and c.requests.intent().revision == revision
+        if return_before_tick:
+            assert c.requests.receipt(returning)["state"] == "completed"
+            assert c.requests.intent().mode == "app" and c.requests.intent().revision == revision + 1
+            assert rig.bench.firmware.effective_limit() == 6
+        else:
+            assert status["local_hold_verified"] and c.requests.intent().mode == "paused"
+            assert c.requests.intent().revision == revision and rig.bench.firmware.effective_limit() == 0
+        assert j.get("managed_owner_pause") == original_pause
         assert j.get("trial_phase") == "active" and not j.get("managed_control_fault")
-        assert not mp.starts(rig) and rig.bench.firmware.effective_limit() == 0
+        assert not mp.starts(rig)
         stops = [frame for frame in rig.bench.device_calls if frame[2] == "RemoteStopTransaction"]
         assert len(stops) == 1 and stops[0][3] == {"transactionId": local}
 
@@ -241,6 +255,7 @@ async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
         original_control = copy.deepcopy(j.get("control"))
         original_ticket = original_control["ticket"]
         original_stop_ticket = controls._stop_ticket
+        original_stop = copy.deepcopy(j.get("managed_owner_stop"))
         revision = c.requests.intent().revision
         attempts = []
 
@@ -262,7 +277,7 @@ async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
             effect = "INSERT INTO review_pause_binding_child VALUES(123);"
         j.db.execute(
             "CREATE TEMP TRIGGER review_pause_binding_refusal BEFORE INSERT ON meta "
-            "WHEN NEW.key='managed_owner_pause' BEGIN "
+            "WHEN NEW.key='managed_owner_stop' BEGIN "
             "SELECT review_pause_binding_attempt(json_extract(NEW.value,'$.ticket')); "
             + effect
             + " END"
@@ -278,6 +293,7 @@ async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
         assert j.get("control") == original_control
         assert controls._stop_ticket == original_stop_ticket
         assert j.get("managed_owner_pause") == original_pause
+        assert j.get("managed_owner_stop") == original_stop
         assert c.requests.intent().mode == "paused" and c.requests.intent().revision == revision
         assert j.active() == local and j.get("control")["uncertain"]
         assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)

@@ -5,6 +5,8 @@
 - Complete normal Start observation after a paused process/connection recovery, so an established session does
   not expire at its startup deadline. Bind a Pause's replacement Stop claim so genuine closed zero can settle
   rejected or unanswered Stop without another owner request.
+- Preserve the original Pause receipt separately from its Stop proof, including temporary-schedule cleanup and
+  Return requested before the next settling poll. Commit the Stop claim and its proof together before dispatch.
 - Keep bounded local/cached Authorize available while cloud registration is incomplete, preserving cached denial,
   expiry and actual cloud decisions. Show verified local app/schedule control with an explicit cloud-outage label.
 - Add real-peer recovery, registration and HA freshness regressions, including failed replies and permission changes

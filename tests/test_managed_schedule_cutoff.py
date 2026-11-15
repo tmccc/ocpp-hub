@@ -2492,7 +2492,10 @@ async def test_pending_increase_crosses_daily_start(
 # Intent: timer retirement preserves an independent session, but a subsequent explicit Pause owns its Stop.
 # Why: Return must wait for selective cleanup even when that independent session had continued at the selected cap.
 @pytest.mark.parametrize("demand", [False, True])
-async def test_independent_continuation_pause_deferred_return(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+@pytest.mark.parametrize("stop_reply", ["Accepted", "Rejected"])
+async def test_independent_continuation_pause_deferred_return(
+    tmp_path, tls, unused_tcp_port, monkeypatch, demand, stop_reply
+):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=32)
         await b.c.current.settle()
@@ -2510,6 +2513,15 @@ async def test_independent_continuation_pause_deferred_return(tmp_path, tls, unu
         assert b.device.effective_limit() == 32 and b.session.journal.active() == local and not b.stops()
 
         pause_id = uuid.uuid4().hex
+        ordinary_answer = b.device.answer
+
+        # A Stop refusal must not make selective cleanup and the requested Return depend on each other.
+        def answer_stop(action, payload):
+            if action == "RemoteStopTransaction" and stop_reply == "Rejected":
+                return {"status": "Rejected"}
+            return ordinary_answer(action, payload)
+
+        b.device.answer = answer_stop
         b.c.command(pause_id, "pause", b.c.requests.intent().revision)
         await b.c.pause_task
         assert b.device.effective_limit() == 0 and b.stops() == [local]
@@ -2544,6 +2556,7 @@ async def test_independent_continuation_pause_deferred_return(tmp_path, tls, unu
         assert b.c.requests.receipt(pause_id)["state"] == "completed"
         assert b.c.requests.receipt(return_id)["state"] == "completed"
         assert b.c.current.selected() == b.device.effective_limit() == 32 and set(b.device.plans) == {9}
+        b.device.answer = ordinary_answer
         local2 = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
         assert local2 != local and (await healthy(b.c))["current_a"] == 32
         assert b.stops() == [local] and not starts(b.rig)

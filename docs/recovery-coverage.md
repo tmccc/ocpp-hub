@@ -120,6 +120,8 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
   a genuine charger lifecycle. The original Pause must recover local readiness without another owner command.
   Statement and deferred-COMMIT refusals at its replacement binding retain the prior claim and later recover;
   corresponding owner-epoch persistence failures after accepted Start retain Pause, zero and unknown Start debt.
+  Return before the first settling poll and temporary-cleanup/Stop-refusal combinations must complete the same
+  requests after genuine closure, without a second owner command or a guessed Start/Stop.
 - `test_trial_auth.py` and `test_prototype_runtime.py` cover connected/Pending/Rejected registration, bounded local
   approval, cached denial/expiry, real TLS and current cloud refusals/lost replies. Stop, revocation and expiry
   during physical readback remain restrictive on both registered and locally authorized paths.
