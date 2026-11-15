@@ -328,7 +328,7 @@ class LocalControl:
             if self.desired() != limit:
                 raise DeniedError("desired ceiling changed during preparation")
 
-        async with self.peer.sequence(0, check) as call:
+        async with self.peer.sequence(0 if limit == 0 else 1, check) as call:
             if not self.ready:
                 await self._cap(call, limit, epoch, guard=check)
 
@@ -357,7 +357,7 @@ class LocalControl:
             if guard is not None:
                 guard()
 
-        async with self.peer.sequence(1, check) as call:
+        async with self.peer.sequence(0 if limit == 0 else 1, check) as call:
             answer = await self._cap(call, limit, epoch)
         check()
         self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))

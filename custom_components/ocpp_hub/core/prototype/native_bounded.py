@@ -168,6 +168,10 @@ def require_native(
     _require_ready(native, closed, allow_unplugged, closing_local)
 
 
+class NativeReadinessError(SecurityError):
+    """Strict native comparisons passed, but a closed zero-output prerequisite is not yet satisfied."""
+
+
 # Closed/zero is an operation prerequisite, not proof of a new immutable native contradiction.
 def _require_ready(
     native: HandoverEvidence, closed: bool, allow_unplugged: bool, closing_local: int | None = None
@@ -182,7 +186,7 @@ def _require_ready(
         or native.output_limit_a != 0
         or any(value != 0 for value in native.currents_a + native.powers_w)
     ):
-        raise SecurityError("native bounded admission or release requires actual closed zero-output evidence")
+        raise NativeReadinessError("native bounded admission or release requires actual closed zero-output evidence")
 
 
 @dataclass(frozen=True, repr=False, init=False)

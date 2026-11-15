@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import stat
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,12 +17,14 @@ from typing import Any
 from .gateway import Gateway
 from .local_control import recover_unreported_local_start
 from .managed_current import managed_current_ceiling
+from .managed_faults import ManagedRefusal, latch_managed_fault
 from .managed_schedule import recorded_timer_hold
 from .native_bounded import NativeBoundedSpec
 from .native_bounded_handover import NativeBoundedHandover
+from .native_faults import diagnostic_type
 from .native_http import NativeTransportUnavailableError
 from .policy import Policy
-from .rpc import UnavailableError
+from .rpc import IntroductionDeferredError, UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
 from .seat_pause import SeatPauseVerifier
 from .security import SecurityError, StaleEvidenceError
@@ -250,6 +254,8 @@ class TrialSession:
             elif self.journal.get("native_bounded_handover"):
                 raise SecurityError("native bounded journal requires its explicit original mode specification")
             self.connected_cleanup_only = False
+            self._introduction_refusal: ManagedRefusal | None = None
+            self._introduction_refused_epoch: int | None = None
             self.runtime.ceiling_enabled = lambda: not self.connected_cleanup_only
         except BaseException:
             self.journal.close()
@@ -274,6 +280,12 @@ class TrialSession:
     # Initial admission is unplugged only; an already active supervised trial can reapply its hold after reconnect.
     async def _before_ceiling(self) -> None:
         if self.native_bounded is not None:
+            if self._introduction_refusal is not None:
+                self._persist_introduction_refusal()
+            if self._introduction_refused_epoch == self.gateway._charger_epoch and self.journal.get(
+                "managed_control_fault"
+            ):
+                raise UnavailableError("native bounded introduction remains terminally refused for this connection")
             try:
                 if self.connected_cleanup_only:
                     native = await self.native_bounded.read(closed=True)
@@ -287,7 +299,18 @@ class TrialSession:
                     sum(resource.kind == "profile" for resource in native.physical.resources),
                     any(resource.key == "profile:7001" for resource in native.physical.resources),
                 )
-            except SecurityError, RecoveryRequiredError:
+            except (SecurityError, RecoveryRequiredError) as error:
+                if self.journal.get("managed_mode"):
+                    self._introduction_refused_epoch = self.gateway._charger_epoch
+                    self._introduction_refusal = ManagedRefusal(
+                        "native_authority_or_preservation_failed",
+                        {
+                            "type": diagnostic_type(error),
+                            "detail": str(error)[:1024],
+                            "at_epoch": time.time(),
+                        },
+                    )
+                    self._persist_introduction_refusal()
                 if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
                     self.journal.put("trial_phase", "blocked")
                 raise UnavailableError("native bounded introduction failed; positive controls remain blocked") from None
@@ -331,6 +354,19 @@ class TrialSession:
             if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
                 self.journal.put("trial_phase", "blocked")
             raise UnavailableError("native trial audit failed; controls remain blocked") from None
+
+    # Retry only the failed atomic publication, retaining the proved refusal even if the device changes meanwhile.
+    def _persist_introduction_refusal(self) -> None:
+        refusal = self._introduction_refusal
+        if refusal is None:
+            return
+        self.gateway.controls.invalidate()
+        try:
+            latch_managed_fault(self.gateway, refusal.classification, diagnostic=refusal.diagnostic)
+        except sqlite3.Error as error:
+            raise IntroductionDeferredError("strict introduction refusal awaits durable diagnostic") from error
+        self._introduction_refusal = None
+        raise UnavailableError("native bounded introduction failed; positive controls remain blocked")
 
     # Take a final native idle check immediately before binding; the charger then introduces itself through real Boot.
     async def start(self) -> None:

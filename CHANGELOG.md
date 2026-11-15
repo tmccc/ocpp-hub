@@ -2,6 +2,12 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Retry initial and reconnect introduction when closed-zero or native lifecycle evidence is still pending on the
+  same actual Boot. Preserve strict content refusals with a durable diagnostic and attention state.
+- Give native command validation and OCPP send/reply independent bounded deadlines. Allow queued restrictive
+  controls to cancel only unsent audits; preserve correlation cleanup, generation checks and dispatched uncertainty.
+  Add focused real HTTP/TLS recovery regressions and negative controls for strict evidence and priority handling.
+
 - Complete normal Start observation after a paused process/connection recovery, so an established session does
   not expire at its startup deadline. Bind a Pause's replacement Stop claim so genuine closed zero can settle
   rejected or unanswered Stop without another owner request.

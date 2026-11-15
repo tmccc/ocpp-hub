@@ -120,11 +120,19 @@ class PriorityGate:
         self._waiting: list[tuple[int, int]] = []
         self._serial = 0
         self._busy = False
+        self.restrictive_waiting = asyncio.Event()
 
     # A nested authorization cannot wait behind the very command which is waiting for its response.
     @property
     def busy(self) -> bool:
         return self._busy
+
+    # Only queued restrictive work may interrupt an audit; a dispatched command always retains its reply wait.
+    def _update_restrictive_waiting(self) -> None:
+        if any(priority == 0 for priority, _ in self._waiting):
+            self.restrictive_waiting.set()
+        else:
+            self.restrictive_waiting.clear()
 
     # Enter in priority order; cancellation removes the waiting ticket.
     @asynccontextmanager
@@ -133,14 +141,17 @@ class PriorityGate:
             self._serial += 1
             ticket = (priority, self._serial)
             heapq.heappush(self._waiting, ticket)
+            self._update_restrictive_waiting()
             try:
                 await self._condition.wait_for(lambda: not self._busy and self._waiting[0] == ticket)
             except BaseException:
                 self._waiting.remove(ticket)
                 heapq.heapify(self._waiting)
+                self._update_restrictive_waiting()
                 self._condition.notify_all()
                 raise
             heapq.heappop(self._waiting)
+            self._update_restrictive_waiting()
             self._busy = True
         try:
             yield
@@ -157,6 +168,7 @@ class Peer:
     def __init__(self, name: str, timeout: float) -> None:
         self.name = name
         self.timeout = timeout
+        self.validation_timeout = 15.0
         self.sender: Sender | None = None
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
@@ -184,7 +196,7 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
     ) -> Frame:
         async with self.gate.enter(priority):
-            return await self._call_locked(action, payload, check, token, before_send, on_dispatch)
+            return await self._call_locked(action, payload, check, token, before_send, on_dispatch, priority > 0)
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
     @asynccontextmanager
@@ -194,9 +206,34 @@ class Peer:
         async with self.gate.enter(priority):
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
-                return await self._call_locked(action, payload, check, None, None, on_dispatch)
+                return await self._call_locked(action, payload, check, None, None, on_dispatch, priority > 0)
 
             yield call
+
+    # Bound native preparation independently, retiring its sockets promptly on Stop, disconnect or cancellation.
+    async def _validate(
+        self, action: str, payload: dict[str, Any], future: asyncio.Future[Frame], preemptible: bool
+    ) -> None:
+        if self.validate_send is None:
+            return
+        validation = asyncio.ensure_future(self.validate_send(action, payload))
+        signal = self.gate.restrictive_waiting if preemptible else asyncio.Event()
+        restrictive = asyncio.create_task(signal.wait())
+        try:
+            async with asyncio.timeout(self.validation_timeout):
+                done, _ = await asyncio.wait((validation, restrictive, future), return_when=asyncio.FIRST_COMPLETED)
+                if restrictive in done:
+                    raise UnavailableError("request was not sent; restrictive control superseded validation")
+                if future in done:
+                    future.result()  # A retired peer's exception must terminate its audit before any dispatch.
+                    raise UnavailableError("request was not sent; peer replied before dispatch")
+                await validation
+        finally:
+            validation.cancel()
+            restrictive.cancel()
+            await asyncio.gather(validation, restrictive, return_exceptions=True)
+        if preemptible and self.gate.restrictive_waiting.is_set():
+            raise UnavailableError("request was not sent; restrictive control superseded validation")
 
     # Send one request only while the caller owns the outgoing gate.
     async def _call_locked(
@@ -207,6 +244,7 @@ class Peer:
         token: str | None,
         before_send: Callable[[], None] | None,
         on_dispatch: Callable[[str], None] | None = None,
+        preemptible: bool = True,
     ) -> Frame:
         if check is not None:
             check()
@@ -218,23 +256,24 @@ class Peer:
             raise RecoveryRequiredError("stored OCPP message identifier requires explicit reconciliation")
         future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
         self._pending[unique_id] = future
+        dispatched = False
         try:
+            actual = payload() if callable(payload) else payload
+            await self._validate(action, actual, future, preemptible)
+            if check is not None:
+                check()
+            if self.sender is not sender:
+                raise UnavailableError("request was not sent; peer changed during outgoing validation")
+            if before_send is not None:
+                before_send()
+            if self.before_send is not None:
+                self.before_send(action, actual)
+            message = build_call(unique_id, action, actual)
+            self.diagnostics.sending(action, len(unique_id))
+            if on_dispatch is not None:
+                on_dispatch(action)
             async with asyncio.timeout(self.timeout):
-                actual = payload() if callable(payload) else payload
-                if self.validate_send is not None:
-                    await self.validate_send(action, actual)
-                    if check is not None:
-                        check()
-                    if self.sender is not sender:
-                        raise UnavailableError("peer changed during outgoing validation")
-                if before_send is not None:
-                    before_send()
-                if self.before_send is not None:
-                    self.before_send(action, actual)
-                message = build_call(unique_id, action, actual)
-                self.diagnostics.sending(action, len(unique_id))
-                if on_dispatch is not None:
-                    on_dispatch(action)
+                dispatched = True
                 await sender(message)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
@@ -243,7 +282,8 @@ class Peer:
                 self.diagnostics.phase = "complete"
                 return answer
         except (TimeoutError, OSError) as error:
-            raise UnavailableError("peer outcome is unconfirmed") from error
+            detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
+            raise UnavailableError(detail) from error
         finally:
             self.diagnostics.interrupted()
             self._pending.pop(unique_id, None)

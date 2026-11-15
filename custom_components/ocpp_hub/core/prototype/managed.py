@@ -16,6 +16,7 @@ from .managed_current import (
     require_current_source,
 )
 from .managed_current_recovery import capture_interrupted_collision
+from .managed_faults import latch_managed_fault
 from .managed_intent import ControlIntent, ManagedRequests
 from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
@@ -97,6 +98,8 @@ class ManagedController:
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
+        if action != "pause" and self.session._introduction_refusal is not None:
+            raise RecoveryRequiredError("strict introduction refusal awaits durable diagnostic")
         if action == "set_current":
             if current_a is None:
                 raise SecurityError("a current selection requires an integer current")
@@ -350,19 +353,7 @@ class ManagedController:
 
     # A persistent failed restoration cannot be silently undone by another poll or a process restart.
     def fault(self, reason: str, *, diagnostic: dict[str, Any] | None = None) -> None:
-        journal = self.session.journal
-        if not journal.get("managed_control_fault"):
-            with journal.atomic():
-                fault: dict[str, Any] = {"classification": reason, "at_epoch": time.time()}
-                if diagnostic is not None:
-                    journal.put("managed_native_failure", diagnostic)
-                    fault["native_failure_digest"] = fingerprint(diagnostic)
-                journal.put("managed_control_fault", fault)
-                control = journal.get("control", {})
-                journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
-                if journal.get("trial_phase") in ("active", "recovering", "blocked"):
-                    journal.put("trial_phase", "blocked")
-            self.session.gateway.controls.invalidate()
+        latch_managed_fault(self.session.gateway, reason, diagnostic=diagnostic)
 
     # Reuse only the existing owned zero profile; a fault never creates Stop, cleanup or positive authority.
     async def hold_fault(self, *, occurrence: str | None = None) -> None:
@@ -449,6 +440,8 @@ class ManagedController:
 
     # Preserve scoped test restrictions and recheck ordinary source immediately before any positive physical write.
     def require_positive(self, native: HandoverEvidence) -> None:
+        if self.session._introduction_refusal is not None:
+            raise RecoveryRequiredError("strict introduction refusal awaits durable diagnostic")
         self.tests.check_positive(native)
         if self.ordinary.active():
             local = self.session.journal.active()
@@ -828,6 +821,13 @@ class ManagedController:
         }
         if self.stopping:
             return {**base, "state": "stopping", "owner_control_enabled": False}
+        if s._introduction_refusal is not None:
+            classification = s._introduction_refusal.classification
+            try:
+                s._persist_introduction_refusal()
+            except UnavailableError:
+                pass  # Retain the proved strict refusal while its atomic diagnostic latch awaits storage.
+            return {**base, "state": "attention", "fault": classification}
         if j.get("managed_control_fault"):
             await self.hold_fault()
             if (

@@ -140,6 +140,13 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
 - The native-observation and introduction tests repeat malformed application responses, lose or refuse restrictive
   RPC replies, and supersede the initial zero with a newer Pause. Readiness still needs fresh validated content,
   current Boot/binding and confirmed closed zero. Validated content changes and HTTP framing remain restrictive.
+- `test_introduction_readiness_retry.py` repeats first-Boot and reconnect readiness waits at6/32A, verifies same-Boot
+  recovery after genuine native closure, and retains strict configuration/history/owned-profile refusals even when
+  readiness also fails. Persistent unknown sessions never gain Start, Stop or positive-release authority.
+- `test_rpc_validation_deadlines.py` uses independently delayed HTTP and TLS replies to separate audit and wire
+  budgets. Held audits cover Pause, caller cancellation and charger retirement; missing dispatched replies retain
+  unknown outcomes. Deadline and priority negative controls check correlation cleanup and gate reuse. These are
+  selected engine regressions, not a fresh full engine/model qualification; all native freshness bounds remain.
 - `test_managed_cloud_zero_controls.py` sends Fast and delayed-stop set/cancel through real managed TLS with cloud
   numbers0/1, exact positive local IDs, closed/unknown mappings and sequential reuse.
 - `test_qualification_collection.py` expands real dynamic parameters without running test bodies. Full-mode controls

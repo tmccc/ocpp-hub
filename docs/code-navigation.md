@@ -71,6 +71,12 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 Read recovery siblings alongside their callers. The small modules divide proof and settlement across files; a
 function that returns successfully may only advance one boundary, leaving an actual command or receipt pending.
 
+For introduction, follow `TrialSession._before_ceiling()`, `NativeBoundedHandover.introduce()` and the runtime's
+typed deferred retry loop. `managed_faults.py` shares the strict diagnostic latch with ordinary supervision.
+`test_introduction_readiness_retry.py` separates pending prerequisites from simultaneous content contradictions.
+For command timing, follow `Peer._validate()` through its priority gate and then the independent send/reply deadline;
+`test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch.
+
 ## Follow a control through every boundary
 
 - **Start/current:** HA entity → `ProxyClient.request()` → `ManagementServer` → `ManagedController.command()` →

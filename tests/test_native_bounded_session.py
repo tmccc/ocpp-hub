@@ -258,8 +258,16 @@ async def test_connected_first_boot_rechecks_native_guard_and_history(
             await rig.bench.call(charger, "raced-boot", "BootNotification", BOOT)
             await until(lambda: session.runtime.status.charger_fault.stage == "boot_or_ceiling")
             assert not session.gateway.controls.ready
-            assert session.journal.get("trial_phase") == "blocked"
+            assert session.journal.get("trial_phase") == ("active" if fault == "open-session" else "blocked")
             assert rig.bench.received_limits == [] and not rig.bench.firmware.profiles
             assert session.journal.active() is None
             assert session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
             assert session.journal.get("next_transaction") == 9000000
+            if fault == "open-session":
+                epoch, boot = session.gateway._charger_epoch, session.gateway.boot_observation
+                assert session.journal.get("trial_binding") is None and session.journal.get("trial_starting") is True
+                rig.bench.firmware.active = None
+                await until(lambda: session.gateway.controls.ready)
+                assert session.gateway._charger_epoch == epoch and session.gateway.boot_observation == boot
+                assert session.journal.active() is None
+                assert set(rig.bench.received_limits) == {0}

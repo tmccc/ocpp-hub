@@ -194,11 +194,13 @@ async def test_conflicting_binding_does_not_retry_introduction(tmp_path, tls, un
                 read_count = len(rig.peer.requests)
                 rig.peer.configuration["untouched"] = original
                 for _ in range(5):
-                    assert (await controller.tick())["state"] == "starting"
+                    assert (await controller.tick())["state"] == "attention"
                     await asyncio.sleep(0.03)
                 assert len(rig.peer.requests) == read_count
                 assert session.native_bounded.introduced_epoch != session.gateway._charger_epoch
-                assert not session.gateway.controls.ready and rig.bench.received_limits[first_profile:] == []
-                assert rig.bench.firmware.effective_limit() == current and not starts(rig)
+                assert session.gateway.controls.desired() == 0
+                assert set(rig.bench.received_limits[first_profile:]) <= {0}
+                assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
+                assert session.journal.get("managed_control_fault") is not None
         finally:
             rig.peer.configuration["untouched"] = original

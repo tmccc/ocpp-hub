@@ -41,6 +41,12 @@ Repeated undecodable native responses revoke readiness until valid evidence retu
 only after independently confirmed closed zero. Cloud transaction number0 remains valid for Fast and delayed-stop
 controls through its exact current local mapping.
 
+Introduction retries fresh closed-zero and native lifecycle prerequisites on the same admitted Boot. Changes to
+identity, configuration, history or owned profiles retain a specific managed diagnostic and require attention.
+Native command validation has a separate bounded allowance from sending and awaiting the OCPP reply; all existing
+freshness limits still apply. A newer restrictive control can cancel an unsent audit, while a dispatched command
+retains its actual reply or unknown outcome.
+
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
 an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the

@@ -10,6 +10,12 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 ## Current iCS implementation — 15 November 2026
 
+- [~] Introduction readiness and RPC deadline corrections distinguish retryable closed-zero/lifecycle waits from
+  strict content refusals, and unsent validation from dispatched uncertainty. Focused regressions and all HA suites
+  provide this change's verification; the owner's restriction excludes a fresh full engine qualification and live
+  charging tests.
+- [x] The four runtime-review corrections below were committed, pushed and deployed as `3105e8b`; their verification
+  combined focused offline checks with all three HA suites on that commit, without a new full engine qualification.
 - [~] Four runtime-review corrections cover normal Start after paused recovery, failed Stop claim settlement,
   local authorization during incomplete cloud registration and HA local-only presentation. New regressions
   reproduce the old failures. Verification uses focused offline recovery checks and fresh HA suites under the

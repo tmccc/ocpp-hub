@@ -30,7 +30,7 @@ from .managed_schedule import (
     require_continuing_session,
     supervised_timer,
 )
-from .native_bounded import NativeBoundedSpec, _require_ready
+from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready
 from .native_faults import MeasuredValues, NativeContentError, _NativeMeasurementError
 from .native_history import audit_history, inspect_history
 from .native_http import NativeTransportUnavailableError
@@ -51,6 +51,10 @@ NativePatch = Callable[[dict[str, Any]], Awaitable[None]]
 
 class AuditSupersededError(UnavailableError):
     """The independently read snapshot straddled a change to the journal's control or lifecycle authority."""
+
+
+class NativeSessionPendingError(RecoveryRequiredError):
+    """Native and local lifecycle evidence must converge without adopting or stopping an unknown session."""
 
 
 class NativeBoundedHandover:
@@ -149,7 +153,9 @@ class NativeBoundedHandover:
         )
 
     # Read rich native evidence under current authority; eligible repair audits are fenced before observation.
-    async def read(self, route: str = "trial", closed: bool = False) -> HandoverEvidence:
+    async def read(
+        self, route: str = "trial", closed: bool = False, *, owned: bool = False, initial: bool = False
+    ) -> HandoverEvidence:
         self.read_sequence += 1
         sequence, before = self.read_sequence, self.authority()
         repair, gateway = self.repair_audits, self.gateway
@@ -185,12 +191,18 @@ class NativeBoundedHandover:
             content_current = True
             measured = self._inspect(native, route=route)
             inspect_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
+            if initial:
+                if native.physical.history is None:
+                    raise SecurityError("actual Boot introduction requires complete current history")
+                verify_initial_history(
+                    gateway.journal, native.physical.history, gateway.journal.identity, self.spec.hardware_identity
+                )
             if attempt is not None and (gateway.controls._operations or gateway.charger._pending):
                 raise RecoveryRequiredError("native repair awaits settled resource operations")
-            resource_error = self.book.native_conflict(native.physical, owned=attempt is not None)
+            resource_error = self.book.native_conflict(native.physical, owned=owned or attempt is not None)
             strict_complete = True
             self.book.check_originals(native.physical)
-            if attempt is not None:
+            if owned or attempt is not None:
                 self.book.owned_present(native.physical)
             if resource_error is not None:
                 raise resource_error
@@ -208,9 +220,9 @@ class NativeBoundedHandover:
                     self.schedule_changed()
             if self.ordinary_source_observer is not None:
                 self.ordinary_source_observer(native)
-            _require_ready(native, False, self.allow_unplugged, self._closing_local(native))
             if measured.exceeded:
                 raise _NativeMeasurementError(native, measured, self.authority(), sequence)
+            _require_ready(native, False, self.allow_unplugged, self._closing_local(native))
         except NativeContentError as error:
             invalidate()
             # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
@@ -363,8 +375,9 @@ class NativeBoundedHandover:
         binding = journal.get("trial_binding")
         first_zero = binding is None or bool(journal.get("trial_starting"))
         try:
-            native = await self.read(closed=first_zero)
+            native = await self.read(closed=first_zero, owned=True, initial=binding is None)
         except (
+            NativeReadinessError,
             NativeTransportUnavailableError,
             StaleEvidenceError,
             UnavailableError,
@@ -397,10 +410,13 @@ class NativeBoundedHandover:
             "boot_digest": self.spec.boot_digest,
         }:
             raise SecurityError("native bounded introduction binding changed")
-        if binding is None:
-            self.require_known_session(native)
-        else:
-            self.require_recovery_session(native)
+        try:
+            if binding is None:
+                self.require_known_session(native)
+            else:
+                self.require_recovery_session(native)
+        except NativeSessionPendingError as error:
+            raise IntroductionDeferredError("introduction awaits native lifecycle reconciliation") from error
         self.book.owned_present(native.physical)
         if binding is not None or journal.get("control", {}).get("uncertain"):
             control = journal.get("control", {})
@@ -530,9 +546,11 @@ class NativeBoundedHandover:
         known = self.gateway.journal.active()
         if native.physical.transaction_open:
             if known is None or native.physical.native_transaction_id != known:
-                raise RecoveryRequiredError("bounded external native activity requires actual lifecycle reconciliation")
+                raise NativeSessionPendingError(
+                    "bounded external native activity requires actual lifecycle reconciliation"
+                )
         elif native.physical.native_transaction_id is not None or known is not None:
-            raise RecoveryRequiredError("native and local transaction closure disagree")
+            raise NativeSessionPendingError("native and local transaction closure disagree")
 
     # A genuine Stop may have occurred while the process was absent; retain the ledger debt until its real replay.
     def require_recovery_session(self, native: HandoverEvidence) -> None:
