@@ -682,7 +682,7 @@ class Gateway:
             return self._tag_info(tag)
         if not self._local_tag(tag):
             return {"status": "Invalid"}
-        if self.vendor.sender is not None:
+        if self.vendor.sender is not None and self.vendor_registration == "Accepted":
             return await self._cloud_authorize(tag)
         return self._tag_info(tag)
 

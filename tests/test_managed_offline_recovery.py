@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 import ssl
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from ocpp_hub_core.prototype import managed_test_charge as charge_tests
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
@@ -447,3 +449,136 @@ async def test_local_recovery_rechecks_authority_after_awaited_native_read(
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+# Intent: a normal Start after verified offline recovery must outlive its startup lease once actually observed.
+# Why: restored Pause readiness does not itself mark this epoch released, so ordinary return can mask Start proof.
+@pytest.mark.parametrize("initial", ["app", "paused"])
+async def test_normal_start_after_offline_pause_retires_startup_budget(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    initial: str,
+) -> None:
+    async with replacement_offline(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial=initial, selected=16
+    ) as recovery:
+        test = recovery.test
+        c, j, rig = test.controller, test.session.journal, test.rig
+        await local_boot(recovery)
+        status = await locally_ready(c)
+        assert status["local_hold_verified"] and status["normal_start_ready"]
+        assert not status["cloud_connected"] and c.released_epoch != test.session.gateway._charger_epoch
+        before = c.requests.intent()
+        monkeypatch.setattr(charge_tests, "STARTUP_BUDGET", 2)
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", before.revision)
+        await c.tests.settle()
+        lease = c.tests.lease
+        assert lease is not None and lease.normal
+        startup_deadline = lease.deadline
+        assert len(starts(rig)) == 1
+
+        # The real offline lifecycle cannot wait for cloud transaction mapping or an empty delivery queue.
+        reply = await rig.bench.call(
+            test.charger,
+            uuid.uuid4().hex,
+            "StartTransaction",
+            START | {"idTag": starts(rig)[0][3]["idTag"]},
+        )
+        assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+        local = reply[2]["transactionId"]
+        rig.peer.plan_session = (local, 987654)
+        rig.peer.paused, rig.peer.permission_enabled = False, True
+        rig.bench.cp, rig.bench.connection = "C", "Charging"
+        rig.bench.firmware.fire_plan(9)
+        for _ in range(5):
+            status = await c.tick()
+            if c.requests.receipt(identifier)["state"] == "completed":
+                break
+            await asyncio.sleep(0.02)
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert c.tests.lease is None and c.tests.state()["state"] == "running"
+        assert j.active() == local and status["power_w"] > 0
+
+        # Crossing the original monotonic budget must not expire an already verified regular session.
+        await asyncio.sleep(max(0, startup_deadline - time.monotonic()) + 0.1)
+        status = await c.tick()
+        assert c.requests.intent().mode == "app" and c.requests.intent().revision == before.revision + 1
+        assert c.requests.receipt(identifier)["state"] == "completed" and c.tests.lease is None
+        assert j.active() == local and rig.bench.firmware.current == 16
+        assert status["local_healthy"] and not status["cloud_connected"]
+        assert j.next_delivery() is not None and test.session.journal.vendor_id(local) is None
+        assert len(starts(rig)) == 1
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+
+
+# Intent: a failed durable owner-epoch transition cannot publish an accepted normal Start as released app authority.
+# Why: even a genuine accepted RemoteStart must fall back to a zero hold if its intent/state transaction rolls back.
+@pytest.mark.parametrize("failure", ["statement", "commit"])
+async def test_normal_start_owner_epoch_persistence_failure_keeps_pause_authority(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    async with replacement_offline(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial="paused", selected=16
+    ) as recovery:
+        test = recovery.test
+        c, j, rig, g = test.controller, test.session.journal, test.rig, test.session.gateway
+        await local_boot(recovery)
+        assert (await locally_ready(c))["normal_start_ready"]
+        before, saved_epoch, memory_epoch = c.requests.intent(), j.get("managed_owner_epoch"), c.released_epoch
+        assert before.mode == "paused" and memory_epoch != g._charger_epoch
+        attempts = []
+
+        # Record the exact new release fact attempted by the real worker; no gateway or storage result is mocked.
+        def epoch_attempt(value):
+            attempts.append(json.loads(value))
+            return 0
+
+        j.db.create_function("review_owner_epoch_attempt", 1, epoch_attempt)
+        if failure == "statement":
+            effect = "SELECT RAISE(ABORT,'independent owner epoch storage refusal');"
+        else:
+            # A deferred real foreign key fails only when the full intent/state transaction attempts COMMIT.
+            j.db.execute("CREATE TABLE review_owner_epoch_parent(id INTEGER PRIMARY KEY)")
+            j.db.execute(
+                "CREATE TABLE review_owner_epoch_child("
+                "id REFERENCES review_owner_epoch_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+            )
+            effect = "INSERT INTO review_owner_epoch_child VALUES(123);"
+        j.db.execute(
+            "CREATE TEMP TRIGGER review_owner_epoch_refusal BEFORE INSERT ON meta "
+            "WHEN NEW.key='managed_owner_epoch' BEGIN SELECT review_owner_epoch_attempt(NEW.value); "
+            + effect
+            + " END"
+        )
+        identifier = uuid.uuid4().hex
+        try:
+            c.command(identifier, "start", before.revision)
+            await c.tests.settle()
+        finally:
+            j.db.execute("DROP TRIGGER review_owner_epoch_refusal")
+        if c.pause_task is not None:
+            await asyncio.wait_for(c.pause_task, 8)
+        await until(lambda: rig.bench.firmware.effective_limit() == 0)
+        assert attempts == [g._charger_epoch] and not j.db.in_transaction
+        assert j.get("managed_owner_epoch") == saved_epoch and c.released_epoch == memory_epoch
+        assert c.requests.intent() == before and before.mode == "paused"
+        assert c.requests.receipt(identifier)["state"] == "uncertain"
+        assert c.requests.receipt(identifier)["result"]["classification"] == "start_not_confirmed"
+        state = c.tests.state()
+        assert state["start_attempted"] and not state["start_rpc_accepted"]
+        assert state["failure"]["type"] == "IntegrityError" and state["failure"]["effects_started"]
+        assert c.tests.lease is None and j.active() is None
+        assert j.get("local_start_receipt")["stage"] == "accepted"
+        assert len(starts(rig)) == 1
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+        status = await c.tick()
+        assert status["desired_control"] == "paused" and not status.get("normal_start_ready", False)
+        assert not status["owner_control_enabled"] and rig.bench.firmware.effective_limit() == 0
+        assert len(starts(rig)) == 1

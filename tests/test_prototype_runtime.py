@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from ocpp_hub_core.frames import build_call, build_call_result
 from ocpp_hub_core.prototype.gateway import Gateway, decode
+from ocpp_hub_core.prototype.policy import Policy
 from ocpp_hub_core.prototype.rpc import RegistrationDeferredError
 from ocpp_hub_core.prototype.runtime import OfflineRuntime, RuntimeSettings
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, Admission, SecurityError
@@ -44,12 +45,16 @@ class Bench:
 
     # Allocate private real journal state; the only connection addresses are generated literal loopback ports.
     def __init__(
-        self, path: Path, tls_pair: tuple[ssl.SSLContext, ssl.SSLContext, Path], credential: Admission
+        self,
+        path: Path,
+        tls_pair: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+        credential: Admission,
+        policy: Policy | None = None,
     ) -> None:
         self.server_tls, self.client_tls, _ = tls_pair
         self.admission = credential
         self.store = Journal(path, credential.identity)
-        self.gateway = Gateway(self.store, timeout=0.15)
+        self.gateway = Gateway(self.store, policy, timeout=0.15)
         self.calls: list[list[Any]] = []
         self.connections: list[ServerConnection] = []
         self.boot_status = "Accepted"
@@ -239,6 +244,35 @@ async def test_runtime_rejected_or_malformed_boot_recovers(
             await until(lambda: runtime.status.heartbeats >= 1)
             assert runtime.status.charger_connected
     await bench.close()
+
+
+# Intent: real TLS charger traffic retains bounded local Authorize while an open cloud has refused registration.
+# Why: an accepted websocket is not accepted OCPP registration and must not make local permission less available.
+@pytest.mark.parametrize("registration", ["Pending", "Rejected"])
+async def test_runtime_unregistered_cloud_keeps_local_authorize(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    admission: Admission,
+    registration: str,
+) -> None:
+    bench = Bench(tmp_path / "journal.db", tls, admission, Policy(strict_cloud_authorization=True))
+    bench.boot_status, bench.boot_interval = registration, 30
+    try:
+        async with serve(
+            bench.vendor, "127.0.0.1", 0, ssl=bench.server_tls, subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG
+        ) as cloud:
+            await bench.start(cloud.sockets[0].getsockname()[1])
+            async with bench.charger() as charger:
+                await bench.boot(charger)
+                await until(lambda: bench.gateway.vendor_registration == registration)
+                await charger.send(build_call("local-auth", "Authorize", {"idTag": "LOCAL_TEST"}))
+                answer = decode(await charger.recv())
+                assert answer[:2] == [3, "local-auth"]
+                assert answer[2]["idTagInfo"]["status"] == "Accepted"
+                assert set(answer[2]["idTagInfo"]) == {"status", "expiryDate"}
+                assert not [frame for frame in bench.calls if frame[0] == 2 and frame[2] == "Authorize"]
+    finally:
+        await bench.close()
 
 
 # Intent: vendor transport reconnects without interrupting the local receiver or losing queued events.

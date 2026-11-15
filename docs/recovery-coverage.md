@@ -113,6 +113,18 @@ offline qualification. This work requires neither live charging nor deployment.
 
 The ordinary suites also retain explicit recovery checks outside the finite model families:
 
+- `test_managed_offline_recovery.py` starts a real normal session after process replacement and verified offline
+  Pause, for both prior app and paused intent. Its actual lifecycle must complete the receipt and outlive the
+  startup budget without Stop. This differs from pausing an epoch whose app authority was already released.
+- `test_pause_stop_recovery.py` rejects or loses an actual known-session Stop reply, then closes the session through
+  a genuine charger lifecycle. The original Pause must recover local readiness without another owner command.
+  Statement and deferred-COMMIT refusals at its replacement binding retain the prior claim and later recover;
+  corresponding owner-epoch persistence failures after accepted Start retain Pause, zero and unknown Start debt.
+- `test_trial_auth.py` and `test_prototype_runtime.py` cover connected/Pending/Rejected registration, bounded local
+  approval, cached denial/expiry, real TLS and current cloud refusals/lost replies. Stop, revocation and expiry
+  during physical readback remain restrictive on both registered and locally authorized paths.
+- `tests_ha_proxy/test_client.py` verifies local-only app presentation, cloud recovery, both independent reading
+  deadlines and missing local/owner/service proof. These additions do not change the finite model counts above.
 - `test_denial_operator_composition.py` combines an acknowledged earlier denial with another closed Start awaiting
   independent nonacceptance evidence. Real tool inspection/reconciliation, actual subsequent Start/Stop replies and
   one fresh Pause complete both proofs. Repeated lost replies, exhausted refusals, Stop refusal and a new denied

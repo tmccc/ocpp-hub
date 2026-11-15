@@ -2,6 +2,14 @@
 
 ## Unreleased — iCS prototype and commissioning package
 
+- Complete normal Start observation after a paused process/connection recovery, so an established session does
+  not expire at its startup deadline. Bind a Pause's replacement Stop claim so genuine closed zero can settle
+  rejected or unanswered Stop without another owner request.
+- Keep bounded local/cached Authorize available while cloud registration is incomplete, preserving cached denial,
+  expiry and actual cloud decisions. Show verified local app/schedule control with an explicit cloud-outage label.
+- Add real-peer recovery, registration and HA freshness regressions, including failed replies and permission changes
+  during readback. Verify these changes with focused offline checks and HA suites; do not rerun engine qualification.
+
 - Add a code navigation guide for the active proxy, shared imports, control/recovery paths, test support and review
   checkpoints. Separate current README controls from historical trials and the older Raedian HA integration.
 - Update agent language/runtime guidance, developer layout, release commands and roadmap status for the standalone

@@ -389,10 +389,18 @@ class LocalControl:
             raise RecoveryRequiredError("scheduled Stop no longer owns the active transaction")
         previous = self.journal.get("control", {})
         if self._stopping is None or self._stopping.done() or previous.get("ticket") != self._stop_ticket:
-            epoch, ticket = self._claim(True, stopping=True)
-            self._stop_ticket = ticket
-            if guard is not None:
-                guard()  # Bind the exact claim even if the owned child is cancelled before its first instruction.
+            previous_stop_ticket, committed = self._stop_ticket, False
+            try:
+                # Synchronous guards may bind the claim; both durable facts must commit before a child can send.
+                with self.journal.atomic():
+                    epoch, ticket = self._claim(True, stopping=True)
+                    self._stop_ticket = ticket
+                    if guard is not None:
+                        guard()
+                committed = True
+            finally:
+                if not committed:
+                    self._stop_ticket = previous_stop_ticket
             self._stopping = self._launch(
                 self._stop(epoch, ticket, previous.get("start_pending", False), expected_local, guard)
             )

@@ -376,6 +376,57 @@ async def test_snapshot_expires_between_polls(actual_hass, peer):
     assert hass.states.get("button.ics_proxy_start").state != "unavailable"
 
 
+# Intent: verified local app control names a cloud outage and returns to its ordinary label after cloud recovery.
+# Why: local control stays available during an outage; Waiting for verification wrongly implies unfinished work.
+async def test_app_schedule_mode_reports_local_only_and_cloud_recovery(actual_hass, peer):
+    peer["state"].update(healthy=False, local_healthy=True, cloud_connected=False, state="local_only")
+    entry = await setup(actual_hass, peer)
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule (cloud offline)"
+    assert actual_hass.states.get("button.ics_proxy_start").state != "unavailable"
+    peer["state"].update(healthy=True, cloud_connected=True, state="healthy")
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
+    assert set(peer["commands"]) == {"status"}
+
+
+# Intent: locally verified app control expires on either reading deadline even while the cloud remains offline.
+# Why: the outage label cannot preserve stale local permission between management polls.
+@pytest.mark.parametrize("age_key", ["native_age_seconds", "status_age_seconds"])
+async def test_local_only_app_mode_expires_between_polls(actual_hass, peer, age_key):
+    peer["state"].update(healthy=False, local_healthy=True, cloud_connected=False, state="local_only")
+    peer["state"][age_key] = 14
+    await setup(actual_hass, peer)
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule (cloud offline)"
+    requests = len(peer["commands"])
+    await asyncio.sleep(1.2)
+    await actual_hass.async_block_till_done()
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
+    assert len(peer["commands"]) == requests
+
+
+# Intent: cloud outage presentation cannot stand in for owner permission, service readiness or local health.
+# Why: only fresh verified app control deserves a stable app/schedule label.
+@pytest.mark.parametrize("missing_proof", ["owner_control_enabled", "running", "local_healthy"])
+async def test_local_only_app_mode_keeps_verification_guards(actual_hass, peer, missing_proof):
+    peer["state"].update(healthy=False, local_healthy=True, cloud_connected=False, state="local_only")
+    peer["state"][missing_proof] = False
+    await setup(actual_hass, peer)
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
+    assert set(peer["commands"]) == {"status"}
+
+
+# Intent: absent or unknown cloud connection facts cannot be displayed as a confirmed cloud outage.
+# Why: a locally healthy status can establish app control without establishing why cloud health is unavailable.
+@pytest.mark.parametrize("missing", [False, True], ids=["unknown", "absent"])
+async def test_app_schedule_mode_does_not_invent_cloud_outage(actual_hass, peer, missing):
+    peer["state"].update(healthy=False, local_healthy=True, cloud_connected=None, state="local_only")
+    if missing:
+        del peer["state"]["cloud_connected"]
+    await setup(actual_hass, peer)
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
+    assert set(peer["commands"]) == {"status"}
+
+
 # Intent: a normal explicit Start works from ready app or paused control and a known zero-watt session stays idle.
 # Why: starting a session can resume a deliberate pause but cannot manufacture actual power or a test deadline.
 @pytest.mark.parametrize("paused", [False, True], ids=["app", "paused"])

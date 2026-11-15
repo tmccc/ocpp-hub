@@ -12,6 +12,7 @@ from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
 from ocpp_hub_core.prototype.auth_info import InfoBook, tag_key, validate_info
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import DeniedError, Policy
+from ocpp_hub_core.prototype.rpc import RegistrationDeferredError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 
 from tests.test_prototype import START, Rig
@@ -40,6 +41,7 @@ class StrictRig(Rig):
         self.authorization_seen = asyncio.Event()
         self.authorization_release: asyncio.Event | None = None
         self.authorization_failure: str | None = None
+        self.boot_status = "Accepted"
 
     # Return correlated metadata, retaining ordinary Boot and lifecycle behavior from the independent peer.
     async def vendor_send(self, raw: str) -> None:
@@ -55,6 +57,14 @@ class StrictRig(Rig):
                 await self.gateway.receive("vendor", build_call_error(frame[1], "InternalError", "synthetic refusal"))
                 return
             await self.gateway.receive("vendor", build_call_result(frame[1], {"idTagInfo": self.actual_info}))
+        elif frame[0] == 2 and frame[2] == "BootNotification" and self.boot_status != "Accepted":
+            self.vendor_frames.append(frame)
+            await self.gateway.receive(
+                "vendor",
+                build_call_result(
+                    frame[1], {"status": self.boot_status, "interval": 30, "currentTime": "2030-01-01T00:00:00Z"}
+                ),
+            )
         elif frame[0] == 2 and frame[2] == "StartTransaction" and self.start_info is not None:
             self.vendor_frames.append(frame)
             self.next_vendor += 1
@@ -257,6 +267,83 @@ async def test_local_owner_offline_authorization_has_bounded_local_expiry(tmp_pa
         await rig.close()
 
 
+# Intent: a connected but unregistered cloud uses the same bounded local/cache permission as a disconnected cloud.
+# Why: Pending/Rejected registration cannot turn an approved local tag into an OCPP InternalError or hide revocation.
+@pytest.mark.parametrize("registration", ["connected", "Pending", "Rejected"])
+@pytest.mark.parametrize("decision", ["local", "cached", "blocked", "expired", "unknown"])
+async def test_authorize_before_cloud_registration_keeps_local_permission(
+    tmp_path: Path, registration: str, decision: str
+) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        tag = "UNAPPROVED" if decision == "unknown" else "local_test"
+        cached = None
+        if decision != "local":
+            cached = info(
+                status="Blocked" if decision == "blocked" else "Accepted",
+                **({"expiryDate": "2000-01-01T00:00:00Z"} if decision == "expired" else {}),
+            )
+            rig.gateway.auth_info.put(tag, cached)
+        rig.boot_status = "Pending" if registration == "connected" else registration
+        rig.gateway.attach_vendor(rig.vendor_send)
+        if registration != "connected":
+            with pytest.raises(RegistrationDeferredError):
+                await rig.gateway._ensure_vendor_boot()
+        assert rig.gateway.vendor_registration == registration
+        before = datetime.now(UTC)
+        answer = await rig.charger("local-auth", "Authorize", {"idTag": tag})
+        assert answer[:2] == [3, "local-auth"]
+        metadata = answer[2]["idTagInfo"]
+        if decision == "local":
+            assert set(metadata) == {"status", "expiryDate"}
+            assert metadata["status"] == "Accepted"
+            expiry_at = datetime.fromisoformat(metadata["expiryDate"])
+            assert before + timedelta(seconds=59) <= expiry_at <= datetime.now(UTC) + timedelta(seconds=60)
+        elif decision == "unknown":
+            assert metadata == {"status": "Invalid"}
+        else:
+            assert cached is not None
+            assert metadata == {**cached, "status": "Expired" if decision == "expired" else cached["status"]}
+        assert not [frame for frame in rig.vendor_frames if frame[0] == 2 and frame[2] == "Authorize"]
+    finally:
+        await rig.close()
+
+
+# Intent: ready-cloud refusals and lost replies cannot fall back to an older cached approval.
+# Why: once Authorize was dispatched, only its actual reply may grant permission; transport replacement revokes it.
+@pytest.mark.parametrize("outcome", ["Blocked", "Expired", "timeout", "callerror", "replaced"])
+async def test_registered_cloud_authorize_never_falls_back_after_dispatch(tmp_path: Path, outcome: str) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        cached = info()
+        rig.gateway.auth_info.put("LOCAL_TEST", cached)
+        if outcome in ("Blocked", "Expired"):
+            rig.actual_info = info(status=outcome)
+        elif outcome in ("timeout", "callerror"):
+            rig.authorization_failure = outcome
+        else:
+            rig.authorization_release = asyncio.Event()
+        pending = asyncio.create_task(rig.charger("cloud-auth", "Authorize", {"idTag": "LOCAL_TEST"}))
+        await rig.authorization_seen.wait()
+        if outcome == "replaced":
+            rig.gateway.attach_vendor(rig.vendor_send)
+            assert rig.authorization_release is not None
+            rig.authorization_release.set()
+        answer = await pending
+        if outcome in ("Blocked", "Expired"):
+            assert answer == [3, "cloud-auth", {"idTagInfo": rig.actual_info}]
+        else:
+            assert answer[:3] == [4, "cloud-auth", "InternalError"]
+        assert len([frame for frame in rig.vendor_frames if frame[0] == 2 and frame[2] == "Authorize"]) == 1
+    finally:
+        if rig.authorization_release is not None:
+            rig.authorization_release.set()
+        await rig.close()
+
+
 # Intent: an ordinary Authorize cannot return Accepted after a newer local Stop claimed the station.
 # Why: metadata fetched before the hold must not release permission after the awaited cloud reply.
 async def test_ordinary_authorize_rechecks_stop_after_cloud_wait(tmp_path: Path) -> None:
@@ -290,12 +377,21 @@ async def test_tagged_stop_metadata_is_an_immutable_fact(tmp_path: Path) -> None
 # Intent: a Stop, revocation or expiry during composite readback changes the final Authorize answer.
 # Why: the last permission check must follow every await, including physical-ceiling verification.
 @pytest.mark.parametrize("change", ["stop", "revoked", "expired"])
-async def test_authorize_rechecks_permission_after_cap_readback(tmp_path: Path, change: str) -> None:
+@pytest.mark.parametrize("registration", ["Accepted", "Pending"])
+async def test_authorize_rechecks_permission_after_cap_readback(
+    tmp_path: Path, change: str, registration: str
+) -> None:
     from tests.test_prototype_runtime import until
 
     rig = StrictRig(tmp_path / "state.db")
     await rig.boot()
-    await rig.cloud()
+    if registration == "Accepted":
+        await rig.cloud()
+    else:
+        rig.boot_status = registration
+        rig.gateway.attach_vendor(rig.vendor_send)
+        with pytest.raises(RegistrationDeferredError):
+            await rig.gateway._ensure_vendor_boot()
     seen, release = asyncio.Event(), asyncio.Event()
     normal = rig.charger_send
     paused = False

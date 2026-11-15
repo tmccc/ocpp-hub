@@ -10,6 +10,10 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 ## Current iCS implementation — 15 November 2026
 
+- [~] Four runtime-review corrections cover normal Start after paused recovery, failed Stop claim settlement,
+  local authorization during incomplete cloud registration and HA local-only presentation. New regressions
+  reproduce the old failures. Verification uses focused offline recovery checks and fresh HA suites under the
+  owner's restriction on rerunning engine qualification; this is not a fresh full four-suite qualification.
 - [x] Recovery and diagnostic corrections through implementation `71710af` are committed, pushed and deployed to
   the standalone service and HA client. Coverage includes interrupted work, native/storage recovery, saved Stop
   acknowledgements, Boot binding and truthful pending/unknown diagnostics. See the changelog and coverage matrix.

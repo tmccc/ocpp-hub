@@ -181,9 +181,13 @@ class ManagedController:
                 g.controls._revision,
             )
             local = j.active()
+            prior_control = j.get("control", {})
+            stop_epoch, prior_ticket = prior_control.get("stop_epoch", 0), prior_control.get("ticket")
+            stop_ticket: str | None = None
 
             # A restrictive Stop still belongs to one current owner request and one known local session.
             def guard() -> None:
+                nonlocal stop_ticket
                 if (
                     self.stopping
                     or intent.mode != "paused"
@@ -196,6 +200,23 @@ class ManagedController:
                     or j.active() != local
                 ):
                     raise RecoveryRequiredError("owner Stop awaits the current Pause and known session")
+                control = j.get("control", {})
+                if stop_ticket is None and (
+                    control.get("stop_epoch", 0) == stop_epoch and control.get("ticket") == prior_ticket
+                ):
+                    return  # LocalControl checks once before synchronously taking its restrictive claim.
+                if (
+                    control.get("stop_epoch") != stop_epoch + 1
+                    or control.get("owner") != "local"
+                    or control.get("inhibit") is not True
+                    or not isinstance(control.get("ticket"), str)
+                    or control["ticket"] != g.controls._stop_ticket
+                    or stop_ticket not in (None, control["ticket"])
+                ):
+                    raise RecoveryRequiredError("owner Stop claim was superseded")
+                if stop_ticket is None:
+                    stop_ticket = control["ticket"]
+                    j.put("managed_owner_pause", {"ticket": stop_ticket, "revision": intent.revision})
 
             try:
                 native = await self.native.read()

@@ -621,6 +621,8 @@ diagnostic schemas on an older proxy remain compatible with the existing health 
 
 Pending current and Start operations retain their own labels and current intent/revision while physical
 measurements remain unknown. Missing connection facts remain unknown rather than being labelled disconnected.
+Verified local app/schedule control remains labelled as available during a cloud outage, with `cloud offline`
+shown explicitly. Both native and status readings must still be fresh; an outage never extends their deadlines.
 The timeline retains cloud-wait and cleanup phases, protocol details retain Boot-probe and completed-RPC labels,
 and temporary-schedule alarms retain their specific cause. A control whose send or reply fails is reported as
 possibly sent with an unknown outcome; the client does not retry it. Optional native observation notes can fail
@@ -629,6 +631,12 @@ without terminating supervision. Required atomic fault proof and command settlem
 Software metadata distinguishes the actual HA/client version and an available installed client `BUILD` stamp from
 source fingerprints. The proxy fingerprint covers the installed core Python sources and its managed/reporting/trial
 entry points; the client fingerprint covers its installed Python sources. A fingerprint is not a claimed Git commit.
+
+A normal Start from a recovered Pause records its current connection authority after the guarded physical command
+succeeds. Its startup deadline retires only after actual session evidence; an unobserved Start still expires and
+holds zero. A rejected or unanswered Stop can settle after its same Pause has independently verified genuine
+session closure and zero. Local authorization uses the existing bounded tag/cache policy while cloud registration
+is incomplete; once registered, an actual cloud denial or unanswered authorization cannot fall back to approval.
 
 ## Historical service commissioning — 9–10 November 2026
 

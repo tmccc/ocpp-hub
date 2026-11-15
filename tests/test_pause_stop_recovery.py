@@ -2,9 +2,11 @@
 
 import asyncio
 import copy
+import sqlite3
 import uuid
 
 import pytest
+from ocpp_hub_core.prototype.gateway import decode
 
 from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
@@ -163,3 +165,138 @@ async def test_faulted_pause_persistent_meter_witness(tmp_path, tls, unused_tcp_
             await c.pause_task
         assert (await mp.healthy(c))["local_hold_verified"]
         assert c.requests.receipt(request)["state"] == "completed"
+
+
+# Intent: one clean owner Pause settles its exact failed Stop claim after independent genuine closed zero.
+# Why: replacing the original Pause ticket must not strand uncertainty when its ordinary session really closes.
+@pytest.mark.parametrize("failure", ["rejected", "unanswered"])
+async def test_clean_pause_settles_failed_stop_after_genuine_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, failure
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        c, j, rig, controls = b.c, b.session.journal, b.rig, b.session.gateway.controls
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await mp.healthy(c)
+        assert j.get("trial_phase") == "active" and not j.get("managed_control_fault")
+        assert not j.get("local_start_receipt") and not mp.starts(rig)
+        answer, send, failed = rig.bench.firmware.answer, b.charger.send, []
+
+        # Reject at the independent device before applying Stop; the station-zero write is answered normally.
+        def device_answer(action, payload):
+            if action == "RemoteStopTransaction" and failure == "rejected":
+                failed.append(payload)
+                return {"status": "Rejected"}
+            return answer(action, payload)
+
+        # Lose only the genuine physical Stop response, leaving native reads and later lifecycle frames intact.
+        async def device_send(raw):
+            frame = decode(raw)
+            call = next((row for row in rig.bench.device_calls if row[1] == frame[1]), None)
+            if failure == "unanswered" and frame[0] == 3 and call is not None and call[2] == "RemoteStopTransaction":
+                failed.append(call[3])
+                return
+            await send(raw)
+
+        monkeypatch.setattr(rig.bench.firmware, "answer", device_answer)
+        monkeypatch.setattr(b.charger, "send", device_send)
+        request = uuid.uuid4().hex
+        c.command(request, "pause", c.requests.intent().revision)
+        original_pause = copy.deepcopy(j.get("managed_owner_pause"))
+        revision = c.requests.intent().revision
+        assert c.pause_task is not None
+        await asyncio.wait_for(c.pause_task, 8)
+        assert failed == [{"transactionId": local}]
+        control = j.get("control")
+        assert control["ticket"] != original_pause["ticket"] and control["uncertain"]
+        assert j.active() == local and not controls.stop_acknowledged(local)
+        assert rig.bench.firmware.current == rig.bench.firmware.effective_limit() == 0
+        assert not j.get("managed_control_fault")
+
+        # A real charger lifecycle closes the session independently of whether its Stop command was accepted.
+        await genuine_stop(b, local)
+        status = await c.tick()
+        assert status["local_hold_verified"] and c.requests.receipt(request)["state"] == "completed"
+        assert not j.get("control")["uncertain"]
+        assert status["local_healthy"] and status["normal_start_ready"]
+        assert c.requests.intent().mode == "paused" and c.requests.intent().revision == revision
+        assert j.get("trial_phase") == "active" and not j.get("managed_control_fault")
+        assert not mp.starts(rig) and rig.bench.firmware.effective_limit() == 0
+        stops = [frame for frame in rig.bench.device_calls if frame[2] == "RemoteStopTransaction"]
+        assert len(stops) == 1 and stops[0][3] == {"transactionId": local}
+
+
+# Intent: refusing the exact owner-Stop binding rolls back its claim and later genuine closure settles the same Pause.
+# Why: a separately committed replacement ticket would strand uncertainty once closed zero skips another Stop.
+@pytest.mark.parametrize("failure", ["statement", "commit"])
+async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
+    tmp_path, tls, unused_tcp_port, monkeypatch, failure
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        c, j, rig, controls = b.c, b.session.journal, b.rig, b.session.gateway.controls
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await mp.healthy(c)
+        request = uuid.uuid4().hex
+        c.command(request, "pause", c.requests.intent().revision)
+        original_pause = copy.deepcopy(j.get("managed_owner_pause"))
+        original_control = copy.deepcopy(j.get("control"))
+        original_ticket = original_control["ticket"]
+        original_stop_ticket = controls._stop_ticket
+        revision = c.requests.intent().revision
+        attempts = []
+
+        # Observe the attempted replacement binding inside SQLite before the real statement is refused.
+        def binding_attempt(ticket):
+            attempts.append(ticket)
+            return 0
+
+        j.db.create_function("review_pause_binding_attempt", 1, binding_attempt)
+        if failure == "statement":
+            effect = "SELECT RAISE(ABORT,'independent owner Stop binding storage refusal');"
+        else:
+            # The new claim and binding must also roll back when a deferred reference fails their actual COMMIT.
+            j.db.execute("CREATE TABLE review_pause_binding_parent(id INTEGER PRIMARY KEY)")
+            j.db.execute(
+                "CREATE TABLE review_pause_binding_child("
+                "id REFERENCES review_pause_binding_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+            )
+            effect = "INSERT INTO review_pause_binding_child VALUES(123);"
+        j.db.execute(
+            "CREATE TEMP TRIGGER review_pause_binding_refusal BEFORE INSERT ON meta "
+            "WHEN NEW.key='managed_owner_pause' BEGIN "
+            "SELECT review_pause_binding_attempt(json_extract(NEW.value,'$.ticket')); "
+            + effect
+            + " END"
+        )
+        try:
+            assert c.pause_task is not None
+            with pytest.raises(sqlite3.IntegrityError):
+                await asyncio.wait_for(c.pause_task, 8)
+        finally:
+            j.db.execute("DROP TRIGGER review_pause_binding_refusal")
+        assert len(attempts) == 1 and attempts[0] != original_ticket
+        assert not j.db.in_transaction
+        assert j.get("control") == original_control
+        assert controls._stop_ticket == original_stop_ticket
+        assert j.get("managed_owner_pause") == original_pause
+        assert c.requests.intent().mode == "paused" and c.requests.intent().revision == revision
+        assert j.active() == local and j.get("control")["uncertain"]
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+        assert rig.bench.firmware.current == rig.bench.firmware.effective_limit() == 0
+
+        # The car finishes independently; no remote Stop was launched, so there is no command event to await.
+        reply = await rig.bench.call(
+            b.charger,
+            uuid.uuid4().hex,
+            "StopTransaction",
+            {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+        )
+        assert reply[0] == 3
+        rig.peer.permission_enabled = False
+        await until(lambda: j.active() is None and j.next_delivery() is None)
+        status = await mp.healthy(c)
+        assert status["local_hold_verified"] and status["local_healthy"] and status["normal_start_ready"]
+        assert c.requests.receipt(request)["state"] == "completed" and not j.get("control")["uncertain"]
+        assert c.requests.intent().mode == "paused" and c.requests.intent().revision == revision
+        assert not j.get("managed_control_fault") and j.get("trial_phase") == "active"
+        assert not mp.starts(rig) and not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+        assert rig.bench.firmware.effective_limit() == 0

@@ -490,6 +490,7 @@ class ManagedChargeTests:
                 self.guard(lease)
                 if lease.normal:
                     j.put("managed_control_intent", {"mode": "app", "revision": lease.revision + 1})
+                    j.put("managed_owner_epoch", lease.epoch)
                     c.requests.supersede_pauses(lease.identifier)
                 j.put(
                     "managed_test_charge",
@@ -501,6 +502,8 @@ class ManagedChargeTests:
                     },
                 )
             if lease.normal:
+                # The guarded accepted normal Start already established this connection's positive authority.
+                c.released_epoch = lease.epoch
                 lease.revision += 1
                 lease.mode = "app"
         except (

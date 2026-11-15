@@ -85,8 +85,8 @@ class ProxySensor(ProxyEntity, SensorEntity):
                 return "Local test" if test["source"] == "local" else "App test"
             if data.get("desired_control") == "paused":
                 return "Paused locally" if data.get("local_hold_verified") and self.native_fresh else "Pause requested"
-            if self.coordinator.fresh_healthy and data.get("owner_control_enabled") is True:
-                return "App / schedule"
+            if self.coordinator.fresh_local_healthy and data.get("owner_control_enabled") is True:
+                return "App / schedule (cloud offline)" if data.get("cloud_connected") is False else "App / schedule"
             return "Needs attention" if data.get("state") in ("attention", "degraded") else "Waiting for verification"
         if self.key == "last_session_energy":
             if data.get("charger_history_complete", True) is not True:
