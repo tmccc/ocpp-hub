@@ -67,7 +67,7 @@ def assert_positive_rollback(b, attempt, wire, replies, selected):
 
 
 # Recovered HTTP alone retains the fault; new owner Pause, real closure and separate Return prove recovery.
-async def explicit_release_recovery(b, local, selected):
+async def explicit_release_recovery(b, local, selected, *, verify_next_daily=True):
     c, j = b.c, b.session.journal
     fault = copy.deepcopy(j.get("managed_control_fault"))
     original, configuration = copy.deepcopy(b.device.plans[9]), copy.deepcopy(b.rig.peer.configuration)
@@ -88,6 +88,15 @@ async def explicit_release_recovery(b, local, selected):
     assert set(b.stops()) == {local} and b.device.effective_limit() == 0
     assert j.active() == local and j.get("managed_control_fault") == fault
     assert c.requests.receipt(pause)["state"] != "completed"
+    # Physical closure precedes the actual OCPP Stop; neither can substitute for the other.
+    b.device.active = None
+    b.device.requested_current = 0
+    b.rig.peer.permission_enabled = False
+    b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+    for _ in range(2):
+        await c.tick()
+        assert j.active() == local and j.get("managed_control_fault") == fault
+        assert c.requests.receipt(pause)["state"] != "completed" and b.device.effective_limit() == 0
     await b.close_transaction(local)
     for _ in range(12):
         await c.tick()
@@ -103,6 +112,10 @@ async def explicit_release_recovery(b, local, selected):
     c.command(returning, "app_control", c.requests.intent().revision)
     assert (await healthy(c))["station_ceiling_a"] == selected
     assert c.requests.intent().mode == "app" and c.requests.receipt(returning)["state"] == "completed"
+    assert set(b.stops()) == {local} and not starts(b.rig)
+    assert b.device.plans == {9: original} and b.rig.peer.configuration == configuration
+    if not verify_next_daily:
+        return  # The scenario caller retains its own longer full-daily observation and closure suffix.
     day = datetime.fromtimestamp(b.clock.now, ZoneInfo("Europe/London"))
     midnight = int((day + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     following = await b.advance_idle_to(midnight)

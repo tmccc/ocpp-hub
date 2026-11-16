@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from contextlib import asynccontextmanager
 
 import pytest
+from ocpp_hub_core.prototype.release_attempt import ReleaseOutcome
+from ocpp_hub_core.prototype.rpc import UnavailableError
 
 from tests.managed_scenario_helpers import (
     END,
@@ -18,6 +21,7 @@ from tests.managed_scenario_helpers import (
     settle,
     unknown_report,
 )
+from tests.release_outcome_helpers import explicit_release_recovery, observe_device_replies
 from tests.test_managed_proxy import healthy, introduced
 from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_managed_schedule_scenarios import early_cleanup_selected
@@ -38,13 +42,29 @@ def matches_operation(operation, action, payload):
 
 # Refuse before physical application or withhold its actual response after the independent device applied it.
 @asynccontextmanager
-async def fail_one_operation(b, operation, lost_ack):
+async def fail_one_operation(b, operation, lost_ack, witness=None):
     answer, before_reply = b.device.answer, b.rig.bench.before_reply
     entered, release = asyncio.Event(), asyncio.Event()
+    if witness is None:
+        witness = {}  # Existing selective-cleanup callers need no positive-release observations.
+
+    # Capture actual sender-owned facts at the independent peer; no guard, result or authority is manufactured.
+    def observe_restore():
+        if operation == "restore":
+            attempt = b.session.gateway.controls.release_attempt
+            assert attempt is not None and attempt.purpose == "automatic" and not attempt.finished
+            assert attempt.positive_may_have_dispatched and not attempt.positive_confirmed
+            assert attempt.ticket == b.session.journal.get("control")["ticket"]
+            witness.update(
+                attempt=attempt,
+                physical_limit=b.device.effective_limit(),
+                device_profiles=copy.deepcopy(b.device.profiles),
+            )
 
     # The peer itself refuses one request and leaves its independently stored physical state intact.
     def refuse_once(action, payload):
         if not lost_ack and not entered.is_set() and matches_operation(operation, action, payload):
+            observe_restore()
             entered.set()
             return {"status": "Rejected", "data": ""} if operation == "clear" else {"status": "Rejected"}
         return answer(action, payload)
@@ -52,6 +72,7 @@ async def fail_one_operation(b, operation, lost_ack):
     # A missing reply is injected only after the firmware's actual application of the matching request.
     async def withhold_once(action, payload):
         if lost_ack and not entered.is_set() and matches_operation(operation, action, payload):
+            observe_restore()
             entered.set()
             try:
                 await asyncio.wait_for(release.wait(), b.session.gateway.charger.timeout + 0.05)
@@ -69,8 +90,8 @@ async def fail_one_operation(b, operation, lost_ack):
         await asyncio.sleep(0)
 
 
-# Intent: each real physical mutation can refuse or lose its reply, then recover in the same or a replaced process.
-# Why: uncertainty cannot expand Stop scope, report a failed zero as success, or remove an unrelated timer.
+# Intent: restrictive work retries, while a refused or late positive release needs fresh owner recovery.
+# Why: failures cannot expand Stop scope or erase positive dispatch; real refusal and application remain distinct.
 @pytest.mark.parametrize("operation", ["zero", "zero_before_cutoff", "stop", "clear", "restore"])
 @pytest.mark.parametrize("lost_ack", [False, True])
 @pytest.mark.parametrize("restart", [False, True])
@@ -106,7 +127,12 @@ async def test_n08_physical_mutation_recovery(
                 b.rig.peer.plan_session = (local, b.timer)
             elif operation == "restore":
                 b.rig.peer.plan_session = (local, 9)
-        async with fail_one_operation(b, operation, lost_ack) as entered:
+        witness = {}
+        initial_profiles = copy.deepcopy(b.device.profiles)
+        wire = len(b.rig.bench.device_calls)
+        replies = observe_device_replies(b, monkeypatch) if operation == "restore" else []
+        unmatched = b.session.gateway.charger.diagnostics.snapshot()["unmatched_replies"]
+        async with fail_one_operation(b, operation, lost_ack, witness) as entered:
             work = asyncio.create_task(b.c.tick())
             try:
                 await asyncio.wait_for(entered.wait(), 5)
@@ -128,6 +154,32 @@ async def test_n08_physical_mutation_recovery(
                 if not work.done():
                     work.cancel()
                     await asyncio.gather(work, return_exceptions=True)
+        if operation == "restore":
+            attempt = witness["attempt"]
+            assert attempt.finished and not attempt.cancelled and attempt.positive_may_have_dispatched
+            assert not attempt.positive_confirmed and attempt.zero_may_have_dispatched and attempt.zero_confirmed
+            assert type(attempt.positive_failure) is UnavailableError and attempt.failure is attempt.positive_failure
+            assert attempt.outcome() is ReleaseOutcome.POSSIBLE_POSITIVE
+            profiles = [frame for frame in b.rig.bench.device_calls[wire:] if frame[2] == "SetChargingProfile"]
+            limits = [
+                frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+                for frame in profiles
+            ]
+            assert len(limits) >= 2 and limits[0] == 32 and all(limit == 0 for limit in limits[1:])
+            if lost_ack:
+                assert witness["physical_limit"] == 32
+                profile = profiles[0][3]["csChargingProfiles"]
+                assert witness["device_profiles"][profile["chargingProfileId"]] == profile
+                assert isinstance(attempt.positive_failure.__cause__, TimeoutError)
+                assert [3, profiles[0][1], {"status": "Accepted"}] in replies
+                assert b.session.gateway.charger.diagnostics.snapshot()["unmatched_replies"] > unmatched
+            else:
+                assert witness["physical_limit"] == 0 and witness["device_profiles"] == initial_profiles
+                assert attempt.positive_failure.__cause__ is None
+                assert [3, profiles[0][1], {"status": "Rejected"}] in replies
+            witness["fault"] = copy.deepcopy(b.session.journal.get("managed_control_fault"))
+            assert witness["fault"]["classification"] == "owner_release_unconfirmed"
+            assert b.session.journal.get("control")["uncertain"] is True and b.device.effective_limit() == 0
         b.clock.now += 301
         if restart:
             await replace_controller(b)
@@ -136,7 +188,14 @@ async def test_n08_physical_mutation_recovery(
         async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
             if restart:
                 await introduced(b.rig, b.session, b.sock, "mutation-recovery")
-            if operation == "clear":
+            if operation == "restore":
+                await settle(b, 6)
+                assert b.session.journal.get("managed_control_fault") == witness["fault"]
+                assert b.c.requests.intent().mode == "app" and b.device.effective_limit() == 0 and not b.stops()
+                await explicit_release_recovery(b, local, 32, verify_next_daily=False)
+                stops = tuple(b.stops())
+                assert set(stops) == {local}  # The new owner's Pause supplies this known Stop authority.
+            elif operation == "clear":
                 await settle(b, 6)
                 await healthy(b.c)
                 stops = tuple(b.stops())

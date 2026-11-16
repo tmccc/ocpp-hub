@@ -1031,7 +1031,9 @@ source/lifecycle/timer prerequisite keeps zero and waits for fresh proof only wh
 sent no positive profile and confirmed its own rollback zero. A later cleanup failure remains a failure.
 An earlier possibly dispatched positive write remains uncertain even if a later read fails or zero rollback
 succeeds: fresh observations alone cannot clear its fault. Use a new Pause, verified closure and a separate Return
-for the existing owner recovery. Explicit Return retains its separate request policy.
+for the existing owner recovery. A charger-refused positive release also retains its fault: a real `Rejected`
+reply is distinct from an unknown applied outcome, and neither is a temporary native-audit wait.
+Explicit Return retains its separate request policy.
 
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy

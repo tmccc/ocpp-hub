@@ -149,6 +149,13 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
   selected engine regressions, not a fresh full engine/model qualification; all native freshness bounds remain.
 - `test_managed_cloud_zero_controls.py` sends Fast and delayed-stop set/cancel through real managed TLS with cloud
   numbers0/1, exact positive local IDs, closed/unknown mappings and sequential reuse.
+- Automatic-release regressions retain whole-operation dispatch, actual zero confirmation and cleanup outcomes.
+  Before-positive source/native waits can retry after verified rollback; a charger-refused positive release or a
+  failed attempt after positive dispatch retains its fault. The post-positive source tests and the four restore
+  cases in `test_managed_schedule_mutation_scenarios.py` prove new Pause, real closure and separate Return recovery.
+  Their fake peer distinguishes an actual `Rejected` without application from application followed by a reply
+  delayed beyond its deadline. These focused failures are not extra registered model dimensions; existing source,
+  timer and process-overlap families retain their successful automatic recovery and original denominators.
 - `test_qualification_collection.py` expands real dynamic parameters without running test bodies. Full-mode controls
   consistently omit an ordinary parameter or file while retaining every model case; the independent denominator
   rejects them. Filtering, executor selection and configured mount boundaries have separate negative controls.
