@@ -231,7 +231,9 @@ async def test_process_sigkill_before_start_dispatch(
         paused = await child.status(lambda value: value.get("local_hold_verified") is True)
         assert child.rig.bench.firmware.effective_limit() == 0
         events.append("pause")
-        assert (await child.request("receipt", request_id=identifier))["result"]["state"] == "failed"
+        abandoned = (await child.request("receipt", request_id=identifier))["result"]
+        assert abandoned["state"] == "failed"
+        assert abandoned["result"] == {"classification": "start_not_accepted_at_verified_zero"}
         events.append("retired")
         assert (await child.request("app_control", revision=paused["control_revision"]))["ok"]
         await child.status(
@@ -239,6 +241,7 @@ async def test_process_sigkill_before_start_dispatch(
         )
         events.append("return")
         await child.ordinary_recovery(case.selected, case.demand)
+        assert (await child.request("receipt", request_id=identifier))["result"] == abandoned
         events.extend(case.events[-4:])
         assert len(child.kills) == 1 and not starts(child.rig)
         assert child.rig.bench.firmware.plans == plans and child.rig.peer.configuration == config

@@ -177,10 +177,16 @@ def complete_record(c: ManagedController, record: TerminalRecord) -> None:
         j.put(record.key, {**state, "state": "cancelled", "recovery_reason": "previous_selection_at_verified_zero"})
         return
     local = record.transaction[0] if record.transaction is not None else None
+    unissued = local is None and state["source"] == "local"
+    result = (
+        {"classification": "start_not_accepted_at_verified_zero"}
+        if unissued
+        else {"closed_at_verified_zero": True, "charging": False}
+    )
     j.db.execute(
-        "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action=? AND revision=? "
+        "UPDATE managed_requests SET state=?,result=? WHERE id=? AND action=? AND revision=? "
         "AND state IN ('accepted','running','uncertain')",
-        (encoded({"closed_at_verified_zero": True, "charging": False}), *record.request[:3]),
+        ("failed" if unissued else "completed", encoded(result), *record.request[:3]),
     )
     j.put(
         record.key,
@@ -189,7 +195,9 @@ def complete_record(c: ManagedController, record: TerminalRecord) -> None:
             "state": "completed",
             "charging": False,
             "local_transaction": local,
-            "recovery_reason": "owned_operation_settled_at_verified_zero",
+            "recovery_reason": "start_not_accepted_at_verified_zero"
+            if unissued
+            else "owned_operation_settled_at_verified_zero",
         },
     )
 

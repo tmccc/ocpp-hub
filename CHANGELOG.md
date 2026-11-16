@@ -6,6 +6,7 @@
   Introduction still requires a genuine Boot, and retries stop with the connection.
 - Retire exact failed-current and interrupted test metadata after verified closed zero. Preserve historical outcomes
   and actual Start, cloud permission, lifecycle and mutation debt. Internal Pause retries settle their own ticket.
+  An interrupted local Start proven never sent retains a failed receipt when its metadata is retired.
 - Let a fresh explicit Pause repair eligible faults beside closed normal/timed tests and owned temporary timers.
   Remove only the receipted timer, verify the original timetable, and retain independent cutoff duties until closure
   or a successful explicit Return. Temporary native unavailability before automatic restoration keeps zero and retries.
