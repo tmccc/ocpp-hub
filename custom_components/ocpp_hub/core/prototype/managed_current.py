@@ -542,8 +542,8 @@ class ManagedCurrentLimits:
                         reason = "timer_retired"
                     elif active is not None or timer.get("unreported_native"):
                         reason = "session_opened"
-                    self.cancel_under_timer(identifier, value, previous_value, reason, failure=cause)
-                    await c.schedule.protect_station(j.get(KEY))
+                    ticket = self.cancel_under_timer(identifier, value, previous_value, reason, failure=cause)
+                    await self.confirm_timer_hold(identifier, previous_value, ticket)
                     self.record_failure_diagnostic(cause)
                     return
                 if not superseded and mode == "app" and overlap:
@@ -728,7 +728,7 @@ class ManagedCurrentLimits:
     # Restrict an interrupted selection without giving it owner Pause authority over a concurrent transaction.
     def cancel_under_timer(
         self, identifier: str, value: int, previous: int, reason: str, *, failure: dict[str, Any] | None = None
-    ) -> None:
+    ) -> str | None:
         c, j = self.controller, self.journal
         with j.atomic():
             timer, active = j.get(KEY), j.active()
@@ -739,8 +739,17 @@ class ManagedCurrentLimits:
                 timer = {**timer, "unidentified_local": active}
                 j.put(KEY, timer)
             c.schedule.begin_hold(timer)
-            j.put("control", {**j.get("control", {}), "resume_limit": previous})
-            c.session.gateway.controls._claim(True, stopping=True)
+            control = j.get("control", {})
+            j.put("control", {**control, "resume_limit": previous})
+            ticket = None
+            if not (
+                control.get("owner") == "local"
+                and control.get("inhibit") is True
+                and isinstance(control.get("ticket"), str)
+                and re.fullmatch(r"[a-f0-9]{32}", control["ticket"]) is not None
+            ):
+                # Preserve an existing zero operation instead of invalidating its in-flight verification.
+                _, ticket = c.session.gateway.controls._claim(True, stopping=True)
             j.put(
                 "managed_current_change",
                 {
@@ -752,6 +761,63 @@ class ManagedCurrentLimits:
                 },
             )
             c.requests.finish(identifier, "failed", {"classification": reason})
+        return ticket
+
+    # Worker retirement must await actual zero, independently of the watchdog's best-effort retry cooldown.
+    async def confirm_timer_hold(self, identifier: str, previous: int, ticket: str | None) -> None:
+        c, j = self.controller, self.journal
+        g = c.session.gateway
+        intent, timer = c.requests.intent(), j.get(KEY)
+        epoch, revision, boot = g._charger_epoch, g.controls._revision, g.boot_observation
+
+        # Concurrent restrictive writes may change tickets; a new owner instruction or source revokes this proof.
+        def guard() -> None:
+            change, lease, control = j.get("managed_current_change", {}), j.get(KEY, {}), j.get("control", {})
+            if (
+                c.stopping
+                or c.requests.intent() != intent
+                or intent.mode != "app"
+                or g._charger_epoch != epoch
+                or g.controls._revision != revision
+                or g.boot_observation != boot
+                or not g.current_boot_seen(epoch)
+                or not c.schedule.hold_authorized()
+                or lease.get("id") != timer["id"]
+                or lease.get("body") != timer.get("body")
+                or j.active() not in (None, timer.get("bound_local"), timer.get("unidentified_local"))
+                or change.get("id") != identifier
+                or change.get("state") != "cancelled"
+                or self.selected() != previous
+                or control.get("owner") != "local"
+                or control.get("inhibit") is not True
+                or g.controls.desired() != 0
+            ):
+                raise RecoveryRequiredError("cancelled current timer hold was superseded")
+
+        for attempt in range(3):
+            try:
+                guard()
+                await g.controls.ensure_ceiling(guard=guard)
+                guard()
+                if not g.controls.ready or g.controls.desired() != 0:
+                    raise RecoveryRequiredError("cancelled current timer hold remains unconfirmed")
+                # Inherited uncertainty belongs to its original operation, including any pending Start or Stop.
+                if ticket is not None and not (
+                    j.get("control", {}).get("start_pending")
+                    or j.get("managed_control_fault")
+                    or j.get("vendor_start_grant")
+                    or j.get("uncertain_vendor_command")
+                    or local_start_receipt(j).get("stage") in ("prepared", "issued")
+                    or c.tests.lease is not None
+                    or c.requests.return_in_progress()
+                ):
+                    g.controls._complete(ticket, uncertain=False)
+                return
+            except DeniedError:
+                if attempt == 2:
+                    return  # Durable zero and uncertainty remain owned by ordinary timer supervision.
+            except UnavailableError, RecoveryRequiredError, TimeoutError:
+                return  # Neither lost evidence nor changed authority establishes a confirmed physical outcome.
 
     # Supervision observes the completed update instead of sampling through a legitimate profile replacement.
     async def settle(self) -> None:

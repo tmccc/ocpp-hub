@@ -12,6 +12,8 @@
 - Ask the manufacturer cloud again for an approved timer tag with a cached denial. Fresh denial, lost replies and
   changed owner/connection authority still refuse the Start. Report unbound cloud Starts as an explicit health blocker.
 - Defer Return until timed local/cloud tests finish settling, retaining normal Start's existing Return behavior.
+- Wait for verified zero when a native daily session crosses a failed current increase, preserving an existing
+  restrictive operation and the previous selected current without issuing a Stop.
 - Add real TLS/native HTTP regressions for these paths, including rejected/lost clears, failed storage commits,
   interrupted processes and native failures immediately before positive dispatch.
 
