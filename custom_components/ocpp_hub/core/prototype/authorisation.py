@@ -27,6 +27,11 @@ class VendorAuthorisation:
         )
         return token
 
+    # Expiry cannot prove that a cloud Start has finished awaiting its matching actual session.
+    def pending(self) -> bool:
+        grant = self.journal.get("vendor_start_grant", {})
+        return bool(grant) and grant.get("local") is None
+
     # A grant authorises only its bounded pending start or the currently open transaction bound to that grant.
     def allows(self, tag: str) -> bool:
         grant = self.journal.get("vendor_start_grant", {})

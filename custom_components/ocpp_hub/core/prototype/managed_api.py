@@ -166,6 +166,7 @@ class ManagementServer:
                     and result.get("local_hold_verified") is True
                     and not self.controller.requests.return_in_progress()
                     and not self.controller.current.pending()
+                    and not self.controller.tests.return_blocked()
                     and self.controller.requests.has_capacity()
                 )
                 result["sessions"] = session_history(self.controller.session.journal)

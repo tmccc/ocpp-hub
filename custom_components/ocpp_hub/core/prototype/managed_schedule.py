@@ -41,6 +41,7 @@ from .trial_handover_evidence import HandoverEvidence
 if TYPE_CHECKING:
     from .gateway import Gateway
     from .managed import ManagedController
+    from .managed_fault_timer import FaultTimerRemoval, PausedReleaseAuthority
 
 KEY = "managed_temporary_schedule"
 
@@ -1077,7 +1078,9 @@ class ManagedSchedule:
             resume_cutoff(self.j)
 
     # Mark sent intent at the final transport boundary, and reconcile acknowledgements or lost replies by readback.
-    async def send(self, lease: dict[str, Any], adding: bool) -> None:
+    async def send(
+        self, lease: dict[str, Any], adding: bool, *, fault_removal: FaultTimerRemoval | None = None
+    ) -> None:
         c, j = self.c, self.j
         g = c.session.gateway
         epoch = g._charger_epoch
@@ -1086,9 +1089,18 @@ class ManagedSchedule:
             if adding
             else {"vendorId": "IoCharger", "messageId": "clearPlans", "data": encoded([lease["body"]["planId"]])}
         )
+        if fault_removal is not None:
+            if adding or c.session.book.fault_timer_removal is not None:
+                raise RecoveryRequiredError("fault timer cleanup scope is already occupied")
+            payload = fault_removal.payload
+            c.session.book.fault_timer_removal = fault_removal
 
         # Check again inside the write gate after waiting for the independent native reads.
         def check() -> None:
+            if fault_removal is not None:
+                fault_removal.authority.guard_timer_removal(fault_removal)
+                fault_removal.require_payload("DataTransfer", payload)
+                return
             current = j.get(KEY, {})
             held_install = lease.get("idle_cutoff_hold") is True and lease.get("idle_cutoff_replacement") is True
             if (
@@ -1137,11 +1149,18 @@ class ManagedSchedule:
 
         # Persist this exact send before the protocol can deliver it to the charger.
         def mark() -> None:
-            j.put(KEY, {**lease, "state": "installing" if adding else "clearing", "sent_at": time.time()})
+            current = fault_removal.require_live_occurrence() if fault_removal is not None else lease
+            j.put(KEY, {**current, "state": "installing" if adding else "clearing", "sent_at": time.time()})
             c.session.book.temporary_plan_write = payload
 
         try:
-            reply = await g.charger.call("DataTransfer", payload, check=check, before_send=mark)
+            reply = await g.charger.call(
+                "DataTransfer",
+                payload,
+                check=check,
+                before_send=mark,
+                token=fault_removal.token if fault_removal is not None else None,
+            )
             result = "accepted" if reply[0] == 3 and reply[2] == {"status": "Accepted", "data": ""} else "rejected"
         except TimerVehicleDisconnectedError:
             current = j.get(KEY, {})
@@ -1152,6 +1171,8 @@ class ManagedSchedule:
             result = "unconfirmed"
         finally:
             c.session.book.temporary_plan_write = None
+            if fault_removal is not None and c.session.book.fault_timer_removal is fault_removal:
+                c.session.book.fault_timer_removal = None
         current = j.get(KEY)
         if (
             current["id"] == lease["id"]
@@ -1581,11 +1602,17 @@ class ManagedSchedule:
         return lease, candidates
 
     # The daily plan stays enabled. Only a fresh verified closed session or missed/cancelled timer permits cleanup.
-    async def observe(self, n: HandoverEvidence) -> None:
+    async def observe(self, n: HandoverEvidence, *, fault_authority: PausedReleaseAuthority | None = None) -> None:
         c, j = self.c, self.j
         lease = j.get(KEY, {})
         state = lease.get("state")
+        if fault_authority is not None:
+            fault_authority.guard_timer_observation()
+            if c.requests.intent().mode != "paused":
+                raise RecoveryRequiredError("fault timer observation requires explicit Pause")
         if state not in {"requested", *OBSERVABLE}:
+            if fault_authority is not None:
+                return  # Completed cutoff duties remain under the owner's zero; this path never restores app control.
             if supervised_timer(lease) and self.needs_source(lease):
                 await self.protect_deadline(lease)
             return
@@ -1695,4 +1722,5 @@ class ManagedSchedule:
                 "next_clear": now + delay,
             }
             j.put(KEY, lease)
-            await self.send(lease, False)
+            removal = fault_authority.removal() if fault_authority is not None else None
+            await self.send(lease, False, fault_removal=removal)

@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased — iCS prototype and commissioning package
+## 0.2.2 — iCS runtime recovery
+
+- Retry the read-only Boot request on an authenticated connection after refusal, reply loss or a missing Boot.
+  Introduction still requires a genuine Boot, and retries stop with the connection.
+- Retire exact failed-current and interrupted test metadata after verified closed zero. Preserve historical outcomes
+  and actual Start, cloud permission, lifecycle and mutation debt. Internal Pause retries settle their own ticket.
+- Let a fresh explicit Pause repair eligible faults beside closed normal/timed tests and owned temporary timers.
+  Remove only the receipted timer, verify the original timetable, and retain independent cutoff duties until closure
+  or a successful explicit Return. Temporary native unavailability before automatic restoration keeps zero and retries.
+- Ask the manufacturer cloud again for an approved timer tag with a cached denial. Fresh denial, lost replies and
+  changed owner/connection authority still refuse the Start. Report unbound cloud Starts as an explicit health blocker.
+- Defer Return until timed local/cloud tests finish settling, retaining normal Start's existing Return behavior.
+- Add real TLS/native HTTP regressions for these paths, including rejected/lost clears, failed storage commits,
+  interrupted processes and native failures immediately before positive dispatch.
+
 
 - Retry initial and reconnect introduction when closed-zero or native lifecycle evidence is still pending on the
   same actual Boot. Preserve strict content refusals with a durable diagnostic and attention state.

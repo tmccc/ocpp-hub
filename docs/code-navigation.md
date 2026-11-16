@@ -71,6 +71,13 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 Read recovery siblings alongside their callers. The small modules divide proof and settlement across files; a
 function that returns successfully may only advance one boundary, leaving an actual command or receipt pending.
 
+`managed_settlement.py` binds exact terminal current/test records and internal Pause claims to caller-owned zero
+proofs. `managed_fault_timer.py` carries the acknowledged Pause authority across the schedule, native and resource
+checks for one exact timer removal. Start with `test_managed_settlement_regressions.py` and
+`test_managed_fault_timer.py` for their real-peer recovery and storage-failure cases. `test_runtime_boot_retry.py`
+covers repeated read-only probes; `test_managed_cached_authorization.py` and
+`test_managed_cloud_pending_return.py` cover cloud decisions, retained permissions and timed-test Return settlement.
+
 For introduction, follow `TrialSession._before_ceiling()`, `NativeBoundedHandover.introduce()` and the runtime's
 typed deferred retry loop. `managed_faults.py` shares the strict diagnostic latch with ordinary supervision.
 `test_introduction_readiness_retry.py` separates pending prerequisites from simultaneous content contradictions.

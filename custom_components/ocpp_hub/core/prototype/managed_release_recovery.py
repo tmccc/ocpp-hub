@@ -7,14 +7,14 @@ import math
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..control import HUB_PROFILE_ID
 from .managed_current import managed_current_ceiling
 from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
-from .managed_cutoffs import supervised_timer
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
 from .managed_delivery_recovery import complete_delivery_recovery, delivery_recovery_evidence
+from .managed_fault_timer import FaultTimerRemoval, PausedReleaseAuthority, receipted_timer_requests
 from .managed_native_repair import repair_pending, repair_revoked
-from .managed_occurrences import occurrences
+from .managed_occurrences import activate, occurrences
+from .managed_settlement import complete_record, current_candidate, require_record, test_candidate
 from .managed_start_delivery import DENIALS, complete_denied_start, denial_faults, denied_start_evidence
 from .native_faults import MEASURED_FAULT, measurement_cause
 from .store import RecoveryRequiredError, fingerprint
@@ -149,12 +149,18 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     boot = g.boot_observation
     ticket = j.get("control", {}).get("ticket")
     current = legacy_current_evidence(c, fault)
+    terminal_current = current_candidate(c) if current is None else None
+    terminal_test = test_candidate(c)
+    terminal = [record for record in (terminal_current, terminal_test) if record is not None]
     delivery = delivery_recovery_evidence(c, fault)
     operator = operator_recovery_evidence(c, fault)
     denied = denied_start_evidence(c, fault)
+    timer_requests = receipted_timer_requests(j)
 
     # Any newer Pause, Boot, local operation, request or unrelated write debt revokes this snapshot.
-    def guard() -> None:
+    def common_guard(removal: FaultTimerRemoval | None) -> None:
+        for record in terminal:
+            require_record(c, record)
         control = j.get("control", {})
         if (
             c.stopping
@@ -192,62 +198,50 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             and not c.pause_task.done()
             or g.controls._operations
             or g.charger._pending
+            and removal is None
             or g.vendor._pending
             or j.get("managed_current_change", {}).get("state") in ("pending", "recovering", "interrupted", "uncertain")
             and current is None
+            and terminal_current is None
             or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
             or j.get("managed_test_charge", {}).get("state") not in (None, "completed")
             and not (denied_start_evidence(c, fault) or {}).get("normal")
-            or any(supervised_timer(lease) for lease in occurrences(j).values())
-            or any(lease.get("state") == "requested" for lease in occurrences(j).values())
+            and terminal_test is None
             or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
-            or j.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action!='pause' AND state IN ('accepted','running') "
-                "AND id IS NOT ? LIMIT 1",
-                (((denied_start_evidence(c, fault) or {}).get("normal") or {}).get("id"),),
-            ).fetchone()
+            or any(
+                tuple(row) not in timer_requests
+                and row["id"] != ((denied_start_evidence(c, fault) or {}).get("normal") or {}).get("id")
+                and row["id"] != (terminal_test.identifier if terminal_test is not None else None)
+                for row in j.db.execute(
+                    "SELECT id,action,revision FROM managed_requests "
+                    "WHERE action!='pause' AND state IN ('accepted','running')"
+                )
+            )
         ):
             raise RecoveryRequiredError("release reconciliation awaits the exact paused zero and settled journal")
         c.native.spec.require_boot(j.get("boot"))
         require_lifecycle_idle(g)
 
-    guard()
-    # Production native read verifies commissioned native6/native32, original history, freshness and read generation.
+    authority = PausedReleaseAuthority.capture(c, common_guard)
+    authority.guard_timer_observation()
+    observable = [v for v in occurrences(j).values() if v.get("state") in ("installing", "armed", "clearing")]
+    if len(observable) == 1 and j.get("managed_temporary_schedule", {}).get("state") == "complete":
+        activate(j, observable[0]["id"])
+        authority.guard_timer_observation()
+    # Native source publication precedes selective cleanup; it may settle observations, never actual Start debt.
     native = await c.native.read(closed=True)
-    guard()
-    c.native.require(native, closed=True)
-    c.native.require_known_session(native)
-    if (
-        native.physical.transaction_open
-        or any(v != 0 for v in native.currents_a + native.powers_w)
-        or native.saved_schedule_digest != c.native.spec.saved_schedule_digest
-        or j.get("trial_binding")
-        != {
-            "configuration_digest": c.native.binding_digest(native),
-            "station": c.native.choice.value(),
-            "boot_digest": c.native.spec.boot_digest,
-        }
-    ):
-        raise RecoveryRequiredError("release reconciliation awaits closed native zero and original configuration")
-    present = s.book.owned_present(native.physical)
-    station = [r for r in present if r.kind == "profile" and r.identifier == HUB_PROFILE_ID]
-    row = j.db.execute(
-        "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-    ).fetchone()
-    if (
-        len(station) != 1
-        or station[0].canonical.get("limit") != 0
-        or row is None
-        or row["state"] != "confirmed"
-        or row["confirmed"] is None
-        or json.loads(row["confirmed"]) != station[0].canonical
-    ):
-        raise RecoveryRequiredError("release reconciliation awaits independently confirmed owned station zero")
+    authority.require_observed_zero(native)
+    await c.schedule.observe(native, fault_authority=authority)
+    authority.guard_settled()
+    native = await c.native.read(closed=True)
+    authority.require_original_zero(native)
     with j.atomic():
-        guard()
+        authority.require_original_zero(native)
         control = j.get("control")
+        for record in terminal:
+            complete_record(c, record)
         j.put(
             PROOF,
             {
@@ -309,4 +303,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     c.native.introduced_epoch = epoch
     c.native.introduced_revision = revision
     c.released_epoch = None
+    if terminal_test is not None:
+        c.tests.lease = None
+        c.tests.changed.set()
     return True

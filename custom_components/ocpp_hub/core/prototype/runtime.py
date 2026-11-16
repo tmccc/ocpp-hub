@@ -168,29 +168,45 @@ class ConnectionRuntime:
                     self.status.charger_connected = False
                     self.status.boot_observed = False
 
-    # Explicitly enabled read-only probing never fabricates a boot or changes charger configuration.
+    # Retry only the read-only request on this socket; every delay still accepts a spontaneous genuine Boot.
+    async def _wait_for_real_boot(self, epoch: int) -> None:
+        if not self.settings.boot_probe_after:
+            await self.gateway.wait_for_boot(epoch)
+            return
+        wait, delay = self.settings.boot_probe_after, self.settings.retry_min
+        while not self.gateway.current_boot_seen(epoch):
+            self.gateway._require_epoch("charger", epoch)
+            if self._closing:
+                raise UnavailableError("runtime closed before Boot")
+            try:
+                await asyncio.wait_for(self.gateway.wait_for_boot(epoch), wait)
+                return
+            except TimeoutError:
+                pass
+
+            # A Boot received while the RPC gate was occupied makes another probe unnecessary.
+            def guard() -> None:
+                self.gateway._require_epoch("charger", epoch)
+                if self._closing or self.gateway.current_boot_seen(epoch):
+                    raise UnavailableError("Boot probe was superseded")
+
+            try:
+                result = await self.gateway.charger.call(
+                    "TriggerMessage", {"requestedMessage": "BootNotification"}, check=guard
+                )
+                if result[0] != 3 or result[2].get("status") != "Accepted":
+                    raise UnavailableError("charger refused the read-only boot probe")
+                await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
+                return
+            except (UnavailableError, TimeoutError) as error:
+                self.status.last_failure = "BootOrCeilingUnavailable"
+                self.status.charger_fault.record(error, "boot_probe", "TriggerMessage")
+            wait, delay = delay, min(2 * delay, self.settings.retry_max)
+
+    # Only a genuine Boot starts introduction; its restrictive retry has a separate lifetime from Boot probing.
     async def _boot_probe(self, epoch: int) -> None:
         try:
-            if self.settings.boot_probe_after:
-                try:
-                    await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
-                except TimeoutError:
-                    try:
-                        result = await self.gateway.charger.call(
-                            "TriggerMessage",
-                            {"requestedMessage": "BootNotification"},
-                            check=lambda: self.gateway._require_epoch("charger", epoch),
-                        )
-                        if result[0] != 3 or result[2].get("status") != "Accepted":
-                            raise UnavailableError("charger refused the read-only boot probe")
-                        await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
-                    except (UnavailableError, TimeoutError) as error:
-                        self.status.last_failure = "BootOrCeilingUnavailable"
-                        self.status.charger_fault.record(error, "boot_probe", "TriggerMessage")
-                        # A failed read-only probe does not invalidate a later genuine Boot on this same connection.
-                        await self.gateway.wait_for_boot(epoch)
-            else:
-                await self.gateway.wait_for_boot(epoch)
+            await self._wait_for_real_boot(epoch)
             self.status.boot_observed = self.gateway.current_boot_seen(epoch)
             self.gateway._require_epoch("charger", epoch)
             if self.before_ceiling is not None:

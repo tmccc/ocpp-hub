@@ -151,6 +151,7 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
             (status.get("fault") == "native_observation_unavailable", "native_observation_unavailable"),
             (status.get("fault") == "current_update_pending", "current_update_pending"),
             (status.get("fault") == "start_operation_pending", "start_operation_pending"),
+            (gateway.authorisation.pending(), "cloud_start_pending"),
             (status.get("charger_connected") is False, "charger_disconnected"),
             (status.get("cloud_connected") is False, "cloud_disconnected"),
             (status.get("boot_verified") is False, "boot_unverified"),

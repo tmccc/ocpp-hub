@@ -2124,8 +2124,9 @@ async def test_lost_source_after_positive_write_with_telemetry_outage(tmp_path, 
 # Why: a rejected timer clear can span midnight and the daily tag's original cloud approval may have expired.
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
+@pytest.mark.parametrize("prior_decision", ["expired", "denied"])
 async def test_daily_occurrences_during_prolonged_clear_refusal(
-    tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand
+    tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand, prior_decision
 ):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await b.arm()
@@ -2171,6 +2172,8 @@ async def test_daily_occurrences_during_prolonged_clear_refusal(
                 if not demand:
                     b.device.requested_current = 0
                 assert b.session.gateway.auth_info.get(tag)["status"] == "Expired"
+                if prior_decision == "denied":
+                    b.session.gateway.auth_info.put(tag, {"status": "Blocked"})
                 body = START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()}
                 for plan in (b.timer, 987655):
                     b.rig.peer.plan_session = (987654, plan)

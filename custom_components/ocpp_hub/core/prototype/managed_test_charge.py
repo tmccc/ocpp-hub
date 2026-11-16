@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
+from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
 from .managed_start_binding import known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
@@ -76,7 +77,7 @@ class ManagedChargeTests:
                 )
                 if not preserve:
                     self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
-                controller.session.gateway.controls._claim(True, stopping=True)
+                claim_internal_pause(controller, "test", saved["id"])
                 self.journal.put(
                     "managed_test_charge",
                     {
@@ -104,6 +105,13 @@ class ManagedChargeTests:
     def state(self) -> dict[str, Any]:
         value: dict[str, Any] = self.journal.get("managed_test_charge", {})
         return value
+
+    # Timed tests retain Pause through settlement; normal Start has its own deferred Return lifecycle.
+    def return_blocked(self) -> bool:
+        lease, state = self.lease, self.state()
+        return bool(
+            lease is not None and not lease.normal or state.get("kind") == "test" and state.get("state") == "stopping"
+        )
 
     # A durable failed receipt proves this request had no effects; it cannot own a later ordinary session.
     def retire_refused_unsent(self) -> None:
@@ -424,6 +432,7 @@ class ManagedChargeTests:
     # The service owns the worker after client disappearance; failures revoke only this Start's authority.
     async def _start(self, lease: TestLease) -> None:
         c, j = self.controller, self.journal
+        previous_current = current_candidate(c) if lease.normal else None
         effects = False
         try:
             self.guard(lease)
@@ -492,6 +501,13 @@ class ManagedChargeTests:
                     j.put("managed_control_intent", {"mode": "app", "revision": lease.revision + 1})
                     j.put("managed_owner_epoch", lease.epoch)
                     c.requests.supersede_pauses(lease.identifier)
+                    if previous_current is not None:
+                        try:
+                            require_record(c, previous_current)
+                        except RecoveryRequiredError:
+                            pass  # A newer current request retains its own outcome while Start was awaiting replies.
+                        else:
+                            complete_record(c, previous_current)
                 j.put(
                     "managed_test_charge",
                     {
@@ -1044,7 +1060,7 @@ class ManagedChargeTests:
             )
             if intent.mode != "paused" and not preserve:
                 j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
-                c.session.gateway.controls._claim(True, stopping=True)
+                claim_internal_pause(c, "test", lease.identifier)
                 j.db.execute(
                     "UPDATE managed_requests SET state='failed',result=? WHERE action='app_control' "
                     "AND state IN ('accepted','running')",

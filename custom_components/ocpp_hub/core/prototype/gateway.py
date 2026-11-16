@@ -374,7 +374,7 @@ class Gateway:
                         native_report is not None
                         and self.policy.strict_cloud_authorization
                         and isinstance(tag, str)
-                        and self._tag_info(tag)["status"] == "Expired"
+                        and self._tag_info(tag)["status"] != "Accepted"
                         and self.auth_info.accepted_for_delayed_report(
                             tag, timestamp(payload["timestamp"]).timestamp(), payload["timestamp"]
                         )
@@ -579,7 +579,7 @@ class Gateway:
             return info
         return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
 
-    # A native timer can send Start directly on the next day, after its previous cloud approval expired.
+    # A native timer can ask the cloud again after its cached decision expired or previously denied permission.
     async def _renew_direct_start(self, payload: dict[str, Any], epoch: int, *, held_native: bool = False) -> None:
         tag = payload.get("idTag")
         if (
@@ -597,7 +597,7 @@ class Gateway:
         ):
             return
         stored = self.auth_info.stored(tag)
-        if stored is None or stored["status"] != "Accepted" or self._tag_info(tag)["status"] != "Expired":
+        if stored is None or self._tag_info(tag)["status"] == "Accepted":
             return
         integer(payload.get("connectorId"), 1, 1)
         number(payload.get("meterStart"), 1e12)
@@ -615,7 +615,7 @@ class Gateway:
             ):
                 raise DeniedError("scheduled start authority changed during renewal")
 
-        # Share even a timeout or unchanged expired answer across this burst of retries. A later burst may retry.
+        # Share even a timeout or unchanged denial across this burst of retries. A later burst may retry.
         key = (tag.casefold(), epoch, self._vendor_epoch, ticket)
         pending = self._start_renewals.get(key)
         if pending is not None:

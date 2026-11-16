@@ -20,6 +20,14 @@ from tools import managed_proxy
 from tools.managed_reporting import Reporting
 
 
+# Intent: even an otherwise healthy cached sample cannot hide a retained unbound cloud Start.
+# Why: health recomputation must preserve the blocker independently of a producer's state label.
+def test_health_explains_pending_cloud_start():
+    result = health_snapshot(healthy_status(10000) | {"cloud_start_pending": True}, 10000)
+    assert result["healthy"] is False and result["local_healthy"] is False
+    assert result["health_blockers"] == ["cloud_start_pending"]
+
+
 # Intent: a cloud outage and a simultaneous local verification failure both remain visible without changing health.
 # Why: the connection symptom cannot hide an independent recovery/preservation/native-limit prerequisite.
 @pytest.mark.parametrize("change", [{"phase": "recovering"}, {"preservation_failed": True}, {"native_limit_a": 32}])

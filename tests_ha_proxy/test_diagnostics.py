@@ -65,6 +65,7 @@ def detail():
         ("verification_pending", "delivery_storage_pending", None, "required journal storage"),
         ("not_assessed", "pause_verification_pending", None, "physical zero output has not yet been verified"),
         ("not_assessed", "command_outcome_unknown", None, "unresolved outcome"),
+        ("not_assessed", "cloud_start_pending", None, "cloud Start is awaiting its matching session"),
         ("verification_pending", "fault_latched", "measured_output_limit_exceeded", "validated measurements exceeded"),
     ],
 )
@@ -166,7 +167,7 @@ async def test_real_ha_diagnostic_download_is_passive_redacted_and_truthful(
     monkeypatch.setattr(coordinator.client, "request", deny)
     report = await async_get_config_entry_diagnostics(actual_hass, entry)
     assert report["snapshot_fresh"] is (not stale and not failed)
-    assert report["software"]["client_version"] == "0.2.1"
+    assert report["software"]["client_version"] == "0.2.2"
     assert len(report["software"]["client_source_sha256"]) == 64
     assert report["software"]["proxy_source_sha256"] == "c" * 64
     assert report["diagnostics"]["pending_commands"][0]["confirmation"] == "unknown"

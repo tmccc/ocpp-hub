@@ -7,7 +7,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
@@ -20,6 +20,9 @@ from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_bootstrap import initialize_trial_baseline
 from .trial_evidence import Evidence, Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
+
+if TYPE_CHECKING:
+    from .managed_fault_timer import FaultTimerRemoval
 
 
 @dataclass(frozen=True, repr=False)
@@ -97,6 +100,7 @@ class ResourceBook:
         self.journal, self.baseline = journal, baseline
         self.before_positive_release: Callable[[], None] | None = None
         self.temporary_plan_write: dict[str, Any] | None = None
+        self.fault_timer_removal: FaultTimerRemoval | None = None
         if baseline.identity_digest != fingerprint(journal.identity):
             raise SecurityError("baseline belongs to another charger")
         for r in baseline.resources:
@@ -249,6 +253,14 @@ class ResourceBook:
                 action == "ClearChargingProfile" or action == "SetChargingProfile" and not safety
             ):
                 raise DeniedError("original profiles prevent new profile writes and automatic clears")
+        removal = self.fault_timer_removal
+        if removal is not None and action == "DataTransfer" and payload is removal.payload:
+            removal.require_payload(action, payload)
+            removal.authority.guard_timer_removal(removal)
+            if payload is not self.temporary_plan_write or removal.verified_native_digest is None:
+                raise DeniedError("fault timer removal lacks this call's native zero proof")
+            self.temporary_plan_write = None
+            return
         if phase != "active" and not reading:
             key = "profile:" + str(payload.get("id"))
             if (

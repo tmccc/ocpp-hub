@@ -54,6 +54,7 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
         and value.get("boot_verified") is True
         and value.get("phase") == "active"
         and value.get("preservation_failed") is False
+        and value.get("cloud_start_pending") is not True
         and selected is not None
         and 6 <= selected <= native_ceiling
         and value.get("native_limit_a") == native_ceiling
@@ -68,6 +69,7 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
             (value.get("running") is True, "service_not_running"),
             (value.get("charger_connected") is not False, "charger_disconnected"),
             (value.get("boot_verified") is not False, "boot_unverified"),
+            (value.get("cloud_start_pending") is not True, "cloud_start_pending"),
             (bool(authority), "control_verification_pending"),
             (remaining is not None and remaining > 1800, "certificate_validity_insufficient"),
             (value.get("cloud_connected") is not False, "cloud_disconnected"),

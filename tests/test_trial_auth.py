@@ -378,9 +378,7 @@ async def test_tagged_stop_metadata_is_an_immutable_fact(tmp_path: Path) -> None
 # Why: the last permission check must follow every await, including physical-ceiling verification.
 @pytest.mark.parametrize("change", ["stop", "revoked", "expired"])
 @pytest.mark.parametrize("registration", ["Accepted", "Pending"])
-async def test_authorize_rechecks_permission_after_cap_readback(
-    tmp_path: Path, change: str, registration: str
-) -> None:
+async def test_authorize_rechecks_permission_after_cap_readback(tmp_path: Path, change: str, registration: str) -> None:
     from tests.test_prototype_runtime import until
 
     rig = StrictRig(tmp_path / "state.db")
@@ -533,13 +531,16 @@ async def test_native_direct_start_after_expiry(tmp_path: Path, outcome: str) ->
 # Intent: two OCPP requests for the same expired scheduled start share renewal and one immutable transaction.
 # Why: the charger retries its timer rapidly when an initial response takes longer than its retry interval.
 @pytest.mark.parametrize("outcome", ["accepted", "same_expired", "callerror", "timeout"])
-async def test_overlapping_direct_starts_share_cloud_decision(tmp_path: Path, outcome: str) -> None:
+@pytest.mark.parametrize("cached_denial", [False, True])
+async def test_overlapping_direct_starts_share_cloud_decision(
+    tmp_path: Path, outcome: str, cached_denial: bool
+) -> None:
     rig = StrictRig(tmp_path / "state.db")
     try:
         await rig.boot()
         await rig.cloud()
         expired = info(expiryDate="2000-01-01T00:00:00Z")
-        rig.gateway.auth_info.put(START["idTag"], expired)
+        rig.gateway.auth_info.put(START["idTag"], info(status="Blocked") if cached_denial else expired)
         if outcome == "same_expired":
             rig.actual_info = expired
         rig.authorization_failure = outcome
@@ -589,18 +590,21 @@ async def test_direct_start_uses_concurrent_ordinary_authorize(tmp_path: Path) -
         await rig.close()
 
 
-# Intent: a cached explicit denial differs from a formerly Accepted decision that expired with time.
-# Why: the arrival of a direct Start cannot independently reverse a revocation or concurrent-use rejection.
+# Intent: an approved timer's cached denial changes only after a fresh correlated cloud decision.
+# Why: local policy must neither make a denial permanent nor reverse it without the real backend's permission.
 @pytest.mark.parametrize("status", ["Blocked", "Invalid", "Expired", "ConcurrentTx"])
-async def test_direct_start_preserves_explicit_denial(tmp_path: Path, status: str) -> None:
+@pytest.mark.parametrize("fresh", ["Accepted", "Blocked"])
+async def test_direct_start_refreshes_explicit_denial(tmp_path: Path, status: str, fresh: str) -> None:
     rig = StrictRig(tmp_path / "state.db")
     try:
         await rig.boot()
         await rig.cloud()
         rig.gateway.auth_info.put(START["idTag"], info(status=status))
-        assert (await rig.charger("direct", "StartTransaction", START))[0] == 4
-        assert rig.store.active() is None
-        assert not any(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames)
+        rig.actual_info = info(status=fresh)
+        result = await rig.charger("direct", "StartTransaction", START)
+        assert result[0] == (3 if fresh == "Accepted" else 4)
+        assert (rig.store.active() is not None) == (fresh == "Accepted")
+        assert sum(f[0] == 2 and f[2] == "Authorize" for f in rig.vendor_frames) == 1
     finally:
         await rig.close()
 

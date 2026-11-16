@@ -638,6 +638,18 @@ Software metadata distinguishes the actual HA/client version and an available in
 source fingerprints. The proxy fingerprint covers the installed core Python sources and its managed/reporting/trial
 entry points; the client fingerprint covers its installed Python sources. A fingerprint is not a claimed Git commit.
 
+A manufacturer cloud Start that has not reported its matching session remains a visible health blocker, including
+after its permission expires. The proxy retains that obligation until independently reconciled; expiry and zero
+output do not prove the command was unused. A bound, normally running cloud session has no such pending blocker.
+
+Fresh verified Pause can retire obsolete failed-current or interrupted local/cloud test metadata while preserving
+the original command outcome. It cannot retire an accepted but unbound Start, unknown mutation or missing lifecycle
+report. Eligible acknowledged faults use the same closed-zero proof to settle their exact closed operation. If an
+owned temporary timer remains, recovery removes only that receipted plan and verifies the original timetable before
+clearing the fault. Separate cutoff duties remain under Pause until real closure or successful explicit Return.
+Timed tests must finish their final Pause observation before Return is accepted; normal Start retains its existing
+deferred Return behavior.
+
 A normal Start from a recovered Pause records its current connection authority after the guarded physical command
 succeeds. Its startup deadline retires only after actual session evidence; an unobserved Start still expires and
 holds zero. A rejected or unanswered Stop can settle after its same Pause has independently verified genuine
@@ -1000,10 +1012,14 @@ feature. Active-session current modulation, selective cleanup beside original pr
 are optional extensions and do not block the delivered daily operation. This is an operational handover for this
 installation, not a claim that every app feature or electrical load has been exercised.
 
-The iCS native timer can send `StartTransaction` directly after yesterday's cloud permission expires.
-The proxy requests fresh cloud authorisation for a previously accepted, configured tag before accepting that
+The iCS native timer can send `StartTransaction` directly after yesterday's cloud permission expires or was denied.
+The proxy requests fresh cloud authorisation for that configured tag before accepting the
 start. A missing response, explicit denial or intervening Pause prevents a new transaction. Rapid identical
 retries share the cloud decision and the accepted transaction number.
+
+If the charger does not send Boot after reconnecting, the enabled read-only Boot request retries with bounded
+backoff on that connection. A refused request, lost reply or Accepted reply without Boot cannot strand it permanently.
+Only a genuine Boot permits introduction; retries stop when it arrives or the connection ends.
 
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy

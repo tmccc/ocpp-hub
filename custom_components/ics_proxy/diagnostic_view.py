@@ -13,6 +13,9 @@ REASONS = {
     "native_observation_unavailable": "Fresh independent charger readings are unavailable.",
     "current_update_pending": "A current update is awaiting its required operation or recorded outcome.",
     "start_operation_pending": "A Start operation is awaiting its required operation or recorded outcome.",
+    "cloud_start_pending": (
+        "A manufacturer cloud Start is awaiting its matching session; further controls remain blocked."
+    ),
     "charger_disconnected": "The charger connection is unavailable.",
     "cloud_disconnected": "The manufacturer cloud connection is unavailable.",
     "boot_unverified": "The current charger connection has not completed registration verification.",

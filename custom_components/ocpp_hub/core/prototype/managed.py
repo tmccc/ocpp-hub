@@ -30,6 +30,13 @@ from .managed_schedule import (
     supervised_timer,
     temporary_continuation,
 )
+from .managed_settlement import (
+    complete_record,
+    current_candidate,
+    internal_pause_matches,
+    require_settled_debt,
+    test_candidate,
+)
 from .managed_start_binding import ManagedStartBinding
 from .managed_test_charge import ManagedChargeTests
 from .managed_view import summarize_charger_history
@@ -111,6 +118,8 @@ class ManagedController:
         previous = self.requests.existing(identifier, action, revision)
         if previous is not None:
             return previous
+        if action == "app_control" and self.tests.return_blocked():
+            raise RecoveryRequiredError("return awaits timed test settlement")
         if action == "app_control" and self.current.pending():
             raise RecoveryRequiredError("return awaits the current-setting outcome")
         if action == "app_control" and self.session.journal.get("managed_control_fault"):
@@ -294,6 +303,24 @@ class ManagedController:
             await self.schedule.observe(native)
         self.require_paused(native)
         g, j = self.session.gateway, self.session.journal
+        records = [record for record in (current_candidate(self), test_candidate(self)) if record is not None]
+        internal = internal_pause_matches(self)
+        if records or internal:
+            try:
+                require_settled_debt(self)
+            except RecoveryRequiredError:
+                pass  # Unknown Start and lifecycle facts remain authoritative even at fresh native zero.
+            else:
+                with j.atomic():
+                    self.require_paused(native)
+                    require_settled_debt(self)
+                    for record in records:
+                        complete_record(self, record)
+                    if internal:
+                        g.controls._complete(j.get("control")["ticket"], uncertain=False)
+                if any(record.key == "managed_test_charge" for record in records):
+                    self.tests.lease = None
+                    self.tests.changed.set()
         if self.current.failed_idle_hold():
             # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
             g.controls._complete(j.get("control")["ticket"], uncertain=False)
@@ -315,7 +342,7 @@ class ManagedController:
             == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
             or j.get("managed_owner_stop")
             == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
-            or receipt.get("stage") == "unsent"
+            or receipt.get("stage") in ("unsent", "rejected")
             and receipt.get("settled_ticket") == control.get("ticket")
             or receipt.get("bound_ticket") == control.get("ticket")
             and j.db.execute(
@@ -647,6 +674,8 @@ class ManagedController:
         if expected.revision != revision:
             self.requests.finish(identifier, "failed", {"classification": "stale_revision"})
             return
+        if self.tests.return_blocked():
+            return  # An already accepted Return survives until observation completes the timed test under Pause.
         j = self.session.journal
         control = j.get("control", {})
         if control.get("uncertain") and j.get("managed_owner_stop") == {
@@ -782,6 +811,7 @@ class ManagedController:
                 "charger_connected": runtime.charger_connected,
                 "cloud_connected": runtime.vendor_connected and g.vendor_registration == "Accepted",
                 "boot_verified": g.current_boot_seen(g._charger_epoch),
+                "cloud_start_pending": g.authorisation.pending(),
                 "owner_control_enabled": False,
                 "local_hold_verified": False,
                 "native_observed_at": None,
@@ -800,6 +830,7 @@ class ManagedController:
             "charger_connected": s.runtime.status.charger_connected,
             "cloud_connected": s.runtime.status.vendor_connected and g.vendor_registration == "Accepted",
             "boot_verified": g.current_boot_seen(g._charger_epoch),
+            "cloud_start_pending": g.authorisation.pending(),
             "phase": j.get("trial_phase"),
             "pending_lifecycle_events": j.db.execute(
                 "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
@@ -1056,6 +1087,7 @@ class ManagedController:
             and j.get("trial_phase") == "active"
             and not control.get("uncertain")
             and not s.runtime.status.delivery_blocked
+            and not g.authorisation.pending()
         )
         healthy = local_healthy and cloud
         if healthy and not paused:

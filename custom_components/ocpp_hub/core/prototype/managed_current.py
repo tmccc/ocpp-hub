@@ -13,6 +13,7 @@ from ..control import HUB_PROFILE_ID
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
+from .managed_settlement import claim_internal_pause
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
 from .rpc import UnavailableError
@@ -176,7 +177,7 @@ class ManagedCurrentLimits:
             with self.journal.atomic():
                 intent = controller.requests.intent()
                 self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
-                controller.session.gateway.controls._claim(True, stopping=True)
+                claim_internal_pause(controller, "current", change["id"])
                 control = self.journal.get("control")
                 self.journal.put("control", {**control, "resume_limit": previous})
                 state = "uncertain" if change.get("mode") == "paused" else "interrupted"
@@ -516,7 +517,7 @@ class ManagedCurrentLimits:
     async def _failed_apply(
         self, identifier: str, value: int, previous_value: int, mode: str, revision: int, error: Exception
     ) -> None:
-        c, g, j = self.controller, self.controller.session.gateway, self.journal
+        c, j = self.controller, self.journal
         cause = {
             "id": identifier,
             "revision": revision - 1,
@@ -556,7 +557,7 @@ class ManagedCurrentLimits:
                 with j.atomic():
                     if not superseded:
                         j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
-                        g.controls._claim(True, stopping=True)
+                        claim_internal_pause(c, "current", identifier)
                     control = j.get("control", {})
                     if control.get("inhibit") is True and j.get("managed_current_change", {}).get("id") == identifier:
                         j.put("control", {**control, "resume_limit": previous_value})
@@ -674,7 +675,7 @@ class ManagedCurrentLimits:
             with j.atomic():
                 intent = c.requests.intent()
                 j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
-                c.session.gateway.controls._claim(True, stopping=True)
+                claim_internal_pause(c, "current", change["id"])
                 j.put("control", {**j.get("control"), "resume_limit": change["previous_a"]})
                 j.put("managed_current_change", {**j.get("managed_current_change"), "state": "interrupted"})
             return

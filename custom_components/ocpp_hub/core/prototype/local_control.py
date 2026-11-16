@@ -110,6 +110,7 @@ class LocalControl:
         self._operations: set[asyncio.Task[Any]] = set()
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
+        self._release_ticket: str | None = None
         self._stop_ack: StopAcknowledgement | None = None
         self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
@@ -515,9 +516,13 @@ class LocalControl:
             receipt = self.journal.get("local_start_receipt", {})
             if receipt.get("ticket") == ticket:
                 with self.journal.atomic():
-                    self.journal.put("local_start_receipt", {**receipt, "stage": stage})
-                    if stage == "rejected" and receipt.get("local") is None:
-                        control = self.journal.get("control", {})
+                    control = self.journal.get("control", {})
+                    settled = stage == "rejected" and receipt.get("local") is None and control.get("ticket") == ticket
+                    self.journal.put(
+                        "local_start_receipt",
+                        {**receipt, "stage": stage, **({"settled_ticket": ticket} if settled else {})},
+                    )
+                    if settled:
                         self.journal.put("control", {**control, "start_pending": False})
 
         # The native and resource gates both run before the transport can send this command.
@@ -567,29 +572,34 @@ class LocalControl:
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
         epoch, ticket = self._claim(previous.get("inhibit", False))
 
-        restoring_zero = False
+        self._release_ticket = ticket
+        try:
+            restoring_zero = False
 
-        # The positive guard can revoke release; the same ticket and Boot still authorize rollback to zero.
-        def check() -> None:
-            self._check(epoch, ticket)
-            if not restoring_zero and guard is not None:
-                guard()
-
-        async with self.peer.sequence(1, check) as call:
-            try:
-                await self._cap(
-                    call,
-                    number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a),
-                    epoch,
-                )
-                check()
-            except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
-                self._complete(ticket, inhibit=True)
+            # The positive guard can revoke release; the same ticket and Boot still authorize rollback to zero.
+            def check() -> None:
                 self._check(epoch, ticket)
-                restoring_zero = True
-                await self._cap(call, 0, epoch)
-                if isinstance(error, ReleaseDeferredError):
-                    self._complete(ticket, uncertain=False)
-                raise
-            # Changing the station ceiling cannot bind a pending command to a transaction.
-            self._complete(ticket, owner="shared", inhibit=False, uncertain=False)
+                if not restoring_zero and guard is not None:
+                    guard()
+
+            async with self.peer.sequence(1, check) as call:
+                try:
+                    await self._cap(
+                        call,
+                        number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a),
+                        epoch,
+                    )
+                    check()
+                except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
+                    self._complete(ticket, inhibit=True)
+                    self._check(epoch, ticket)
+                    restoring_zero = True
+                    await self._cap(call, 0, epoch)
+                    if isinstance(error, ReleaseDeferredError):
+                        self._complete(ticket, uncertain=False)
+                    raise
+                # Changing the station ceiling cannot bind a pending command to a transaction.
+                self._complete(ticket, owner="shared", inhibit=False, uncertain=False)
+        finally:
+            if self._release_ticket == ticket:
+                self._release_ticket = None

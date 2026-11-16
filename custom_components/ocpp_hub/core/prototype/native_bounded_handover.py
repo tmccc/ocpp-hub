@@ -7,7 +7,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
@@ -45,6 +45,9 @@ from .trial_handover import ObserveHandover
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
 from .trial_rollback import require_lifecycle_idle
+
+if TYPE_CHECKING:
+    from .managed_fault_timer import FaultTimerRemoval
 
 NativePatch = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -154,7 +157,13 @@ class NativeBoundedHandover:
 
     # Read rich native evidence under current authority; eligible repair audits are fenced before observation.
     async def read(
-        self, route: str = "trial", closed: bool = False, *, owned: bool = False, initial: bool = False
+        self,
+        route: str = "trial",
+        closed: bool = False,
+        *,
+        owned: bool = False,
+        initial: bool = False,
+        timer_removal: FaultTimerRemoval | None = None,
     ) -> HandoverEvidence:
         self.read_sequence += 1
         sequence, before = self.read_sequence, self.authority()
@@ -197,8 +206,11 @@ class NativeBoundedHandover:
                 verify_initial_history(
                     gateway.journal, native.physical.history, gateway.journal.identity, self.spec.hardware_identity
                 )
-            if attempt is not None and (gateway.controls._operations or gateway.charger._pending):
-                raise RecoveryRequiredError("native repair awaits settled resource operations")
+            if attempt is not None:
+                if timer_removal is not None:
+                    timer_removal.require_validation_call()
+                elif gateway.controls._operations or gateway.charger._pending:
+                    raise RecoveryRequiredError("native repair awaits settled resource operations")
             resource_error = self.book.native_conflict(native.physical, owned=owned or attempt is not None)
             strict_complete = True
             self.book.check_originals(native.physical)
@@ -680,15 +692,60 @@ class NativeBoundedHandover:
         zero = action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0
         if zero:
             return  # Existing ledger guards still forbid recreating a station profile after verified absence.
+        removal = self.book.fault_timer_removal
+        if removal is not None and action == "DataTransfer" and payload is removal.payload:
+            removal.require_payload(action, payload)
+            removal.authority.guard_timer_removal(removal)
+            native = await self.read(closed=True, timer_removal=removal)
+            removal.authority.guard_timer_removal(removal)
+            removal.require_payload(action, payload)
+            self.require_selected(native)
+            removal.authority.require_timer_zero(native, removal)
+            removal.verified_native_digest = native.digest
+            return
         selecting = self.gateway.journal.get("managed_current_change", {}).get("state") == "pending"
         timer = (
             action == "DataTransfer"
             and payload.get("vendorId") == "IoCharger"
             and payload.get("messageId") in ("setPlan", "clearPlans")
         )
-        native = await self.read(
-            closed=timer or action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
+        intent = self.gateway.journal.get("managed_control_intent")
+        restoration = self.book.before_positive_release
+        release_ticket = self.gateway.controls._release_ticket
+        automatic_timer = (
+            action == "SetChargingProfile"
+            and isinstance(intent, dict)
+            and intent.get("mode") == "app"
+            and restoration is not None
+            and not selecting
+            and release_ticket is not None
+            and release_ticket == self.gateway.journal.get("control", {}).get("ticket")
+            and self.gateway.journal.get("managed_current_change", {}).get("state") != "recovering"
+            and supervised_timer(self.gateway.journal.get("managed_temporary_schedule", {}))
+            and not self.gateway.journal.get("managed_control_fault")
         )
+        try:
+            native = await self.read(
+                closed=timer or action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
+            )
+        except (NativeTransportUnavailableError, StaleEvidenceError, UnavailableError) as error:
+            availability = isinstance(error, (NativeTransportUnavailableError, StaleEvidenceError)) or (
+                type(error) is UnavailableError
+                and isinstance(error.__cause__, (NativeTransportUnavailableError, StaleEvidenceError))
+            )
+            if (
+                automatic_timer
+                and availability
+                and self.gateway.journal.get("managed_control_intent") == intent
+                and self.book.before_positive_release is restoration
+                and self.gateway.controls._release_ticket == release_ticket
+                and self.gateway.journal.get("control", {}).get("ticket") == release_ticket
+                and not self.gateway.journal.get("managed_control_fault")
+            ):
+                raise ReleaseDeferredError(
+                    "automatic timer restoration awaits fresh native evidence before send"
+                ) from error
+            raise
         self.require_selected(native)
         change = self.gateway.journal.get("managed_current_change", {})
         if action == "SetChargingProfile" and change.get("state") == "recovering":
