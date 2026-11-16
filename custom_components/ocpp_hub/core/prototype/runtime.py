@@ -15,6 +15,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
+from .connection_scope import CloudAttemptScope, current_scope
 from .diagnostics import FaultDiagnostics
 from .gateway import Gateway
 from .policy import DeniedError
@@ -70,6 +71,7 @@ class RuntimeStatus:
     last_failure: str | None = None
     vendor_attempts: int = 0
     vendor_failed_charger_epoch: int | None = None
+    vendor_failed_scope: CloudAttemptScope | None = None
     charger_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
     vendor_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
 
@@ -324,6 +326,7 @@ class ConnectionRuntime:
         while not self._closing:
             fault_count = self.status.vendor_fault.count
             attempted_charger_epoch = self.gateway._charger_epoch
+            attempted_scope = None
             stage = "opening"
             try:
                 if (
@@ -335,6 +338,7 @@ class ConnectionRuntime:
                     continue
                 attempted_boot = self.gateway.journal.get("boot")
                 attempted_boot_revision = self.gateway.boot_metadata_revision
+                attempted_scope = current_scope(self.gateway)
                 self.status.vendor_attempts += 1
                 async with self.transport.connect() as connection:
                     if (
@@ -366,6 +370,7 @@ class ConnectionRuntime:
                     self.status.vendor_fault.record(error, stage, self.gateway.vendor.diagnostics.action)
             if self.status.vendor_fault.count > fault_count:
                 self.status.vendor_failed_charger_epoch = attempted_charger_epoch
+                self.status.vendor_failed_scope = attempted_scope
             if not self._closing:
                 await asyncio.sleep(delay)
                 delay = min(self.settings.retry_max, delay * 2)

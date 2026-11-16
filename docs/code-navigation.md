@@ -84,6 +84,19 @@ typed deferred retry loop. `managed_faults.py` shares the strict diagnostic latc
 For command timing, follow `Peer._validate()` through its priority gate and then the independent send/reply deadline;
 `test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch.
 
+`connection_scope.py` separates connection-origin bookkeeping from exact Boot-bound cloud and resume evidence.
+`release_attempt.py` retains possible positive effects across the owned operation, its later reads and rollback.
+Read their callers in `runtime.py`, `native_bounded_handover.py`, `local_control.py`, `managed.py` and
+`managed_schedule.py` together. `test_managed_introduction_scope.py`, `test_managed_closed_timer_release_retry.py`
+and `test_managed_timer_release_supersession.py` cover those boundaries through real peers. The companion
+`test_release_positive_effect_retention.py` checks that rollback cannot erase a preceding positive dispatch.
+`test_rpc_native_cleanup_failure.py` exercises real native cancellation and failed SQLite publication;
+`test_rpc_completed_verdict.py` separately checks the standalone Peer contract with explicit unit collaborators.
+For normal Start handoffs, read `test_managed_return_during_start.py`, `test_managed_return_after_start_child.py`
+and `test_managed_start_reply_lifecycle_order.py` alongside their scope and report-preparation guards.
+`test_managed_return_after_start_boot.py` covers the current Pause service's independent zero claim after a matching
+Boot, including failed claim storage, while the old Start remains fenced to its own observation.
+
 ## Follow a control through every boundary
 
 - **Start/current:** HA entity → `ProxyClient.request()` → `ManagementServer` → `ManagedController.command()` →

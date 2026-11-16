@@ -12,9 +12,10 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..control import HUB_PROFILE_ID
+from .connection_scope import current_scope
 from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
-from .local_control import local_start_receipt
+from .local_control import ControlSupersededError, local_start_receipt
 from .managed_cutoffs import OBSERVABLE as OBSERVABLE
 from .managed_cutoffs import idle_cutoff_pending as idle_cutoff_pending
 from .managed_cutoffs import release_idle_cutoffs, resume_cutoff
@@ -33,7 +34,8 @@ from .managed_occurrences import (
 )
 from .native_start_attempts import matching_unassigned_start, split_attempts, start_millisecond_range
 from .policy import DeniedError, integer, number
-from .rpc import UnavailableError
+from .release_attempt import ReleaseAttempt, TimerRestriction
+from .rpc import UnavailableError, ValidationPreemptedError
 from .schedule_time import cutoff_epoch, temporary_window
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
@@ -620,7 +622,7 @@ class ManagedSchedule:
         )
 
     # Close the gap between an independent session's actual Stop and a following Start before the next tick.
-    async def prepare_report_hold(self, payload: dict[str, Any]) -> None:
+    async def prepare_report_hold(self, payload: dict[str, Any], *, _reclassified: bool = False) -> None:
         j, g = self.j, self.c.session.gateway
         lease, tag = j.get(KEY, {}), payload.get("idTag")
         if j.active() is not None or not isinstance(tag, str):
@@ -708,6 +710,10 @@ class ManagedSchedule:
                     operations.add(self.c.pause_task)
                 if operations:
                     await asyncio.wait(operations, timeout=min(1.0, g.charger.timeout))
+                if self.c.requests.intent().mode == "app":
+                    if _reclassified:
+                        raise UnavailableError("Start report authority changed again during its control handoff")
+                    return await self.prepare_report_hold(payload, _reclassified=True)
                 if not self.held_report_ready(owner_command=True) or not self.matches_pending_start(tag):
                     raise UnavailableError("the acknowledged owner report awaits verified Pause zero")
             return
@@ -1371,16 +1377,100 @@ class ManagedSchedule:
             ):
                 raise RecoveryRequiredError("timer station hold was superseded")
 
+        claim_scope, claim_revision = current_scope(g), g.controls._revision
+        claim_intent = c.requests.intent()
+        identity_digest = fingerprint({key: lease.get(key) for key in IDENTITY})
+        allowed_local = (None, lease.get("bound_local"), lease.get("unidentified_local"))
+
+        # Link only this actual owned zero claim to the still-live release it genuinely superseded.
+        def claimed(old_ticket: str | None, new_ticket: str) -> None:
+            attempt, operation = g.controls.release_attempt, asyncio.current_task()
+            control, current = j.get("control", {}), j.get(KEY, {})
+            if (
+                attempt is None
+                or attempt.finished
+                or attempt.purpose != "automatic"
+                or attempt.positive_may_have_dispatched
+                or claim_scope is None
+                or current_scope(g) != claim_scope
+                or attempt.scope != claim_scope
+                or g.controls._revision != claim_revision
+                or attempt.control_revision != claim_revision
+                or c.requests.intent() != claim_intent
+                or attempt.intent != claim_intent
+                or claim_intent.mode != "app"
+                or old_ticket is None
+                or old_ticket != attempt.ticket
+                or g.controls._release_ticket != old_ticket
+                or control.get("ticket") != new_ticket
+                or control.get("owner") != "local"
+                or control.get("inhibit") is not True
+                or g.controls.desired() != 0
+                or operation is None
+                or operation not in g.controls._operations
+                or not self.hold_authorized()
+                or j.get("managed_control_fault")
+                or j.active() not in allowed_local
+                or current.get("id") != lease["id"]
+                or fingerprint({key: current.get(key) for key in IDENTITY}) != identity_digest
+            ):
+                return  # Missing supersession proof never prevents the independently authorized restrictive operation.
+            attempt.restriction = TimerRestriction(
+                claim_scope,
+                claim_revision,
+                claim_intent,
+                old_ticket,
+                new_ticket,
+                lease["id"],
+                identity_digest,
+                allowed_local,
+                operation,
+            )
+
         try:
             if j.get("trial_phase") == "recovering" and g.controls.desired() == 0:
                 await g.controls.ensure_ceiling(guard=guard)
             else:
-                await g.controls.set_limit(0, guard=guard)
+                await g.controls.set_limit(0, guard=guard, on_restrictive_claim=claimed)
         except DeniedError, UnavailableError, RecoveryRequiredError:
             # A separate scoped Stop can still succeed when a station write fails. Never release on this evidence.
             return
         if g.controls.ready and g.controls.desired() == 0:
             g.timer_retry_after.pop((lease["id"], "next_cap"), None)
+
+    # Recheck the linked zero's live owner after validator cleanup without treating a queued claim as zero proof.
+    def release_superseded(self, attempt: ReleaseAttempt) -> bool:
+        c, j, g = self.c, self.j, self.c.session.gateway
+        proof, control, lease = attempt.restriction, j.get("control", {}), j.get(KEY, {})
+        if (
+            proof is None
+            or not attempt.known_unsent()
+            or attempt.purpose != "automatic"
+            or type(attempt.positive_failure) not in (ControlSupersededError, ValidationPreemptedError)
+            or type(attempt.failure) not in (ControlSupersededError, ValidationPreemptedError)
+            or c.stopping
+            or j.get("managed_control_fault")
+            or current_scope(g) != proof.scope
+            or attempt.scope != proof.scope
+            or g.controls._revision != proof.control_revision
+            or attempt.control_revision != proof.control_revision
+            or c.requests.intent() != proof.intent
+            or attempt.intent != proof.intent
+            or attempt.ticket != proof.old_ticket
+            or control.get("ticket") != proof.new_ticket
+            or control.get("owner") != "local"
+            or control.get("inhibit") is not True
+            or g.controls.desired() != 0
+            or j.active() not in proof.allowed_local
+            or lease.get("id") != proof.occurrence
+            or fingerprint({key: lease.get(key) for key in IDENTITY}) != proof.identity_digest
+            or not self.hold_authorized()
+            or proof.operation.cancelled()
+        ):
+            return False
+        if proof.operation.done():
+            return proof.operation.exception() is None and g.controls.ready and control.get("uncertain") is False
+        return proof.operation in g.controls._operations and control.get("uncertain") is True
 
     # After a new Boot, a previously observed or recovering transaction must be held until its origin is re-established.
     def needs_source(self, lease: dict[str, Any]) -> bool:
@@ -1655,15 +1745,20 @@ class ManagedSchedule:
                 # Only our older occurrence's completed zero hold can refresh this still-unsent installation ticket.
                 lease = {**lease, "ticket": j.get("control", {}).get("ticket")}
                 j.put(KEY, lease)
+            intent = c.requests.intent()
             if (
                 lease.get("retire_reason")
-                or not self.can_install(n)
-                or c.requests.intent().revision != lease["revision"]
+                or c.stopping
+                or j.get("managed_control_fault")
+                or intent.mode != "app"
+                or intent.revision != lease["revision"]
                 or lease["epoch"] != c.session.gateway._charger_epoch
+                or n.physical.connection == "Unplug"
                 or now >= lease["start_epoch"] - 10
             ):
                 self.finish(lease, "cancelled_before_install")
-            else:
+            elif self.can_install(n):
+                # A busy peer or queued observation withholds this unsent request without revoking its owner.
                 await self.send(lease, True)
             return
         if "end_epoch" not in lease:

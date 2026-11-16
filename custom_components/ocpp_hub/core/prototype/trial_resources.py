@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -458,3 +459,15 @@ class ResourceBook:
                 raise strict from failure
             raise
         return sorted(result, key=lambda r: (r.identifier == HUB_PROFILE_ID, r.key))
+
+    # The owned release child retains its guard through cancellation of the caller awaiting it.
+    @contextmanager
+    def positive_release_guard(self, guard: Callable[[], None]) -> Iterator[None]:
+        if self.before_positive_release is not None:
+            raise RecoveryRequiredError("another owned positive release still retains its guard")
+        self.before_positive_release = guard
+        try:
+            yield
+        finally:
+            if self.before_positive_release is guard:
+                self.before_positive_release = None

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.3 — iCS recovery and control handoffs
+
+- Distinguish an actual replacement introduction from an ordinary temporary zero hold. Preserve the saved app
+  choice during same-connection outages; bind failed cloud attempts and recovery acknowledgement to actual Boot.
+- Keep an accepted unsent timer pending while an ordinary cloud report finishes. Departure, a newer Pause,
+  replacement and the installation deadline still cancel it without changing its accepted window or payload.
+- Retry the complete restrictive zero check after an audited open-session introduction loses a reply. Never
+  replay introduction, Start or Stop merely to finish that check.
+- Track possible positive writes through the whole owned release, including later reads and zero rollback.
+  Retry temporary native failures before positive dispatch only after confirmed zero. Let an actual timer zero
+  supersede an unsent automatic release without borrowing its pending acknowledgement or clearing its uncertainty.
+- Keep completed strict validation failures ahead of simultaneous restrictive requests. Preserve failed native
+  audit publication during cancellation, including the cleanup cause of an externally cancelled operation.
+- Handle native evidence expiring during the final Pause recheck inside supervision. Retain unfinished test and
+  lifecycle obligations and wait for fresh evidence instead of publishing the expired reading as healthy.
+- Restore zero when Return interrupts normal Start, both during its acknowledgement wait and after the owned
+  operation finishes. Preserve the owner's Pause revision, accepted Start debt and original Return request.
+- Reclassify a reply-first transaction report after its awaited control handoff. Retain later Pause, authorization,
+  Boot, native-source and lifecycle checks rather than continuing an obsolete paused-report decision.
+- Add real TLS/native HTTP, SQLite failure, message-ordering and cancellation regressions, with separate unit
+  checks for validation ordering and the exact native-availability exception contract.
+
 ## 0.2.2 — iCS runtime recovery
 
 - Retry the read-only Boot request on an authenticated connection after refusal, reply loss or a missing Boot.

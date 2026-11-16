@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .connection_scope import CloudAttemptScope, current_scope
 from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
@@ -50,6 +51,7 @@ class TestLease:
     initial_zero_ticket: str | None = None
     initial_zero_boot: str | None = None
     initial_zero_stop_epoch: int | None = None
+    start_scope: CloudAttemptScope | None = None
 
 
 class ManagedChargeTests:
@@ -490,6 +492,7 @@ class ManagedChargeTests:
                     "managed_test_charge",
                     {**self.state(), "tag_digest": fingerprint(tag.casefold()), "start_attempted": True},
                 )
+                lease.start_scope = current_scope(c.session.gateway)
 
             await c.session.gateway.start_managed(
                 tag, lambda: self.guard(lease), request_id=lease.identifier, on_prepared=prepared
@@ -1043,6 +1046,42 @@ class ManagedChargeTests:
             )
             self.changed.set()
 
+    # A failed normal Start can reclaim only zero from its own unchanged ticket beneath the original owner Pause.
+    def failed_start_zero_needed(self, lease: TestLease, reason: str, failure: dict[str, Any] | None) -> bool:
+        c, j, g = self.controller, self.journal, self.controller.session.gateway
+        intent, state, receipt, control = (
+            c.requests.intent(),
+            self.state(),
+            local_start_receipt(j),
+            j.get("control", {}),
+        )
+        return bool(
+            self.lease is lease
+            and lease.normal
+            and reason == "start_not_confirmed"
+            and failure is not None
+            and failure.get("id") == lease.identifier
+            and failure.get("effects_started") is True
+            and lease.mode == intent.mode == "paused"
+            and lease.revision == intent.revision
+            and lease.start_scope is not None
+            and current_scope(g) == lease.start_scope
+            and g.controls._revision == lease.control_revision
+            and state.get("id") == lease.identifier
+            and state.get("source") == "local"
+            and state.get("start_attempted") is True
+            and receipt.get("request_id") == lease.identifier
+            and receipt.get("digest") == state.get("tag_digest")
+            and receipt.get("stage") in ("issued", "accepted")
+            and receipt.get("ticket")
+            and control.get("ticket") == receipt["ticket"]
+            and control.get("owner") in ("local", "shared")
+            and control.get("inhibit") is False
+            and j.get("trial_phase") == "active"
+            and not j.get("managed_control_fault")
+            and not c.stopping
+        )
+
     # Normal expiry retains separate reporting debt; only an explicit Pause can Stop an independent daily.
     def stop(self, lease: TestLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
         if self.lease is not lease or self.state().get("state") == "stopping":
@@ -1066,6 +1105,8 @@ class ManagedChargeTests:
                     "AND state IN ('accepted','running')",
                     (json.dumps({"classification": "superseded_by_test_stop"}),),
                 )
+            elif self.failed_start_zero_needed(lease, reason, failure):
+                c.session.gateway.controls._claim(True)
             j.put(
                 "managed_test_charge",
                 {

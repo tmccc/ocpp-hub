@@ -21,6 +21,10 @@ class UnavailableError(RuntimeError):
     """The peer did not give a confirmed outcome."""
 
 
+class ValidationPreemptedError(UnavailableError):
+    """A genuinely queued restrictive operation retired validation before dispatch."""
+
+
 class IntroductionDeferredError(UnavailableError):
     """Introduction needs fresh evidence or its first restrictive zero; no Stop or positive command was sent."""
 
@@ -219,21 +223,47 @@ class Peer:
         validation = asyncio.ensure_future(self.validate_send(action, payload))
         signal = self.gate.restrictive_waiting if preemptible else asyncio.Event()
         restrictive = asyncio.create_task(signal.wait())
+        cancellation: asyncio.CancelledError | None = None
         try:
             async with asyncio.timeout(self.validation_timeout):
                 done, _ = await asyncio.wait((validation, restrictive, future), return_when=asyncio.FIRST_COMPLETED)
-                if restrictive in done:
-                    raise UnavailableError("request was not sent; restrictive control superseded validation")
+                if validation.done():
+                    validation.result()  # A completed strict/storage refusal precedes simultaneous preemption.
+                if signal.is_set():
+                    raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
                 if future in done:
                     future.result()  # A retired peer's exception must terminate its audit before any dispatch.
                     raise UnavailableError("request was not sent; peer replied before dispatch")
                 await validation
+        except asyncio.CancelledError as error:
+            cancellation = error
+            raise
         finally:
             validation.cancel()
             restrictive.cancel()
-            await asyncio.gather(validation, restrictive, return_exceptions=True)
+            cleanup = asyncio.gather(validation, restrictive, return_exceptions=True)
+            while True:
+                try:
+                    outcomes = await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+            failure = next(
+                (
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if cancellation is not None:
+                if failure is not None:
+                    raise cancellation from failure
+                raise cancellation
+            if failure is not None:
+                raise failure  # Native cancellation can itself fail required durable audit publication.
         if preemptible and self.gate.restrictive_waiting.is_set():
-            raise UnavailableError("request was not sent; restrictive control superseded validation")
+            raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
 
     # Send one request only while the caller owns the outgoing gate.
     async def _call_locked(

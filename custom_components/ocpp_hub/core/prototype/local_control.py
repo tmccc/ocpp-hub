@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -15,12 +17,17 @@ from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .composite import FutureScheduleError, verify_composite
 from .policy import DeniedError, Policy, number
+from .release_attempt import ReleaseAttempt, native_availability
 from .rpc import Peer, UnavailableError
 from .security import SecurityError
 from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
+
+
+class ControlSupersededError(DeniedError):
+    """A specific newer durable control ticket retired this operation's ownership."""
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,7 @@ class LocalControl:
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
         self._release_ticket: str | None = None
+        self.release_attempt: ReleaseAttempt | None = None
         self._stop_ack: StopAcknowledgement | None = None
         self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
@@ -181,7 +189,7 @@ class LocalControl:
         if epoch != self.epoch():
             raise UnavailableError("local control belongs to a retired charger")
         if ticket is not None and self.journal.get("control", {}).get("ticket") != ticket:
-            raise DeniedError("a newer local operation superseded this request")
+            raise ControlSupersededError("a newer local operation superseded this request")
 
     # Record ownership and uncertainty before anything can be sent to the charger.
     def _claim(self, inhibit: bool, stopping: bool = False) -> tuple[int, str]:
@@ -334,11 +342,27 @@ class LocalControl:
                 await self._cap(call, limit, epoch, guard=check)
 
     # A positive slider update cannot silently release an explicit zero-current hold.
-    async def set_limit(self, value: Any, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
-        return await self._owned(self._set_limit(value, guard=guard, shared=shared))
+    async def set_limit(
+        self,
+        value: Any,
+        *,
+        guard: Callable[[], None] | None = None,
+        shared: bool = False,
+        on_restrictive_claim: Callable[[str | None, str], None] | None = None,
+    ) -> Frame:
+        return await self._owned(
+            self._set_limit(value, guard=guard, shared=shared, on_restrictive_claim=on_restrictive_claim)
+        )
 
     # Keep the complete claimed slider operation alive independently of an individual API client.
-    async def _set_limit(self, value: Any, *, guard: Callable[[], None] | None = None, shared: bool = False) -> Frame:
+    async def _set_limit(
+        self,
+        value: Any,
+        *,
+        guard: Callable[[], None] | None = None,
+        shared: bool = False,
+        on_restrictive_claim: Callable[[str | None, str], None] | None = None,
+    ) -> Frame:
         if guard is not None:
             guard()
         limit = number(value, self.policy.max_current_a)
@@ -349,6 +373,8 @@ class LocalControl:
         if previous.get("inhibit") and limit > 0:
             raise DeniedError("resume or release explicitly before raising a stopped limit")
         epoch, ticket = self._claim(previous.get("inhibit", False) or limit == 0)
+        if limit == 0 and on_restrictive_claim is not None:
+            on_restrictive_claim(previous.get("ticket"), ticket)
         if limit > 0:
             self._complete(ticket, resume_limit=limit)
 
@@ -459,11 +485,14 @@ class LocalControl:
         *,
         request_id: str | None = None,
         on_prepared: Callable[[], None] | None = None,
+        scope_guard: Callable[[], None] | None = None,
     ) -> Frame:
         if self.policy.allow_local_start or not 6 <= self.policy.max_current_a <= 32:
             raise DeniedError("managed Start requires the restricted installation policy")
         return await self._owned(
-            self._start(tag, guard=guard, shared=True, request_id=request_id, on_prepared=on_prepared)
+            self._start(
+                tag, guard=guard, shared=True, request_id=request_id, on_prepared=on_prepared, scope_guard=scope_guard
+            )
         )
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
@@ -475,7 +504,10 @@ class LocalControl:
         shared: bool = False,
         request_id: str | None = None,
         on_prepared: Callable[[], None] | None = None,
+        scope_guard: Callable[[], None] | None = None,
     ) -> Frame:
+        if scope_guard is not None:
+            scope_guard()
         if guard is not None:
             guard()
         if not self.policy.allow_local_start and guard is None:
@@ -505,10 +537,14 @@ class LocalControl:
             if on_prepared is not None:
                 on_prepared()
 
-        # The request generation is checked again after native validation and immediately before each actual send.
+        restoring_zero = False
+
+        # Positive permission may be revoked; the same exact ticket and Boot still permit its restrictive rollback.
         def check() -> None:
             self._check(epoch, ticket)
-            if guard is not None:
+            if scope_guard is not None:
+                scope_guard()
+            if not restoring_zero and guard is not None:
                 guard()
 
         # Write dispatch and ACK independently of the control ticket a later Pause can supersede.
@@ -546,23 +582,63 @@ class LocalControl:
                         record_stage("rejected")
                     raise UnavailableError("transaction start was not confirmed")
                 record_stage("accepted")
+                check()
+                self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
             except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError:
                 retire_unsent_local_start(self.journal, ticket)
                 self._complete(ticket, inhibit=True)
                 self._check(epoch, ticket)
+                restoring_zero = True
                 await self._cap(call, 0, epoch)
+                check()
                 raise
-        if guard is not None:
-            guard()
-        self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
         return answer
 
     # Releasing local ownership is a physical operation, never removal of the station safety profile.
-    async def release(self, acknowledge_uncertainty: bool = False, *, guard: Callable[[], None] | None = None) -> None:
-        await self._owned(self._release(acknowledge_uncertainty, guard))
+    async def release(
+        self,
+        acknowledge_uncertainty: bool = False,
+        *,
+        guard: Callable[[], None] | None = None,
+        attempt: ReleaseAttempt | None = None,
+        context: AbstractContextManager[None] | None = None,
+        rollback_guard: Callable[[], None] | None = None,
+    ) -> None:
+        await self._owned(self._release_owned(acknowledge_uncertainty, guard, attempt, context, rollback_guard))
+
+    # Completion and guard lifetime belong to this shielded child, including its rollback and cancellation cleanup.
+    async def _release_owned(
+        self,
+        acknowledge_uncertainty: bool,
+        guard: Callable[[], None] | None,
+        attempt: ReleaseAttempt | None,
+        context: AbstractContextManager[None] | None,
+        rollback_guard: Callable[[], None] | None,
+    ) -> None:
+        try:
+            if self.release_attempt is not None:
+                raise RecoveryRequiredError("another owned release is still running")
+            with context if context is not None else nullcontext():
+                if attempt is not None:
+                    self.release_attempt = attempt
+                await self._release(acknowledge_uncertainty, guard, rollback_guard, attempt=attempt)
+        finally:
+            if attempt is not None:
+                attempt.failure = sys.exception()
+                attempt.cancelled = isinstance(attempt.failure, asyncio.CancelledError)
+                attempt.finished = True
+                if self.release_attempt is attempt:
+                    self.release_attempt = None
 
     # A failed physical release reinstalls zero instead of retaining only a misleading software hold.
-    async def _release(self, acknowledge_uncertainty: bool, guard: Callable[[], None] | None = None) -> None:
+    async def _release(
+        self,
+        acknowledge_uncertainty: bool,
+        guard: Callable[[], None] | None = None,
+        rollback_guard: Callable[[], None] | None = None,
+        *,
+        attempt: ReleaseAttempt | None = None,
+    ) -> None:
         if guard is not None:
             guard()  # Check before claiming, including when a newer Pause ran before this owned task started.
         if self.journal.get("trial_starting"):
@@ -571,7 +647,8 @@ class LocalControl:
         if previous.get("uncertain") and not acknowledge_uncertainty:
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
         epoch, ticket = self._claim(previous.get("inhibit", False))
-
+        if attempt is not None:
+            attempt.ticket = ticket
         self._release_ticket = ticket
         try:
             restoring_zero = False
@@ -579,10 +656,20 @@ class LocalControl:
             # The positive guard can revoke release; the same ticket and Boot still authorize rollback to zero.
             def check() -> None:
                 self._check(epoch, ticket)
+                if rollback_guard is not None:
+                    rollback_guard()
                 if not restoring_zero and guard is not None:
                     guard()
 
-            async with self.peer.sequence(1, check) as call:
+            # Record possible physical effects at actual sender invocation and retain them through later reads.
+            def dispatched(action: str) -> None:
+                if attempt is not None and action == "SetChargingProfile":
+                    if restoring_zero:
+                        attempt.zero_may_have_dispatched = True
+                    else:
+                        attempt.positive_may_have_dispatched = True
+
+            async with self.peer.sequence(1, check, on_dispatch=dispatched) as call:
                 try:
                     await self._cap(
                         call,
@@ -590,12 +677,25 @@ class LocalControl:
                         epoch,
                     )
                     check()
+                    if attempt is not None:
+                        attempt.positive_confirmed = True
                 except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
+                    if attempt is not None:
+                        attempt.positive_failure = error
                     self._complete(ticket, inhibit=True)
                     self._check(epoch, ticket)
                     restoring_zero = True
                     await self._cap(call, 0, epoch)
-                    if isinstance(error, ReleaseDeferredError):
+                    check()
+                    if attempt is not None:
+                        attempt.zero_confirmed = True
+                    if isinstance(error, ReleaseDeferredError) and (
+                        attempt is None
+                        or not attempt.positive_may_have_dispatched
+                        and native_availability(error)
+                        and rollback_guard is not None
+                    ):
+                        check()
                         self._complete(ticket, uncertain=False)
                     raise
                 # Changing the station ceiling cannot bind a pending command to a transaction.

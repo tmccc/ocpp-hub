@@ -1,9 +1,13 @@
 """Known ordinary sessions and temporary native outages recover through real TLS and native HTTP."""
 
 import asyncio
+import socket
 import uuid
+from dataclasses import replace
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests import test_native_bounded_session as native_bench
@@ -14,6 +18,56 @@ from tests.test_managed_test_charge import owner_start, positive_flow
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
+
+
+# Intent: an ordinary same-connection zero hold during a genuine cloud outage preserves the owner's app revision.
+# Why: recovering phase alone does not mean a replacement introduction retired the owner's authority.
+async def test_same_connection_outage_hold_preserves_app_authority(tmp_path, tls, unused_tcp_port, monkeypatch):
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+        c, g, j = b.controller, b.session.gateway, b.session.journal
+        intent = c.requests.intent()
+        epoch, boot = g._charger_epoch, g.boot_observation
+        transport = b.session.runtime.transport
+        original = transport.config
+        faults = b.session.runtime.status.vendor_fault.count
+        with socket.socket() as unavailable:
+            unavailable.bind(("127.0.0.1", 0))
+            url = urlsplit(original.vendor_url)
+            transport.config = replace(
+                original,
+                vendor_url=urlunsplit(url._replace(netloc="127.0.0.1:" + str(unavailable.getsockname()[1]))),
+            )
+            try:
+                await b.rig.bench.cloud.close()
+                await until(
+                    lambda: (
+                        b.session.runtime.status.vendor_fault.count > faults
+                        and b.session.runtime.status.vendor_failed_scope == current_scope(g)
+                        and not b.session.runtime.status.vendor_connected
+                    )
+                )
+                b.rig.peer.unavailable = True
+                for _ in range(3):
+                    await c.tick()
+                requests = []
+                while not b.rig.peer.failed_reads.empty():
+                    requests.append(b.rig.peer.failed_reads.get_nowait())
+                assert requests and all(request["action"] == "getConfig" for request in requests)
+                assert j.get("trial_phase") == "recovering"
+                assert b.rig.bench.firmware.effective_limit() == 0
+                b.rig.peer.unavailable = False
+                await c.tick()
+                assert g._charger_epoch == epoch and g.boot_observation == boot
+                assert c.requests.intent() == intent
+                assert not j.get("managed_control_fault")
+            finally:
+                b.rig.peer.unavailable = False
+                transport.config = original
+        await until(lambda: g.vendor_registration == "Accepted")
+        status = await healthy(c)
+        assert c.requests.intent() == intent and status["station_ceiling_a"] == 32
+        assert not starts(b.rig) and not any(f[2] == "RemoteStopTransaction" for f in b.rig.bench.device_calls)
 
 
 # Close only the fake device's real reported session after the behavior under test has been observed.

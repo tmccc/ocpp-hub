@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
+from .connection_scope import ConnectionLineage, current_scope
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
@@ -92,6 +93,8 @@ class NativeBoundedHandover:
         self.positive_guard: Callable[[HandoverEvidence], None] | None = None
         self.introduced_epoch: int | None = None
         self.introduced_revision: int | None = None
+        self.introduction_lineage: ConnectionLineage | None = None
+        self.acknowledged_lineage: ConnectionLineage | None = None
         if fingerprint(spec.original_configuration) != book.baseline.configuration_digest:
             raise SecurityError("native bounded mode requires the exact original full configuration")
         saved = gateway.journal.get("native_bounded_handover")
@@ -385,6 +388,9 @@ class NativeBoundedHandover:
         if not gateway.current_boot_seen(epoch) or fingerprint(journal.get("boot")) != self.spec.boot_digest:
             raise SecurityError("native bounded introduction requires the commissioned actual Boot")
         binding = journal.get("trial_binding")
+        scope = current_scope(gateway)
+        if binding is not None and scope is not None:
+            self.introduction_lineage = scope.lineage
         first_zero = binding is None or bool(journal.get("trial_starting"))
         try:
             native = await self.read(closed=first_zero, owned=True, initial=binding is None)
@@ -470,17 +476,21 @@ class NativeBoundedHandover:
                     or self.recovery_zero_only is not None
                     and self.recovery_zero_only()
                 ):
-                    await gateway.controls.ensure_ceiling()
-                    if lease and journal.active() is not None:
-                        journal.put(
-                            "managed_temporary_schedule",
-                            {
-                                **lease,
-                                "recovery_session": True,
-                                "unidentified_local": journal.active(),
-                                "hold_since": time.time(),
-                            },
-                        )
+                    try:
+                        await gateway.controls.ensure_ceiling()
+                    except UnavailableError, TimeoutError:
+                        pass  # The completed audit hands only zero retries to the runtime after final authority checks.
+                    else:
+                        if lease and journal.active() is not None:
+                            journal.put(
+                                "managed_temporary_schedule",
+                                {
+                                    **lease,
+                                    "recovery_session": True,
+                                    "unidentified_local": journal.active(),
+                                    "hold_since": time.time(),
+                                },
+                            )
                 elif journal.active() is not None:
                     await gateway.stop()
             elif (
@@ -612,12 +622,14 @@ class NativeBoundedHandover:
             gateway, journal = self.gateway, self.gateway.journal
             local_binding = local_recovery_binding(gateway, self.spec.digest) if local_only else None
             epoch, revision = gateway._charger_epoch, gateway.controls._revision
+            scope = current_scope(gateway)
             ticket = journal.get("control", {}).get("ticket")
             if (
                 journal.get("trial_phase") != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
                 or gateway.charger.sender is None
                 or not gateway.current_boot_seen(epoch)
+                or scope is None
                 or self.introduced_epoch != epoch
                 or self.introduced_revision != revision
             ):
@@ -656,6 +668,7 @@ class NativeBoundedHandover:
                 journal.get("trial_phase") != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
                 or revision != gateway.controls._revision
+                or current_scope(gateway) != scope
                 or ticket != control.get("ticket")
                 or not gateway.current_boot_seen(epoch)
                 or not control.get("inhibit")
@@ -681,6 +694,7 @@ class NativeBoundedHandover:
             with journal.atomic():
                 journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": False})
                 journal.put("trial_phase", "active")
+            self.acknowledged_lineage = scope.lineage
             return {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
@@ -712,16 +726,24 @@ class NativeBoundedHandover:
         intent = self.gateway.journal.get("managed_control_intent")
         restoration = self.book.before_positive_release
         release_ticket = self.gateway.controls._release_ticket
-        automatic_timer = (
+        attempt = self.gateway.controls.release_attempt
+        automatic_release = (
             action == "SetChargingProfile"
             and isinstance(intent, dict)
             and intent.get("mode") == "app"
             and restoration is not None
+            and attempt is not None
+            and attempt.purpose == "automatic"
+            and attempt.intent.mode == "app"
+            and intent.get("revision") == attempt.intent.revision
+            and attempt.positive_guard is restoration
+            and not attempt.positive_may_have_dispatched
+            and current_scope(self.gateway) == attempt.scope
+            and self.gateway.controls._revision == attempt.control_revision
             and not selecting
             and release_ticket is not None
+            and attempt.ticket == release_ticket
             and release_ticket == self.gateway.journal.get("control", {}).get("ticket")
-            and self.gateway.journal.get("managed_current_change", {}).get("state") != "recovering"
-            and supervised_timer(self.gateway.journal.get("managed_temporary_schedule", {}))
             and not self.gateway.journal.get("managed_control_fault")
         )
         try:
@@ -734,17 +756,19 @@ class NativeBoundedHandover:
                 and isinstance(error.__cause__, (NativeTransportUnavailableError, StaleEvidenceError))
             )
             if (
-                automatic_timer
+                automatic_release
                 and availability
                 and self.gateway.journal.get("managed_control_intent") == intent
                 and self.book.before_positive_release is restoration
                 and self.gateway.controls._release_ticket == release_ticket
                 and self.gateway.journal.get("control", {}).get("ticket") == release_ticket
+                and attempt is not None
+                and not attempt.positive_may_have_dispatched
+                and current_scope(self.gateway) == attempt.scope
+                and self.gateway.controls._revision == attempt.control_revision
                 and not self.gateway.journal.get("managed_control_fault")
             ):
-                raise ReleaseDeferredError(
-                    "automatic timer restoration awaits fresh native evidence before send"
-                ) from error
+                raise ReleaseDeferredError("automatic restoration awaits fresh native evidence before send") from error
             raise
         self.require_selected(native)
         change = self.gateway.journal.get("managed_current_change", {})

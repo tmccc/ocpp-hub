@@ -933,6 +933,10 @@ static authorization gates. Scoped cloud-outage admission is described below; Re
 cloud reconciliation. A Start payload cannot select its own current/tag/duration; current selection is a separate
 idle-only command. The raw generic Start path remains unavailable. Existing timed tests remain.
 
+If Return interrupts a normal Start, zero is reasserted while the original accepted Start remains pending until
+its real lifecycle is known. Return cannot complete from zero power alone. An immediate transaction report after
+the Start acknowledgement is rechecked against the control state after that handoff; a later Pause still wins.
+
 The normal Start control was deployed and tested with the connected Leon on 2026-11-10. HA Start resumed a verified
 pause at 6 A, distinguished the initial open session at 0 W from measured charging, and continued beyond two minutes.
 HA Pause then closed the session at 0 W. It delivered 65 Wh, peaked at 1464 W and received actual cloud acknowledgement
@@ -1021,6 +1025,11 @@ If the charger does not send Boot after reconnecting, the enabled read-only Boot
 backoff on that connection. A refused request, lost reply or Accepted reply without Boot cannot strand it permanently.
 Only a genuine Boot permits introduction; retries stop when it arrives or the connection ends.
 
+An ordinary temporary zero hold on the existing connection preserves the saved app choice during a cloud outage.
+Offline replacement retains the documented Pause behavior. Temporary native unavailability before an automatic
+positive release keeps zero and waits for fresh proof; an earlier possibly dispatched positive write remains
+uncertain even if a later read fails or zero rollback succeeds. Explicit Return retains its separate request policy.
+
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy
 and no stop. The session list and allocation counter use assigned transaction numbers. On a managed
@@ -1036,6 +1045,8 @@ An authenticated `temporary_schedule` request takes a fresh control revision and
 authority, the proxy installs a one-off plan using the daily timer's tag and at most the selected current.
 The start must be before 06:00. The duration is the elapsed time to 06:00 on that local date, including
 clock changes. For example, a 03:45 start lasts 135 minutes. The original daily plan stays in place.
+An accepted timer waits while an ordinary cloud acknowledgement is pending, within the same installation window.
+Disconnect, a newer Pause, replacement or expiry still cancels an unsent installation.
 The service verifies the complete two-plan readback. An observed unplug retires the temporary timer.
 A connector-1 Available event also retires it if the car reconnects between polls. A retired timer's
 tag cannot authorize another Start before cleanup. Changing the selected current while the timer is armed

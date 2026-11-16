@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
+from .connection_scope import current_scope
 from .local_control import local_start_receipt
 from .managed_current import (
     ManagedCurrentLimits,
@@ -50,6 +51,7 @@ from .native_faults import (
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
+from .release_attempt import ReleaseAttempt, native_availability
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .store import RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
@@ -141,13 +143,85 @@ class ManagedController:
                 self.pause_task = asyncio.create_task(self._stop_requested())
         return receipt
 
+    # The current persistent Pause may reclaim only the shared ticket of its exact retired normal Start.
+    def reclaim_failed_start_pause(self) -> None:
+        g, j = self.session.gateway, self.session.journal
+        intent, state = self.requests.intent(), self.tests.state()
+        failure = state.get("failure")
+        if (
+            intent.mode != "paused"
+            or state.get("kind") != "normal"
+            or state.get("source") != "local"
+            or state.get("state") != "stopping"
+            or state.get("stop_reason") != "start_not_confirmed"
+            or state.get("start_attempted") is not True
+            or state.get("revision") != intent.revision
+            or not isinstance(failure, dict)
+            or failure.get("id") != state.get("id")
+            or failure.get("action") != "start"
+            or failure.get("revision") != intent.revision
+            or failure.get("effects_started") is not True
+        ):
+            return
+        receipt, control, owner_pause = local_start_receipt(j), j.get("control", {}), j.get("managed_owner_pause", {})
+        scope, revision = current_scope(g), g.controls._revision
+        row = j.db.execute(
+            "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
+        ).fetchone()
+        if (
+            scope is None
+            or row is None
+            or tuple(row) != ("start", intent.revision, "uncertain")
+            or receipt.get("request_id") != state.get("id")
+            or receipt.get("digest") != state.get("tag_digest")
+            or receipt.get("stage") not in ("issued", "accepted")
+            or not receipt.get("ticket")
+            or control.get("ticket") != receipt["ticket"]
+            or control.get("owner") != "shared"
+            or control.get("inhibit") is not False
+            or control.get("uncertain") is not False
+            or owner_pause.get("revision") != intent.revision
+        ):
+            return
+
+        # This is current Pause authority under its own Boot, never adoption of the failed Start's older scope.
+        def current() -> bool:
+            return (
+                not self.stopping
+                and not j.get("managed_control_fault")
+                and self.tests.lease is None
+                and not g.controls._operations
+                and not g.charger._pending
+                and self.requests.intent() == intent
+                and current_scope(g) == scope
+                and g.controls._revision == revision
+                and j.get("trial_phase") == "active"
+                and self.tests.state() == state
+                and local_start_receipt(j) == receipt
+                and j.get("control") == control
+                and j.get("managed_owner_pause") == owner_pause
+                and fingerprint(j.get("boot")) == self.native.spec.boot_digest
+                and recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
+                and j.db.execute(
+                    "SELECT action,revision,state FROM managed_requests WHERE id=?", (state["id"],)
+                ).fetchone()
+                == row
+            )
+
+        if current():
+            with j.atomic():
+                if current():
+                    g.controls._claim(True)
+
     # Explicit owner Pause can restrict the commissioned station even while a native HTTP read is unavailable.
     async def ensure_pause_zero(self) -> None:
         g, j = self.session.gateway, self.session.journal
         intent = self.requests.intent()
         if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
             return
+        self.reclaim_failed_start_pause()
         epoch, ticket = g._charger_epoch, j.get("control", {}).get("ticket")
+        scope, revision = current_scope(g), g.controls._revision
 
         # Recheck the owner's claim and authenticated device immediately before each wire operation.
         def guard() -> None:
@@ -160,6 +234,9 @@ class ManagedController:
                 or control.get("owner") != "local"
                 or control.get("inhibit") is not True
                 or g._charger_epoch != epoch
+                or scope is None
+                or current_scope(g) != scope
+                or g.controls._revision != revision
                 or not g.current_boot_seen(epoch)
                 or fingerprint(j.get("boot")) != self.native.spec.boot_digest
                 or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
@@ -361,10 +438,14 @@ class ManagedController:
     def prepare_offline_pause(self) -> None:
         g, j = self.session.gateway, self.session.journal
         intent = self.requests.intent()
+        scope = current_scope(g)
         if (
             j.get("trial_phase") == "recovering"
             and not (self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
-            and self.session.runtime.status.vendor_failed_charger_epoch == g._charger_epoch
+            and scope is not None
+            and self.session.runtime.status.vendor_failed_scope == scope
+            and self.native.introduction_lineage == scope.lineage
+            and self.native.acknowledged_lineage != scope.lineage
             and intent.mode == "app"
         ):
             with j.atomic():
@@ -607,12 +688,30 @@ class ManagedController:
             guard()
             self.require_paused(native)
             self.requests.confirm_pauses()
-        self.session.book.before_positive_release = release_guard
+        scope = current_scope(g)
+        if scope is None:
+            raise UnavailableError("managed release awaits a current actual Boot")
+        attempt = ReleaseAttempt(
+            "automatic" if expected_intent.mode == "app" else "explicit",
+            expected_intent,
+            scope,
+            revision,
+            release_guard,
+        )
+
+        # Restrictive rollback keeps its exact Boot proof even when the positive release permission is revoked.
+        def rollback_guard() -> None:
+            if current_scope(g) != scope or g.controls._revision != revision:
+                raise UnavailableError("release rollback belongs to a superseded Boot observation")
+
         try:
-            await g.controls.release(guard=guard)
+            await g.controls.release(
+                guard=guard,
+                attempt=attempt,
+                context=self.session.book.positive_release_guard(release_guard),
+                rollback_guard=rollback_guard,
+            )
             guard()
-        except ReleaseDeferredError:
-            raise
         except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError) as error:
             if not self.stopping and self.requests.intent() == expected_intent:
                 # Detailed peer/guard errors stay in the private journal; public status exposes classification only.
@@ -625,22 +724,25 @@ class ManagedController:
                         "charger_rpc": g.charger.diagnostics.snapshot(),
                     },
                 )
-                if self.ordinary.active() and isinstance(error, UnavailableError):
-                    raise ReleaseDeferredError("ordinary recovery retains zero pending a new guarded proof") from error
+                if self.schedule.release_superseded(attempt):
+                    raise ReleaseDeferredError("automatic release yielded to its exact timer zero operation") from error
                 if (
-                    continuing_local is not None
-                    and not isinstance(error, SecurityError)
-                    and supervised_timer(j.get(KEY, {}))
-                    and j.active() == continuing_local
+                    attempt.purpose == "automatic"
+                    and attempt.known_unsent()
+                    and attempt.zero_confirmed
+                    and native_availability(error)
+                    and current_scope(g) == attempt.scope
+                    and g.controls._revision == attempt.control_revision
+                    and attempt.ticket is not None
+                    and j.get("control", {}).get("ticket") == attempt.ticket
+                    and g.controls.ready
+                    and g.controls.desired() == 0
+                    and not j.get("managed_control_fault")
                 ):
-                    self.schedule.begin_hold(j.get(KEY))
-                    raise ReleaseDeferredError(
-                        "independent continuation awaits renewed zero and source proof"
-                    ) from error
+                    g.controls._complete(attempt.ticket, uncertain=False)
+                    raise ReleaseDeferredError("automatic release retains verified zero pending fresh proof") from error
                 self.fault("owner_release_unconfirmed")
             raise
-        finally:
-            self.session.book.before_positive_release = None
         self.released_epoch = epoch
         j.put("managed_owner_epoch", epoch)
         timer = j.get(KEY, {})
@@ -957,6 +1059,10 @@ class ManagedController:
             if self.requests.intent().mode == "paused":
                 self.require_paused(native)
                 verified_pause = True
+            previous_intent = self.requests.intent()
+            self.tests.observed(native)
+            observed_intent = self.requests.intent()
+            intent_changed = observed_intent != previous_intent
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
             self.failures = 0
             self.strict_failure_seen = False
@@ -1034,15 +1140,13 @@ class ManagedController:
         self.strict_failure_seen = False
         self.native_unavailable = 0
         self.latest_native = native
-        previous_intent = self.requests.intent()
-        self.tests.observed(native)
-        if self.requests.intent() != previous_intent:
+        if intent_changed:
             return {
                 **base,
                 "state": "pausing",
                 "owner_control_enabled": False,
-                "desired_control": self.requests.intent().mode,
-                "control_revision": self.requests.intent().revision,
+                "desired_control": observed_intent.mode,
+                "control_revision": observed_intent.revision,
             }
         control = j.get("control", {})
         if (
