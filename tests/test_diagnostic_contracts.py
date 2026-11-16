@@ -78,12 +78,61 @@ def emitted_phases():
 
 # Unpack parallel phase assignments so sending() cannot evade the producer-derived contract.
 def assignment_pairs(target, value):
-    if isinstance(target, ast.Tuple):
-        assert isinstance(value, ast.Tuple)
-        for child, assigned in zip(target.elts, value.elts, strict=True):
+    if isinstance(target, ast.Starred):
+        # A starred phase receives a list, never a reviewed literal string, even with a literal source sequence.
+        yield from assignment_pairs(target.value, ast.Starred(value=value, ctx=ast.Load()))
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        assigned_values = value.elts if isinstance(value, (ast.Tuple, ast.List)) else [value] * len(target.elts)
+        for child, assigned in zip(target.elts, assigned_values, strict=True):
             yield from assignment_pairs(child, assigned)
     else:
         yield target, value
+
+
+# Intent: unrelated dynamic tuple unpacking cannot prevent collection of the actual diagnostic producer contract.
+# Why: RPC completion sets come from awaited calls, while only a phase target requires a literal-vocabulary review.
+def test_phase_assignment_scan_handles_unrelated_dynamic_unpacking():
+    statement = ast.parse("done, _ = await wait_for_replies()").body[0]
+    pairs = list(assignment_pairs(statement.targets[0], statement.value))
+    assert [target.id for target, _ in pairs] == ["done", "_"]
+    assert all(value is statement.value for _, value in pairs)
+
+
+# Intent: unpacking a dynamic expression into a phase still fails the independent literal-producer contract.
+# Why: accepting unrelated unpacking must not silently hide a new dynamic diagnostic producer.
+def test_dynamic_unpacked_phase_still_requires_review():
+    statement = ast.parse("self.phase, ignored = next_state()").body[0]
+    target, value = next(assignment_pairs(statement.targets[0], statement.value))
+    assert target.attr == "phase"
+    with pytest.raises(AssertionError, match="review dynamic diagnostic producer"):
+        literal_branches(value)
+
+
+# Intent: nested list and starred phase targets cannot hide a dynamic producer inside unrelated unpacking.
+# Why: relaxing unrelated tuple assignments must preserve conservative review at every diagnostic target leaf.
+@pytest.mark.parametrize("target", ["ignored, [self.phase]", "*self.phase, ignored"])
+def test_dynamic_nested_phase_target_still_requires_review(target):
+    statement = ast.parse(target + " = next_state()").body[0]
+    phases = [
+        value
+        for assigned, value in assignment_pairs(statement.targets[0], statement.value)
+        if isinstance(assigned, ast.Attribute) and assigned.attr == "phase"
+    ]
+    assert len(phases) == 1
+    with pytest.raises(AssertionError, match="review dynamic diagnostic producer"):
+        literal_branches(phases[0])
+
+
+# Intent: nested literal phase assignments keep their precise independently derived vocabulary.
+# Why: another field's value cannot be mistaken for the phase in a parallel assignment.
+def test_nested_literal_phase_assignment_retains_exact_value():
+    statement = ast.parse("other, (self.phase, count) = 'ignored', ('complete', 1)").body[0]
+    phases = [
+        literal_branches(value)
+        for target, value in assignment_pairs(statement.targets[0], statement.value)
+        if isinstance(target, ast.Attribute) and target.attr == "phase"
+    ]
+    assert phases == [{"complete"}]
 
 
 # Defaults and actual phase writes define this set; the HA allowlist never supplies expected values.
