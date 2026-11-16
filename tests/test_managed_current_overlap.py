@@ -11,8 +11,9 @@ from datetime import UTC, datetime
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import RecoveryRequiredError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError, ReleaseDeferredError
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
@@ -358,8 +359,10 @@ async def test_next_window_after_real_cutoff(tmp_path, tls, unused_tcp_port, mon
 
 # Intent: source changes during final send validation revoke positive recovery and retain zero until reidentified.
 # Why: an earlier matching native plan cannot authorize a release after fresher evidence contradicts its source.
-@pytest.mark.parametrize("completed_timer", [False, True])
-async def test_source_changes_before_positive_send(tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer):
+@pytest.mark.parametrize("completed_timer,reject_rollback", [(False, False), (True, False), (False, True)])
+async def test_source_changes_before_positive_send(
+    tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, reject_rollback
+):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
         if completed_timer:
@@ -370,6 +373,21 @@ async def test_source_changes_before_positive_send(tmp_path, tls, unused_tcp_por
             release.set()
         native_send = b.c.native.validate_send
         changed = False
+        attempts = []
+        wire = len(b.rig.bench.device_calls)
+        change_id = b.session.journal.get("managed_current_change")["id"]
+        answer, refusals = b.device.answer, []
+
+        # Refuse rollback only after the genuine positive validator has observed the changed source.
+        def reject_actual_rollback(action, payload):
+            if reject_rollback and attempts and action == "SetChargingProfile":
+                limit = payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+                if limit == 0:
+                    refusals.append(copy.deepcopy(payload))
+                    return {"status": "Rejected"}
+            return answer(action, payload)
+
+        monkeypatch.setattr(b.device, "answer", reject_actual_rollback)
 
         # Change only independent peer evidence immediately before the actual outgoing positive-profile gate.
         async def changed_source(action, payload):
@@ -377,6 +395,12 @@ async def test_source_changes_before_positive_send(tmp_path, tls, unused_tcp_por
             if action == "SetChargingProfile":
                 limit = payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
                 if limit == 6 and not changed:
+                    attempt = b.session.gateway.controls.release_attempt
+                    assert attempt is not None and attempt.purpose == "automatic"
+                    assert not attempt.finished and not attempt.positive_may_have_dispatched
+                    assert attempt.ticket == b.session.journal.get("control")["ticket"]
+                    assert b.session.journal.get("managed_current_change")["continuing_local"] == local
+                    attempts.append(attempt)
                     b.rig.peer.plan_session = (local, 987654)
                     changed = True
             await native_send(action, payload)
@@ -384,6 +408,35 @@ async def test_source_changes_before_positive_send(tmp_path, tls, unused_tcp_por
         b.session.gateway.charger.validate_send = changed_source
         await b.c.tick()
         assert changed and b.device.effective_limit() == b.device.current == 0 and not b.stops()
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        assert attempt.known_unsent() and attempt.zero_may_have_dispatched
+        assert type(attempt.positive_failure) is ReleaseDeferredError
+        assert b.session.gateway.controls.release_attempt is None
+        profiles = [item for item in b.rig.bench.device_calls[wire:] if item[2] == "SetChargingProfile"]
+        assert len(profiles) == 1
+        assert profiles[0][3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+        recovery = b.session.journal.get("managed_current_change")
+        assert recovery["id"] == change_id and recovery["state"] == "recovering"
+        assert recovery["source_boot"] == attempt.scope.boot and recovery["continuing_local"] is None
+        if reject_rollback:
+            assert len(refusals) == 1 and not attempt.zero_confirmed
+            assert type(attempt.failure) is UnavailableError and attempt.failure is not attempt.positive_failure
+            fault = copy.deepcopy(b.session.journal.get("managed_control_fault"))
+            assert fault["classification"] == "owner_release_unconfirmed"
+            assert b.session.journal.get("control")["uncertain"] is True
+            assert not b.session.gateway.controls.ready
+            monkeypatch.setattr(b.device, "answer", answer)
+            b.rig.peer.plan_session = (local, 9)
+            status = await b.c.tick()
+            assert b.session.journal.get("managed_control_fault") == fault and status["state"] == "attention"
+            assert b.c.requests.intent().mode == "app" and b.c.current.selected() == 6
+            assert b.device.effective_limit() == b.device.current == 0 and b.device.plans == {9: original}
+            assert not b.stops() and not starts(b.rig)
+            return
+        assert attempt.zero_confirmed and attempt.positive_failure is attempt.failure and not refusals
+        assert not b.session.journal.get("managed_control_fault")
+        assert b.session.journal.get("control")["uncertain"] is False
         for _ in range(4):
             await b.c.tick()
             assert b.device.effective_limit() == 0 and b.c.requests.intent().mode == "app"

@@ -9,7 +9,8 @@
 - Retry the complete restrictive zero check after an audited open-session introduction loses a reply. Never
   replay introduction, Start or Stop merely to finish that check.
 - Track possible positive writes through the whole owned release, including later reads and zero rollback.
-  Retry temporary native failures before positive dispatch only after confirmed zero. Let an actual timer zero
+  Retry temporary native failures or a revoked current-recovery source before positive dispatch only after
+  confirmed zero. Let an actual timer zero
   supersede an unsent automatic release without borrowing its pending acknowledgement or clearing its uncertainty.
 - Keep completed strict validation failures ahead of simultaneous restrictive requests. Preserve failed native
   audit publication during cancellation, including the cleanup cause of an externally cancelled operation.
