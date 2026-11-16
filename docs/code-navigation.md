@@ -86,10 +86,16 @@ For command timing, follow `Peer._validate()` through its priority gate and then
 
 `connection_scope.py` separates connection-origin bookkeeping from exact Boot-bound cloud and resume evidence.
 `release_attempt.py` retains possible positive effects across the owned operation, its later reads and rollback.
+Its `ReleaseOutcome` distinguishes unfinished, successful, cancelled, possibly positive, unconfirmed-zero,
+waiting and failed whole operations; the caller separately checks current owner/Boot/ticket authority.
 Read their callers in `runtime.py`, `native_bounded_handover.py`, `local_control.py`, `managed.py` and
 `managed_schedule.py` together. `test_managed_introduction_scope.py`, `test_managed_closed_timer_release_retry.py`
 and `test_managed_timer_release_supersession.py` cover those boundaries through real peers. The companion
 `test_release_positive_effect_retention.py` checks that rollback cannot erase a preceding positive dispatch.
+`tests/release_outcome_helpers.py` records forwarded real TLS replies and drives explicit Pause/closure/Return
+recovery for the post-positive source regressions in `test_managed_schedule_cutoff.py` and
+`test_managed_schedule_source_freshness.py`. These cases retain the fault after a genuine positive ACK and zero
+rollback; fresh source proof alone is not a new owner acknowledgement.
 `test_rpc_native_cleanup_failure.py` exercises real native cancellation and failed SQLite publication;
 `test_rpc_completed_verdict.py` separately checks the standalone Peer contract with explicit unit collaborators.
 For normal Start handoffs, read `test_managed_return_during_start.py`, `test_managed_return_after_start_child.py`

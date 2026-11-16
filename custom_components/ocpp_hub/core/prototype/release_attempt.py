@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 
 from ..frames import Frame
@@ -23,6 +24,19 @@ def native_availability(error: BaseException) -> bool:
     if type(error) is UnavailableError and error.__cause__ is not None:
         error = error.__cause__
     return isinstance(error, (NativeTransportUnavailableError, StaleEvidenceError))
+
+
+class ReleaseOutcome(Enum):
+    """One whole-operation result distinguishes safe zero waits from failures with unconfirmed effects."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    CANCELLED = "cancelled"
+    POSSIBLE_POSITIVE = "possible_positive"
+    ZERO_UNCONFIRMED = "zero_unconfirmed"
+    NATIVE_UNAVAILABLE = "native_unavailable"
+    PREREQUISITE_PENDING = "prerequisite_pending"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -63,3 +77,24 @@ class ReleaseAttempt:
     # A later unsent read or confirmed zero cannot erase an earlier possibly dispatched positive mutation.
     def known_unsent(self) -> bool:
         return self.finished and not self.cancelled and not self.positive_may_have_dispatched
+
+    # Callers consume one result after owned cleanup; the original verdict alone never proves unsent or zero.
+    def outcome(self) -> ReleaseOutcome:
+        if not self.finished:
+            return ReleaseOutcome.PENDING
+        if self.cancelled:
+            return ReleaseOutcome.CANCELLED
+        error = self.failure
+        if error is None:
+            return ReleaseOutcome.SUCCEEDED if self.positive_confirmed else ReleaseOutcome.FAILED
+        if self.positive_may_have_dispatched or self.positive_confirmed:
+            return ReleaseOutcome.POSSIBLE_POSITIVE
+        if not self.zero_confirmed:
+            return ReleaseOutcome.ZERO_UNCONFIRMED
+        if error is not self.positive_failure:
+            return ReleaseOutcome.FAILED
+        if native_availability(error):
+            return ReleaseOutcome.NATIVE_UNAVAILABLE
+        if type(error) is ReleaseDeferredError and error.__cause__ is None:
+            return ReleaseOutcome.PREREQUISITE_PENDING
+        return ReleaseOutcome.FAILED

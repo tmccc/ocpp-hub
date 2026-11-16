@@ -21,11 +21,17 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import RecoveryRequiredError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError, ReleaseDeferredError
 
 from tests import test_native_bounded_session as native_bench
 from tests import test_trial_session as trial_bench
 from tests.handover_helpers import crash
+from tests.release_outcome_helpers import (
+    applied_release_attempt,
+    assert_positive_rollback,
+    explicit_release_recovery,
+    observe_device_replies,
+)
 from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, pending_cloud_offer, starts
 from tests.test_managed_schedule import SchedulePeer
 from tests.test_prototype import BOOT, START
@@ -1315,6 +1321,8 @@ async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypa
             peer = b.session.gateway.charger
             validate = peer.validate_send
             checked = asyncio.Event()
+            attempts = []
+            wire = len(b.rig.bench.device_calls)
 
             # Change the observed plan before the final native read in the real outgoing positive profile gate.
             async def reassigned(action, payload):
@@ -1322,6 +1330,11 @@ async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypa
                     action == "SetChargingProfile"
                     and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
                 ):
+                    attempt = b.session.gateway.controls.release_attempt
+                    assert attempt is not None and attempt.purpose == "automatic"
+                    assert not attempt.finished and not attempt.positive_may_have_dispatched
+                    assert attempt.ticket == b.session.journal.get("control")["ticket"]
+                    attempts.append(attempt)
                     b.rig.peer.plan_session = (local, b.timer)
                     checked.set()
                 if validate is not None:
@@ -1329,9 +1342,24 @@ async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypa
 
             peer.validate_send = reassigned
             try:
-                for _ in range(5):
+                await b.c.tick()
+                assert checked.is_set() and len(attempts) == 1
+                attempt = attempts[0]
+                assert attempt.known_unsent() and attempt.zero_may_have_dispatched and attempt.zero_confirmed
+                assert type(attempt.failure) is ReleaseDeferredError and attempt.positive_failure is attempt.failure
+                assert b.session.gateway.controls.release_attempt is None
+                profiles = [item for item in b.rig.bench.device_calls[wire:] if item[2] == "SetChargingProfile"]
+                assert len(profiles) == 1
+                assert (
+                    profiles[0][3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+                )
+                lease = b.session.journal.get("managed_temporary_schedule")
+                assert lease["bound_local"] == local and lease["source_boot"] == attempt.scope.boot
+                assert lease["cutoff_reached"] and lease["state"] == "armed"
+                assert not b.session.journal.get("managed_control_fault")
+                for _ in range(4):
                     await b.c.tick()
-                assert checked.is_set() and b.device.effective_limit() == 0
+                assert b.device.effective_limit() == 0
                 assert set(b.stops()) == {local} and not starts(b.rig)
             finally:
                 peer.validate_send = validate
@@ -2073,8 +2101,8 @@ async def test_lost_provisional_zero_ack_then_daily_source(tmp_path, tls, unused
         assert daily != local and (await healthy(b.c))["power_w"] > 0 and not b.stops() and not starts(b.rig)
 
 
-# Intent: a confirmed source correction during a positive ACK survives subsequent telemetry loss at cutoff.
-# Why: the completed write must restore zero even when the next ordinary native poll cannot perform the correction.
+# Intent: source correction after positive dispatch restores zero and retains the fault until fresh owner recovery.
+# Why: a later telemetry outage or confirmed rollback cannot make the earlier possibly positive release unsent.
 async def test_lost_source_after_positive_write_with_telemetry_outage(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await b.arm()
@@ -2088,6 +2116,9 @@ async def test_lost_source_after_positive_write_with_telemetry_outage(tmp_path, 
         observer = b.session.prepared.observer
         read = observer._read
         corrected = asyncio.Event()
+        attempts = []
+        wire = len(b.rig.bench.device_calls)
+        replies = observe_device_replies(b, monkeypatch)
 
         # Lose the separate telemetry path only after a genuine complete read has corrected the open session's source.
         async def unavailable(action, data=None):
@@ -2100,6 +2131,7 @@ async def test_lost_source_after_positive_write_with_telemetry_outage(tmp_path, 
                 and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
                 and not corrected.is_set()
             ):
+                attempts.append(applied_release_attempt(b, 6))
                 b.rig.peer.plan_session = (local, 987654)
                 await b.c.native.read()
                 observer._read = unavailable
@@ -2114,10 +2146,10 @@ async def test_lost_source_after_positive_write_with_telemetry_outage(tmp_path, 
             b.rig.bench.before_reply = None
             observer._read = read
         b.rig.peer.plan_session = (local, 9)
+        assert len(attempts) == 1
+        assert_positive_rollback(b, attempts[0], wire, replies, 6)
         b.clock.now += 16
-        assert (await healthy(b.c))["station_ceiling_a"] == 6 and b.session.journal.active() == local
-        await b.close_transaction(local)
-        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9} and not b.stops()
+        await explicit_release_recovery(b, local, 6)
 
 
 # Intent: a retained one-off cannot exclude an independently verified daily occurrence on a later local date.

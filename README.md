@@ -1026,9 +1026,12 @@ backoff on that connection. A refused request, lost reply or Accepted reply with
 Only a genuine Boot permits introduction; retries stop when it arrives or the connection ends.
 
 An ordinary temporary zero hold on the existing connection preserves the saved app choice during a cloud outage.
-Offline replacement retains the documented Pause behavior. Temporary native unavailability before an automatic
-positive release keeps zero and waits for fresh proof; an earlier possibly dispatched positive write remains
-uncertain even if a later read fails or zero rollback succeeds. Explicit Return retains its separate request policy.
+Offline replacement retains the documented Pause behavior. Temporary native unavailability or a withheld
+source/lifecycle/timer prerequisite keeps zero and waits for fresh proof only when the whole automatic attempt
+sent no positive profile and confirmed its own rollback zero. A later cleanup failure remains a failure.
+An earlier possibly dispatched positive write remains uncertain even if a later read fails or zero rollback
+succeeds: fresh observations alone cannot clear its fault. Use a new Pause, verified closure and a separate Return
+for the existing owner recovery. Explicit Return retains its separate request policy.
 
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy

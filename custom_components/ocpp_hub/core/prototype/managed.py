@@ -51,7 +51,7 @@ from .native_faults import (
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
-from .release_attempt import ReleaseAttempt, native_availability
+from .release_attempt import ReleaseAttempt, ReleaseOutcome
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .store import RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
@@ -691,15 +691,6 @@ class ManagedController:
         scope = current_scope(g)
         if scope is None:
             raise UnavailableError("managed release awaits a current actual Boot")
-        current_change = j.get("managed_current_change", {})
-        current_recovery = (
-            (current_change.get("id"), current_change.get("recovery_revision"))
-            if current_change.get("state") == "recovering"
-            and current_change.get("recovery_revision") == expected_intent.revision
-            and current_change.get("source_boot") == scope.boot
-            and current_change.get("continuing_local") == continuing_local == j.active()
-            else None
-        )
         attempt = ReleaseAttempt(
             "automatic" if expected_intent.mode == "app" else "explicit",
             expected_intent,
@@ -735,22 +726,9 @@ class ManagedController:
                 )
                 if self.schedule.release_superseded(attempt):
                     raise ReleaseDeferredError("automatic release yielded to its exact timer zero operation") from error
-                current_change = j.get("managed_current_change", {})
-                # Fresh source loss withholds this recovery; it cannot erase a positive write or cleanup failure.
-                current_source_wait = (
-                    current_recovery is not None
-                    and type(error) is ReleaseDeferredError
-                    and attempt.positive_failure is error
-                    and current_change.get("state") == "recovering"
-                    and (current_change.get("id"), current_change.get("recovery_revision")) == current_recovery
-                    and current_change.get("source_boot") == scope.boot
-                    and j.active() == continuing_local
-                )
                 if (
                     attempt.purpose == "automatic"
-                    and attempt.known_unsent()
-                    and attempt.zero_confirmed
-                    and (native_availability(error) or current_source_wait)
+                    and attempt.outcome() in (ReleaseOutcome.NATIVE_UNAVAILABLE, ReleaseOutcome.PREREQUISITE_PENDING)
                     and current_scope(g) == attempt.scope
                     and g.controls._revision == attempt.control_revision
                     and attempt.ticket is not None

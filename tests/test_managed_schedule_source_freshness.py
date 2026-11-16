@@ -10,6 +10,12 @@ from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 
+from tests.release_outcome_helpers import (
+    applied_release_attempt,
+    assert_positive_rollback,
+    explicit_release_recovery,
+    observe_device_replies,
+)
 from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_managed_schedule_source_boot import arm_at_32
@@ -137,8 +143,8 @@ async def test_fresh_daily_keeps_current_through_cutoff(tmp_path, tls, unused_tc
             await asyncio.gather(watcher, return_exceptions=True)
 
 
-# Intent: each outgoing continuation must honor a failed source audit, but a fresh open audit still identifies the car.
-# Why: both results can arrive after the positive profile was applied and before its confirmation has returned.
+# Intent: a post-positive source failure needs explicit owner recovery; a valid open audit still identifies the car.
+# Why: positive application and ACK are not whole-release confirmation, and rollback cannot erase that earlier effect.
 @pytest.mark.parametrize("failure", ["missing", "open"])
 async def test_source_freshness_during_positive_confirmation(tmp_path, tls, unused_tcp_port, monkeypatch, failure):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
@@ -153,6 +159,9 @@ async def test_source_freshness_during_positive_confirmation(tmp_path, tls, unus
         observer = b.session.prepared.observer
         port = observer.port
         observed = asyncio.Event()
+        attempts = []
+        wire = len(b.rig.bench.device_calls)
+        replies = observe_device_replies(b, monkeypatch)
 
         # The independent native endpoint loses its real response while the positive profile ACK remains outstanding.
         async def unavailable(reader, writer):
@@ -170,6 +179,7 @@ async def test_source_freshness_during_positive_confirmation(tmp_path, tls, unus
                     and not observed.is_set()
                     and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
                 ):
+                    attempts.append(applied_release_attempt(b, 32))
                     if failure == "open":
                         with pytest.raises(SecurityError):
                             await b.c.native.read(closed=True)
@@ -188,6 +198,11 @@ async def test_source_freshness_during_positive_confirmation(tmp_path, tls, unus
             finally:
                 observer.port = port
                 b.rig.bench.before_reply = None
+        assert len(attempts) == 1
+        if failure == "missing":
+            assert_positive_rollback(b, attempts[0], wire, replies, 32)
+            await explicit_release_recovery(b, local, 32)
+            return
         assert (await healthy(b.c))["current_a"] == 32 and not b.stops()
         await b.close_transaction(local)
         await healthy(b.c)
