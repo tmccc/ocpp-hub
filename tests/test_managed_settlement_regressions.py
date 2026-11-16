@@ -180,6 +180,76 @@ async def test_interrupted_test_retires_after_real_closed_zero(tmp_path, tls, un
             await replacement.close()
 
 
+# Intent: replacement settles each exact action without turning closure into a missing power-test success.
+# Why: local Start, timed power verification and cloud arming have different durable confirmation contracts.
+@pytest.mark.parametrize("action", ["start", "start_test", "arm_cloud_test"])
+async def test_interrupted_request_retains_its_action_outcome(tmp_path, tls, unused_tcp_port, monkeypatch, action):
+    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
+    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=60, startup=60) as b:
+        c, j = b.controller, b.session.journal
+        identifier, local = uuid.uuid4().hex, None
+        if action == "arm_cloud_test":
+            # Fail the actual arm receipt UPDATE after its independently committed permission/request metadata.
+            j.db.execute(
+                "CREATE TRIGGER refuse_arm_confirmation BEFORE UPDATE ON managed_requests "
+                f"WHEN NEW.id='{identifier}' AND NEW.state='completed' "
+                "BEGIN SELECT RAISE(ABORT,'synthetic arm confirmation failure'); END"
+            )
+            try:
+                with pytest.raises(sqlite3.Error):
+                    c.command(identifier, action, c.requests.intent().revision)
+            finally:
+                j.db.execute("DROP TRIGGER refuse_arm_confirmation")
+            assert c.tests.state()["state"] == "armed"
+        else:
+            c.command(identifier, action, c.requests.intent().revision)
+            await c.tests.settle()
+            local = await positive_flow(b)
+            # The actual device has flowed, but no supervisor observation has published that proof.
+            assert c.tests.state()["state"] == "awaiting_power"
+            assert not c.tests.state().get("start_source_verified")
+            assert "flow_started_at" not in c.tests.state()
+        assert c.requests.receipt(identifier)["state"] == "accepted"
+        expected_starts = int(local is not None)
+        assert len(starts(b.rig)) == expected_starts
+        await c.tests.close()
+        await crash(b.session)
+        replacement = managed_session(b.rig)
+        await replacement.start()
+        recovered = ManagedController(replacement)
+        try:
+            assert recovered.requests.receipt(identifier)["state"] == "uncertain"
+            async with b.rig.charger(replacement) as charger:
+                await introduced(b.rig, replacement, charger, uuid.uuid4().hex)
+                fresh = ChargeRig(b.rig, replacement, recovered, charger)
+                recovered.command(uuid.uuid4().hex, "pause", recovered.requests.intent().revision)
+                if local is not None:
+                    await close_session(b.rig, replacement, charger, local)
+                assert (await settled_without_another_command(recovered))["local_hold_verified"]
+                terminal = copy.deepcopy(recovered.requests.receipt(identifier))
+                if action == "start_test":
+                    assert terminal["state"] == "failed"
+                    assert terminal["result"] == {"classification": "test_interrupted_at_verified_zero"}
+                else:
+                    assert terminal["state"] == "completed"
+                    assert terminal["result"] == (
+                        {"local_session_verified": True, "charging": False, "timed": False}
+                        if action == "start"
+                        else {"armed": True, "charging_started": False}
+                    )
+                assert not terminal["result"].get("positive_power_verified")
+                assert recovered.tests.state()["state"] == "completed" and recovered.tests.lease is None
+                assert len(starts(b.rig)) == expected_starts
+                await two_later_sessions(fresh, selected=6, original_starts=expected_starts)
+                assert recovered.requests.receipt(identifier) == terminal
+        finally:
+            await recovered.tests.close()
+            if recovered.pause_task is not None:
+                await asyncio.gather(recovered.pause_task, return_exceptions=True)
+            await replacement.close()
+
+
 # Intent: the exact failed selection retires after fresh verified Pause without claiming its unknown target succeeded.
 # Why: physical zero may heal while stale metadata would still disable ordinary or later fault recovery.
 async def test_failed_current_record_retires_after_verified_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
