@@ -5,8 +5,8 @@ from datetime import datetime
 import pytest
 
 from tests.managed_scenario_helpers import demand_from_vehicle, originals, select_current
+from tests.peer_mutation_helpers import fail_one_operation
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
-from tests.test_managed_schedule_mutation_scenarios import fail_one_operation
 from tests.test_prototype_tls import tls as tls
 from tests_model.schedule_cases import SequenceCase
 from tests_model.test_schedule_sequences import PeerLedger, recovery, turns

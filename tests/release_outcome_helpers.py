@@ -1,7 +1,6 @@
 """Real peer witnesses and explicit owner recovery after a possibly positive automatic release."""
 
 import copy
-import json
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -9,22 +8,8 @@ from zoneinfo import ZoneInfo
 from ocpp_hub_core.prototype.release_attempt import ReleaseOutcome
 from ocpp_hub_core.prototype.store import ReleaseDeferredError
 
+from tests.peer_mutation_helpers import observe_device_replies as observe_device_replies
 from tests.test_managed_proxy import healthy, starts
-
-
-# Record only real replies sent by the independent TLS peer, always forwarding their original bytes unchanged.
-def observe_device_replies(b, monkeypatch):
-    send, replies = b.sock.send, []
-
-    # Retain the reply only after the real socket send succeeds; no engine callback or verdict is replaced.
-    async def observed(raw):
-        await send(raw)
-        frame = json.loads(raw)
-        if frame[0] in (3, 4):
-            replies.append(copy.deepcopy(frame))
-
-    monkeypatch.setattr(b.sock, "send", observed)
-    return replies
 
 
 # Observe the actual owned attempt only after the independent firmware has applied its positive profile.

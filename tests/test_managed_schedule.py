@@ -22,56 +22,12 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
 
 from tests import test_native_bounded_session as native_bench
-from tests.handover_helpers import NativeVehiclePeer
+from tests.native_schedule_support import ORIGINAL_PLAN as ORIGINAL_PLAN
+from tests.native_schedule_support import SchedulePeer as SchedulePeer
 from tests.test_managed_api import TOKEN, call
 from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
 from tests.test_prototype import BOOT, START
 from tests.test_prototype_tls import tls as tls
-
-ORIGINAL_PLAN = {
-    "planId": 9,
-    "type": "Plan",
-    "idTag": "NATIVE_TIMER",
-    "eco": "Fast",
-    "stopModel": "Duration",
-    "stopValue": 360,
-    "limitCurrent": 320,
-    "ConnectorId": 1,
-    "validTime": "2020-01-01T00:00:00Z",
-    "startTime": 0,
-    "kindType": "Recurring",
-    "recurring": 127,
-    "maxEnergy": 0,
-}
-
-
-class SchedulePeer(NativeVehiclePeer):
-    """The physical getter uses tenths of amps and different connector casing from its OCPP request."""
-
-    # Seed the device with actual mutable wire-format daily settings before the baseline is read.
-    def __init__(self, bench: Any) -> None:
-        super().__init__(bench)
-        wire = dict(ORIGINAL_PLAN)
-        wire.update(connectorId=wire.pop("ConnectorId"), limitCurrent=wire["limitCurrent"] / 10)
-        del wire["maxEnergy"]
-        bench.firmware.plans[9] = wire
-
-    # Simulate the complete native envelope and its independent representation, including fields never sent on OCPP.
-    def native(self, key: str) -> Any:
-        value = super().native(key)
-        if key == "SETPLAN":
-            plans = []
-            for raw in value["planList"]:
-                plan = dict(raw)
-                plan.update(
-                    ConnectorId=plan.pop("connectorId"),
-                    limitCurrent=int(plan["limitCurrent"] * 10),
-                    stopValue=int(plan["stopValue"]),
-                    maxEnergy=0,
-                )
-                plans.append(plan)
-            return {"planList": plans, "defaultEco": {"mode": "Fast"}}
-        return value
 
 
 # Intent: prove add/readback, actual scheduled Start/Stop, missed starts, superseding Pause, and selective cleanup.
