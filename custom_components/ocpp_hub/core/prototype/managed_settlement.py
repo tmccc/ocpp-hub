@@ -77,7 +77,7 @@ def current_candidate(c: ManagedController) -> TerminalRecord | None:
 
 
 # Closed lifecycle or exact known-unsent provenance distinguishes obsolete test metadata from unbound Start debt.
-def test_candidate(c: ManagedController) -> TerminalRecord | None:
+def charge_test_candidate(c: ManagedController) -> TerminalRecord | None:
     j, tests = c.session.journal, c.tests
     state, lease = tests.state(), tests.lease
     request = request_snapshot(j, state.get("id"))

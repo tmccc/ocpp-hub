@@ -31,11 +31,11 @@ from .managed_schedule import (
     temporary_continuation,
 )
 from .managed_settlement import (
+    charge_test_candidate,
     complete_record,
     current_candidate,
     internal_pause_matches,
     require_settled_debt,
-    test_candidate,
 )
 from .managed_start_binding import ManagedStartBinding
 from .managed_test_charge import ManagedChargeTests
@@ -303,7 +303,7 @@ class ManagedController:
             await self.schedule.observe(native)
         self.require_paused(native)
         g, j = self.session.gateway, self.session.journal
-        records = [record for record in (current_candidate(self), test_candidate(self)) if record is not None]
+        records = [record for record in (current_candidate(self), charge_test_candidate(self)) if record is not None]
         internal = internal_pause_matches(self)
         if records or internal:
             try:

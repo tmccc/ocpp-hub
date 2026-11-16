@@ -14,7 +14,7 @@ from .managed_delivery_recovery import complete_delivery_recovery, delivery_reco
 from .managed_fault_timer import FaultTimerRemoval, PausedReleaseAuthority, receipted_timer_requests
 from .managed_native_repair import repair_pending, repair_revoked
 from .managed_occurrences import activate, occurrences
-from .managed_settlement import complete_record, current_candidate, require_record, test_candidate
+from .managed_settlement import charge_test_candidate, complete_record, current_candidate, require_record
 from .managed_start_delivery import DENIALS, complete_denied_start, denial_faults, denied_start_evidence
 from .native_faults import MEASURED_FAULT, measurement_cause
 from .store import RecoveryRequiredError, fingerprint
@@ -150,7 +150,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     ticket = j.get("control", {}).get("ticket")
     current = legacy_current_evidence(c, fault)
     terminal_current = current_candidate(c) if current is None else None
-    terminal_test = test_candidate(c)
+    terminal_test = charge_test_candidate(c)
     terminal = [record for record in (terminal_current, terminal_test) if record is not None]
     delivery = delivery_recovery_evidence(c, fault)
     operator = operator_recovery_evidence(c, fault)
