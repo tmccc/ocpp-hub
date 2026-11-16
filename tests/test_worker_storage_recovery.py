@@ -121,7 +121,13 @@ async def test_current_completion_eventually_recovers_same_service(
             await asyncio.wait_for(asyncio.shield(c.current.worker), 3)
             assert c.requests.receipt(identifier)["state"] == "uncertain"
             change = j.get("managed_current_change")
-            assert change["state"] == "uncertain" and change["failure"]["id"] == identifier
+            assert change["state"] in ("uncertain", "cancelled") and change["failure"]["id"] == identifier
+            if change["state"] == "cancelled":
+                # The concurrent poll may already retire metadata under fresh Pause; its command stays unknown.
+                assert tick is not None
+                await asyncio.wait_for(tick, 3)
+                c.require_paused(await c.native.read(closed=True))
+                assert c.requests.receipt(identifier)["state"] == "uncertain"
             assert b.rig.bench.firmware.effective_limit() == 0
             actual_positive = [
                 f

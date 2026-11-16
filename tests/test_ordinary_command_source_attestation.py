@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.test_managed_proxy import healthy, starts
+from tests.test_managed_proxy import healthy, pending_cloud_offer, starts
 from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
@@ -50,7 +50,10 @@ async def test_manual_command_source_is_stable_across_native_outage(
         b.rig.bench.cp, b.rig.bench.connection = "C", "Charging"
         b.device.requested_current = 32
         await until(lambda: j.vendor_id(local) is not None and j.next_delivery() is None)
-        await healthy(c)
+        if source == "absent":
+            await pending_cloud_offer(c, 32)
+        else:
+            await healthy(c)
         grant = j.get("vendor_start_grant")
         if source in ("shared", "changed"):
             assert grant["local"] == local

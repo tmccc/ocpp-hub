@@ -26,7 +26,7 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from tests import test_native_bounded_session as native_bench
 from tests import test_trial_session as trial_bench
 from tests.handover_helpers import crash
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
+from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, pending_cloud_offer, starts
 from tests.test_managed_schedule import SchedulePeer
 from tests.test_prototype import BOOT, START
 from tests.test_prototype_tls import tls as tls
@@ -2576,7 +2576,7 @@ async def test_lifecycle_turnover_at_timer_stop(tmp_path, tls, unused_tcp_port, 
         await b.acknowledge_older_owner_start()
         b.clock.now = b.start
         first = await b.fire(b.timer)
-        await healthy(b.c)
+        await pending_cloud_offer(b.c, 6)
         b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
         jobs = []
 

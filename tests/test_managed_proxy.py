@@ -90,6 +90,19 @@ async def healthy(controller: ManagedController) -> dict[str, Any]:
             await asyncio.sleep(0.02)
 
 
+# Wait for a permitted physical offer while independently retaining the unhealthy unbound cloud-Start obligation.
+async def pending_cloud_offer(controller: ManagedController, limit: int) -> dict[str, Any]:
+    async with asyncio.timeout(5):
+        while True:
+            status = await controller.tick()
+            assert status["cloud_start_pending"] is True and status.get("local_healthy") is not True
+            assert status["state"] not in ("attention", "stopping"), status
+            if status.get("station_ceiling_a") == limit and status.get("owner_control_enabled") is True:
+                assert status["state"] == "degraded" and status["phase"] == "active"
+                return status
+            await asyncio.sleep(0.02)
+
+
 # Count the physical peer's actual Start requests independently from the supervisor's saved state.
 def starts(rig: ConnectedBench) -> list[list[Any]]:
     return [frame for frame in rig.bench.device_calls if frame[2] == "RemoteStartTransaction"]

@@ -10,7 +10,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
+from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
@@ -116,7 +116,7 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
         grant = dict(j.get("vendor_start_grant"))
         b.clock.now = b.start
         temporary = await b.fire(b.timer, demand=demand)
-        await healthy(b.c)
+        await pending_cloud_offer(b.c, 6)
         assert j.get("vendor_start_grant") == grant
         end = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
         b.clock.now = end

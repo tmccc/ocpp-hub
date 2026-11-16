@@ -49,11 +49,13 @@ async def test_failed_app_current_returns_only_to_previous_selection(
 
         monkeypatch.setattr(test.rig.bench.firmware, "answer", refuse_target)
         identifier = await select(test, 16)
+        historical = test.controller.requests.receipt(identifier)
         status = await healthy(test.controller)
         journal = test.session.journal
         receipt = test.controller.requests.receipt(identifier)
         assert failed and applied_at_failure == (6 if outcome == "rejected" else 16)
         assert receipt["state"] == "uncertain"
+        assert receipt == historical
         assert test.controller.current.selected() == 6 and journal.get("control")["resume_limit"] == 6
         assert receipt["result"] == {
             "classification": "current_unconfirmed",
@@ -62,7 +64,7 @@ async def test_failed_app_current_returns_only_to_previous_selection(
         }
         change = journal.get("managed_current_change")
         assert change["current_a"] == 16 and change["previous_a"] == 6 and change["mode"] == "app"
-        assert change["state"] == "uncertain" and test.controller.current.selected() == 6
+        assert change["state"] == "cancelled" and test.controller.current.selected() == 6
         assert journal.get("control")["resume_limit"] == 6 and journal.get("control")["inhibit"] is True
         assert status["local_hold_verified"] and test.rig.bench.firmware.effective_limit() == 0
         assert not journal.get("managed_control_fault")

@@ -12,7 +12,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
+from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
 from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
@@ -65,7 +65,7 @@ async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypat
                 local = result[2]["transactionId"]
                 assert b.device.effective_limit() == 0 and j.get("vendor_start_grant") == grant
                 b.rig.peer.plan_session = (local, 9)
-                assert (await healthy(b.c))["station_ceiling_a"] == 6
+                assert (await pending_cloud_offer(b.c, 6))["station_ceiling_a"] == 6
                 assert b.device.current == (6 if demand else 0) and not b.stops()
                 b.clock.now += 60
                 await b.close_transaction(local)
