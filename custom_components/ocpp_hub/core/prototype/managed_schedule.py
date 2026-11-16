@@ -21,6 +21,7 @@ from .managed_cutoffs import release_idle_cutoffs, resume_cutoff
 from .managed_cutoffs import supervised_timer as supervised_timer
 from .managed_occurrences import (
     HEAD,
+    IDENTITY,
     activate,
     installed_digest,
     occurrences,
@@ -674,6 +675,32 @@ class ManagedSchedule:
             await self.protect_station(lease)
             if not g.controls.ready or g.controls.desired() != 0:
                 raise UnavailableError("the delayed occurrence awaits verified zero")
+        if (
+            supervised_timer(lease)
+            and "hold_since" in lease
+            and report_matches(lease, tag, occurred)
+            and g.controls.desired() == 0
+            and not self.held_report_ready()
+        ):
+            # Cancelling a deadline watcher does not cancel its shielded zero verification; join that proof.
+            if self.c.stopping or j.get("managed_control_fault") or not self.hold_authorized():
+                raise UnavailableError("the delayed timer report awaits its authenticated hold")
+            epoch, revision, intent = g._charger_epoch, g.controls._revision, self.c.requests.intent()
+            boot = g.boot_observation
+            identity = {key: lease.get(key) for key in IDENTITY}
+            operations = set(g.controls._operations)
+            if operations:
+                await asyncio.wait(operations, timeout=min(1.0, g.charger.timeout))
+            current = j.get(KEY, {})
+            if (
+                g._charger_epoch != epoch
+                or g.controls._revision != revision
+                or g.boot_observation != boot
+                or self.c.requests.intent() != intent
+                or any(current.get(key) != value for key, value in identity.items())
+                or not self.held_report_ready()
+            ):
+                raise UnavailableError("the delayed timer report awaits its current confirmed zero")
         if self.c.requests.intent().mode == "paused" and self.matches_pending_start(tag):
             if not g.controls.ready or g.controls.desired() != 0:
                 operations = set(g.controls._operations)

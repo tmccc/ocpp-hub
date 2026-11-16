@@ -14,6 +14,8 @@
 - Defer Return until timed local/cloud tests finish settling, retaining normal Start's existing Return behavior.
 - Wait for verified zero when a native daily session crosses a failed current increase, preserving an existing
   restrictive operation and the previous selected current without issuing a Stop.
+- Join an in-flight timer zero verification before accepting its delayed Start report. Missing or superseded
+  proof remains retryable without granting current or forgetting the timer's cutoff.
 - Add real TLS/native HTTP regressions for these paths, including rejected/lost clears, failed storage commits,
   interrupted processes and native failures immediately before positive dispatch.
 
