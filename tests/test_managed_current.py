@@ -17,6 +17,7 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.policy import DeniedError
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
@@ -307,14 +308,14 @@ async def test_pause_wins_during_current_profile_native_validation(
         assert actual is not None
 
         # Delay only the known higher-current profile's actual native boundary; keep all real validation intact.
-        async def delayed(action: str, payload: dict[str, Any]) -> None:
+        async def delayed(action: str, payload: dict[str, Any]) -> GateDecision | None:
             if (
                 action == "SetChargingProfile"
                 and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 16
             ):
                 entered.set()
                 await proceed.wait()
-            await actual(action, payload)
+            return await actual(action, payload)
 
         monkeypatch.setattr(test.session.gateway.charger, "validate_send", delayed)
         identifier = uuid.uuid4().hex

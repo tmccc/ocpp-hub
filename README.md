@@ -1025,15 +1025,28 @@ If the charger does not send Boot after reconnecting, the enabled read-only Boot
 backoff on that connection. A refused request, lost reply or Accepted reply without Boot cannot strand it permanently.
 Only a genuine Boot permits introduction; retries stop when it arrives or the connection ends.
 
-An ordinary temporary zero hold on the existing connection preserves the saved app choice during a cloud outage.
-Offline replacement retains the documented Pause behavior. Temporary native unavailability or a withheld
-source/lifecycle/timer prerequisite keeps zero and waits for fresh proof only when the whole automatic attempt
-sent no positive profile and confirmed its own rollback zero. A later cleanup failure remains a failure.
-An earlier possibly dispatched positive write remains uncertain even if a later read fails or zero rollback
-succeeds: fresh observations alone cannot clear its fault. Use a new Pause, verified closure and a separate Return
-for the existing owner recovery. A charger-refused positive release also retains its fault: a real `Rejected`
-reply is distinct from an unknown applied outcome, and neither is a temporary native-audit wait.
-Explicit Return retains its separate request policy.
+An ordinary temporary zero hold on the existing connection preserves the saved app
+choice during a cloud outage. Offline replacement retains the documented Pause
+behavior. Recovery checks current permission, pending prerequisites and actual
+command effects separately. Fresh native or source evidence does not itself grant
+permission: the current owner choice, Boot and control claim must still agree when
+a command is sent and its result is committed.
+
+Temporary native unavailability or a withheld source/lifecycle/timer prerequisite
+can keep an automatic operation waiting after it claims physical ownership only
+if it sent no positive profile and confirmed its own rollback zero; failed cleanup
+remains a failure. Before ownership, it may wait without borrowing physical proof. An earlier
+possibly dispatched positive write stays uncertain even after zero rollback.
+A real charger `Rejected` is distinct from an unknown applied outcome, and both
+retain the release fault. Recovery requires a new Pause, verified actual closure
+and a separate Return. A prior completed release does not impose that requirement
+on an unrelated new temporary hold. Explicit Return is separately accepted once.
+Unavailable native proof in Return's own release preflight makes that request
+unconfirmed, without silently replaying it; fresh proof alone does not grant
+another Return. Earlier Pause or test settlement retains its separate wait rules.
+Named source, timer-cleanup, owner-return and actual cloud-acknowledgement waits
+can retain the same accepted Return. Connection failure, zero-proof debt and
+reconciliation blockage make it unconfirmed; a new Return is required after recovery.
 
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy

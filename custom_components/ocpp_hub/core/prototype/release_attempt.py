@@ -3,40 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 from typing import Literal
 
 from ..frames import Frame
 from .connection_scope import CloudAttemptScope
 from .managed_intent import ControlIntent
-from .native_http import NativeTransportUnavailableError
-from .rpc import UnavailableError
-from .security import StaleEvidenceError
-from .store import ReleaseDeferredError
-
-
-# Only typed native availability causes permit this retry policy; strict and storage refusals stay distinct.
-def native_availability(error: BaseException) -> bool:
-    if type(error) is ReleaseDeferredError and error.__cause__ is not None:
-        error = error.__cause__
-    if type(error) is UnavailableError and error.__cause__ is not None:
-        error = error.__cause__
-    return isinstance(error, (NativeTransportUnavailableError, StaleEvidenceError))
-
-
-class ReleaseOutcome(Enum):
-    """One whole-operation result distinguishes safe zero waits from failures with unconfirmed effects."""
-
-    PENDING = "pending"
-    SUCCEEDED = "succeeded"
-    CANCELLED = "cancelled"
-    POSSIBLE_POSITIVE = "possible_positive"
-    ZERO_UNCONFIRMED = "zero_unconfirmed"
-    NATIVE_UNAVAILABLE = "native_unavailable"
-    PREREQUISITE_PENDING = "prerequisite_pending"
-    FAILED = "failed"
+from .recovery_contracts import (
+    AuthorityStamp,
+    FailureKind,
+    Guard,
+    OwnedReleaseResult,
+    Pending,
+    ReleaseEffects,
+    WireReply,
+)
 
 
 @dataclass(frozen=True)
@@ -62,7 +43,7 @@ class ReleaseAttempt:
     intent: ControlIntent
     scope: CloudAttemptScope
     control_revision: int
-    positive_guard: Callable[[], None]
+    positive_guard: Guard
     ticket: str | None = None
     positive_may_have_dispatched: bool = False
     positive_confirmed: bool = False
@@ -73,28 +54,44 @@ class ReleaseAttempt:
     failure: BaseException | None = None
     positive_failure: BaseException | None = None
     restriction: TimerRestriction | None = None
+    pending: Pending | None = None
+    positive_reply: WireReply = WireReply.MISSING
+    cleanup_failed: bool = False
+    before_ticket: str | None = None
+    initial_failure_kind: FailureKind | None = None
+    failure_kind: FailureKind | None = None
+    published: bool = False
+    published_authority: AuthorityStamp | None = None
+
+    # Freeze actual owned facts after cleanup; current authority is checked independently by the coordinator.
+    def result(self) -> OwnedReleaseResult:
+        if not self.finished:
+            raise RuntimeError("owned release has not finished")
+        return OwnedReleaseResult(
+            AuthorityStamp(self.intent, self.scope, self.control_revision, self.ticket or self.before_ticket),
+            self.ticket is not None,
+            self.published,
+            self.published_authority,
+            ReleaseEffects(
+                self.positive_may_have_dispatched,
+                self.positive_reply,
+                self.positive_confirmed,
+                self.zero_may_have_dispatched,
+                self.zero_confirmed,
+            ),
+            self.pending,
+            self.failure,
+            self.initial_failure_kind,
+            self.failure_kind,
+            self.cleanup_failed,
+            self.cancelled,
+        )
 
     # A later unsent read or confirmed zero cannot erase an earlier possibly dispatched positive mutation.
     def known_unsent(self) -> bool:
-        return self.finished and not self.cancelled and not self.positive_may_have_dispatched
-
-    # Callers consume one result after owned cleanup; the original verdict alone never proves unsent or zero.
-    def outcome(self) -> ReleaseOutcome:
-        if not self.finished:
-            return ReleaseOutcome.PENDING
-        if self.cancelled:
-            return ReleaseOutcome.CANCELLED
-        error = self.failure
-        if error is None:
-            return ReleaseOutcome.SUCCEEDED if self.positive_confirmed else ReleaseOutcome.FAILED
-        if self.positive_may_have_dispatched or self.positive_confirmed:
-            return ReleaseOutcome.POSSIBLE_POSITIVE
-        if not self.zero_confirmed:
-            return ReleaseOutcome.ZERO_UNCONFIRMED
-        if error is not self.positive_failure:
-            return ReleaseOutcome.FAILED
-        if native_availability(error):
-            return ReleaseOutcome.NATIVE_UNAVAILABLE
-        if type(error) is ReleaseDeferredError and error.__cause__ is None:
-            return ReleaseOutcome.PREREQUISITE_PENDING
-        return ReleaseOutcome.FAILED
+        return (
+            self.finished
+            and not self.cancelled
+            and not self.positive_may_have_dispatched
+            and not self.positive_confirmed
+        )

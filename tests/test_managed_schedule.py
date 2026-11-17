@@ -17,6 +17,7 @@ from ocpp_hub_core.prototype import managed_schedule
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from ocpp_hub_core.prototype.managed_current import capability_value
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
@@ -120,10 +121,10 @@ async def test_temporary_native_schedule(
                 assert original_validate is not None
 
                 # The cable is removed after request acceptance but before the final independent device read.
-                async def disconnect_vehicle(action: str, payload: dict[str, Any]) -> None:
+                async def disconnect_vehicle(action: str, payload: dict[str, Any]) -> GateDecision | None:
                     if action == "DataTransfer" and payload.get("messageId") == "setPlan":
                         rig.bench.cp, rig.bench.connection = "A", "Unplug"
-                    await original_validate(action, payload)
+                    return await original_validate(action, payload)
 
                 s.gateway.charger.validate_send = disconnect_vehicle
                 await healthy(c)
@@ -262,12 +263,13 @@ async def test_temporary_native_schedule(
         assert validate is not None
 
         # Move the clock inside the final asynchronous validation of the positive write, after the release claim.
-        async def cross_deadline(action: str, body: dict[str, Any]) -> None:
+        async def cross_deadline(action: str, body: dict[str, Any]) -> GateDecision | None:
             nonlocal logical
-            await validate(action, body)
+            decision = await validate(action, body)
             if outcome == "release-deadline" and action == "SetChargingProfile":
                 if body["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0:
                     logical = target + 1
+            return decision
 
         replacement.gateway.charger.validate_send = cross_deadline
         async with rig.charger(replacement) as sock:

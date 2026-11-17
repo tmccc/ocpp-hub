@@ -9,7 +9,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_cutoffs import idle_cutoff_pending, supervised_timer
 from ocpp_hub_core.prototype.managed_occurrences import KEY
-from ocpp_hub_core.prototype.store import ReleaseDeferredError
+from ocpp_hub_core.prototype.recovery_contracts import FailureKind, WireReply
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import introduced, managed_session, starts
@@ -127,7 +127,10 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
             assert attempt.finished and not attempt.cancelled and g.controls.release_attempt is None
             assert attempt.positive_may_have_dispatched and not attempt.positive_confirmed
             assert attempt.zero_may_have_dispatched and attempt.zero_confirmed
-            assert not attempt.known_unsent() and not isinstance(attempt.failure, ReleaseDeferredError)
+            result = attempt.result()
+            assert not attempt.known_unsent() and result.pending is None and not result.published
+            assert result.failure_kind is FailureKind.TRANSPORT and result.effects.positive_reply is WireReply.ACCEPTED
+            assert result.effects.positive_dispatched and result.effects.zero_verified
             assert not any(item[1] == witness["composite_token"] for item in b.rig.bench.device_calls)
             sent = b.rig.bench.device_calls[wire:]
             assert sum(item[2] == "SetChargingProfile" for item in sent) == 2

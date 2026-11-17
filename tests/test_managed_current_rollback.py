@@ -7,6 +7,7 @@ import uuid
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
 from tests.test_managed_current import adjustable, select
@@ -88,14 +89,14 @@ async def test_pause_during_unsent_app_increase_keeps_previous_selection(tmp_pat
         assert actual is not None
 
         # Pause at the real validation boundary and retain its complete native verification after release.
-        async def delayed(action, payload):
+        async def delayed(action, payload) -> GateDecision | None:
             if (
                 action == "SetChargingProfile"
                 and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 16
             ):
                 entered.set()
                 await proceed.wait()
-            await actual(action, payload)
+            return await actual(action, payload)
 
         monkeypatch.setattr(test.session.gateway.charger, "validate_send", delayed)
         identifier = uuid.uuid4().hex

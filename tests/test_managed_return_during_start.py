@@ -73,7 +73,7 @@ async def test_return_during_start_ack_restores_zero_without_native_http(
             await asyncio.wait_for(start_seen.wait(), 4)
             assert len(starts(rig)) == 1 and not c.tests.worker.done()
             owned = [task for task in g.controls._operations if not task.done()]
-            assert len(owned) == 1 and owned[0].get_coro().cr_code is LocalControl._start.__code__
+            assert len(owned) == 1 and owned[0].get_coro().cr_code is LocalControl._start_owned.__code__
             start_child = owned[0]
             receipt = copy.deepcopy(j.get("local_start_receipt"))
             assert receipt["request_id"] == identifier and receipt["stage"] == "issued"

@@ -16,6 +16,7 @@ from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
@@ -84,6 +85,11 @@ def record_current_source(j: Journal, n: HandoverEvidence, boot: str | None) -> 
 
 # Current recovery has no Stop authority and can continue only its freshly identified independent original session.
 def require_current_source(g: Gateway, local: int | None) -> None:
+    require_allowed(current_source_decision(g, local))
+
+
+# Current source prerequisites are ordinary data at both preflight and the final transport boundary.
+def current_source_decision(g: Gateway, local: int | None) -> GateDecision:
     j = g.journal
     change = j.get("managed_current_change", {})
     intent = j.get("managed_control_intent", {})
@@ -97,14 +103,23 @@ def require_current_source(g: Gateway, local: int | None) -> None:
         and change.get("native_open") is not False
         or j.active() != local
     ):
-        raise ReleaseDeferredError("current recovery awaits the independent original session on this Boot")
+        return Pending(Prerequisite.SOURCE, "current recovery awaits the independent original session on this Boot")
+    return ALLOW
 
 
 # Every recovery read must still describe the same open original transaction before its positive ceiling is sent.
 def require_current_session(g: Gateway, n: HandoverEvidence, local: int) -> None:
-    require_current_source(g, local)
+    require_allowed(current_session_decision(g, n, local))
+
+
+# Actual native and journal identities must agree before continuing this current operation's original session.
+def current_session_decision(g: Gateway, n: HandoverEvidence, local: int) -> GateDecision:
+    decision = current_source_decision(g, local)
+    if isinstance(decision, Pending):
+        return decision
     if not n.physical.transaction_open or n.physical.native_transaction_id != local:
-        raise ReleaseDeferredError("current recovery awaits matching native and OCPP lifecycle evidence")
+        return Pending(Prerequisite.LIFECYCLE, "current recovery awaits matching native and OCPP lifecycle evidence")
+    return ALLOW
 
 
 # Prefer the exact modern request's cause; a malformed binding cannot borrow an older global diagnostic.
@@ -654,22 +669,26 @@ class ManagedCurrentLimits:
             g.controls._complete(j.get("control")["ticket"], uncertain=False)
 
     # Reconcile the failed selection under zero, then restore only the previous verified current without any Start.
-    async def recover_overlap(self) -> None:
+    async def recover_overlap(self) -> Pending | None:
         c, j = self.controller, self.journal
         change = j.get("managed_current_change", {})
         if change.get("state") != "recovering":
-            return
+            return None
         if c.requests.intent().mode != "app" or c.requests.intent().revision != change["recovery_revision"]:
             j.put("managed_current_change", {**change, "state": "cancelled"})
-            return
+            return None
         if not c.stopping and c.session.gateway.controls.desired() != 0:
             # Restoration may have succeeded before settlement storage failed; retry from a new restrictive ticket.
             with j.atomic():
                 c.session.gateway.controls._claim(True, stopping=True)
                 c.released_epoch = None
         await self.protect_overlap()
-        native = await c.native.read()
-        c.native.require_known_session(native)
+        native = await c.native.read_result()
+        if isinstance(native, Pending):
+            return native
+        decision = c.native.session_decision(native)
+        if isinstance(decision, Pending):
+            return decision
         if change.get("recovery_reason") == "process_replaced" and not j.get("managed_current_change")["observed_open"]:
             # Preserve the existing fail-closed policy when replacement confirms there was no overlapping session.
             with j.atomic():
@@ -678,13 +697,18 @@ class ManagedCurrentLimits:
                 claim_internal_pause(c, "current", change["id"])
                 j.put("control", {**j.get("control"), "resume_limit": change["previous_a"]})
                 j.put("managed_current_change", {**j.get("managed_current_change"), "state": "interrupted"})
-            return
+            return None
         local = j.active()
         if local is not None:
-            require_current_session(c.session.gateway, native, local)
-        await c.restore_owner_control(continuing_local=local)
+            decision = current_session_decision(c.session.gateway, native, local)
+            if isinstance(decision, Pending):
+                return decision
+        progress = await c.recovery.restore(continuing_local=local)
+        if not progress.shared:
+            return progress.pending
         with j.atomic():
             self.returned_to_previous(recovery=change)
+        return None
 
     # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:

@@ -17,8 +17,9 @@ import pytest
 from ocpp_hub_core.prototype import auth_info, managed_schedule
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision, Prerequisite
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import RecoveryRequiredError, ReleaseDeferredError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests import native_schedule_support as schedule_support
 from tests import test_trial_session as trial_bench
@@ -1137,7 +1138,7 @@ async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypa
             wire = len(b.rig.bench.device_calls)
 
             # Change the observed plan before the final native read in the real outgoing positive profile gate.
-            async def reassigned(action, payload):
+            async def reassigned(action, payload) -> GateDecision | None:
                 if (
                     action == "SetChargingProfile"
                     and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
@@ -1150,7 +1151,8 @@ async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypa
                     b.rig.peer.plan_session = (local, b.timer)
                     checked.set()
                 if validate is not None:
-                    await validate(action, payload)
+                    return await validate(action, payload)
+                return None
 
             peer.validate_send = reassigned
             try:
@@ -1158,7 +1160,10 @@ async def test_unknown_source_at_cutoff(tmp_path, tls, unused_tcp_port, monkeypa
                 assert checked.is_set() and len(attempts) == 1
                 attempt = attempts[0]
                 assert attempt.known_unsent() and attempt.zero_may_have_dispatched and attempt.zero_confirmed
-                assert type(attempt.failure) is ReleaseDeferredError and attempt.positive_failure is attempt.failure
+                result = attempt.result()
+                assert result.pending is not None and result.pending.reason is Prerequisite.SOURCE
+                assert result.failure is None and not result.cleanup_failed and not result.published
+                assert not result.effects.positive_dispatched and result.effects.zero_verified
                 assert b.session.gateway.controls.release_attempt is None
                 profiles = [item for item in b.rig.bench.device_calls[wire:] if item[2] == "SetChargingProfile"]
                 assert len(profiles) == 1
@@ -1719,7 +1724,7 @@ async def test_changed_source_during_cutoff_profile_ack(
         validate = b.session.gateway.charger.validate_send
 
         # Correct the source either before the first zero write or before Stop after zero has been verified.
-        async def before_command(action, payload):
+        async def before_command(action, payload) -> GateDecision | None:
             zero = (
                 action == "SetChargingProfile"
                 and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
@@ -1730,7 +1735,8 @@ async def test_changed_source_during_cutoff_profile_ack(
                 entered.set()
                 await release.wait()
             if validate is not None:
-                await validate(action, payload)
+                return await validate(action, payload)
+            return None
 
         if stage == "zero_ack":
             b.rig.bench.before_reply = slow_zero

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
@@ -468,11 +469,11 @@ async def test_replacement_after_prepared_local_start(tmp_path, tls, unused_tcp_
         real = b.session.gateway.charger.validate_send
 
         # Capture the real durable journal and the independent device's actual profiles before its Start send.
-        async def delay(action, payload):
+        async def delay(action, payload) -> GateDecision | None:
             if action == "RemoteStartTransaction":
                 entered.set()
                 await proceed.wait()
-            await real(action, payload)
+            return await real(action, payload)
 
         b.session.gateway.charger.validate_send = delay
         with closing(sqlite3.connect(":memory:")) as snapshot:

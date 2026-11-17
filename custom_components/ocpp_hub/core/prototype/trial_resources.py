@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -16,6 +16,7 @@ from .ics import is_safe_transaction_query
 from .managed_occurrences import occurrences
 from .native_faults import NativeContentError
 from .policy import DeniedError
+from .recovery_contracts import GateDecision, Guard, Pending
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_bootstrap import initialize_trial_baseline
@@ -99,7 +100,7 @@ class ResourceBook:
     # A fresh trial cannot silently claim an older unowned journal or replace its original baseline.
     def __init__(self, journal: Journal, baseline: Baseline) -> None:
         self.journal, self.baseline = journal, baseline
-        self.before_positive_release: Callable[[], None] | None = None
+        self.before_positive_release: Guard | None = None
         self.temporary_plan_write: dict[str, Any] | None = None
         self.fault_timer_removal: FaultTimerRemoval | None = None
         if baseline.identity_digest != fingerprint(journal.identity):
@@ -240,7 +241,7 @@ class ResourceBook:
         self.journal.put("trial_phase", "active")
 
     # Persist intent immediately before send; only the bounded constant-profile trial subset can create resources.
-    def before_send(self, action: str, payload: dict[str, Any]) -> None:
+    def before_send(self, action: str, payload: dict[str, Any]) -> GateDecision | None:
         phase = self.journal.get("trial_phase")
         reads = ("GetConfiguration", "GetCompositeSchedule", "TriggerMessage")
         reading = action in reads or action == "DataTransfer" and is_safe_transaction_query(payload)
@@ -261,7 +262,7 @@ class ResourceBook:
             if payload is not self.temporary_plan_write or removal.verified_native_digest is None:
                 raise DeniedError("fault timer removal lacks this call's native zero proof")
             self.temporary_plan_write = None
-            return
+            return None
         if phase != "active" and not reading:
             key = "profile:" + str(payload.get("id"))
             if (
@@ -269,7 +270,7 @@ class ResourceBook:
                 and action == "RemoteStopTransaction"
                 and safety
             ):
-                return
+                return None
             if phase in ("blocked", "recovering") and action == "SetChargingProfile":
                 projected = profile_projection(payload)
                 if projected["id"] == HUB_PROFILE_ID and projected["limit"] == 0 and safety:
@@ -281,11 +282,11 @@ class ResourceBook:
                 and payload.get("messageId") == "clearPlans"
             ):
                 self.temporary_plan_write = None
-                return  # The bounded native gate verified the exact preimage, closed session and owned zero.
+                return None  # The bounded native gate verified the exact preimage, closed session and owned zero.
             if phase == "rollback" and action == "ClearChargingProfile" and set(payload) == {"id"}:
                 receipt = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
                 if receipt is not None and receipt["state"] != "absent_verified":
-                    return
+                    return None
             if phase != "active":
                 raise DeniedError("trial is not accepting mutations")
         if action == "SetChargingProfile":
@@ -299,7 +300,9 @@ class ResourceBook:
                 spec = NativeBoundedSpec.parse(self.journal.get("native_bounded_handover", {}).get("spec", {}))
                 ceiling = managed_current_ceiling(self.journal, spec)
             if canonical["id"] == HUB_PROFILE_ID and canonical["limit"] > 0 and self.before_positive_release:
-                self.before_positive_release()
+                decision = self.before_positive_release()
+                if isinstance(decision, Pending):
+                    return decision
             if canonical["limit"] > ceiling:
                 raise DeniedError("trial resource exceeds its approved current ceiling")
             key = "profile:" + str(canonical["id"])
@@ -338,7 +341,7 @@ class ResourceBook:
         elif action == "DataTransfer":
             if payload is self.temporary_plan_write:
                 self.temporary_plan_write = None
-                return
+                return None
             if payload.get("vendorId") != "IoCharger" or payload.get("messageId") not in (
                 "getTransaction",
                 "setTransaction",
@@ -349,6 +352,7 @@ class ResourceBook:
                 raise DeniedError("first commissioning trial preserves the existing Fast mode")
         elif action not in ("RemoteStartTransaction", "RemoteStopTransaction", *reads):
             raise DeniedError("command is outside the narrow commissioning trial")
+        return None
 
     # A real refusal remains distinct from confirmation; resource verification can reconcile either saved intent.
     def after_result(self, action: str, payload: dict[str, Any], answer: Frame) -> None:
@@ -462,7 +466,7 @@ class ResourceBook:
 
     # The owned release child retains its guard through cancellation of the caller awaiting it.
     @contextmanager
-    def positive_release_guard(self, guard: Callable[[], None]) -> Iterator[None]:
+    def positive_release_guard(self, guard: Guard) -> Iterator[None]:
         if self.before_positive_release is not None:
             raise RecoveryRequiredError("another owned positive release still retains its guard")
         self.before_positive_release = guard

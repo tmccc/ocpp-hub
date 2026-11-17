@@ -13,9 +13,10 @@ from .managed_cutoffs import supervised_timer
 from .managed_occurrences import occurrences
 from .managed_schedule import recorded_station_profile
 from .managed_start_binding import known_plan_source
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
-from .store import RecoveryRequiredError, ReleaseDeferredError, fingerprint
-from .trial_rollback import require_lifecycle_idle
+from .store import RecoveryRequiredError, fingerprint
+from .trial_rollback import lifecycle_decision
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -258,6 +259,10 @@ class OrdinaryRecovery:
 
     # This guard also runs inside the real positive RPC gate after all native HTTP waits.
     def require_authority(self, local: int | None, *, introduced: bool = True) -> None:
+        require_allowed(self.authority_decision(local, introduced=introduced))
+
+    # The same exact ordinary source and owner prerequisites apply before and inside the outgoing gate.
+    def authority_decision(self, local: int | None, *, introduced: bool = True) -> GateDecision:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         hold, source = j.get(KEY, {}), j.get(SOURCE, {})
         grant, local_start = j.get("vendor_start_grant", {}), local_start_receipt(j)
@@ -299,15 +304,26 @@ class OrdinaryRecovery:
                 (local,),
             ).fetchone()
         ):
-            raise ReleaseDeferredError("ordinary continuation awaits exact fresh source and reconciled owner authority")
+            return Pending(
+                Prerequisite.SOURCE, "ordinary continuation awaits fresh source and reconciled owner authority"
+            )
         c.native.spec.require_boot(j.get("boot"))
+        return ALLOW
 
     # Repair a superseded Boot's zero introduction only after the full current zero and source proof.
     def confirm_zero_introduction(self, native: HandoverEvidence, local: int | None) -> None:
+        require_allowed(self.zero_introduction_decision(native, local))
+
+    # A zero-only introduction acknowledges current proof without replaying Start, Stop or another domain's duty.
+    def zero_introduction_decision(self, native: HandoverEvidence, local: int | None) -> GateDecision:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        self.require_authority(local, introduced=False)
+        decision = self.authority_decision(local, introduced=False)
+        if isinstance(decision, Pending):
+            return decision
         c.native.require(native, closed=local is None)
-        c.native.require_known_session(native)
+        decision = c.native.session_decision(native)
+        if isinstance(decision, Pending):
+            return decision
         control = j.get("control", {})
         epoch, boot, revision, ticket = (
             g._charger_epoch,
@@ -320,7 +336,9 @@ class OrdinaryRecovery:
         row = j.db.execute(
             "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
-        require_lifecycle_idle(g, continuing_local=local)
+        decision = lifecycle_decision(g, continuing_local=local)
+        if isinstance(decision, Pending):
+            return decision
         if (
             any(v != 0 for v in native.currents_a + native.powers_w)
             or control.get("owner") != "local"
@@ -344,16 +362,18 @@ class OrdinaryRecovery:
             or g.charger._pending
             or g.vendor._pending
         ):
-            raise ReleaseDeferredError("ordinary introduction awaits confirmed zero and reconciled binding")
+            return Pending(Prerequisite.CLOUD, "ordinary introduction awaits confirmed zero and reconciled binding")
         with j.atomic():
-            self.require_authority(local, introduced=False)
+            decision = self.authority_decision(local, introduced=False)
+            if isinstance(decision, Pending):
+                return decision
             if (g._charger_epoch, g.boot_observation, g.controls._revision, j.get("control", {}).get("ticket")) != (
                 epoch,
                 boot,
                 revision,
                 ticket,
             ):
-                raise ReleaseDeferredError("ordinary zero introduction was superseded")
+                return Pending(Prerequisite.SUPERSEDED, "ordinary zero introduction was superseded")
             j.put(
                 "managed_ordinary_zero_introduction",
                 {
@@ -366,16 +386,24 @@ class OrdinaryRecovery:
             )
             j.put("trial_starting", False)
         c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
+        return ALLOW
 
     # A native reread must still prove the exact known session that is about to receive its original cap.
     def require_session(self, native: HandoverEvidence, local: int) -> None:
-        self.require_authority(local)
+        require_allowed(self.session_decision(native, local))
+
+    # Native and journal source observations must still identify the same transaction at this effect boundary.
+    def session_decision(self, native: HandoverEvidence, local: int) -> GateDecision:
+        decision = self.authority_decision(local)
+        if isinstance(decision, Pending):
+            return decision
         if (
             not native.physical.transaction_open
             or native.physical.native_transaction_id != local
             or self.source(native) != self.c.session.journal.get(SOURCE, {}).get("source")
         ):
-            raise ReleaseDeferredError("ordinary continuation source changed during verification")
+            return Pending(Prerequisite.SOURCE, "ordinary continuation source changed during verification")
+        return ALLOW
 
     # A real daily Start can need its OCPP number before native HTTP publishes that number; zero remains mandatory.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
@@ -453,18 +481,29 @@ class OrdinaryRecovery:
         return NativeStartReport(None, None, None, accepted)
 
     # Fresh zero/source proof restores only the original intent and never emits a Start or Stop.
-    async def recover(self) -> None:
+    async def recover(self) -> Pending | None:
         c, j = self.c, self.c.session.journal
         await self.hold("restricted_introduction")
-        native = await c.native.read()
+        native = await c.native.read_result()
+        if isinstance(native, Pending):
+            return native
         local = j.active()
         if self.closure_gap(native):
-            raise RecoveryRequiredError("ordinary zero hold awaits exact native closure")
-        self.confirm_zero_introduction(native, local)
-        self.require_authority(local)
+            return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
+        decision = self.zero_introduction_decision(native, local)
+        if isinstance(decision, Pending):
+            return decision
+        decision = self.authority_decision(local)
+        if isinstance(decision, Pending):
+            return decision
         if local is not None:
-            self.require_session(native, local)
+            decision = self.session_decision(native, local)
+            if isinstance(decision, Pending):
+                return decision
         elif native.physical.transaction_open:
-            raise ReleaseDeferredError("ordinary idle recovery cannot adopt a new native transaction")
-        await c.restore_owner_control(continuing_local=local)
+            return Pending(Prerequisite.LIFECYCLE, "ordinary idle recovery cannot adopt a new native transaction")
+        progress = await c.recovery.restore(continuing_local=local)
+        if not progress.shared:
+            return progress.pending
         j.put(KEY, {**j.get(KEY), "state": "complete", "completed_at": time.time()})
+        return None

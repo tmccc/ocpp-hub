@@ -7,6 +7,7 @@ from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import DeniedError
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight
 from websockets.asyncio.server import serve
@@ -265,15 +266,17 @@ async def test_cancelled_vendor_start_retains_only_possible_dispatch(
                         validate = gateway.charger.validate_send
 
                         # Keep the real native validation result, delaying its return before physical dispatch.
-                        async def blocked_validation(action, payload):
+                        async def blocked_validation(action, payload) -> GateDecision | None:
+                            decision = None
                             if validate is not None:
-                                await validate(action, payload)
+                                decision = await validate(action, payload)
                             reserved_grants.append(bool(session.journal.get("vendor_start_grant")))
                             entered.set()
                             if failure != "cancel":
                                 error = DeniedError if failure == "denied" else SecurityError
                                 raise error("injected validation or transport failure")
                             await release.wait()
+                            return decision
 
                         gateway.charger.validate_send = blocked_validation
                     frame = [2, "cancelled-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "LOCAL_TEST"}]

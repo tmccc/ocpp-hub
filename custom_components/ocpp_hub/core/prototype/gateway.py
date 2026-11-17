@@ -38,6 +38,7 @@ from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, reply_as
 from .security import SecurityError
+from .start_handoff import OwnedStartResult, StartHandoff
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
 
@@ -1024,6 +1025,19 @@ class Gateway:
         request_id: str | None = None,
         on_prepared: Callable[[], None] | None = None,
     ) -> Frame:
+        result = await self.start_managed_result(tag, guard, request_id=request_id, on_prepared=on_prepared)
+        return result.require_reply()
+
+    # One exact-scoped owned Start publishes authority in its child, while retaining truthful failed wire outcomes.
+    async def start_managed_result(
+        self,
+        tag: str,
+        guard: Callable[[], None],
+        *,
+        request_id: str | None = None,
+        on_prepared: Callable[[], None] | None = None,
+        handoff: StartHandoff | None = None,
+    ) -> OwnedStartResult:
         scope, revision = current_scope(self), self.controls._revision
 
         # Restrictive rollback retains the exact source even after the positive management grant is revoked.
@@ -1038,8 +1052,8 @@ class Gateway:
                 raise DeniedError("managed test tag authorization is no longer current")
 
         check()
-        return await self.controls.start_managed(
-            tag, check, request_id=request_id, on_prepared=on_prepared, scope_guard=source
+        return await self.controls.start_managed_result(
+            tag, check, request_id=request_id, on_prepared=on_prepared, scope_guard=source, scope=scope, handoff=handoff
         )
 
     # A local stop installs a durable zero-current hold even when there is no known transaction to stop.

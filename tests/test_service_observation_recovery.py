@@ -100,7 +100,7 @@ async def test_actual_service_recovers_cancelled_start_initial_zero(
         def cancel_start_child(loop, coroutine, **kwargs):
             task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
             if (
-                getattr(coroutine, "cr_code", None) is LocalControl._start.__code__
+                getattr(coroutine, "cr_code", None) is LocalControl._start_owned.__code__
                 and coroutine.cr_frame.f_locals.get("self") is s.gateway.controls
             ):
                 task.cancel()

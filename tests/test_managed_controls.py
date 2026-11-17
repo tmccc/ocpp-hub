@@ -193,10 +193,10 @@ async def test_newer_pause_preempts_return_during_native_validation(
                 original_release = session.gateway.controls._release
 
                 # Delay only scheduling, then execute the real owned release including its pre-claim guard.
-                async def delayed_release(acknowledge_uncertainty, guard=None):
+                async def delayed_release(*args, **kwargs):
                     entered.set()
                     await proceed.wait()
-                    return await original_release(acknowledge_uncertainty, guard)
+                    return await original_release(*args, **kwargs)
 
                 monkeypatch.setattr(session.gateway.controls, "_release", delayed_release)
             actual_claim = session.gateway.controls._claim
@@ -211,7 +211,7 @@ async def test_newer_pause_preempts_return_during_native_validation(
             count = len(rig.bench.received_limits)
             task = asyncio.create_task(controller.tick())
             try:
-                await entered.wait()
+                await asyncio.wait_for(entered.wait(), 2)
                 claims.clear()
                 controller.command(identifier(), "pause", status["control_revision"])
                 proceed.set()

@@ -46,7 +46,7 @@ class StationRig(TrialRig):
             choice,
             lambda: (len(self.firmware.profiles), 7001 in self.firmware.profiles),
         )
-        self.gateway.controls.prepare_station = self.discovery.prepare
+        self.gateway.controls.prepare_station = self.discovery.prepare_result
         self.read_started = asyncio.Event()
         self.read_release: asyncio.Event | None = None
         self.drop_set = False

@@ -6,7 +6,7 @@ import asyncio
 import copy
 
 import pytest
-from ocpp_hub_core.prototype.release_attempt import ReleaseOutcome
+from ocpp_hub_core.prototype.recovery_contracts import FailureKind, WireReply
 from ocpp_hub_core.prototype.rpc import UnavailableError
 
 from tests.managed_scenario_helpers import (
@@ -99,7 +99,10 @@ async def test_n08_physical_mutation_recovery(
             assert attempt.finished and not attempt.cancelled and attempt.positive_may_have_dispatched
             assert not attempt.positive_confirmed and attempt.zero_may_have_dispatched and attempt.zero_confirmed
             assert type(attempt.positive_failure) is UnavailableError and attempt.failure is attempt.positive_failure
-            assert attempt.outcome() is ReleaseOutcome.POSSIBLE_POSITIVE
+            result = attempt.result()
+            assert not result.published and result.failure_kind is FailureKind.TRANSPORT
+            assert result.effects.positive_dispatched and result.effects.zero_verified
+            assert result.effects.positive_reply is (WireReply.MISSING if lost_ack else WireReply.REJECTED)
             profiles = [frame for frame in b.rig.bench.device_calls[wire:] if frame[2] == "SetChargingProfile"]
             limits = [
                 frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]

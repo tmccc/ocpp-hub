@@ -12,6 +12,7 @@ from typing import Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
 from .diagnostics import RpcDiagnostics
+from .recovery_contracts import CallResult, GateDecision, Guard, NotSent, Pending, Reply, ResultCall, require_reply
 from .store import Journal, RecoveryRequiredError, fingerprint
 
 Sender = Callable[[str], Awaitable[None]]
@@ -176,8 +177,8 @@ class Peer:
         self.sender: Sender | None = None
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
-        self.before_send: Callable[[str, dict[str, Any]], None] | None = None
-        self.validate_send: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
+        self.before_send: Callable[[str, dict[str, Any]], GateDecision | None] | None = None
+        self.validate_send: Callable[[str, dict[str, Any]], Awaitable[GateDecision | None]] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
         self.diagnostics = RpcDiagnostics()
 
@@ -199,27 +200,62 @@ class Peer:
         before_send: Callable[[], None] | None = None,
         on_dispatch: Callable[[str], None] | None = None,
     ) -> Frame:
+        return require_reply(await self.call_result(action, payload, priority, check, token, before_send, on_dispatch))
+
+    # Managed operations consume an unsent prerequisite as data while sharing the sole send and cleanup path.
+    async def call_result(
+        self,
+        action: str,
+        payload: dict[str, Any] | Callable[[], dict[str, Any]],
+        priority: int = 10,
+        check: Guard | None = None,
+        token: str | None = None,
+        before_send: Guard | None = None,
+        on_dispatch: Callable[[str], None] | None = None,
+    ) -> CallResult:
         async with self.gate.enter(priority):
             return await self._call_locked(action, payload, check, token, before_send, on_dispatch, priority > 0)
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
     @asynccontextmanager
     async def sequence(
-        self, priority: int, check: Callable[[], None], *, on_dispatch: Callable[[str], None] | None = None
+        self,
+        priority: int,
+        check: Callable[[], None],
+        *,
+        on_dispatch: Callable[[str], None] | None = None,
+        on_reply: Callable[[str, Frame], None] | None = None,
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
-        async with self.gate.enter(priority):
+        async with self.sequence_results(priority, check, on_dispatch=on_dispatch, on_reply=on_reply) as result_call:
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
-                return await self._call_locked(action, payload, check, None, None, on_dispatch, priority > 0)
+                return require_reply(await result_call(action, payload))
+
+            yield call
+
+    # Retain one priority-gate owner for a typed multi-call operation, including its restrictive rollback.
+    @asynccontextmanager
+    async def sequence_results(
+        self,
+        priority: int,
+        check: Guard,
+        *,
+        on_dispatch: Callable[[str], None] | None = None,
+        on_reply: Callable[[str, Frame], None] | None = None,
+    ) -> AsyncIterator[ResultCall]:
+        async with self.gate.enter(priority):
+            # Each call revalidates after native waits and before recording any resource intent.
+            async def call(action: str, payload: dict[str, Any]) -> CallResult:
+                return await self._call_locked(action, payload, check, None, None, on_dispatch, priority > 0, on_reply)
 
             yield call
 
     # Bound native preparation independently, retiring its sockets promptly on Stop, disconnect or cancellation.
     async def _validate(
         self, action: str, payload: dict[str, Any], future: asyncio.Future[Frame], preemptible: bool
-    ) -> None:
+    ) -> GateDecision | None:
         if self.validate_send is None:
-            return
+            return None
         validation = asyncio.ensure_future(self.validate_send(action, payload))
         signal = self.gate.restrictive_waiting if preemptible else asyncio.Event()
         restrictive = asyncio.create_task(signal.wait())
@@ -234,7 +270,7 @@ class Peer:
                 if future in done:
                     future.result()  # A retired peer's exception must terminate its audit before any dispatch.
                     raise UnavailableError("request was not sent; peer replied before dispatch")
-                await validation
+                decision = await validation
         except asyncio.CancelledError as error:
             cancellation = error
             raise
@@ -264,20 +300,24 @@ class Peer:
                 raise failure  # Native cancellation can itself fail required durable audit publication.
         if preemptible and self.gate.restrictive_waiting.is_set():
             raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
+        return decision
 
     # Send one request only while the caller owns the outgoing gate.
     async def _call_locked(
         self,
         action: str,
         payload: dict[str, Any] | Callable[[], dict[str, Any]],
-        check: Callable[[], None] | None,
+        check: Guard | None,
         token: str | None,
-        before_send: Callable[[], None] | None,
+        before_send: Guard | None,
         on_dispatch: Callable[[str], None] | None = None,
         preemptible: bool = True,
-    ) -> Frame:
+        on_reply: Callable[[str, Frame], None] | None = None,
+    ) -> CallResult:
         if check is not None:
-            check()
+            decision = check()
+            if isinstance(decision, Pending):
+                return NotSent(decision)
         sender = self.sender
         if sender is None:
             raise UnavailableError("peer is disconnected")
@@ -289,15 +329,23 @@ class Peer:
         dispatched = False
         try:
             actual = payload() if callable(payload) else payload
-            await self._validate(action, actual, future, preemptible)
+            decision = await self._validate(action, actual, future, preemptible)
+            if isinstance(decision, Pending):
+                return NotSent(decision)
             if check is not None:
-                check()
+                decision = check()
+                if isinstance(decision, Pending):
+                    return NotSent(decision)
             if self.sender is not sender:
                 raise UnavailableError("request was not sent; peer changed during outgoing validation")
             if before_send is not None:
-                before_send()
+                decision = before_send()
+                if isinstance(decision, Pending):
+                    return NotSent(decision)
             if self.before_send is not None:
-                self.before_send(action, actual)
+                decision = self.before_send(action, actual)
+                if isinstance(decision, Pending):
+                    return NotSent(decision)
             message = build_call(unique_id, action, actual)
             self.diagnostics.sending(action, len(unique_id))
             if on_dispatch is not None:
@@ -307,10 +355,12 @@ class Peer:
                 await sender(message)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
+                if on_reply is not None:
+                    on_reply(action, answer)
                 if self.after_result is not None:
                     self.after_result(action, actual, answer)
                 self.diagnostics.phase = "complete"
-                return answer
+                return Reply(answer)
         except (TimeoutError, OSError) as error:
             detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
             raise UnavailableError(detail) from error

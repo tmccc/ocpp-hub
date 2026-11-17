@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -15,7 +16,7 @@ from ..control import HUB_PROFILE_ID
 from .connection_scope import current_scope
 from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
-from .local_control import ControlSupersededError, local_start_receipt
+from .local_control import local_start_receipt
 from .managed_cutoffs import OBSERVABLE as OBSERVABLE
 from .managed_cutoffs import idle_cutoff_pending as idle_cutoff_pending
 from .managed_cutoffs import release_idle_cutoffs, resume_cutoff
@@ -34,11 +35,12 @@ from .managed_occurrences import (
 )
 from .native_start_attempts import matching_unassigned_start, split_attempts, start_millisecond_range
 from .policy import DeniedError, integer, number
+from .recovery_contracts import ALLOW, FailureKind, GateDecision, Pending, Prerequisite, require_allowed
 from .release_attempt import ReleaseAttempt, TimerRestriction
-from .rpc import UnavailableError, ValidationPreemptedError
+from .rpc import UnavailableError
 from .schedule_time import cutoff_epoch, temporary_window
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, encoded, fingerprint
+from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
@@ -385,6 +387,11 @@ def cutoff_due(lease: dict[str, Any]) -> bool:
 
 # A provisional hold may be lifted only for this same open transaction on a positively identified original plan.
 def require_continuing_session(j: Journal, n: HandoverEvidence, local: int) -> None:
+    require_allowed(continuing_session_decision(j, n, local))
+
+
+# Source identification is a shared prerequisite; it grants neither Stop authority nor reusable send permission.
+def continuing_session_decision(j: Journal, n: HandoverEvidence, local: int) -> GateDecision:
     lease = j.get(KEY, {})
     if (
         not supervised_timer(lease)
@@ -399,7 +406,8 @@ def require_continuing_session(j: Journal, n: HandoverEvidence, local: int) -> N
         )
         or j.get("managed_control_intent", {"mode": "app"})["mode"] != "app"
     ):
-        raise ReleaseDeferredError("the held transaction awaits positive identification of its original plan")
+        return Pending(Prerequisite.SOURCE, "the held transaction awaits positive identification of its original plan")
+    return ALLOW
 
 
 # Only evidence from this actual Boot may exempt the current transaction from zero or authorize a timer Stop.
@@ -1092,7 +1100,7 @@ class ManagedSchedule:
 
     # Finishing a timer never changes control intent, selected amps, the original plan or a transaction.
     def finish(self, lease: dict[str, Any], reason: str) -> None:
-        with self.j.atomic():
+        with nullcontext() if self.j.db.in_transaction else self.j.atomic():
             closure = (
                 {"idle_cutoff_hold": False, "idle_cutoff_released": "session_closed"}
                 if reason == "session_closed"
@@ -1243,14 +1251,23 @@ class ManagedSchedule:
 
     # A withheld positive write can be retried after a verified zero and independent native removal.
     def check_release(self) -> None:
+        require_allowed(self.release_decision())
+
+    # Timer cleanup and owner Return are distinct obligations even when they both retain station zero.
+    def release_decision(self) -> GateDecision:
         lease = self.arm_idle_cutoff()
         if lease.get("idle_cutoff_hold") and not self.owner_returning():
-            raise ReleaseDeferredError("station zero awaits a positively identified session or owner Return")
+            return Pending(Prerequisite.OWNER_RETURN, "station zero awaits an identified session or owner Return")
         if self.release_needs_cleanup(lease):
-            raise ReleaseDeferredError("positive release awaits verified native timer removal")
+            return Pending(Prerequisite.TIMER_CLEANUP, "positive release awaits verified native timer removal")
+        return ALLOW
 
     # Retire a missed or superseded timer while still under verified zero, before Return or restart raises the ceiling.
     async def before_release(self, n: HandoverEvidence) -> None:
+        require_allowed(await self.before_release_result(n))
+
+    # Cleanup owns its ledger while the common release path receives any remaining prerequisite explicitly.
+    async def before_release_result(self, n: HandoverEvidence) -> GateDecision:
         lease = self.j.get(KEY, {})
         if self.release_needs_cleanup(lease):
             if not lease.get("retire_reason") and "hold_since" not in lease:
@@ -1267,7 +1284,8 @@ class ManagedSchedule:
             if self.release_needs_cleanup(self.j.get(KEY)):
                 await self.observe(await self.c.native.read(closed=True))
             if self.release_needs_cleanup(self.j.get(KEY)):
-                raise ReleaseDeferredError("positive release awaits verified native timer removal")
+                return Pending(Prerequisite.TIMER_CLEANUP, "positive release awaits verified native timer removal")
+        return ALLOW
 
     # Report unresolved physical work without freezing the supervisor that can still verify its recovery.
     def problem(self) -> str | None:
@@ -1446,8 +1464,8 @@ class ManagedSchedule:
             proof is None
             or not attempt.known_unsent()
             or attempt.purpose != "automatic"
-            or type(attempt.positive_failure) not in (ControlSupersededError, ValidationPreemptedError)
-            or type(attempt.failure) not in (ControlSupersededError, ValidationPreemptedError)
+            or attempt.initial_failure_kind is not FailureKind.SUPERSEDED
+            or attempt.failure_kind is not FailureKind.SUPERSEDED
             or c.stopping
             or j.get("managed_control_fault")
             or current_scope(g) != proof.scope
@@ -1630,30 +1648,44 @@ class ManagedSchedule:
 
     # A known closing transaction needs zero, with no guessed Stop, until native and ledger closure agree.
     async def await_closure_agreement(self, native: HandoverEvidence) -> None:
+        require_allowed(await self.closure_decision(native))
+
+    # Both closure channels must agree; a real scoped zero protects their ordinary asynchronous arrival gap.
+    async def closure_decision(self, native: HandoverEvidence) -> GateDecision:
         lease = self.j.get(KEY, {})
         if known_timer_closure_gap(self.j, native):
             if not lease.get("closure_gap"):
                 lease = {**lease, "closure_gap": True}
                 self.j.put(KEY, lease)
             await self.protect_station(lease)
-            raise RecoveryRequiredError("identified timer awaits both closure indicators")
+            return Pending(Prerequisite.LIFECYCLE, "identified timer awaits both closure indicators")
         if lease.get("closure_gap"):
             self.j.put(KEY, {**lease, "closure_gap": False})
+        return ALLOW
 
     # While a cutoff hold is active, allow only the known scheduled session to receive a Stop.
-    async def hold_until_closed(self, n: HandoverEvidence | None = None) -> None:
+    async def hold_until_closed(self, n: HandoverEvidence | None = None) -> Pending | None:
         c, j = self.c, self.j
         g = c.session.gateway
         if not g.current_boot_seen(g._charger_epoch):
-            raise RecoveryRequiredError("deadline hold awaits the current charger Boot")
+            return Pending(Prerequisite.SUPERSEDED, "deadline hold awaits the current charger Boot")
         if c.native.introduced_epoch != g._charger_epoch:
             # An authenticated observation can still have an unknown origin; keep reading while introduction recovers.
-            await c.native.read()
-            raise RecoveryRequiredError("deadline hold awaits the current charger introduction")
-        n = n or await c.native.read()
-        await self.await_closure_agreement(n)
+            observed = await c.native.read_result()
+            if isinstance(observed, Pending):
+                return observed
+            return Pending(Prerequisite.SUPERSEDED, "deadline hold awaits the current charger introduction")
+        observed = n or await c.native.read_result()
+        if isinstance(observed, Pending):
+            return observed
+        n = observed
+        decision = await self.closure_decision(n)
+        if isinstance(decision, Pending):
+            return decision
         lease = j.get(KEY)
-        c.native.require_known_session(n)
+        decision = c.native.session_decision(n)
+        if isinstance(decision, Pending):
+            return decision
         active = j.active()
         bound = lease.get("bound_local")
         if active is not None and (active != bound or temporary_continuation(j, lease, active)):
@@ -1661,9 +1693,11 @@ class ManagedSchedule:
                 independent_session(j, lease, n, active) or temporary_continuation(j, lease, active)
             ):
                 if g.controls._operations or g.charger._pending:
-                    raise RecoveryRequiredError("independent session awaits the in-flight station verification")
+                    return Pending(Prerequisite.OWNED_OPERATION, "independent session awaits station verification")
                 await self.protect_station(lease)
-                await c.restore_owner_control(continuing_local=active)
+                progress = await c.recovery.restore(continuing_local=active)
+                if not progress.shared:
+                    return progress.pending
                 current = j.get(KEY)
                 if current["id"] == lease["id"] and current.get("unidentified_local") == active:
                     j.put(
@@ -1675,8 +1709,7 @@ class ManagedSchedule:
                             not in ("unidentified_local", "hold_since", "next_cap", "next_stop", "recovery_session")
                         },
                     )
-                self.clear_idle_cutoff("verified_session")
-                return
+                return None
             await self.protect_station(lease)
             raise RecoveryRequiredError("deadline hold awaits reconciliation of the scheduled session")
         if (
@@ -1686,15 +1719,16 @@ class ManagedSchedule:
             and (j.get("trial_phase") == "recovering" or not j.get("control", {}).get("uncertain"))
         ):
             c.require_paused(n, timer_cleanup=True)
-            return
+            return None
         if bound is not None:
             await request_timer_stop(g, lease, self.hold_authorized)
         else:
             await self.protect_station(lease)
         if active is None and j.active() is None and g.controls.ready and g.controls.desired() == 0:
             c.require_paused(await c.native.read(closed=True), timer_cleanup=True)
-            return
+            return None
         raise RecoveryRequiredError("deadline hold awaits verified closure")
+        return None
 
     # Reconcile native timer presence and transaction history after the verified read has published its source.
     def observe_timer(self, lease: dict[str, Any], n: HandoverEvidence) -> tuple[dict[str, Any], dict[int, bool]]:

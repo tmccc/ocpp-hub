@@ -17,9 +17,11 @@ from .managed_start_binding import known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
 from .policy import DeniedError
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
+from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
+from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
@@ -92,7 +94,7 @@ class ManagedChargeTests:
         self.retire_refused_unsent()
         controller.session.gateway.start_observer = self.started
         controller.native.observation_listener = self.record_source
-        controller.native.positive_guard = self.check_positive
+        controller.native.positive_guard = self.positive_decision
         self.prepare_report_hold = controller.session.gateway.prepare_report_hold
         self.held_start_report = controller.session.gateway.held_start_report
         controller.session.gateway.prepare_report_hold = self.prepare_owner_report
@@ -470,11 +472,9 @@ class ManagedChargeTests:
                 while True:
                     self.guard(lease)
                     native = await c.native.read(closed=True)
-                    try:
-                        c.require_zero(native, allow_offline=lease.normal)
+                    if not isinstance(c.zero_decision(native, allow_offline=lease.normal), Pending):
                         break
-                    except RecoveryRequiredError:
-                        await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)
             if native.physical.connection != "Plug":
                 raise DeniedError("test requires a connected vehicle")
             self.guard(lease)
@@ -494,12 +494,22 @@ class ManagedChargeTests:
                 )
                 lease.start_scope = current_scope(c.session.gateway)
 
-            await c.session.gateway.start_managed(
-                tag, lambda: self.guard(lease), request_id=lease.identifier, on_prepared=prepared
-            )
-            self.guard(lease)
-            with j.atomic():
+            # This synchronous writer joins the child's transaction; it never opens a nested atomic block.
+            def publish(context: StartHandoffContext) -> StartPublication:
                 self.guard(lease)
+                receipt = local_start_receipt(j)
+                if (
+                    not j.db.in_transaction
+                    or context.request_id != lease.identifier
+                    or context.scope != current_scope(c.session.gateway)
+                    or context.control_revision != c.session.gateway.controls._revision
+                    or j.get("control", {}).get("ticket") != context.ticket
+                    or receipt.get("ticket") != context.ticket
+                    or receipt.get("digest") != context.tag_digest
+                    or receipt.get("request_id") != lease.identifier
+                    or receipt.get("stage") != "accepted"
+                ):
+                    raise RecoveryRequiredError("owned Start publication was superseded")
                 if lease.normal:
                     j.put("managed_control_intent", {"mode": "app", "revision": lease.revision + 1})
                     j.put("managed_owner_epoch", lease.epoch)
@@ -508,23 +518,41 @@ class ManagedChargeTests:
                         try:
                             require_record(c, previous_current)
                         except RecoveryRequiredError:
-                            pass  # A newer current request retains its own outcome while Start was awaiting replies.
+                            pass  # A newer current request retains its own independently owned outcome.
                         else:
                             complete_record(c, previous_current)
+                intent = c.requests.intent()
                 j.put(
                     "managed_test_charge",
                     {
                         **self.state(),
                         "state": "awaiting_power",
                         "start_rpc_accepted": True,
-                        "revision": lease.revision + int(lease.normal),
+                        "revision": intent.revision,
                     },
                 )
-            if lease.normal:
-                # The guarded accepted normal Start already established this connection's positive authority.
-                c.released_epoch = lease.epoch
-                lease.revision += 1
-                lease.mode = "app"
+                return StartPublication(lease.identifier, intent, lease.epoch)
+
+            # Only successful COMMIT can change these in-memory authorities; no await separates publication.
+            def committed(publication: StartPublication) -> None:
+                if lease.normal:
+                    c.released_epoch = publication.epoch
+                    lease.revision = publication.intent.revision
+                    lease.mode = publication.intent.mode
+                self.changed.set()
+
+            result = await c.session.gateway.start_managed_result(
+                tag,
+                lambda: self.guard(lease),
+                request_id=lease.identifier,
+                on_prepared=prepared,
+                handoff=StartHandoff(publish, committed),
+            )
+            if result.failure is not None:
+                raise result.failure
+            if result.publication is None:
+                raise RecoveryRequiredError("managed Start authority publication was not confirmed")
+            self.guard(lease)
         except (
             DeniedError,
             SecurityError,
@@ -725,26 +753,31 @@ class ManagedChargeTests:
 
     # Positive writes under expired Start authority need a verified daily or the genuine owner's closed lifecycle.
     def check_positive(self, native: HandoverEvidence) -> None:
+        require_allowed(self.positive_decision(native))
+
+    # Expired Start debt is an independent prerequisite, never permission inferred from zero or task completion.
+    def positive_decision(self, native: HandoverEvidence) -> GateDecision:
         if not self.scoped_normal_stop():
-            return
+            return ALLOW
         j, c = self.journal, self.controller
         if self.idle_debt(native):
-            return
+            return ALLOW
         owner = local_start_receipt(j)
         local = j.active()
         if c.requests.intent().mode == "app" and local is not None:
             if self.independent_daily(native, local):
-                return
-            raise ReleaseDeferredError("expired Start cannot release an unidentified or owner transaction")
+                return ALLOW
+            return Pending(Prerequisite.SOURCE, "expired Start cannot release an unidentified or owner transaction")
         if j.get("control", {}).get("start_pending") or native.physical.transaction_open:
-            raise ReleaseDeferredError("expired Start awaits its real owner lifecycle")
+            return Pending(Prerequisite.LIFECYCLE, "expired Start awaits its real owner lifecycle")
         if (
             owner.get("local") is not None
             and not j.db.execute(
                 "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner["local"],)
             ).fetchone()
         ):
-            raise ReleaseDeferredError("expired Start awaits actual owner closure")
+            return Pending(Prerequisite.LIFECYCLE, "expired Start awaits actual owner closure")
+        return ALLOW
 
     # Zero authority does not borrow Stop authority from whichever daily transaction happens to be open.
     async def hold_expired(self) -> None:
@@ -825,8 +858,8 @@ class ManagedChargeTests:
                     return False
                 await self.hold_expired()
                 # Reuse the ordinary guarded release; this raises the ceiling and never sends RemoteStart.
-                await c.restore_owner_control(expected, continuing_local=local)
-                return False
+                progress = await c.recovery.restore(expected, continuing_local=local)
+                return not progress.shared
             owner_closed = (
                 not j.get("control", {}).get("start_pending")
                 and local is None
@@ -842,15 +875,17 @@ class ManagedChargeTests:
             )
             if owner_closed:
                 if expected.mode == "app" and (not g.controls.ready or g.controls.desired() == 0):
-                    await c.restore_owner_control(expected)
+                    progress = await c.recovery.restore(expected)
+                    if not progress.shared:
+                        return True
                 j.put("managed_test_charge", {**self.state(), "state": "completed", "charging": False})
                 return False
             if expected.mode == "app" and local is None and not native.physical.transaction_open:
                 if g.controls.ready and g.controls.desired() == state["current_a"]:
                     return False
                 if self.idle_debt(native):
-                    await c.restore_owner_control(expected)
-                    return False
+                    progress = await c.recovery.restore(expected)
+                    return not progress.shared
             await self.hold_expired()
             c.native.require_known_session(native)
             if local is not None and owner.get("local") == local and owner.get("digest") == state.get("tag_digest"):

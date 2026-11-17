@@ -14,6 +14,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from ocpp_hub_core.prototype.policy import DeniedError
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
@@ -193,11 +194,11 @@ async def test_newer_pause_preempts_regular_start(
             assert actual_validate is not None
 
             # Preserve independent native HTTP evidence while delaying the final Start send boundary.
-            async def delayed_validate(action: str, payload: dict[str, Any]) -> None:
+            async def delayed_validate(action: str, payload: dict[str, Any]) -> GateDecision | None:
                 if action == "RemoteStartTransaction":
                     entered.set()
                     await proceed.wait()
-                await actual_validate(action, payload)
+                return await actual_validate(action, payload)
 
             monkeypatch.setattr(test.session.gateway.charger, "validate_send", delayed_validate)
         identifier = uuid.uuid4().hex

@@ -214,7 +214,7 @@ async def test_cancelled_outer_waits_for_real_shielded_unstarted_child(
         # The real outer waiter is cancelled after its genuine shielded child exists in LocalControl's owned pool.
         def hold_child_and_cancel_parent(loop, coroutine, **kwargs):
             if (
-                getattr(coroutine, "cr_code", None) is LocalControl._start.__code__
+                getattr(coroutine, "cr_code", None) is LocalControl._start_owned.__code__
                 and coroutine.cr_frame.f_locals.get("self") is s.gateway.controls
             ):
                 task = asyncio.Task(delayed_child(coroutine), loop=loop, eager_start=False, **kwargs)

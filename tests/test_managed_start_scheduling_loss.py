@@ -35,7 +35,7 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
         def lose_start(loop, coroutine, **kwargs):
             task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
             if (
-                getattr(coroutine, "cr_code", None) is LocalControl._start.__code__
+                getattr(coroutine, "cr_code", None) is LocalControl._start_owned.__code__
                 and coroutine.cr_frame.f_locals.get("self") is s.gateway.controls
             ):
                 task.cancel()

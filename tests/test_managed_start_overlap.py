@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
@@ -361,7 +362,7 @@ async def test_unknown_source_at_daily_release_gate_retains_zero_and_recovers(
         changed = False
 
         # Keep the real native validator and alter only the independent physical source before its fresh read.
-        async def change_before_positive(action: str, payload: dict[str, Any]) -> None:
+        async def change_before_positive(action: str, payload: dict[str, Any]) -> GateDecision | None:
             nonlocal changed
             if (
                 action == "SetChargingProfile"
@@ -369,7 +370,7 @@ async def test_unknown_source_at_daily_release_gate_retains_zero_and_recovers(
             ):
                 b.rig.peer.plan_session = (daily, 987654)
                 changed = True
-            await validate(action, payload)
+            return await validate(action, payload)
 
         monkeypatch.setattr(b.session.gateway.charger, "validate_send", change_before_positive)
         await expire(b)

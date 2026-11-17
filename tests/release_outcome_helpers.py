@@ -5,8 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from ocpp_hub_core.prototype.release_attempt import ReleaseOutcome
-from ocpp_hub_core.prototype.store import ReleaseDeferredError
+from ocpp_hub_core.prototype.recovery_contracts import Prerequisite, WireReply
 
 from tests.peer_mutation_helpers import observe_device_replies as observe_device_replies
 from tests.test_managed_proxy import healthy, starts
@@ -27,8 +26,11 @@ def assert_positive_rollback(b, attempt, wire, replies, selected):
     assert attempt.finished and not attempt.cancelled and not attempt.known_unsent()
     assert attempt.positive_may_have_dispatched and not attempt.positive_confirmed
     assert attempt.zero_may_have_dispatched and attempt.zero_confirmed
-    assert type(attempt.positive_failure) is ReleaseDeferredError and attempt.failure is attempt.positive_failure
-    assert attempt.outcome() is ReleaseOutcome.POSSIBLE_POSITIVE
+    result = attempt.result()
+    assert result.pending is not None and result.pending.reason is Prerequisite.SOURCE
+    assert result.failure is None and not result.cleanup_failed and not result.published
+    assert result.effects.positive_dispatched and result.effects.positive_reply is WireReply.ACCEPTED
+    assert not result.effects.positive_verified and result.effects.zero_dispatched and result.effects.zero_verified
     calls = b.rig.bench.device_calls[wire:]
     profiles = [frame for frame in calls if frame[2] == "SetChargingProfile"]
     limits = [

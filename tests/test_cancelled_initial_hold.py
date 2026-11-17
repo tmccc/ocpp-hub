@@ -20,7 +20,7 @@ async def cancelled_child(b, boundary):
     c, g = b.controller, b.session.gateway
     loop, factory, victims = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory(), []
     captured = asyncio.Event()
-    code = LocalControl._stop.__code__ if boundary == "zero_child" else LocalControl._start.__code__
+    code = LocalControl._stop.__code__ if boundary == "zero_child" else LocalControl._start_owned.__code__
 
     # A pre-first-instruction child cancellation cannot be mistaken for a dispatched physical Start.
     def cancel_selected(loop, coroutine, **kwargs):

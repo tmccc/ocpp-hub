@@ -78,7 +78,7 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
         def observe_task(loop, coroutine, **kwargs):
             task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
             if (
-                getattr(coroutine, "cr_code", None) is LocalControl._start.__code__
+                getattr(coroutine, "cr_code", None) is LocalControl._start_owned.__code__
                 and coroutine.cr_frame.f_locals.get("self") is s.gateway.controls
             ):
                 victims.append(task)

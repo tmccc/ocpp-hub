@@ -13,6 +13,7 @@ from .. import commands
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .policy import DeniedError, integer
+from .recovery_contracts import NotSent, Reply, ResultCall, require_allowed
 from .store import Journal, RecoveryRequiredError, fingerprint
 
 CAPABILITY_KEYS = (
@@ -144,6 +145,18 @@ class StationDiscovery:
 
     # Read one key at a time under the existing control sequence and pin both choice and reported device capabilities.
     async def prepare(self, call: Call, epoch: int) -> StationChoice:
+        # Old commissioning clients still receive Frames; all discovery uses the same result-aware implementation.
+        async def result_call(action: str, payload: dict[str, Any]) -> Reply:
+            return Reply(await call(action, payload))
+
+        result = await self.prepare_result(result_call, epoch)
+        if isinstance(result, NotSent):
+            require_allowed(result.pending)
+            raise AssertionError("pending discovery did not stop the legacy caller")
+        return result
+
+    # A changed source may stop any capability read without turning a normal prerequisite into an exception.
+    async def prepare_result(self, call: ResultCall, epoch: int) -> StationChoice | NotSent:
         boot_digest = fingerprint(self.journal.get("boot"))
         if self.epoch == epoch and self.capabilities is not None:
             if self.journal.get("station_selection") != {
@@ -155,7 +168,10 @@ class StationDiscovery:
             return self.choice
         values = {}
         for key in CAPABILITY_KEYS:
-            values[key] = configuration_value(await call("GetConfiguration", commands.get_configuration([key])), key)
+            result = await call("GetConfiguration", commands.get_configuration([key]))
+            if isinstance(result, NotSent):
+                return result
+            values[key] = configuration_value(result.frame, key)
         if fingerprint(self.journal.get("boot")) != boot_digest:
             raise RecoveryRequiredError("device introduction changed during capability discovery; results discarded")
         capabilities = StationCapabilities.parse(values, self.choice)

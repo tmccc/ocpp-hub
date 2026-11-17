@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .gateway import Gateway
-from .local_control import recover_unreported_local_start
+from .local_control import join_retirement, recover_unreported_local_start
 from .managed_current import managed_current_ceiling
 from .managed_faults import ManagedRefusal, latch_managed_fault
 from .managed_schedule import recorded_timer_hold
@@ -196,7 +196,7 @@ class TrialSession:
                 StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
                 lambda: self._station_inventory,
             )
-            self.gateway.controls.prepare_station = self.station.prepare
+            self.gateway.controls.prepare_station = self.station.prepare_result
             self.gateway.charger.before_send = self.book.before_send
             self.gateway.charger.after_result = self.book.after_result
             actual_settings = settings or RuntimeSettings(boot_probe_after=10)
@@ -262,6 +262,8 @@ class TrialSession:
             raise
         self.started = False
         self.closed = False
+        self.closing = False
+        self._closing_task: asyncio.Task[None] | None = None
         self.final_status: dict[str, Any] | None = None
 
     # Never classify native profile bytes while their actual outgoing Set/Clear response is still unresolved.
@@ -564,8 +566,16 @@ class TrialSession:
 
     # Shutdown never removes an unverified hold; even a journal failure must retire both transport paths.
     async def close(self) -> None:
+        if self._closing_task is None:
+            self.closing = True
+            self._closing_task = asyncio.create_task(self._close_owned())
+        await join_retirement(self._closing_task)
+
+    # A single owned close retires every journal user before closing SQLite, including under repeated cancellation.
+    async def _close_owned(self) -> None:
         if self.closed:
             return
+        self.closing = True
         uncertain = False
         try:
             if self.started and self.journal.get("trial_phase") in ("active", "recovering", "blocked"):

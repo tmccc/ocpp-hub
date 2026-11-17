@@ -16,7 +16,7 @@ from ocpp_hub_core.prototype.rpc import Peer
 
 from tests import test_managed_schedule_cutoff as cutoff_bench
 from tests.handover_helpers import crash
-from tests.test_managed_closed_timer_release_retry import FinalReleaseHttpPeer, coroutine_locals
+from tests.native_fault_support import FinalReleaseHttpPeer, coroutine_locals
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_managed_schedule_idle_cutoff import END, early_cleanup
@@ -92,7 +92,7 @@ async def test_idle_timer_deadline_supersedes_unsent_release(tmp_path, tls, unus
                 if not isinstance(validator, asyncio.Task):
                     continue
                 native_call = coroutine_locals(validator, NativeBoundedHandover.validate_send.__code__)
-                native_read = coroutine_locals(validator, NativeBoundedHandover.read.__code__)
+                native_read = coroutine_locals(validator, NativeBoundedHandover._read.__code__)
                 actual = call.get("actual")
                 if (
                     release.get("self") is not g.controls

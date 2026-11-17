@@ -88,7 +88,7 @@ async def test_closed_timer_restoration_retries_final_native_http503(
                 if not isinstance(validator_task, asyncio.Task):
                     continue
                 native_validation = coroutine_locals(validator_task, NativeBoundedHandover.validate_send.__code__)
-                native_read = coroutine_locals(validator_task, NativeBoundedHandover.read.__code__)
+                native_read = coroutine_locals(validator_task, NativeBoundedHandover._read.__code__)
                 actual = call.get("actual")
                 if (
                     release.get("self") is not g.controls

@@ -12,19 +12,16 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from ocpp_hub_core.prototype.managed_schedule import ManagedSchedule
 from websockets.asyncio.client import connect
 
+from tests.native_fault_support import coroutine_locals
 from tests.test_managed_api import TOKEN, call
-from tests.test_managed_closed_timer_release_retry import coroutine_locals
 from tests.test_managed_normal_start import natural_stop, owner_rig
 from tests.test_managed_proxy import healthy, starts
 from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
 
 
-# Intent: a genuine reply-first Start/lifecycle pair remains accepted across the shielded worker's intent handoff.
-# Why: the handler must reclassify current app authority after waiting, rather than retain the earlier paused branch.
-async def test_reply_first_start_lifecycle_crosses_real_intent_handoff(
-    tmp_path, tls, unused_tcp_port_factory, monkeypatch
-):
+# Exercise one explicit real TLS frame ordering while observing the actual atomic publication boundary.
+async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch, *, report_first):
     async with owner_rig(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, startup=10) as b:
         c, g, j, rig = b.controller, b.session.gateway, b.session.journal, b.rig
         published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
@@ -45,8 +42,16 @@ async def test_reply_first_start_lifecycle_crosses_real_intent_handoff(
                 payload = START | {"idTag": command[3]["idTag"]}
                 burst.update(reply=copy.deepcopy(reply), payload=payload)
                 rig.bench.replies[lifecycle_id] = lifecycle
+                report = build_call(lifecycle_id, "StartTransaction", payload)
+                burst["forwarded"] = []
+                if report_first:
+                    await original_send(report)
+                    burst["forwarded"].append("report")
                 await original_send(raw)
-                await original_send(build_call(lifecycle_id, "StartTransaction", payload))
+                burst["forwarded"].append("reply")
+                if not report_first:
+                    await original_send(report)
+                    burst["forwarded"].append("report")
                 return
             await original_send(raw)
 
@@ -64,7 +69,10 @@ async def test_reply_first_start_lifecycle_crosses_real_intent_handoff(
                     worker = c.tests.worker
                     entries.append(
                         {
-                            "paused": c.requests.intent().mode == "paused",
+                            "intent": c.requests.intent(),
+                            "control": copy.deepcopy(j.get("control")),
+                            "metadata": copy.deepcopy(c.tests.state()),
+                            "lease": None if c.tests.lease is None else (c.tests.lease.mode, c.tests.lease.revision),
                             "positive": rig.bench.firmware.effective_limit() == 6,
                             "pending_worker": worker is not None and not worker.done(),
                             "shield_wait": worker is not None
@@ -90,17 +98,31 @@ async def test_reply_first_start_lifecycle_crosses_real_intent_handoff(
                 identifier = uuid.uuid4().hex
                 monkeypatch.setattr(b.charger, "send", send_reply_then_lifecycle)
                 sys.setprofile(observe_entry)
-                accepted = await call(socket, "start", id=identifier, revision=c.requests.intent().revision)
+                requested_revision = c.requests.intent().revision
+                accepted = await call(socket, "start", id=identifier, revision=requested_revision)
                 assert accepted["ok"] and accepted["result"]["state"] == "accepted"
                 answer = await asyncio.wait_for(asyncio.shield(lifecycle), 5)
                 sys.setprofile(previous_profile)
                 assert not observer_errors and len(entries) == 1, (entries, observer_errors)
                 entry = entries[0]
-                assert entry["paused"] and entry["positive"] and entry["pending_worker"], entry
+                assert entry["positive"] and entry["pending_worker"], entry
+                assert burst["forwarded"] == (["report", "reply"] if report_first else ["reply", "report"])
+                if report_first:
+                    assert entry["intent"].mode == "paused" and entry["intent"].revision == requested_revision
+                    assert entry["metadata"]["state"] == "starting" and not entry["metadata"].get("start_rpc_accepted")
+                    assert entry["control"]["owner"] == "local" and entry["control"]["uncertain"]
+                else:
+                    assert entry["intent"].mode == "app" and entry["intent"].revision == requested_revision + 1
+                    assert entry["metadata"]["state"] == "awaiting_power" and entry["metadata"]["start_rpc_accepted"]
+                    assert entry["control"]["owner"] == "shared" and not entry["control"]["uncertain"]
+                    assert entry["lease"] == ("app", requested_revision + 1)
                 assert entry["shield_wait"] and entry["owned_children"] == 1, entry
                 assert entry["receipt_stage"] in ("issued", "accepted"), entry
                 assert burst["reply"][2]["status"] == "Accepted" and len(starts(rig)) == 1
                 assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted", answer
+                await c.tests.settle()
+                assert c.requests.intent().mode == "app" and c.requests.intent().revision == requested_revision + 1
+                assert j.get("control")["owner"] == "shared" and c.tests.state()["start_rpc_accepted"]
                 # Apply only this genuine accepted lifecycle to the independent physical peer, as Bench.call does.
                 local = answer[2]["transactionId"]
                 rig.bench.firmware.active = local
@@ -120,3 +142,19 @@ async def test_reply_first_start_lifecycle_crosses_real_intent_handoff(
             sys.setprofile(previous_profile)
             monkeypatch.setattr(b.charger, "send", original_send)
             await api.close()
+
+
+# Intent: actual ACK-first frames enter through completely committed app authority before the parent resumes.
+# Why: reply-first delivery must observe atomic child publication and retain the original genuine lifecycle.
+async def test_reply_first_start_lifecycle_crosses_real_intent_handoff(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    await lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch, report_first=False)
+
+
+# Intent: actual report-first frames enter while paused and reclassify after joining the owned Start publication.
+# Why: the earlier paused handler cannot keep its old branch after the actual accepted child commits app authority.
+async def test_report_first_start_lifecycle_waits_for_child_publication(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    await lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch, report_first=True)

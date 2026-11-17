@@ -1,4 +1,4 @@
-"""Return between owned Start completion and app-intent publication retains zero and the original lifecycle."""
+"""A new Pause after atomic Start publication retains zero and the original accepted lifecycle."""
 
 import asyncio
 import copy
@@ -20,8 +20,8 @@ from tests.test_prototype_tls import tls as tls
 pytestmark = pytest.mark.asyncio
 
 
-# Intent: Return after the real owned Start commits still restores zero if its outer worker loses permission.
-# Why: shielding the child leaves a genuine management-input window before the worker publishes app authority.
+# Intent: a new Pause after atomic Start completion revokes its app authority before the parent resumes.
+# Why: observers must see complete publication, and later owner requests retain zero and truthful Start debt.
 async def test_return_after_start_child_commit_restores_zero_without_native_http(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -35,7 +35,7 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
         owner_pause = copy.deepcopy(j.get("managed_owner_pause"))
         plans, configuration = copy.deepcopy(rig.bench.firmware.plans), copy.deepcopy(rig.peer.configuration)
         scope = (g._charger_epoch, g.boot_observation, g.boot_metadata_revision, g.controls._revision)
-        identifier, returning = uuid.uuid4().hex, uuid.uuid4().hex
+        identifier, returning, new_pause = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
         scheduled, callback_errors, witness = [], [], {}
         injected = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -58,7 +58,11 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
                     actual_limit=rig.bench.firmware.effective_limit(),
                     wire=len(rig.bench.device_calls),
                 )
-                witness["return"] = c.command(returning, "app_control", intent.revision)
+                witness["pause"] = c.command(new_pause, "pause", witness["intent"].revision)
+                witness["paused_intent"] = c.requests.intent()
+                witness["current_owner_pause"] = copy.deepcopy(j.get("managed_owner_pause"))
+                witness["paused_control"] = copy.deepcopy(j.get("control"))
+                witness["return"] = c.command(returning, "app_control", witness["paused_intent"].revision)
                 witness["pending_return"] = c.requests.pending_return()
                 rig.peer.unavailable = True
             except Exception as error:
@@ -105,10 +109,16 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
             assert receipt["local"] is None and receipt["ticket"] == scheduled[0]["ticket"]
             assert control["ticket"] == receipt["ticket"] and control["owner"] == "shared"
             assert control["inhibit"] is False and control["uncertain"] is False and control["start_pending"] is True
-            assert witness["actual_limit"] == 6 and witness["intent"] == intent and intent.mode == "paused"
+            assert witness["actual_limit"] == 6 and witness["intent"].mode == "app"
+            assert witness["intent"].revision == intent.revision + 1
+            assert c.tests.state()["start_rpc_accepted"]
+            assert witness["pause"]["id"] == new_pause and witness["pause"]["state"] == "accepted"
             assert witness["owner_pause"] == owner_pause
             assert witness["return"]["id"] == returning and witness["return"]["state"] == "accepted"
-            assert witness["pending_return"] == (returning, intent.revision)
+            assert witness["pending_return"] == (returning, witness["paused_intent"].revision)
+            assert witness["paused_intent"].mode == "paused"
+            assert witness["paused_intent"].revision == witness["intent"].revision + 1
+            intent, owner_pause = witness["paused_intent"], witness["current_owner_pause"]
             assert len(starts(rig)) == 1 and j.active() is None
             await asyncio.wait_for(c.tests.settle(), 4)
             assert c.tests.state()["state"] == "stopping" and c.tests.state()["failure"]["type"] == "DeniedError"
@@ -135,7 +145,8 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
             assert rig.bench.firmware.effective_limit() == 0
             current = j.get("control")
             assert current["owner"] == "local" and current["inhibit"] is True and current["uncertain"] is True
-            assert current["start_pending"] is True and current["stop_epoch"] == control["stop_epoch"]
+            assert current["start_pending"] is True
+            assert current["stop_epoch"] == witness["paused_control"]["stop_epoch"] > control["stop_epoch"]
             assert j.get("local_start_receipt") == receipt and c.requests.intent() == intent
             assert j.get("managed_owner_pause") == owner_pause
             assert rig.bench.firmware.plans == plans and rig.peer.configuration == configuration

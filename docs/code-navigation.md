@@ -59,11 +59,12 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | Process and connections | [`trial_session.py`](../custom_components/ocpp_hub/core/prototype/trial_session.py), `TrialSession`; `trial_transport.py`; `runtime.py`, `ConnectionRuntime`; `tools/managed_proxy.py` | `test_managed_service_cli.py`, `test_service_observation_recovery.py`, `test_managed_boot_supersession.py` |
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
-| Start and cancellation | [`managed_test_charge.py`](../custom_components/ocpp_hub/core/prototype/managed_test_charge.py), `ManagedChargeTests`; `managed_start_binding.py`; `managed_start_cancellation.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_binding.py` |
+| Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
+| Start and cancellation | [`managed_test_charge.py`](../custom_components/ocpp_hub/core/prototype/managed_test_charge.py), `ManagedChargeTests`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
 | Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
 | Native evidence and resources | [`native_bounded_handover.py`](../custom_components/ocpp_hub/core/prototype/native_bounded_handover.py), `NativeBoundedHandover`; `trial_evidence.py`, `NativeObserver`; `native_http.py`; `native_history.py`; `trial_resources.py`, `ResourceBook` | `test_native_read_supersession.py`, `test_native_optional_storage.py`, `test_native_repair_strict_conflict.py` |
 | Persistence and cloud replies | [`store.py`](../custom_components/ocpp_hub/core/prototype/store.py), `Journal`; `delivery_reply.py`; `managed_start_delivery.py`; `managed_stop_delivery.py`; `vendor_read_recovery.py` | `test_stop_saved_reply_recovery.py`, `test_worker_storage_recovery.py`, `test_managed_start_delivery_recovery.py` |
-| Pause, Return and recovery | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `maintain_pause()`, `return_requested()`, `tick()`; `ordinary_recovery.py`; `managed_recovery.py`; specialized `managed_*_recovery.py` siblings | `test_pause_stop_recovery.py`, `test_managed_offline_recovery.py`, `test_combined_recovery_proofs.py` |
+| Pause, Return and recovery | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `maintain_pause()`, `return_requested()`, `tick()`; `recovery_coordinator.py`, `advance()` and `restore()`; `ordinary_recovery.py`; `managed_recovery.py`; specialized `managed_*_recovery.py` siblings | `test_pause_stop_recovery.py`, `test_managed_offline_recovery.py`, `test_combined_recovery_proofs.py` |
 | Native timers and deadlines | [`managed_schedule.py`](../custom_components/ocpp_hub/core/prototype/managed_schedule.py), `ManagedSchedule`; `managed_cutoffs.py`; `managed_occurrences.py`; `schedule_time.py` | `test_managed_schedule_source_boot.py`, `test_managed_schedule_idle_cutoff.py`, `test_managed_deadline_source_wakeup.py` |
 | Status and diagnostics | [`managed_view.py`](../custom_components/ocpp_hub/core/prototype/managed_view.py), `health_snapshot()`; `managed_diagnostics.py`, `snapshot()`; [`tools/managed_reporting.py`](../tools/managed_reporting.py), `Reporting` | `test_managed_diagnostics.py`, `test_diagnostic_contracts.py`, `test_start_diagnostic_progress.py` |
 | HA API and lifecycle | [`ics_proxy/api.py`](../custom_components/ics_proxy/api.py), `ProxyClient`; `coordinator.py`, `ProxyCoordinator`; `notification.py`; entity and diagnostic modules | [`tests_ha_proxy/`](../tests_ha_proxy/): `test_freshness_recovery.py`, `test_current.py`, `test_diagnostics.py`, `test_inflight_lifecycle.py` |
@@ -84,24 +85,48 @@ typed deferred retry loop. `managed_faults.py` shares the strict diagnostic latc
 For command timing, follow `Peer._validate()` through its priority gate and then the independent send/reply deadline;
 `test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch.
 
-`connection_scope.py` separates connection-origin bookkeeping from exact Boot-bound cloud and resume evidence.
-`release_attempt.py` retains possible positive effects across the owned operation, its later reads and rollback.
-Its `ReleaseOutcome` distinguishes unfinished, successful, cancelled, possibly positive, unconfirmed-zero,
-waiting and failed whole operations; the caller separately checks current owner/Boot/ticket authority.
-Read their callers in `runtime.py`, `native_bounded_handover.py`, `local_control.py`, `managed.py` and
-`managed_schedule.py` together. `test_managed_introduction_scope.py`, `test_managed_closed_timer_release_retry.py`
-and `test_managed_timer_release_supersession.py` cover those boundaries through real peers. The companion
-`test_release_positive_effect_retention.py` checks that rollback cannot erase a preceding positive dispatch.
-`tests/release_outcome_helpers.py` records forwarded real TLS replies and drives explicit Pause/closure/Return
-recovery for the post-positive source regressions in `test_managed_schedule_cutoff.py` and
-`test_managed_schedule_source_freshness.py`. These cases retain the fault after a genuine positive ACK and zero
-rollback; fresh source proof alone is not a new owner acknowledgement.
-`test_rpc_native_cleanup_failure.py` exercises real native cancellation and failed SQLite publication;
-`test_rpc_completed_verdict.py` separately checks the standalone Peer contract with explicit unit collaborators.
-For normal Start handoffs, read `test_managed_return_during_start.py`, `test_managed_return_after_start_child.py`
-and `test_managed_start_reply_lifecycle_order.py` alongside their scope and report-preparation guards.
-`test_managed_return_after_start_boot.py` covers the current Pause service's independent zero claim after a matching
-Boot, including failed claim storage, while the old Start remains fenced to its own observation.
+`connection_scope.py` separates introduction lineage from exact Boot-bound cloud
+and resume evidence. `recovery_contracts.py` separates a named pending prerequisite,
+a particular RPC's `Reply`/`NotSent`, exact authority and the whole owned release's
+physical and publication facts. `release_attempt.py` builds those facts through
+later reads and rollback; `recovery_policy.py` makes the shared pure decision.
+A pending last call does not mean an earlier positive profile was never sent.
+Legacy Frame/require adapters translate pending data only at compatibility edges;
+business recovery does not classify exception messages or cause chains.
+
+`recovery_coordinator.py` owns common preflight, release, result interpretation and
+completion. Current, ordinary, expired-Start, timer and connection callers consume
+`RestoreProgress` before settling their own records. Domain obligations can coexist;
+visiting one during a poll does not discharge another. An authority snapshot never
+permits a later send: the executor checks current intent, Boot, revision and ticket
+at the actual effect and SQL publication boundaries. Timer deadline zero retains its
+independent watchdog and exact restrictive claim.
+
+`ReleaseHandoff` joins final release metadata, explicit Return intent/receipt and
+shared control in the wire child's transaction. `start_handoff.py` similarly joins
+normal Start's app intent and awaiting-power lease with shared control, after its
+real Accepted evidence commits separately. Memory publication follows successful
+COMMIT. A completed publication overtaken by a newer owner event is stale; its old
+caller cannot overwrite the new authority or relabel that successful publication
+as a fresh release fault. An Accepted Start is not proof of charging or permission
+to discard its lifecycle/cloud debt.
+
+Follow `Peer.call_result()`/`sequence_results()` and their legacy wrappers into the
+same `_call_locked()` transport. Native and resource guards must forward pending
+results before resource intent or dispatch; completed strict verdicts and cleanup
+storage failures retain precedence. Read `trial_session.py` and `local_control.py`
+together for retirement: closing revokes positive permission, owned completion and
+wire tasks finish before SQLite closes, and repeated caller cancellation cannot
+abandon cleanup. Read `ManagedSchedule.finish()` with its caller transaction; it
+joins an existing publication transaction or opens its own, without nesting one.
+
+Useful boundary tests include `test_managed_introduction_scope.py`,
+`test_managed_timer_release_supersession.py`, `test_release_positive_effect_retention.py`
+and `test_rpc_native_cleanup_failure.py`. For Start, follow
+`test_managed_return_during_start.py`, `test_managed_return_after_start_child.py`,
+`test_managed_return_after_start_boot.py` and `test_managed_start_reply_lifecycle_order.py`
+through actual reply, SQL publication, newer Pause and lifecycle closure. A private
+function entry alone does not establish which of those boundaries occurred.
 
 ## Follow a control through every boundary
 
@@ -141,6 +166,14 @@ shared helpers include `trial_helpers.py`, `managed_scenario_helpers.py`, `servi
 `recovery_barriers.py`, `process_helpers.py`, `process_service_child.py`, `peer_start_ledger.py` and `worker_ports.py`
 under `tests/`. Inspect `fake_charger.py`, `fake_vendor.py` and `prototype_firmware.py` for independent peer behavior.
 Follow other imported helpers too. A shared setup shortcut can weaken many apparently independent tests.
+
+| Support owner | Responsibility and compatibility boundary |
+| --- | --- |
+| `tests/native_schedule_support.py` | Independent native plan peer, calendar, `TimerBench` and `timer_bench(peer_type=...)`. Existing `test_managed_schedule_cutoff.timer_bench` resolves that module's current `SchedulePeer` when called, preserving existing factory overrides. |
+| `tests/peer_mutation_helpers.py` | Actual peer refusal or application followed by a delayed reply, complete physical-profile observations and unchanged forwarding of real TLS replies. Optional release witnesses do not alter existing zero/Stop/clear callers. |
+| `tests/release_outcome_helpers.py` | Whole-release effect assertions and explicitly requested owner Pause/closure/Return recovery. Assertions do not silently issue owner commands to repair an unexpected fault. |
+| `tests/recovery_barriers.py` | Exact request UUID/revision, physical condition and completion checks; a generic healthy snapshot is not completion of a named request. |
+| `tests/native_fault_support.py` | Actual HTTP gates and read-only coroutine witnesses. A moved implementation requires a new selector witness, not a skipped failure cut. |
 
 Inspect failure injection and the oracle independently: what actually failed, whether the peer changed, which reply
 arrived, whether the database rolled back, and what proves later recovery. Include setup, timeout, teardown and

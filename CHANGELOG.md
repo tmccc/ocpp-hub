@@ -2,26 +2,27 @@
 
 ## 0.2.3 — iCS recovery and control handoffs
 
-- Distinguish an actual replacement introduction from an ordinary temporary zero hold. Preserve the saved app
-  choice during same-connection outages; bind failed cloud attempts and recovery acknowledgement to actual Boot.
-- Keep an accepted unsent timer pending while an ordinary cloud report finishes. Departure, a newer Pause,
-  replacement and the installation deadline still cancel it without changing its accepted window or payload.
-- Retry the complete restrictive zero check after an audited open-session introduction loses a reply. Never
-  replay introduction, Start or Stop merely to finish that check.
-- Track possible positive writes through the whole owned release, including later reads and zero rollback.
-  Classify the whole result once: native unavailability and withheld source/lifecycle/timer prerequisites retry
-  only after confirmed zero with no positive dispatch and no later cleanup failure. Let an actual timer zero
-  supersede an unsent automatic release without borrowing its pending acknowledgement or clearing its uncertainty.
-- Keep completed strict validation failures ahead of simultaneous restrictive requests. Preserve failed native
-  audit publication during cancellation, including the cleanup cause of an externally cancelled operation.
-- Handle native evidence expiring during the final Pause recheck inside supervision. Retain unfinished test and
-  lifecycle obligations and wait for fresh evidence instead of publishing the expired reading as healthy.
-- Restore zero when Return interrupts normal Start, both during its acknowledgement wait and after the owned
-  operation finishes. Preserve the owner's Pause revision, accepted Start debt and original Return request.
-- Reclassify a reply-first transaction report after its awaited control handoff. Retain later Pause, authorization,
-  Boot, native-source and lifecycle checks rather than continuing an obsolete paused-report decision.
-- Add real TLS/native HTTP, SQLite failure, message-ordering and cancellation regressions, with separate unit
-  checks for validation ordering and the exact native-availability exception contract.
+- Share typed recovery prerequisites and whole-operation results across current,
+  timer, ordinary and interrupted-Start recovery. Keep permission, actual replies,
+  physical effects and committed completion separate; retain faults after a refused
+  or possibly applied positive release, even when rollback reaches zero.
+- Commit Start's app authority and lease inside its owned operation after recording
+  genuine Accepted evidence. Commit explicit Return and shared release together;
+  preserve accepted debt and guarded zero on SQL failure. Later owner requests win
+  without old work overwriting their authority.
+- Preserve connection-origin bookkeeping separately from exact Boot-bound proof.
+  Keep the saved app choice through ordinary same-connection outages, and retry the
+  complete restrictive zero check without replaying introduction, Start or Stop.
+- Keep unsent timers pending through transient report acknowledgements; retain
+  departure, newer Pause, replacement and installation-deadline cancellation.
+  Allow only the exact timer zero claim to supersede an unsent release.
+- Preserve completed strict verdicts and failed audit cleanup during cancellation.
+  Retire owned completion and wire work before closing the journal, including
+  repeated cancellation during shutdown.
+- Recheck expired native samples and current authority during supervision and
+  reply-first report handoffs. Retain unfinished tests, Stop and lifecycle duties.
+- Separate independent peer mutation/reply and native timer support from test
+  providers, preserving existing factory overrides, callers and model identities.
 
 ## 0.2.2 — iCS runtime recovery
 

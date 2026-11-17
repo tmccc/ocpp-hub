@@ -9,6 +9,7 @@ from typing import Any, Self
 
 from .native_faults import MeasuredValues, NativeContentError
 from .policy import integer, number
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .security import SecurityError, StaleEvidenceError
 from .store import encoded, fingerprint
 from .trial_allocation import observe_history
@@ -176,6 +177,15 @@ class NativeReadinessError(SecurityError):
 def _require_ready(
     native: HandoverEvidence, closed: bool, allow_unplugged: bool, closing_local: int | None = None
 ) -> None:
+    decision = readiness_decision(native, closed, allow_unplugged, closing_local)
+    if isinstance(decision, Pending):
+        raise NativeReadinessError(decision.detail)
+
+
+# A valid native observation may still await closure/zero; immutable content inspection remains a separate check.
+def readiness_decision(
+    native: HandoverEvidence, closed: bool, allow_unplugged: bool, closing_local: int | None = None
+) -> GateDecision:
     physical = native.physical
     unplugged = allow_unplugged and physical.cp == "A" and physical.connection == "Unplug"
     if (closed or unplugged) and (
@@ -186,7 +196,10 @@ def _require_ready(
         or native.output_limit_a != 0
         or any(value != 0 for value in native.currents_a + native.powers_w)
     ):
-        raise NativeReadinessError("native bounded admission or release requires actual closed zero-output evidence")
+        return Pending(
+            Prerequisite.LIFECYCLE, "native bounded admission or release awaits actual closed zero-output evidence"
+        )
+    return ALLOW
 
 
 @dataclass(frozen=True, repr=False, init=False)

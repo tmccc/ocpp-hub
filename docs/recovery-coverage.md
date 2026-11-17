@@ -109,6 +109,50 @@ The machine matrix links exact tests for legacy state, source ownership, cutoff 
 No risk is marked universally covered. Real hardware/network behavior and unbounded repeated failures remain outside
 offline qualification. This work requires neither live charging nor deployment.
 
+## Typed recovery boundary contracts
+
+Permission, prerequisites, physical effects and committed publication are separate
+facts. Pending prerequisites do not authorize a send or discharge another duty.
+The pure policy has explicit inputs; real boundary tests must independently show
+which wire, native, lifecycle or SQLite event supplied those inputs.
+
+| Contract | Required behavior and boundary evidence |
+| --- | --- |
+| T01 — unavailable native proof | With unchanged current authority, an automatic operation that sent no positive profile may wait after confirming its own zero. A preclaim wait records no borrowed effects. Fresh proof can permit a new guarded attempt. |
+| T02 — pending source/lifecycle | A named ordinary prerequisite may retain zero; a strict configuration, history or resource contradiction remains a failure. Matching error text, type wrappers or cause depth cannot select business recovery. |
+| T03 — refused positive | An actual positive call and correlated `Rejected` leave the independent device profiles unchanged, but retain the release fault under the conservative policy. Refusal is distinct from an unknown applied outcome. |
+| T04 — unknown positive reply | Prove actual positive application, caller expiry and any forwarded late reply. Rollback zero cannot erase earlier dispatch or make it a no-positive wait; replacement retains the fault. |
+| T05 — later unsent/read failure | After an actual positive Accepted, a later withheld call or failed read retains the whole operation's positive effects. Confirmed rollback alone does not complete the release. A fully verified and published release remains the opposite case. |
+| T06 — failed cleanup | Rejected/lost zero or real SQL cleanup refusal prevents a safe wait or completion. Preserve both the original boundary and the later cleanup failure; strict/storage cleanup cannot disappear during cancellation. |
+| T07 — deadline supersession | Only the actual scoped timer/occurrence claim can supersede an unsent automatic release. Its new ticket and allowed local session do not borrow a pending zero ACK or prove physical zero. Deadline zero remains independently required. |
+| T08 — newer owner request | A newer Pause or Return retains its exact UUID, revision and ticket. Old work cannot reacquire permission, complete that newer request, clear its fault or overwrite its authority. |
+| T09 — Boot and introduction | Same-lineage Boot observations still change exact proof scope. Failed scope A cannot authorize B, and acknowledged introduction origin cannot rearm. Resume acknowledges only after its real guarded COMMIT; replacement does not inherit process-local origin. |
+| T10 — owned Start handoff | Genuine Accepted evidence remains separate from atomic app/lease/shared publication. After successful child COMMIT those authorities agree; a later Boot cannot borrow old Start proof, and a newer Pause retains its own current zero claim. Accepted lifecycle debt remains fenced. |
+| T11 — publication storage | Real statement and deferred-COMMIT refusal roll back joined authority/receipt/lease writes and prevent memory publication. Accepted or issued Start evidence remains truthful. Later supported recovery does not replay Start or erase independent cloud/history debt. |
+| T12 — fresh operation | A completed earlier release does not poison a new temporary hold. Fresh current proof may restore automatically; a failed same-attempt positive release instead retains its specific fault until owner reconciliation. |
+| T13 — supervision expiry | When a recheck of the same native sample expires, retain real pending Stop/test obligations and wait for a fresh sample. Prove the actual expiry cut; skipping a moved private observer is not recovery evidence. |
+| T14 — closure and next lifecycle | Physical zero/closure and an accepted Stop are distinct from actual StopTransaction, cloud/history settlement and Pause completion. Preserve the fault and pending request through the physical-first gap; then prove separate Return and the original next complete daily session. |
+
+Owned completion includes result interpretation and final publication even when the
+original poll or management client disappears. Session retirement first revokes
+positive permission and waits for every owned journal user before closing SQLite;
+repeated cancellation cannot shorten that lifetime. Urgent timer zero does not wait
+for a global coordinator I/O lock.
+
+Explicit Return retains its separate request policy: after prior Pause/test
+settlement, a native prerequisite failure in its own release preflight makes that
+request unconfirmed, rather than granting automatic replay. Only named source, timer-cleanup, owner-return and actual
+cloud-acknowledgement waits leave the same request accepted. Cloud connection
+failure, zero-proof debt, reconciliation and generic lifecycle blockage make it
+unconfirmed. This differs from automatic owned waiting after confirmed own zero,
+and neither case adds positive authority.
+
+The contracts do not add a Cartesian product or change the finite denominators
+above. Retain independent peer/profile/reply, real SQL rollback and actual lifecycle
+witnesses. Pure decision tables establish policy only; they do not prove dispatch,
+publication atomicity, service shutdown or later physical recovery. Real hardware,
+unbounded failures and unrepresented event orders remain outside offline coverage.
+
 ## Additional focused failure boundaries
 
 The ordinary suites also retain explicit recovery checks outside the finite model families:

@@ -11,9 +11,10 @@ from datetime import UTC, datetime
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.recovery_contracts import FailureKind, GateDecision, Prerequisite
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import RecoveryRequiredError, ReleaseDeferredError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
@@ -390,7 +391,7 @@ async def test_source_changes_before_positive_send(
         monkeypatch.setattr(b.device, "answer", reject_actual_rollback)
 
         # Change only independent peer evidence immediately before the actual outgoing positive-profile gate.
-        async def changed_source(action, payload):
+        async def changed_source(action, payload) -> GateDecision | None:
             nonlocal changed
             if action == "SetChargingProfile":
                 limit = payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
@@ -403,7 +404,7 @@ async def test_source_changes_before_positive_send(
                     attempts.append(attempt)
                     b.rig.peer.plan_session = (local, 987654)
                     changed = True
-            await native_send(action, payload)
+            return await native_send(action, payload)
 
         b.session.gateway.charger.validate_send = changed_source
         await b.c.tick()
@@ -411,7 +412,10 @@ async def test_source_changes_before_positive_send(
         assert len(attempts) == 1
         attempt = attempts[0]
         assert attempt.known_unsent() and attempt.zero_may_have_dispatched
-        assert type(attempt.positive_failure) is ReleaseDeferredError
+        result = attempt.result()
+        assert result.claimed and result.pending is not None and result.pending.reason is Prerequisite.SOURCE
+        assert result.initial_failure_kind is None and not result.published
+        assert not result.effects.positive_dispatched and not result.effects.positive_verified
         assert b.session.gateway.controls.release_attempt is None
         profiles = [item for item in b.rig.bench.device_calls[wire:] if item[2] == "SetChargingProfile"]
         assert len(profiles) == 1
@@ -421,7 +425,8 @@ async def test_source_changes_before_positive_send(
         assert recovery["source_boot"] == attempt.scope.boot and recovery["continuing_local"] is None
         if reject_rollback:
             assert len(refusals) == 1 and not attempt.zero_confirmed
-            assert type(attempt.failure) is UnavailableError and attempt.failure is not attempt.positive_failure
+            assert type(result.failure) is UnavailableError and result.failure_kind is FailureKind.TRANSPORT
+            assert result.cleanup_failed and not result.effects.zero_verified
             fault = copy.deepcopy(b.session.journal.get("managed_control_fault"))
             assert fault["classification"] == "owner_release_unconfirmed"
             assert b.session.journal.get("control")["uncertain"] is True
@@ -434,7 +439,7 @@ async def test_source_changes_before_positive_send(
             assert b.device.effective_limit() == b.device.current == 0 and b.device.plans == {9: original}
             assert not b.stops() and not starts(b.rig)
             return
-        assert attempt.zero_confirmed and attempt.positive_failure is attempt.failure and not refusals
+        assert result.effects.zero_verified and result.failure is None and not result.cleanup_failed and not refusals
         assert not b.session.journal.get("managed_control_fault")
         assert b.session.journal.get("control")["uncertain"] is False
         for _ in range(4):
@@ -593,14 +598,14 @@ async def test_pause_at_positive_send_gate(tmp_path, tls, unused_tcp_port, monke
         requested = False
 
         # Submit the real command while source validation awaits the physical positive-profile send gate.
-        async def pause_before_send(action, payload):
+        async def pause_before_send(action, payload) -> GateDecision | None:
             nonlocal requested
             if action == "SetChargingProfile":
                 limit = payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
                 if limit == 6 and not requested:
                     requested = True
                     b.c.command(pause, "pause", b.c.requests.intent().revision)
-            await native_send(action, payload)
+            return await native_send(action, payload)
 
         b.session.gateway.charger.validate_send = pause_before_send
         await b.c.tick()
