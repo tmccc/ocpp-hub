@@ -61,7 +61,7 @@ def raw(owner, identifier):
 
 
 # Intent: replacement marks only the five replay-sensitive actions accepted/running as uncertain.
-# Why: Pause and schedule recovery retain their distinct lifetimes and all terminal UUID bytes survive startup.
+# Why: Pause and terminal history retain their lifetimes; unfinished retired one-offs refuse without normalization.
 @pytest.mark.parametrize(
     "action", ["app_control", "start", "start_test", "arm_cloud_test", "set_current", "pause", "temporary_schedule"]
 )
@@ -73,6 +73,12 @@ def test_replacement_preserves_action_and_terminal_filters(tmp_path, action, sta
     journal.put("managed_control_intent", {"mode": "paused", "revision": 7})
     identifier = seed(first, action=action, state=state)
     journal.close()
+    if action == "temporary_schedule" and state in ("accepted", "running", "uncertain"):
+        before = path.read_bytes()
+        with pytest.raises(RecoveryRequiredError, match="retired one-off"):
+            Journal(path, "OFFLINE001")
+        assert path.read_bytes() == before
+        return
     journal = Journal(path, "OFFLINE001")
     try:
         recovered = ManagedRequests(journal)

@@ -66,7 +66,7 @@ def test_terminal_history_retains_uuid_results_without_consuming_capacity(tmp_pa
 # Intent: every non-Pause command class reserves capacity for a later immediate restrictive intent.
 # Why: timed or cloud charge admission must not consume a slot that normal Start and Return deliberately reserve.
 @pytest.mark.parametrize(
-    "action", ["start", "start_test", "arm_cloud_test", "set_current", "temporary_schedule", "app_control"]
+    "action", ["start", "start_test", "arm_cloud_test", "set_current", "app_control"]
 )
 def test_all_ordinary_admissions_reserve_the_pause_slot(tmp_path, action):
     journal = Journal(tmp_path / "requests.db", "OFFLINE001")

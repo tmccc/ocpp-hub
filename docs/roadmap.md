@@ -54,13 +54,20 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   480 physical lines smaller, including new guards and a repeated-cleanup inventory correction. Fast checks and
   independent semantic review cover the implementation; full release qualification and deployment remain open.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
-  admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
+  admission, current-selection authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties. Full four-suite qualification and deployment of this local candidate remain open.
 - [x] Centralize physical control writes in `Journal.control`, replacing 27 sites across 11 modules with named
   transitions. Share authority predicates and the pure health decision; make the live poll's stages explicit and
   name its production charging owner `ManagedCharging`. Preserve raw stored formats, public status and actual
   effect/commit/task boundaries. The first grouped check passed 242 tests; broader verification is separate.
   This improves ownership and navigation but adds runtime lines; no physical code-size reduction is claimed.
+- [x] Retire proxy one-off temporary schedules with owner approval. Remove their API, deadline task, native-plan
+  write capability and recovery branches while retaining daily schedules and managed Start/Pause/Return/current.
+  Read-only startup checks refuse unfinished old obligations before journal normalization; completed history and
+  reserved IDs remain passive. Runtime is 2,686 physical lines smaller, including the new guard and shared helpers.
+  Retire only the two one-off model families; preserve all 97 process and 72 current-replacement cases. Focused
+  checks on both HA client runtimes retain daily control and reconnect behaviour. Full qualification and deployment
+  remain separate.
 
 ## iCS implementation history — 15 November 2026
 

@@ -1,16 +1,13 @@
 """Unknown native sources remain held after real reconnect through the production management client."""
 
-import uuid
 from contextlib import AsyncExitStack
-from datetime import UTC, datetime
 
 import pytest
 
 from tests import conftest as _engine  # noqa: F401 - load the standalone engine package.
-from tests.managed_scenario_helpers import END, demand_from_vehicle, originals, unknown_report
+from tests.managed_scenario_helpers import END, originals
 from tests.native_schedule_support import timer_bench
 from tests.test_managed_proxy import introduced
-from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
 from tests_ha_proxy.test_schedule_scenarios import (
@@ -37,19 +34,7 @@ async def test_management_reconnect_revokes_unknown_source(
             await published.healthy()
             saved = originals(b)
             b.clock.now = END - 120
-            b.device.active = 987654
-            b.rig.peer.plan_session = (987654, 9)
-            demand_from_vehicle(b, demand)
-            await published.settle()
-            reply = await b.rig.bench.call(
-                b.sock,
-                uuid.uuid4().hex,
-                "StartTransaction",
-                START | {"idTag": "NATIVE_TIMER", "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
-            )
-            assert reply[0] == 3, reply
-            local = reply[2]["transactionId"]
-            b.rig.peer.plan_session = (local, 9)
+            local = await b.start_plan(9, demand=demand)
             await published.settle(5)
             await published.healthy()
             assert b.device.effective_limit() == 32
@@ -58,9 +43,11 @@ async def test_management_reconnect_revokes_unknown_source(
                 await published.healthy()
             b.clock.now = END - 30
             if loss == "new-id":
-                local = await unknown_report(b, b.clock.now, None, demand)
-            else:
-                b.rig.peer.plan_session = (local, None)
+                previous = local
+                local = await b.start_plan(9, demand=demand)
+                await published.healthy()
+                assert local != previous
+            b.rig.peer.plan_session = (local, None)
             await published.settle()
             await b.sock.close()
             await until(lambda: not b.session.runtime.status.charger_connected)
