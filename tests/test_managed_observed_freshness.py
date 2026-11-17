@@ -113,6 +113,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 fresh_code = trial_evidence.Evidence.require_fresh.__code__
                 pause_code = type(c).require_paused.__code__
                 tick_code = type(c)._tick.__code__
+                supervise_code = type(c)._supervise.__code__
                 observed_code = type(c.charging).observed.__code__
 
                 # Supply wall time only; inspect real call/sample identity without replacing a validator.
@@ -140,7 +141,11 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                         if native is None or native.physical is not physical:
                             return now + offset
                         sample = (id(native), id(physical), physical.observed_at)
-                        if caller is not None and caller.f_code is tick_code:
+                        if (
+                            caller is not None
+                            and caller.f_code is supervise_code
+                            and caller.f_locals.get("self") is c
+                        ):
                             seen_tick.append((sample, now + offset - physical.observed_at))
                         elif (
                             caller is not None
