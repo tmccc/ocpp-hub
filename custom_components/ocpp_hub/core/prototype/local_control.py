@@ -38,11 +38,24 @@ from .recovery_contracts import (
 from .release_attempt import ReleaseAttempt
 from .rpc import Peer, UnavailableError, ValidationPreemptedError
 from .security import SecurityError
-from .start_handoff import OwnedStartResult, StartAttempt, StartHandoff, StartHandoffContext
+from .start_handoff import (
+    OwnedStartResult,
+    StartAttempt,
+    StartBoundary,
+    StartBoundaryObservation,
+    StartHandoff,
+    StartHandoffContext,
+)
 from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
+
+
+# An optional synchronous observation stays inside the owned child's lifetime and grants no effect permission.
+def observe_start(handoff: StartHandoff | None, observation: StartBoundaryObservation) -> None:
+    if handoff is not None and handoff.observed is not None:
+        handoff.observed(observation)
 
 
 class ControlSupersededError(DeniedError):
@@ -663,6 +676,12 @@ class LocalControl:
         finally:
             attempt.failure = sys.exception()
             attempt.finished = True
+            observe_start(
+                handoff,
+                StartBoundaryObservation(
+                    StartBoundary.RETIRED, result=attempt.result(), failure_kind=failure_kind(attempt.failure)
+                ),
+            )
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
     async def _start(
@@ -709,6 +728,15 @@ class LocalControl:
             if on_prepared is not None:
                 on_prepared()
 
+        if scope is not None:
+            observe_start(
+                handoff,
+                StartBoundaryObservation(
+                    StartBoundary.PREPARED,
+                    context=StartHandoffContext(request_id, ticket, scope, self._revision, fingerprint(tag.casefold())),
+                ),
+            )
+
         restoring_zero = False
 
         # Positive permission may be revoked; the same exact ticket and Boot still permit its restrictive rollback.
@@ -732,6 +760,14 @@ class LocalControl:
                     )
                     if settled:
                         self.journal.put("control", {**control, "start_pending": False})
+                if stage in ("accepted", "rejected"):
+                    observe_start(
+                        handoff,
+                        StartBoundaryObservation(
+                            StartBoundary.EVIDENCE_COMMITTED,
+                            reply=WireReply.ACCEPTED if stage == "accepted" else WireReply.REJECTED,
+                        ),
+                    )
 
         # The native and resource gates both run before the transport can send this command.
         def dispatch(action: str) -> None:
@@ -741,11 +777,20 @@ class LocalControl:
                 record_stage("issued")
                 if attempt is not None:
                     attempt.remote_start_dispatched = True
+                observe_start(handoff, StartBoundaryObservation(StartBoundary.DISPATCHED))
 
         # Receipt recording precedes fallible resource/result publication and never claims observed charging.
         def received(action: str, frame: Frame) -> None:
             if attempt is not None and action == "RemoteStartTransaction":
                 attempt.answer = frame
+                reply = (
+                    WireReply.ACCEPTED
+                    if frame[0] == 3 and frame[2].get("status") == "Accepted"
+                    else WireReply.REJECTED
+                    if frame[0] == 3 and frame[2].get("status") == "Rejected"
+                    else WireReply.ERROR
+                )
+                observe_start(handoff, StartBoundaryObservation(StartBoundary.REPLIED, reply=reply))
 
         async with self.peer.sequence(1, check, on_dispatch=dispatch, on_reply=received) as call:
             try:
@@ -779,6 +824,9 @@ class LocalControl:
                     handoff.committed(publication)
                     if attempt is not None:
                         attempt.publication = publication
+                    observe_start(
+                        handoff, StartBoundaryObservation(StartBoundary.PUBLICATION_COMMITTED, publication=publication)
+                    )
             except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError, sqlite3.Error:
                 retire_unsent_local_start(self.journal, ticket)
                 self._complete(ticket, inhibit=True)

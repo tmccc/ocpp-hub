@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .connection_scope import CloudAttemptScope, current_scope
 from .local_control import local_start_receipt, retire_unsent_local_start
+from .managed_intent import ControlIntent
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
 from .managed_start_binding import known_plan_source
@@ -21,6 +22,14 @@ from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, requ
 from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
+from .start_settlement import (
+    StartFailureAction,
+    StartFailureDecision,
+    StartFailureFacts,
+    StartReceiptFacts,
+    StartSettlementTrace,
+    settle_start,
+)
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
@@ -65,6 +74,8 @@ class ManagedChargeTests:
         self.lease: TestLease | None = None
         self.worker: asyncio.Task[None] | None = None
         self._closing = False
+        self.start_trace: StartSettlementTrace | None = None
+        self.last_start_settlement: StartFailureDecision | None = None
         self.timer: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
         self.source: tuple[HandoverEvidence, str | None, int] | None = None
@@ -437,6 +448,9 @@ class ManagedChargeTests:
     async def _start(self, lease: TestLease) -> None:
         c, j = self.controller, self.journal
         previous_current = current_candidate(c) if lease.normal else None
+        trace = StartSettlementTrace(ControlIntent(lease.mode, lease.revision)) if lease.normal else None
+        self.start_trace = trace
+        self.last_start_settlement = None
         effects = False
         try:
             self.guard(lease)
@@ -546,13 +560,14 @@ class ManagedChargeTests:
                 lambda: self.guard(lease),
                 request_id=lease.identifier,
                 on_prepared=prepared,
-                handoff=StartHandoff(publish, committed),
+                handoff=StartHandoff(publish, committed, trace.observe if trace is not None else None),
             )
             if result.failure is not None:
                 raise result.failure
             if result.publication is None:
                 raise RecoveryRequiredError("managed Start authority publication was not confirmed")
             self.guard(lease)
+            self.observe_start_owner(trace)
         except (
             DeniedError,
             SecurityError,
@@ -561,10 +576,20 @@ class ManagedChargeTests:
             TimeoutError,
             sqlite3.Error,
         ) as error:
-            await self._failed_start(lease, error, effects)
+            await self._failed_start(lease, error, effects, trace)
+
+    # Optional observation never adds a critical storage prerequisite or changes an already selected settlement.
+    def observe_start_owner(self, trace: StartSettlementTrace | None) -> None:
+        if trace is not None:
+            try:
+                trace.owner_observed(self.controller.recovery.authority())
+            except sqlite3.Error:
+                pass  # Critical publication/settlement already has its own owned retry; this observation is optional.
 
     # Settle the exact failed operation before optional diagnostics; a newer restrictive winner remains intact.
-    async def _failed_start(self, lease: TestLease, error: Exception, effects: bool) -> None:
+    async def _failed_start(
+        self, lease: TestLease, error: Exception, effects: bool, trace: StartSettlementTrace | None = None
+    ) -> None:
         c, j = self.controller, self.journal
         while not self._closing and not c.stopping:
             try:
@@ -572,12 +597,21 @@ class ManagedChargeTests:
                 row = j.db.execute(
                     "SELECT action,revision,state FROM managed_requests WHERE id=?", (lease.identifier,)
                 ).fetchone()
-                if (
-                    state.get("id") != lease.identifier
-                    or state.get("source") != "local"
-                    or row is None
-                    or row["action"] != ("start" if lease.normal else "start_test")
-                ):
+                facts = StartFailureFacts(
+                    lease.identifier,
+                    "start" if lease.normal else "start_test",
+                    state.get("id"),
+                    state.get("source"),
+                    state.get("state"),
+                    row["action"] if row is not None else None,
+                    row["state"] if row is not None else None,
+                    self.lease is lease,
+                    effects,
+                    state.get("tag_digest"),
+                )
+                decision = settle_start(facts)
+                self.last_start_settlement = decision
+                if decision.action is StartFailureAction.UNRELATED:
                     return
                 cause = {
                     "id": lease.identifier,
@@ -589,22 +623,18 @@ class ManagedChargeTests:
                     "effects_started": effects,
                 }
                 receipt = local_start_receipt(j)
-                if (
-                    receipt.get("request_id") == lease.identifier
-                    and receipt.get("digest") == state.get("tag_digest")
-                    and receipt.get("stage") == "prepared"
-                    and receipt.get("local") is None
-                ):
+                receipt_facts = StartReceiptFacts(
+                    receipt.get("request_id"), receipt.get("digest"), receipt.get("stage"), receipt.get("local")
+                )
+                decision = settle_start(facts, receipt_facts)
+                self.last_start_settlement = decision
+                if decision.retire_prepared:
                     retire_unsent_local_start(j, receipt.get("ticket"))
-                if (
-                    self.lease is not lease
-                    or state.get("state") not in ACTIVE
-                    or state.get("state") == "stopping"
-                    or row["state"] in ("completed", "failed")
-                ):
+                if decision.action is StartFailureAction.DIAGNOSTIC_ONLY:
                     self.record_failure_diagnostic(cause)
+                    self.observe_start_owner(trace)
                     return  # A deadline or later proof already owns the state and immutable terminal receipt.
-                if not effects:
+                if decision.action is StartFailureAction.FAIL_PREFLIGHT:
                     with j.atomic():
                         c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
                         j.put("managed_test_charge", {**self.state(), "state": "failed", "failure": cause})
@@ -614,6 +644,7 @@ class ManagedChargeTests:
                 else:
                     self.stop(lease, "start_not_confirmed", failure=cause)
                 self.record_failure_diagnostic(cause)
+                self.observe_start_owner(trace)
                 return
             except sqlite3.Error:
                 # Genuine critical storage failure retains the separate deadline's existing zero/Stop authority.

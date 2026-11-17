@@ -1,4 +1,4 @@
-"""Immutable records for the effect-free Start/Pause/Return experiment; no record grants wire permission."""
+"""Immutable Start/Pause/Return observation records; no record grants wire permission."""
 
 from __future__ import annotations
 

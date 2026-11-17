@@ -1,4 +1,4 @@
-"""Pure, effect-free evidence/authority pilot; the standalone service does not load or execute this experiment."""
+"""Pure evidence/authority transitions observed inside the existing owned Start child; no effect ports."""
 
 from __future__ import annotations
 

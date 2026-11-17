@@ -141,28 +141,39 @@ four-suite twenty-worker qualification.
   boundaries.
 - Never write to a charger from tests against a real device. The engine is tested with a fake charger over a real websocket.
 
-## Offline control experiment
+## Control transitions and Start settlement
 
-`core/prototype/control_slice.py` and `control_slice_state.py` contain a bounded Start/Pause/Return experiment.
+`core/prototype/start_settlement.py` owns the pure production Start failure selector. It returns unrelated work,
+diagnostic-only completion, preflight failure or required existing Stop settlement, with an independent prepared
+receipt-retirement flag. The async owner rebuilds facts on every storage retry and executes the selected action
+without an intervening await. Prepared retirement still precedes a diagnostic-only exit. Initial zero work counts
+as effects; an unsent RemoteStart alone is not proof of a preflight-only refusal. The original native/resource
+guards, SQL transactions, restrictive execution and cancellation retirement remain responsible for physical work.
+
+`control_slice.py` and `control_slice_state.py` retain bounded Start/Pause/Return observations.
 One immutable aggregate retains exact per-attempt identities, observed replies, committed outcome evidence,
 historical publication, local closure, separate cloud Start/Stop acknowledgement duties and Start-port retirement.
 Return interpretation reuses the production `release_disposition` policy. `step(state, event)` accepts boundary
 facts and returns an immutable state plus persistence, publication or recovery candidates. No candidate grants
-wire permission. The standalone service does not import these modules, and runtime authority has not moved.
+wire permission. The normal Start child feeds actual prepared, dispatch, reply, evidence COMMIT, publication
+COMMIT and retirement observations through its existing `StartHandoff`. There are no new tasks or journal writes.
+Current ownership is sampled at settlement; this is not a reconstruction of every earlier owner event's timing.
+Timed Start shares the production failure selector, while this boundary observation covers normal Start only.
 
 Run `tests/test_control_slice.py` and `tests/test_control_slice_inputs.py` for pure contract and causal-input rows.
+`tests/test_start_settlement.py` checks the production selector and commit-boundary observation without sockets.
 `tests/test_control_slice_peer.py` holds a genuine TLS
 Start reply, commits a newer owner Pause, releases the original Accepted bytes, then proves exact later lifecycle,
 Stop and Return using the existing engine and independent physical/SQL assertions. It also feeds those observed
 facts into the effect-free core; the core does not calculate the expected physical result.
 
-This pilot does not implement native admission, final dispatch/resource checks, restrictive permits, queue or
+The observation does not implement native admission, final dispatch/resource checks, restrictive permits, queue or
 storage scheduling, a complete port owner, restart/replay, journal migration, timers, current changes or debt
 attestation. `ports_retired` concerns only the Start ports represented in this experiment. Outcome storage and
 publication events report successful COMMIT, not attempted SQL. Original native/resource/live guards, SQL handoffs,
 deadline tasks and all existing boundary suites remain necessary. No test family is retired, and no code-size or
-full-suite speed improvement is established by the experiment. A production adapter requires its own concrete
-ownership, event-order and persistence proof before it can replace existing decisions.
+full-suite speed improvement is established by this bounded extraction. The broader state-owner and persistence
+migration remain future work; only the failure-settlement selection now replaces its former async predicates.
 
 `StartPrepared` reports an already admitted boundary; it does not admit a management request. The experiment's
 debt set does not replace `control.start_pending`, uncertainty, faults or operator-debt records. In particular,

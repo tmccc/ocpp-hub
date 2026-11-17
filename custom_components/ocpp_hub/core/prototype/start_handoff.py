@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 from ..frames import Frame
 from .connection_scope import CloudAttemptScope
 from .managed_intent import ControlIntent
+from .recovery_contracts import FailureKind, WireReply
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,28 @@ class StartHandoff:
 
     write_in_transaction: Callable[[StartHandoffContext], StartPublication]
     committed: Callable[[StartPublication], None]
+    observed: Callable[[StartBoundaryObservation], None] | None = None
+
+
+class StartBoundary(Enum):
+    """Observers run synchronously after the actual boundary, within the same owned child."""
+
+    PREPARED = "prepared"
+    DISPATCHED = "dispatched"
+    REPLIED = "replied"
+    EVIDENCE_COMMITTED = "evidence_committed"
+    PUBLICATION_COMMITTED = "publication_committed"
+    RETIRED = "retired"
+
+
+@dataclass(frozen=True)
+class StartBoundaryObservation:
+    boundary: StartBoundary
+    context: StartHandoffContext | None = None
+    reply: WireReply = WireReply.MISSING
+    publication: StartPublication | None = None
+    result: OwnedStartResult | None = None
+    failure_kind: FailureKind | None = None
 
 
 @dataclass(frozen=True)

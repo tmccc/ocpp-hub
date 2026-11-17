@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- Add an effect-free architectural experiment for Start/Pause/Return evidence and authority transitions.
-  Keep per-attempt physical outcomes, committed evidence, publication and lifecycle/cloud debts separate.
-  The standalone service does not load the experiment; existing runtime control and persistence remain authoritative.
+- Select Start failure settlement through one pure production policy, replacing the request, lease, phase and
+  receipt-retirement predicates in the async owner. Keep initial-zero effects distinct from RemoteStart dispatch.
+- Observe the normal Start child's real preparation, dispatch, reply, evidence/publication COMMIT and retirement
+  boundaries through immutable transitions. Keep physical outcomes and newer authority separate; observations have
+  no effect ports, new tasks or journal writes. Existing physical guards and publication owners remain in charge.
 - Add an independent real-peer witness for a genuine Start Accepted reply arriving after a newer Pause commits,
   followed by the exact delayed lifecycle, Stop and Return without repeating Start.
 

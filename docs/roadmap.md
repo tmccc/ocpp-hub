@@ -27,8 +27,11 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [~] A bounded, effect-free Start/Pause/Return transition core retains historical physical evidence separately
   from newer owner authority, with exact outcome COMMIT identity and distinct local/cloud Start/cloud Stop debts.
   It is exercised by pure contract rows and an independent real-peer late-Accepted-after-new-Pause witness.
-  The service does not import it. Existing runtime authority, persistence and test families remain in place;
-  production integration, measured simplification and qualification of a replacement remain open.
+  The normal Start child now feeds its real synchronous boundaries into that observation, and the runtime uses
+  one pure failure-settlement selector in place of the async predicates. A 30-case isolated shadow batch agreed
+  with all 17 observed legacy selections; the same 30 cases passed after replacement. The fast pure selector and
+  boundary tests take well under a second. Existing effect authority, persistence and test families remain in place.
+  Wider state ownership, net code reduction, full qualification and deployment of this change remain open.
 
 ## iCS implementation history — 15 November 2026
 
