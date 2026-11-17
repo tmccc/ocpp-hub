@@ -407,7 +407,7 @@ async def test_lost_original32_reply_reconciles_after_restart_without_rewrite(
             await session.native_bounded.restore_settings(lost_reply)
         assert session.journal.get("native_bounded_handover")["stage"] == "settings_intent"
         await session.close()
-        with pytest.raises(SecurityError, match="explicit original mode"):
+        with pytest.raises(SecurityError, match="explicit native bounded specification"):
             rig.session(bounded=False)
         second = rig.session()
         with pytest.raises(RecoveryRequiredError, match="no new listener"):
