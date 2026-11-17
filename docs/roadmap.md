@@ -10,12 +10,13 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 ## Current iCS implementation — 17 November 2026
 
-- [~] Version 0.2.3 implements shared recovery coordination, explicit permission/result/effect contracts, atomic
+- [x] Version 0.2.3 implements shared recovery coordination, explicit permission/result/effect contracts, atomic
   Start/Return authority publication and owned shutdown. Reconnect completion remains separate from admission
   auditing and verified zero. The README, navigation guide and recovery coverage describe these boundaries and
-  their regressions. Backend implementation `8013d2f` is deployed and independently verified, preserving settings,
-  history and paused zero while unplugged. The HA portion awaits separate restart approval. No new live charging
-  trial was performed.
+  their regressions. Backend and HA client implementation `8013d2f` are deployed and independently verified.
+  Settings, history, the dashboard, 16 entities and all 25 automation states (including five disabled) are preserved.
+  The final checks confirm unplugged, paused zero with the 32 A selection and native configuration retained.
+  Home Assistant remains on core 2026.11.1. No new live charging trial was performed.
 - [x] Implementation `8013d2f` passed all four complete suites with 20 workers each: 20,360 engine/model tests,
   620 HA 2026.11.0 client tests, 620 HA 2026.10.4 client tests and 48 older-integration tests. The normal evidence gate
   with fresh collection and the independent evidence audit passed. Documentation-only follow-ups do not change
