@@ -358,7 +358,7 @@ class ManagedCurrentLimits:
             and not c.stopping
             and not self.pending()
             and not j.get("managed_control_fault")
-            and j.get("trial_phase") == "active"
+            and j.phase.read().active
             and g.controls.ready
             and g.current_boot_seen(g._charger_epoch)
             and c.native.introduced_epoch == g._charger_epoch
@@ -445,7 +445,7 @@ class ManagedCurrentLimits:
                 or control_revision != g.controls._revision
                 or not g.current_boot_seen(epoch)
                 or j.get("managed_control_fault")
-                or j.get("trial_phase") != "active"
+                or not j.phase.read().active
                 or j.active() is not None
                 or j.get("control", {}).get("start_pending")
                 or j.get("vendor_start_grant")
@@ -608,7 +608,7 @@ class ManagedCurrentLimits:
         guard()
         await g.controls.ensure_ceiling(guard=guard)
         guard()
-        if j.get("trial_phase") == "active":
+        if j.phase.read().active:
             g.controls._complete(j.get("control")["ticket"], uncertain=False)
 
     # Reconcile the failed selection under zero, then restore only the previous verified current without any Start.

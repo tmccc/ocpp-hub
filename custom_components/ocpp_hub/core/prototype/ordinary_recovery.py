@@ -71,7 +71,7 @@ class OrdinaryRecovery:
         return (
             not c.stopping
             and (not j.get("managed_control_fault"))
-            and (j.get("trial_phase") in ("active", "recovering"))
+            and (j.phase.read().operating)
             and (c.requests.intent().mode == "app")
             and (not c.current.pending())
             and (c.charging.lease is None)
@@ -176,7 +176,7 @@ class OrdinaryRecovery:
     # The shared zero-only recovery works after reconnect as well as after a bounded ordinary telemetry outage.
     def needed(self) -> bool:
         j = self.c.session.journal
-        return self.ordinary() and (self.active() or j.get("trial_phase") == "recovering")
+        return self.ordinary() and (self.active() or j.phase.read().value == "recovering")
 
     # Either channel can close a real mapped session first; disagreement grants only a zero-output restrictive wait.
     def closure_gap(self, native: HandoverEvidence) -> bool:
@@ -233,7 +233,7 @@ class OrdinaryRecovery:
         epoch, boot = g._charger_epoch, g.boot_observation
         if not j.get("control", {}).get("inhibit") or j.get("control", {}).get("owner") != "local":
             g.controls._claim(True, stopping=True)
-        j.put("trial_phase", "recovering")
+        j.phase.recover()
         c.released_epoch = None
 
         # A new owner intent, source epoch or overlapping state machine cannot inherit this station write.
@@ -376,7 +376,7 @@ class OrdinaryRecovery:
                     "at_epoch": time.time(),
                 },
             )
-            j.put("trial_starting", False)
+            j.phase.introduced()
         c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
         return ALLOW
 

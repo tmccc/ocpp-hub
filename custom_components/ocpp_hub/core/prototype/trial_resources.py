@@ -118,7 +118,7 @@ class ResourceBook:
         fault = self.journal.get("trial_preservation_fault", {})
         inventory_fault = self.journal.get("trial_inventory_fault", {})
         return {
-            "phase": self.journal.get("trial_phase"),
+            "phase": self.journal.phase.read().value,
             "resources": self.journal.db.execute("SELECT COUNT(*) FROM trial_resources").fetchone()[0],
             "uncertain_resources": self.journal.db.execute(
                 "SELECT COUNT(*) FROM trial_resources WHERE state='uncertain'"
@@ -155,8 +155,7 @@ class ResourceBook:
                 "UPDATE trial_resources SET state='uncertain' WHERE key=? AND state!='absent_verified'",
                 (key or "profile:" + str(HUB_PROFILE_ID),),
             )
-            if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
-                self.journal.put("trial_phase", "blocked")
+            self.journal.phase.block_unless_cleanup()
         except sqlite3.Error as failure:
             raise error from failure
         raise error
@@ -209,8 +208,7 @@ class ResourceBook:
                     "trial_preservation_fault",
                     {"missing": missing, "changed": changed, "observed_at": evidence.observed_at},
                 )
-            if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
-                self.journal.put("trial_phase", "blocked")
+            self.journal.phase.block_unless_cleanup()
         except sqlite3.Error as failure:
             raise error from failure
         raise error
@@ -230,13 +228,13 @@ class ResourceBook:
         self.owned_present(evidence)
         if self.journal.active() is not None or self.journal.next_delivery() is not None:
             raise RecoveryRequiredError("trial lifecycle requires reconciliation before activation")
-        if self.journal.get("trial_phase") not in ("prepared", "active"):
+        if not self.journal.phase.read().admissible:
             raise RecoveryRequiredError("rollback has started or completed; trial cannot automatically rearm")
-        self.journal.put("trial_phase", "active")
+        self.journal.phase.activate()
 
     # Persist intent immediately before send; only the bounded constant-profile trial subset can create resources.
     def before_send(self, action: str, payload: dict[str, Any]) -> GateDecision | None:
-        phase = self.journal.get("trial_phase")
+        phase = self.journal.phase.read().value
         reads = ("GetConfiguration", "GetCompositeSchedule", "TriggerMessage")
         reading = action in reads or action == "DataTransfer" and is_safe_transaction_query(payload)
         if not reading:

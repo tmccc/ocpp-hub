@@ -201,7 +201,7 @@ class ManagedCharging:
             not c.stopping
             and (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused")
             and not j.get("managed_control_fault")
-            and j.get("trial_phase") == "active"
+            and j.phase.read().active
             and g.controls.ready
             and g.controls.desired() == (0 if c.requests.intent().mode == "paused" else c.current.selected())
             and (normal or c.current.selected() == 6)
@@ -291,7 +291,7 @@ class ManagedCharging:
             or c.current.selected() != lease.current_a
             or c.current.pending()
             or j.get("managed_control_fault")
-            or j.get("trial_phase") != "active"
+            or not j.phase.read().active
             or self.state().get("id") != lease.identifier
             or self.state().get("state") not in ACTIVE
             or self.state().get("state") == "stopping"
@@ -890,7 +890,7 @@ class ManagedCharging:
             and control.get("ticket") == receipt["ticket"]
             and control.get("owner") in ("local", "shared")
             and control.get("inhibit") is False
-            and j.get("trial_phase") == "active"
+            and j.phase.read().active
             and not j.get("managed_control_fault")
             and not c.stopping
         )

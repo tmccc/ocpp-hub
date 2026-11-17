@@ -71,6 +71,7 @@ class Journal:
             except BlockingIOError:
                 raise RecoveryRequiredError("journal already has an active owner") from None
             from .control_state import ControlAuthority
+            from .installation_lifecycle import InstallationLifecycle
             from .retired_schedules import schedule_history
             from .start_lifecycle import StartLifecycle
 
@@ -82,6 +83,7 @@ class Journal:
             self.db = sqlite3.connect(path, isolation_level=None)
             cleanup.callback(self.db.close)
             self.control = ControlAuthority(self)
+            self.phase = InstallationLifecycle(self)
             self.starts = StartLifecycle(self)
             self._initialize(path, identity)
             cleanup.pop_all()
@@ -219,7 +221,7 @@ class Journal:
 
     # New trial sessions need a durable identity-bound allocation boundary; old receipts and Stop remain readable.
     def require_allocation(self) -> None:
-        if self.get("trial_phase") is None:
+        if self.phase.read().value is None:
             return
         proof = self.get("trial_allocation")
         counter = self.get("next_transaction")

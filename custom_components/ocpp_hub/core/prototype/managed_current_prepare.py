@@ -47,7 +47,7 @@ async def prepare_current_capability(
             or journal.get("native_bounded_handover", {}).get("spec") != spec.value()
             or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
             or journal.get("managed_control_intent", {}).get("mode") != "paused"
-            or journal.get("trial_phase") not in ("active", "recovering")
+            or not journal.phase.read().operating
             or journal.get("managed_control_fault")
             or not control.get("inhibit")
             or control.get("owner") != "local"

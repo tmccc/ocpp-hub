@@ -160,6 +160,14 @@ for a later send; exact native/Boot/ticket checks remain at the actual effect an
 `ManagedCharging` and `ChargeLease` in `managed_charging.py` own normal charging and bounded local/cloud tests.
 The historical `managed_test_charge` journal key and public test command/status names remain unchanged.
 
+`Journal.phase` in `installation_lifecycle.py` is the sole installation phase/introduction-flag writer. Its small
+`InstallationState` names shared read predicates; every `read()` samples only the phase, and the separate
+`starting` property preserves raw legacy values. Transitions retain the existing keys and values without adding
+validation, transactions, device calls or a cache. Supplied control preimages and phase/control/flag write order
+remain explicit, including native-history recovery's phase-before-hold order and phase-only introduction writes.
+`test_installation_lifecycle.py` covers unknown JSON, the distinct fault policies, phase-only authority, ordered
+publication, actual statement and deferred-FK COMMIT rollback, and the absence of an implicit transaction.
+
 `ManagedRequests` owns durable control-intent serialization and Pause/Return request transitions. Domain recovery
 uses `write_intent(journal, current, mode)` with its original captured intent and transaction; constructing a
 request owner during native admission would prematurely normalize requests. `ControlIntent.next` owns revision

@@ -51,8 +51,8 @@ def initialize_trial_baseline(journal: Journal, baseline: dict[str, Any]) -> Non
             if occupied:
                 raise SecurityError("trial requires a new journal or its original verified baseline")
             journal.put("trial_baseline", baseline)
-            journal.put("trial_phase", "prepared")
-        elif journal.get("trial_phase") is None:
+            journal.phase.prepare()
+        elif journal.phase.read().value is None:
             if not pristine_interrupted_bootstrap(journal):
                 raise SecurityError("interrupted trial bootstrap contains unrelated state")
-            journal.put("trial_phase", "prepared")
+            journal.phase.prepare()

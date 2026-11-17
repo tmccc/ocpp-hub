@@ -262,8 +262,8 @@ class ConnectionRuntime:
                 and gateway.controls._revision == control_revision
                 and journal.get("control", {}).get("ticket") == ticket
                 and journal.get("native_bounded_handover", {}).get("stage") == "admitted"
-                and journal.get("trial_phase") in ("active", "recovering")
-                and not journal.get("trial_starting")
+                and journal.phase.read().operating
+                and not journal.phase.starting
                 and journal.get("control", {}).get("inhibit") is True
                 and gateway.controls.desired() == 0
             )

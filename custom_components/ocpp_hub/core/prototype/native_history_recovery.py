@@ -93,7 +93,7 @@ def _reconcile(
         or type(fault.get("at_epoch")) not in (int, float)
         or type(failure.get("at_epoch")) not in (int, float)
         or not 0 <= fault["at_epoch"] - failure["at_epoch"] <= 2
-        or journal.get("trial_phase") not in ("blocked", "recovering")
+        or not journal.phase.read().held
         or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
         or journal.get("trial_preservation_fault")
         or journal.get("trial_inventory_fault")
@@ -196,6 +196,6 @@ def _reconcile(
                 },
             )
         journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
-        journal.put("trial_phase", "recovering")
+        journal.phase.recover()
         journal.control.hold(control)
     return {**summary, "fault_cleared": True, "charging_started": False}

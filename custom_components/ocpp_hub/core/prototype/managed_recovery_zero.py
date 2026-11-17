@@ -34,7 +34,7 @@ def require_original_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
         or type(control.get("resume_limit")) not in (int, float)
         or not 6 <= control["resume_limit"] <= ceiling
         or int(control["resume_limit"]) != control["resume_limit"]
-        or j.get("trial_phase") not in ("blocked", "recovering", "active")
+        or not j.phase.read().supervised
         or j.get("native_bounded_handover", {}).get("stage") != "admitted"
         or j.get("native_bounded_handover", {}).get("fault")
         or j.get("trial_preservation_fault")

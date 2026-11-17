@@ -181,7 +181,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or g.vendor.sender is None
             or g.vendor_registration != "Accepted"
             or not s.runtime.status.vendor_connected
-            or j.get("trial_phase") not in ("active", "blocked", "recovering")
+            or not j.phase.read().supervised
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
             or j.get("native_bounded_handover", {}).get("fault")
             or j.get("trial_preservation_fault")
@@ -315,9 +315,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 ),
             )
             j.db.execute("DELETE FROM meta WHERE key=?", (INTERRUPTED,))
-        j.control.hold(control)
-        j.put("trial_phase", "recovering")
-        j.put("trial_starting", False)
+        j.phase.recover_introduced(control)
     # fault() invalidated the old revision. This complete closed proof re-establishes only current zero introduction.
     # Never assign a newer revision before every binding/Boot/debt/closed-zero check and the durable commit succeed.
     c.native.audited_epoch = epoch

@@ -48,7 +48,7 @@ def initial_zero_recovery(owner: ManagedCharging, lease: ChargeLease) -> bool:
         and not c.current.pending()
         and not c.stopping
         and not c.requests.return_in_progress()
-        and j.get("trial_phase") == "active"
+        and j.phase.read().active
         and not j.get("managed_control_fault")
         and not j.get("uncertain_vendor_command")
         and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
@@ -78,7 +78,7 @@ def retire_cancelled_start(owner: ManagedCharging, lease: ChargeLease) -> Cancel
         j.starts.retire(candidate)
         recover = initial_zero_recovery(owner, lease)
         if recover:
-            j.put("trial_phase", "recovering")
+            j.phase.recover()
     if recover:
         owner.controller.released_epoch = None
     j.starts.set_lease(None)

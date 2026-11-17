@@ -193,7 +193,7 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
     else:
         j = c.session.journal
         value.update(
-            phase=j.get("trial_phase"),
+            phase=j.phase.read().value,
             pending_lifecycle_events=j.db.execute(
                 "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
             ).fetchone()[0],
@@ -236,7 +236,7 @@ def observed_status(
         **base,
         "local_healthy": verdict.local_healthy,
         "checked_at": time.time(),
-        "phase": j.get("trial_phase"),
+        "phase": j.phase.read().value,
         "cloud_connected": verdict.cloud_ready,
         "state": verdict.state,
         "owner_control_enabled": verdict.shared,

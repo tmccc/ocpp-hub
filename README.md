@@ -799,6 +799,11 @@ The timed test button and fresh progress are published on the charger dashboard;
 
 ## Current iCS controls and 32 A operation
 
+Installation preparation, activation, recovery, blocking and cleanup share one journal lifecycle owner,
+`Journal.phase` in `prototype/installation_lifecycle.py`. It names the existing transitions and common phase
+checks while retaining the stored format and each caller's physical proof and SQL transaction. The phase and
+introduction flag remain observations; they do not grant permission for a later command.
+
 Home Assistant also exposes **Start charging** for a regular locally issued session at the selected current. Legacy
 six-ampere operation remains the default until the explicit current capability below is commissioned. Start can run
 from idle app control or a freshly verified local pause. Start rechecks the current intent, Boot and control claim

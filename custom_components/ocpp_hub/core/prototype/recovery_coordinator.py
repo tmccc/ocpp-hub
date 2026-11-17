@@ -239,7 +239,7 @@ class RecoveryCoordinator:
         decision = c.zero_decision(native, continuing_local=continuing_local)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
-        if j.get("trial_phase") == "recovering":
+        if j.phase.read().value == "recovering":
             resumed = await c.native.resume_result(
                 continuing_local=continuing_local, preserve_expired_start=c.charging.preserve_debt
             )
@@ -257,7 +257,7 @@ class RecoveryCoordinator:
             or epoch != g._charger_epoch
             or revision != g.controls._revision
             or ticket != j.get("control", {}).get("ticket")
-            or j.get("trial_phase") != "active"
+            or not j.phase.read().active
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")

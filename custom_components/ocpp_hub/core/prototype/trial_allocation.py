@@ -77,10 +77,10 @@ def initialize_allocation(journal: Journal, history: HistoryObservation, identit
             journal.require_allocation()
             if journal.get("trial_allocation")["hardware_digest"] != fingerprint(hardware):
                 raise SecurityError("saved allocation belongs to another physical charger")
-            if journal.get("trial_phase") == "prepared" and history.floor > journal.get("next_transaction"):
+            if journal.phase.read().value == "prepared" and history.floor > journal.get("next_transaction"):
                 raise RecoveryRequiredError("native history advanced beyond the prepared allocation boundary")
             return
-        if journal.get("next_transaction") is not None or journal.get("trial_phase") != "prepared":
+        if journal.get("next_transaction") is not None or journal.phase.read().value != "prepared":
             raise RecoveryRequiredError("an existing ledger cannot be reseeded from native history")
         if set(row[0] for row in journal.db.execute("SELECT key FROM meta")) != {
             "identity",

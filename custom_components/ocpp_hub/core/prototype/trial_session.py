@@ -135,7 +135,7 @@ class TrialSession:
             retired = self.journal.get("connected_handover")
             if retired is not None and (not isinstance(retired, dict) or retired.get("stage") != "complete"):
                 raise SecurityError("retired vehicle-pause handover requires its original recovery implementation")
-            if not self.journal.get("native_bounded_handover") and self.journal.get("trial_phase") not in (
+            if not self.journal.get("native_bounded_handover") and self.journal.phase.read().value not in (
                 None,
                 "prepared",
             ):
@@ -176,18 +176,10 @@ class TrialSession:
             transport = TrialTransport(config, prepared.tls, actual_settings)
             self.runtime = ConnectionRuntime(self.gateway, transport, actual_settings, self._before_ceiling)
             self.runtime.vendor_enabled = lambda: (
-                self.journal.get("trial_phase") == "active"
-                or (self.journal.get("trial_phase") in ("recovering", "blocked") and self.gateway.controls.ready)
+                self.journal.phase.read().active or (self.journal.phase.read().held and self.gateway.controls.ready)
             )
             # Reconfirming zero can briefly invalidate readiness without revoking an established lifecycle channel.
-            self.runtime.vendor_session_enabled = lambda: (
-                self.journal.get("trial_phase")
-                in (
-                    "active",
-                    "recovering",
-                    "blocked",
-                )
-            )
+            self.runtime.vendor_session_enabled = lambda: self.journal.phase.read().supervised
             self.native_bounded = NativeBoundedHandover(
                 self.gateway,
                 self.book,
@@ -251,8 +243,7 @@ class TrialSession:
                     },
                 )
                 self._persist_introduction_refusal()
-            if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
-                self.journal.put("trial_phase", "blocked")
+            self.journal.phase.block_unless_cleanup()
             raise UnavailableError("native bounded introduction failed; positive controls remain blocked") from None
 
     # Retry only the failed atomic publication, retaining the proved refusal even if the device changes meanwhile.
@@ -270,12 +261,12 @@ class TrialSession:
 
     # Verify native admission or recovery before the listener opens; actual Boot still establishes readiness.
     async def start(self) -> None:
-        phase = self.journal.get("trial_phase")
+        phase = self.journal.phase.read()
         if not self.started and self.journal.get("managed_mode"):
             recover_unreported_local_start(self.journal)
-        if phase == "prepared":
+        if phase.value == "prepared":
             await self.native_bounded.admit()
-        elif phase in ("active", "recovering", "blocked"):
+        elif phase.supervised:
             native = await self.native_bounded.read()
             if self.journal.get("trial_binding") is None:
                 self.native_bounded.require_known_session(native)
@@ -289,11 +280,11 @@ class TrialSession:
                 if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
                     raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
                 self.journal.require_allocation()
-                self.journal.put("trial_phase", "active")
-                self.journal.put("trial_starting", True)
+                self.journal.phase.activate()
+                self.journal.phase.begin_introduction()
             else:
-                self.journal.put("trial_phase", "recovering")
-        elif phase == "rollback":
+                self.journal.phase.recover()
+        elif phase.value == "rollback":
             native = await self.native_bounded.read(closed=True)
             if not self.book.owned_present(native.physical):
                 return
@@ -346,7 +337,7 @@ class TrialSession:
             return await self.native_bounded.resume()
         if command == "start":
             self.journal.require_allocation()
-            if self.journal.get("trial_starting") or not self.gateway.controls.ready:
+            if self.journal.phase.starting or not self.gateway.controls.ready:
                 raise RecoveryRequiredError("local Start requires the current verified trial ceiling")
             tags = self.prepared.config.local_tags
             if len(tags) != 1:
@@ -354,7 +345,7 @@ class TrialSession:
             await self.gateway.start(next(iter(tags)))
             return {"start_requested": True, "ceiling_a": 6}
         if command == "release":
-            if self.journal.get("trial_starting") or not self.gateway.controls.ready:
+            if self.journal.phase.starting or not self.gateway.controls.ready:
                 raise RecoveryRequiredError("release requires the current verified trial ceiling")
             await self.gateway.release()
             return {"local_owner_released": True, "ceiling_a": 6}
@@ -374,7 +365,7 @@ class TrialSession:
         self.closing = True
         uncertain = False
         try:
-            if self.started and self.journal.get("trial_phase") in ("active", "recovering", "blocked"):
+            if self.started and self.journal.phase.read().supervised:
                 try:
                     if self.gateway.charger.sender is None:
                         control = self.journal.get("control", {})

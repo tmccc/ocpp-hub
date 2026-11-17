@@ -77,6 +77,13 @@ changes rather than a cumulative total. Further simplification remains open.
   ordering. Remove three unused exception adapters; retain all charging features and persisted formats. The gain is
   consistent authority vocabulary rather than another large line-count reduction.
 
+## Local lifecycle refactor — 17 November 2026
+
+- [~] Give installation phase and introduction-flag writes one owner, `Journal.phase`, with named transitions
+  and shared phase predicates. Preserve raw stored values, lazy reads, separate fault policies, physical-control
+  preimages and original transaction/write order. This is an ownership improvement; full qualification and
+  deployment are separate from the requested focused development checks and Claude review.
+
 ## iCS implementation history — 15–17 November 2026
 
 - [x] Previous deployment `8013d2f` passed all four complete suites with 20 workers each: 20,360 engine/model tests,

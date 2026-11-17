@@ -88,7 +88,7 @@ class NativeBoundedHandover:
         saved = gateway.journal.get("native_bounded_handover")
         if saved and saved.get("spec") != spec.value():
             raise SecurityError("native bounded specification changed across process replacement")
-        if not saved and gateway.journal.get("trial_phase") != "prepared":
+        if not saved and gateway.journal.phase.read().value != "prepared":
             raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
 
     # The last verified native snapshot expires on the same clock and within the same limit as its admission audit.
@@ -132,7 +132,7 @@ class NativeBoundedHandover:
                 "epoch": gateway._charger_epoch,
                 "boot_observation": gateway.boot_observation,
                 "revision": gateway.controls._revision,
-                "phase": journal.get("trial_phase"),
+                "phase": journal.phase.read().value,
                 "control": journal.get("control"),
                 "active": journal.active(),
                 "boot": journal.get("boot"),
@@ -345,7 +345,7 @@ class NativeBoundedHandover:
     # Initial connected admission has its own guard; allocation is reserved before adding any mode metadata.
     async def admit(self) -> None:
         journal = self.gateway.journal
-        if journal.get("trial_phase") != "prepared":
+        if journal.phase.read().value != "prepared":
             raise RecoveryRequiredError("native bounded admission requires a fresh prepared journal")
         native = await self.observe()
         self.spec.require_admission(native, journal.identity, route="original")
@@ -357,7 +357,7 @@ class NativeBoundedHandover:
             self.book.activate_bounded(native, self.spec.hardware_identity)
             self.save("admitted", original_history=list(native.history))
             journal.control.admit()
-            journal.put("trial_starting", True)
+            journal.phase.begin_introduction()
 
     # Live introduction bodies retain their pending restrictive effects through all awaited cleanup.
     @property
@@ -381,7 +381,7 @@ class NativeBoundedHandover:
         with self._introduction_work():
             gateway, journal = self.gateway, self.gateway.journal
             epoch = gateway._charger_epoch
-            if journal.get("trial_phase") not in ("active", "recovering", "blocked"):
+            if not journal.phase.read().supervised:
                 raise RecoveryRequiredError("native bounded introduction cannot rearm frozen cleanup")
             if not gateway.current_boot_seen(epoch) or fingerprint(journal.get("boot")) != self.spec.boot_digest:
                 raise SecurityError("native bounded introduction requires the commissioned actual Boot")
@@ -389,7 +389,7 @@ class NativeBoundedHandover:
             scope = current_scope(gateway)
             if binding is not None and scope is not None:
                 self.introduction_lineage = scope.lineage
-            first_zero = binding is None or bool(journal.get("trial_starting"))
+            first_zero = binding is None or bool(journal.phase.starting)
             try:
                 native = await self.read(closed=first_zero, owned=True, initial=binding is None)
             except (
@@ -405,7 +405,7 @@ class NativeBoundedHandover:
             gateway._require_epoch("charger", epoch)
             if binding is None:
                 if (
-                    journal.get("trial_phase") != "active"
+                    not journal.phase.read().active
                     or journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone()
                 ):
                     raise RecoveryRequiredError("initial native bounded introduction cannot adopt existing resources")
@@ -458,10 +458,10 @@ class NativeBoundedHandover:
                             raise
                         raise IntroductionDeferredError("initial zero was superseded by a newer owner Pause") from error
                     gateway._require_epoch("charger", epoch)
-                journal.put("trial_phase", "recovering")
+                journal.phase.recover()
             self.audited_epoch = epoch
             verified_revision = gateway.controls._revision
-            journal.put("trial_starting", False)
+            journal.phase.introduced()
             if binding is not None and native.physical.transaction_open:
                 if journal.get("managed_current_change", {}).get("state") == "recovering":
                     pass  # This operation owns only zero; fresh supervision must identify the independent session.
@@ -499,8 +499,8 @@ class NativeBoundedHandover:
         if (
             self.audited_epoch != epoch
             or self.introduction_pending
-            or j.get("trial_starting")
-            or j.get("trial_phase") not in ("active", "recovering")
+            or j.phase.starting
+            or not j.phase.read().operating
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
             or j.get("trial_binding") != binding
             or j.get("managed_control_intent", {}).get("mode") != "paused"
@@ -602,7 +602,7 @@ class NativeBoundedHandover:
             scope = current_scope(gateway)
             ticket = journal.get("control", {}).get("ticket")
             if (
-                journal.get("trial_phase") != "recovering"
+                journal.phase.read().value != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
                 or gateway.charger.sender is None
                 or not gateway.current_boot_seen(epoch)
@@ -650,7 +650,7 @@ class NativeBoundedHandover:
             if isinstance(decision, Pending):
                 return decision
             if (
-                journal.get("trial_phase") != "recovering"
+                journal.phase.read().value != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
                 or not control_scope_matches(gateway, (scope, revision))
                 or ticket != control.get("ticket")
@@ -673,8 +673,7 @@ class NativeBoundedHandover:
                 raise RecoveryRequiredError("local recovery intent changed during native verification")
             journal.require_allocation()
             with journal.atomic():
-                journal.control.hold(control, uncertain=False)
-                journal.put("trial_phase", "active")
+                journal.phase.resume(control)
             self.acknowledged_lineage = scope.lineage
             return {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}
 
@@ -722,8 +721,8 @@ class NativeBoundedHandover:
         else:
             self.require_known_session(native)
             if (
-                self.gateway.journal.get("trial_phase") != "active"
-                or self.gateway.journal.get("trial_starting")
+                not self.gateway.journal.phase.read().active
+                or self.gateway.journal.phase.starting
                 or self.gateway.journal.get("native_bounded_handover", {}).get("stage") != "admitted"
             ):
                 raise RecoveryRequiredError("native bounded positive controls remain frozen")
@@ -735,16 +734,16 @@ class NativeBoundedHandover:
             raise SecurityError("retire the managed current capability before legacy cleanup")
         async with self.lock:
             gateway, journal = self.gateway, self.gateway.journal
-            if journal.get("trial_phase") == "backend_restore_pending":
+            if journal.phase.read().value == "backend_restore_pending":
                 native = await self.read(closed=True)
                 if self.book.owned_present(native.physical):
                     raise RecoveryRequiredError("native bounded cleanup awaits independently verified profile absence")
                 return {"profiles_restored": True, "native_limit_a": 6, "complete": False}
-            if journal.get("trial_phase") not in ("active", "recovering", "blocked", "rollback"):
+            if journal.phase.read().value not in ("active", "recovering", "blocked", "rollback"):
                 raise RecoveryRequiredError("native bounded cleanup is not available in this phase")
-            if journal.get("trial_phase") != "rollback":
+            if journal.phase.read().value != "rollback":
                 self.save("closing")
-                journal.put("trial_phase", "blocked")
+                journal.phase.block()
                 initial = await self.read()
                 present = self.book.owned_present(initial.physical)
                 self.require_known_session(initial)
@@ -768,7 +767,7 @@ class NativeBoundedHandover:
             native = await self.read(closed=True)
             require_lifecycle_idle(gateway)
             self.book.owned_present(native.physical)
-            journal.put("trial_phase", "rollback")
+            journal.phase.begin_cleanup()
             self.save("clearing")
             gateway.controls.invalidate()
             await quiesce()
@@ -797,13 +796,13 @@ class NativeBoundedHandover:
                     if any(row.key == resource.key for row in self.book.owned_present(verification.physical)):
                         raise UnavailableError("native bounded cleanup has not established physical profile absence")
             self.save("awaiting_backend", clear_intent={})
-            journal.put("trial_phase", "backend_restore_pending")
+            journal.phase.await_backend()
             return {"profiles_restored": True, "native_limit_a": 6, "complete": False}
 
     # A route intent is durable and narrowly scoped; a native adapter performs only this exact four-field patch.
     async def restore_route(self, patch: NativePatch, retire: Callable[[], Awaitable[None]]) -> None:
         journal = self.gateway.journal
-        if journal.get("trial_phase") != "backend_restore_pending":
+        if journal.phase.read().value != "backend_restore_pending":
             raise RecoveryRequiredError("native bounded resources are not yet restored")
         state = journal.get("native_bounded_handover", {})
         current = await self.observe()
@@ -829,7 +828,7 @@ class NativeBoundedHandover:
     async def observe_backend(self) -> dict[str, Any]:
         journal = self.gateway.journal
         state = journal.get("native_bounded_handover", {})
-        if journal.get("trial_phase") != "backend_restore_pending" or not state.get("route_restored"):
+        if journal.phase.read().value != "backend_restore_pending" or not state.get("route_restored"):
             raise RecoveryRequiredError("native bounded original route has not been independently verified")
         if self.gateway.charger.sender is not None:
             raise SecurityError("proxy transport remains attached during original-backend verification")
@@ -866,7 +865,7 @@ class NativeBoundedHandover:
         require_lifecycle_idle(self.gateway)
         with journal.atomic():
             self.save("complete", clear_intent={}, fault=None)
-            journal.put("trial_phase", "complete")
+            journal.phase.complete()
         self.last_verified_at = 0
         return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}
 

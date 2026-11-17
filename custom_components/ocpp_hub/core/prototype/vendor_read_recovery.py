@@ -39,7 +39,7 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
             or intent.get("mode") not in ("app", "paused")
             or type(intent.get("revision")) is not int
             or not 0 <= intent["revision"] < 2**53 - 1
-            or journal.get("trial_phase") not in ("active", "recovering", "blocked")
+            or not journal.phase.read().supervised
             or fault is not None
             and not isinstance(fault, dict)
             or fault is not None
@@ -78,6 +78,5 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
         if fault is not None and fault.get("classification") == "owner_control_or_delivery_uncertain":
             journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
         write_intent(journal, ControlIntent(intent["mode"], intent["revision"]), "paused", coalesce=True)
-        journal.control.hold(control)
-        journal.put("trial_phase", "recovering")
+        journal.phase.restrict(control)
         return True

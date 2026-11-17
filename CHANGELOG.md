@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Give installation phases and the introduction flag one journal owner. Name the shared phase predicates and
+  compound transitions while preserving stored values, lazy reads, write order and caller-owned transactions.
+  Keep phase-only recovery distinct from physical holds and the two existing fault-blocking policies.
+
 - Share exact Boot/control-generation checks across Start, Pause, rollback and publication. Put complete authority
   reconstruction on the controller and remove three unused check adapters. Preserve narrower Stop/fault/current
   guards, pending outcomes, journal formats and all charging features.

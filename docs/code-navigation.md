@@ -67,6 +67,7 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
 | Physical control authority | [`control_state.py`](../custom_components/ocpp_hub/core/prototype/control_state.py), `ControlState` and `Journal.control`; the sole serializer for ownership, holds, ticket completion and current/Start projections | `test_control_authority.py`, `test_bound_owner_retirement.py`, `test_release_publication.py` |
+| Installation lifecycle | [`installation_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/installation_lifecycle.py), `Journal.phase`; the sole phase/introduction-flag writer and shared phase predicates | `test_installation_lifecycle.py`, `test_persistence_bootstrap.py`, `test_native_bounded_handover.py` |
 | Live supervision and health | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `_tick()`; `supervision.py`, pure authority/health assessment; `managed_view.py`, shared public views | `test_supervision.py`, `test_managed_proxy.py`, `test_managed_observed_freshness.py` |
 | Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions and terminal progress; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
 | Start lifecycle and settlement | [`start_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/start_lifecycle.py), `StartLifecycle`, typed persisted identity, receipt/pending/metadata writes and the lease slot; `start_settlement.py`, pure failure/retirement policy, shared evidence and scoped candidates | `test_start_lifecycle.py`, `test_start_settlement.py`, `test_control_slice_peer.py` |
@@ -86,6 +87,15 @@ raw extra fields and missing-key defaults; its shared/hold predicates distinguis
 Boolean proof. Admission replaces the record; claim, hold, current selection and Start projection transitions merge
 the caller's existing preimage. Exact-ticket completion cannot publish a late result over a newer Pause. Callers
 keep their transactions and fresh physical checks; the owner adds no cache, migration, socket or transaction.
+
+`Journal.phase` owns the existing `trial_phase` and `trial_starting` keys. `read()` samples only the phase into an
+`InstallationState`; `starting` remains a separate lazy read with its original raw truthiness. Named predicates
+share active, operating, supervised, held, cleanup and legacy admission checks without interpreting a snapshot as
+permission. Phase-only transitions add no physical hold. Compound restriction, fault, local resume and fault
+retirement preserve their supplied control preimages and ordered writes inside the caller's transaction.
+Resource faults retain cleanup while managed faults block only supervised phases. The resource send guard keeps
+its local zero-only phase override; it does not persist activation. Unknown stored JSON and absent legacy phases
+retain their existing comparison and status meanings.
 
 `current_control_scope()` in `connection_scope.py` captures the exact authenticated Boot and control revision;
 `control_scope_matches()` reconstructs that identity at every dispatch or publication check. Missing observations

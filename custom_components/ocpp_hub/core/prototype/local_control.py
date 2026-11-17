@@ -194,7 +194,7 @@ class LocalControl:
     # A real Accepted result on the current transport is necessary before charging-capable vendor commands.
     @property
     def ready(self) -> bool:
-        if self.journal.get("trial_phase") is not None:
+        if self.journal.phase.read().value is not None:
             receipt = self.journal.db.execute(
                 "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
             ).fetchone()
@@ -221,14 +221,14 @@ class LocalControl:
 
     # Record ownership and uncertainty before anything can be sent to the charger.
     def _claim(self, inhibit: bool, stopping: bool = False) -> tuple[int, str]:
-        phase = self.journal.get("trial_phase")
+        phase = self.journal.phase.read()
         previous = self.journal.get("control", {})
-        if stopping and phase in ("rollback", "backend_restore_pending"):
+        if stopping and phase.value in ("rollback", "backend_restore_pending"):
             if self.journal.active() is None and not previous.get("start_pending"):
                 raise DeniedError("trial cleanup remains frozen without a known session to stop")
-        elif stopping and phase in ("blocked", "recovering"):
-            self.journal.put("trial_phase", "recovering")
-        elif phase not in (None, "active"):
+        elif stopping and phase.held:
+            self.journal.phase.recover()
+        elif not phase.legacy_active:
             raise DeniedError("trial local controls are frozen")
         ticket = uuid.uuid4().hex
         self.journal.control.claim(previous, ticket, inhibit, stopping, self.policy.max_current_a)
@@ -258,7 +258,7 @@ class LocalControl:
     async def _cap_result(
         self, call: ResultCall, limit: float, epoch: int, *, guard: Guard | None = None
     ) -> Reply | CapPending:
-        if limit > 0 and self.journal.get("trial_starting"):
+        if limit > 0 and self.journal.phase.starting:
             raise DeniedError("initial native admission has not completed")
         self._confirmed_epoch = -1
         revision = self._revision
@@ -355,9 +355,9 @@ class LocalControl:
     async def ensure_ceiling(self, *, guard: Callable[[], None] | None = None) -> None:
         if guard is not None:
             guard()
-        phase = self.journal.get("trial_phase")
-        recovery_hold = phase in ("blocked", "recovering") and self.journal.get("control", {}).get("inhibit")
-        if phase not in (None, "active") and not recovery_hold:
+        phase = self.journal.phase.read()
+        recovery_hold = phase.held and self.journal.get("control", {}).get("inhibit")
+        if not phase.legacy_active and not recovery_hold:
             raise UnavailableError("trial ceiling reapplication is disabled outside active mode")
         if self.ready:
             return
@@ -402,7 +402,7 @@ class LocalControl:
             guard()
         limit = number(value, self.policy.max_current_a)
         limit = 0.0 if limit < 6 else limit
-        if limit > 0 and self.journal.get("trial_starting"):
+        if limit > 0 and self.journal.phase.starting:
             raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("inhibit") and limit > 0:
@@ -584,7 +584,7 @@ class LocalControl:
             guard()
         if not self.policy.allow_local_start and guard is None:
             raise DeniedError("local Start is disabled; charging remains under the app and charger schedule")
-        if self.journal.get("trial_starting"):
+        if self.journal.phase.starting:
             raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("uncertain") or previous.get("start_pending"):
@@ -740,7 +740,7 @@ class LocalControl:
             pending = guard()  # A newer Pause must be checked before this child claims any ownership.
             if isinstance(pending, Pending):
                 return pending
-        if self.journal.get("trial_starting"):
+        if self.journal.phase.starting:
             raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
         if previous.get("uncertain") and not acknowledge_uncertainty:

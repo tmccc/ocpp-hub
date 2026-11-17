@@ -11,7 +11,7 @@ from .store import Journal, fingerprint
 def recorded_station_profile(j: Journal, spec_digest: str, boot_digest: str) -> bool:
     row = j.db.execute("SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)).fetchone()
     return (
-        j.get("trial_phase") in ("active", "recovering")
+        j.phase.read().operating
         and j.get("managed_mode", {}).get("spec_digest") == spec_digest
         and j.get("trial_binding", {}).get("boot_digest") == boot_digest
         and j.get("native_bounded_handover", {}).get("stage") == "admitted"

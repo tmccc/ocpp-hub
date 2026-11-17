@@ -203,7 +203,7 @@ class ManagedController:
                 and not g.charger._pending
                 and self.requests.intent() == intent
                 and control_scope_matches(g, connection)
-                and j.get("trial_phase") == "active"
+                and j.phase.read().active
                 and self.charging.state() == state
                 and local_start_receipt(j) == receipt
                 and j.get("control") == control
@@ -398,7 +398,7 @@ class ManagedController:
             # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
             g.controls._complete(j.get("control")["ticket"], uncertain=False)
             raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
-        if j.get("trial_phase") == "recovering":
+        if j.phase.read().value == "recovering":
             cloud = self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"
             if not cloud:
                 await self.native.resume(local_only=True)
@@ -432,7 +432,7 @@ class ManagedController:
         intent = self.requests.intent()
         scope = current_scope(g)
         if (
-            j.get("trial_phase") == "recovering"
+            j.phase.read().value == "recovering"
             and not (self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
             and scope is not None
             and self.session.runtime.status.vendor_failed_scope == scope
@@ -489,7 +489,7 @@ class ManagedController:
                 or j.get("control", {}) != control
                 or not ControlState(control).explicit_local_hold
                 or g.controls.desired() != 0
-                or j.get("trial_phase") not in ("active", "blocked", "recovering")
+                or not j.phase.read().supervised
                 or g.charger.sender is None
                 or g._charger_epoch != epoch
                 or g.boot_observation != boot
@@ -585,7 +585,7 @@ class ManagedController:
             if isinstance(decision, Pending):
                 return decision
         if (
-            j.get("trial_phase") not in ("active", "recovering")
+            not j.phase.read().operating
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
             or j.get("managed_control_fault")
             or not g.current_boot_seen(g._charger_epoch)
@@ -906,7 +906,7 @@ class ManagedController:
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )
-        active = facts.authority_valid(faulted, self.stopping) and j.get("trial_phase") == "active"
+        active = facts.authority_valid(faulted, self.stopping) and j.phase.read().active
         local_ready = facts.locally_ready(
             faulted=faulted, stopping=self.stopping, active=active, delivery_blocked=s.runtime.status.delivery_blocked
         )
