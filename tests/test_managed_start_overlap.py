@@ -15,6 +15,7 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
+from tests.peer_mutation_helpers import observe_device_replies
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_schedule_cutoff import ZONE, TimerBench, timer_bench
 from tests.test_prototype import START
@@ -142,8 +143,39 @@ async def test_daily_survives_owner_start_timeout_and_following_nights(
         assert following is not None and following != daily
         assert (await healthy(b.c))["current_a"] == selected
         assert b.session.journal.get("control")["start_pending"] and not b.stops()
+        closure_wire = len(b.rig.bench.device_calls)
+        closure_replies = observe_device_replies(b, monkeypatch)
         await b.close_transaction(following)
         await healthy(b.c)
+        if completed_timer:
+            # Retired timer bookkeeping cannot replace the real zero needed before this fresh connection release.
+            calls = b.rig.bench.device_calls[closure_wire:]
+            profiles = [(i, frame) for i, frame in enumerate(calls) if frame[2] == "SetChargingProfile"]
+            limits = [
+                [
+                    period["limit"]
+                    for period in frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+                ]
+                for _, frame in profiles
+            ]
+            assert len(profiles) >= 2 and limits[-1] and all(limit == selected for limit in limits[-1])
+            assert all(periods and all(limit == 0 for limit in periods) for periods in limits[:-1])
+            assert all([3, frame[1], {"status": "Accepted"}] in closure_replies for _, frame in profiles)
+            zero_composites = [
+                frame for frame in calls[profiles[0][0] + 1 : profiles[-1][0]] if frame[2] == "GetCompositeSchedule"
+            ]
+            assert any(
+                reply[0] == 3
+                and any(frame[1] == reply[1] for frame in zero_composites)
+                and reply[2].get("status") == "Accepted"
+                and reply[2].get("chargingSchedule", {}).get("chargingSchedulePeriod")
+                == [{"startPeriod": 0, "limit": 0}]
+                for reply in closure_replies
+            )
+            assert b.c.released_epoch == b.session.gateway._charger_epoch
+            assert b.c.requests.intent() == intent and b.session.journal.get("local_start_receipt") == receipt
+            assert b.session.journal.get("control")["start_pending"] and not b.stops()
+            assert b.c.requests.receipt(request)["state"] == "uncertain" and len(starts(b.rig)) == 1
 
         owner = await delayed_owner(b)
         assert b.device.effective_limit() == 0

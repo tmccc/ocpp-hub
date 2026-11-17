@@ -854,7 +854,11 @@ class ManagedChargeTests:
             self.retire_closed_at_zero(native)
             local, owner = j.active(), local_start_receipt(j)
             if expected.mode == "app" and local is not None and self.independent_daily(native, local):
-                if g.controls.ready and g.controls.desired() == state["current_a"]:
+                if (
+                    g.controls.ready
+                    and g.controls.desired() == state["current_a"]
+                    and c.released_epoch == g._charger_epoch
+                ):
                     return False
                 await self.hold_expired()
                 # Reuse the ordinary guarded release; this raises the ceiling and never sends RemoteStart.
@@ -881,9 +885,15 @@ class ManagedChargeTests:
                 j.put("managed_test_charge", {**self.state(), "state": "completed", "charging": False})
                 return False
             if expected.mode == "app" and local is None and not native.physical.transaction_open:
-                if g.controls.ready and g.controls.desired() == state["current_a"]:
+                if (
+                    g.controls.ready
+                    and g.controls.desired() == state["current_a"]
+                    and c.released_epoch == g._charger_epoch
+                ):
                     return False
                 if self.idle_debt(native):
+                    # A retired connection release still needs this domain's own verified zero before restoration.
+                    await self.hold_expired()
                     progress = await c.recovery.restore(expected)
                     return not progress.shared
             await self.hold_expired()

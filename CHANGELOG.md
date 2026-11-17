@@ -21,6 +21,9 @@
   repeated cancellation during shutdown.
 - Recheck expired native samples and current authority during supervision and
   reply-first report handoffs. Retain unfinished tests, Stop and lifecycle duties.
+- Prepare a fresh connection release under the expired Start's guarded zero even
+  when its saved ceiling still reads ready. Preserve accepted reporting debt
+  through later daily sessions.
 - Separate independent peer mutation/reply and native timer support from test
   providers, preserving existing factory overrides, callers and model identities.
 
