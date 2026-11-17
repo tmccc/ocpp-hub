@@ -99,7 +99,7 @@ async def test_cli_persists_final_status_when_close_raises(
     # Model the explicit outer CLI boundary after a real session has already produced its failure report.
     class FailedSession:
         # Accept the validated package without opening a socket in this boundary-only regression.
-        def __init__(self, prepared: Any) -> None:
+        def __init__(self, prepared: Any, **kwargs: Any) -> None:
             self.final_status: dict[str, Any] | None = None
 
         # Enter cleanup immediately, as if the bounded startup deadline had expired.
@@ -117,10 +117,11 @@ async def test_cli_persists_final_status_when_close_raises(
         return original_remove(signum)
 
     monkeypatch.setattr(trial_proxy, "TrialSession", FailedSession)
+    monkeypatch.setattr(trial_proxy, "native_spec", lambda *_: object())
     monkeypatch.setattr(loop, "remove_signal_handler", remove)
     save_private(config.journal.with_suffix(".status.json"), {"running": True, "shutdown_uncertain": False})
     with pytest.raises(RuntimeError):
-        await trial_proxy.run(path, 60, False)
+        await trial_proxy.run(path, 60, False, tmp_path / "explicit-test-spec.json")
     assert json.loads(config.journal.with_suffix(".status.json").read_text()) == final
     assert len(removed) == 2
     output = capsys.readouterr().out

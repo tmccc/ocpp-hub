@@ -9,7 +9,6 @@ import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,14 +28,10 @@ from .runtime import ConnectionRuntime, RuntimeSettings
 from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, fingerprint
-from .trial_allocation import initialize_allocation, verify_initial_history
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
-from .trial_evidence import Evidence, NativeObserver
+from .trial_evidence import NativeObserver
 from .trial_handover_evidence import ObserveHandover
-from .trial_observation import StableObserver
-from .trial_recovery import Recovery
 from .trial_resources import Baseline, ResourceBook
-from .trial_rollback import Rollback
 from .trial_transport import TrialTransport
 
 
@@ -120,32 +115,33 @@ def preflight(path: Path) -> PreparedTrial:
 class TrialSession:
     """Only explicit start opens sockets; expiry/shutdown leaves a hold rather than silently rolling back a live car."""
 
-    # The observer override is solely dependency injection for the synthetic, network-guarded trial bench.
+    # Require the native specification explicitly; observation overrides remain confined to isolated test peers.
     def __init__(
         self,
         prepared: PreparedTrial,
         settings: RuntimeSettings | None = None,
-        observe: Callable[[], Awaitable[Evidence]] | None = None,
+        *,
+        native_bounded: NativeBoundedSpec,
         handover_observe: ObserveHandover | None = None,
-        native_bounded: NativeBoundedSpec | None = None,
         allow_local_start: bool = True,
         allow_unplugged_native: bool = False,
     ) -> None:
-        if (
-            type(allow_unplugged_native) is not bool
-            or allow_unplugged_native
-            and (allow_local_start or native_bounded is None)
-        ):
+        if not isinstance(native_bounded, NativeBoundedSpec):
+            raise SecurityError("session requires an explicit native bounded specification")
+        if type(allow_unplugged_native) is not bool or allow_unplugged_native and allow_local_start:
             raise SecurityError("unplugged native monitoring requires bounded mode and disabled local Start")
         self.prepared = prepared
-        self.observe = observe or prepared.observer.observe
-        self.observe_initial = observe or prepared.observer.observe_with_history
         config = prepared.config
         self.journal = Journal(config.journal, config.identity)
         try:
             retired = self.journal.get("connected_handover")
             if retired is not None and (not isinstance(retired, dict) or retired.get("stage") != "complete"):
                 raise SecurityError("retired vehicle-pause handover requires its original recovery implementation")
+            if not self.journal.get("native_bounded_handover") and self.journal.get("trial_phase") not in (
+                None,
+                "prepared",
+            ):
+                raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
             managed = self.journal.get("managed_mode")
             if managed is not None and (
                 managed.get("mode") != "app_schedule" or managed.get("local_start") is not False or allow_local_start
@@ -153,9 +149,7 @@ class TrialSession:
                 raise SecurityError("managed journal requires its saved local Start restriction")
             self.book = ResourceBook(self.journal, prepared.baseline)
             policy = Policy(
-                max_current_a=managed_current_ceiling(self.journal, native_bounded)
-                if native_bounded is not None
-                else 6,
+                max_current_a=managed_current_ceiling(self.journal, native_bounded),
                 allowed_tags=config.local_tags,
                 trust_vendor_start_tags=True,
                 strict_cloud_authorization=True,
@@ -171,20 +165,6 @@ class TrialSession:
                 },
             )
             self.gateway = Gateway(self.journal, policy, timeout=5)
-            self.observe = StableObserver(
-                self.journal,
-                self.observe,
-                lambda: self.gateway._charger_epoch,
-                lambda: self.gateway.controls._revision,
-                self._resource_mutation_inflight,
-            )
-            self.observe_initial = StableObserver(
-                self.journal,
-                self.observe_initial,
-                lambda: self.gateway._charger_epoch,
-                lambda: self.gateway.controls._revision,
-                self._resource_mutation_inflight,
-            )
             self._station_inventory = (sum(r.kind == "profile" for r in prepared.baseline.resources), False)
             self.station = StationDiscovery(
                 self.journal,
@@ -210,32 +190,16 @@ class TrialSession:
                     "blocked",
                 )
             )
-            self.rollback = Rollback(self.gateway, self.book, self.observe)
-            self.recovery = Recovery(
+            self.native_bounded = NativeBoundedHandover(
                 self.gateway,
                 self.book,
-                self.observe,
+                handover_observe or prepared.observer.observe_handover,
+                native_bounded,
                 StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
+                allow_unplugged=allow_unplugged_native,
             )
-            self.native_bounded = (
-                NativeBoundedHandover(
-                    self.gateway,
-                    self.book,
-                    handover_observe or prepared.observer.observe_handover,
-                    native_bounded,
-                    StationChoice(
-                        config.station_profile_kind, config.station_stack_level, config.station_profile_start
-                    ),
-                    allow_unplugged=allow_unplugged_native,
-                )
-                if native_bounded is not None
-                else None
-            )
-            if self.native_bounded is not None:
-                self.native_bounded.introduction_service_pending = lambda: self.runtime.introduction_pending
-                self.gateway.charger.validate_send = self.native_bounded.validate_send
-            elif self.journal.get("native_bounded_handover"):
-                raise SecurityError("native bounded journal requires its explicit original mode specification")
+            self.native_bounded.introduction_service_pending = lambda: self.runtime.introduction_pending
+            self.gateway.charger.validate_send = self.native_bounded.validate_send
             self.connected_cleanup_only = False
             self._introduction_refusal: ManagedRefusal | None = None
             self._introduction_refused_epoch: int | None = None
@@ -262,71 +226,42 @@ class TrialSession:
             "ClearChargingProfile",
         )
 
-    # Initial admission is unplugged only; an already active supervised trial can reapply its hold after reconnect.
+    # Reaudit the explicit native-bound mode on every real charger introduction, retaining cleanup-only startup.
     async def _before_ceiling(self) -> None:
-        if self.native_bounded is not None:
-            if self._introduction_refusal is not None:
-                self._persist_introduction_refusal()
-            if self._introduction_refused_epoch == self.gateway._charger_epoch and self.journal.get(
-                "managed_control_fault"
-            ):
-                raise UnavailableError("native bounded introduction remains terminally refused for this connection")
-            try:
-                if self.connected_cleanup_only:
-                    native = await self.native_bounded.read(closed=True)
-                    present = self.book.owned_present(native.physical)
-                    self.book.require_zero_station(present)
-                    if not self.gateway.current_boot_seen(self.gateway._charger_epoch):
-                        raise SecurityError("bounded cleanup introduction needs actual Boot")
-                    return
-                native = await self.native_bounded.introduce()
-                self._station_inventory = (
-                    sum(resource.kind == "profile" for resource in native.physical.resources),
-                    any(resource.key == "profile:7001" for resource in native.physical.resources),
-                )
-            except (SecurityError, RecoveryRequiredError) as error:
-                if self.journal.get("managed_mode"):
-                    self._introduction_refused_epoch = self.gateway._charger_epoch
-                    self._introduction_refusal = ManagedRefusal(
-                        "native_authority_or_preservation_failed",
-                        {
-                            "type": diagnostic_type(error),
-                            "detail": str(error)[:1024],
-                            "at_epoch": time.time(),
-                        },
-                    )
-                    self._persist_introduction_refusal()
-                if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
-                    self.journal.put("trial_phase", "blocked")
-                raise UnavailableError("native bounded introduction failed; positive controls remain blocked") from None
-            return
-        phase = self.journal.get("trial_phase")
-        if phase not in ("prepared", "active", "recovering", "blocked"):
-            raise UnavailableError("trial ceiling reapplication remains frozen during rollback")
+        if self._introduction_refusal is not None:
+            self._persist_introduction_refusal()
+        if self._introduction_refused_epoch == self.gateway._charger_epoch and self.journal.get(
+            "managed_control_fault"
+        ):
+            raise UnavailableError("native bounded introduction remains terminally refused for this connection")
         try:
-            epoch = self.gateway._charger_epoch
-            initial = self.journal.get("trial_starting") and self.journal.get("trial_binding") is None
-            evidence = await (self.observe_initial() if initial else self.observe())
-            self.gateway._require_epoch("charger", epoch)
-            if initial:
-                if evidence.history is None:
-                    raise SecurityError("first introduction requires a fresh complete native history check")
-                verify_initial_history(
-                    self.journal,
-                    evidence.history,
-                    self.prepared.config.identity,
-                    self.prepared.config.hardware_identity,
-                )
+            if self.connected_cleanup_only:
+                native = await self.native_bounded.read(closed=True)
+                present = self.book.owned_present(native.physical)
+                self.book.require_zero_station(present)
+                if not self.gateway.current_boot_seen(self.gateway._charger_epoch):
+                    raise SecurityError("bounded cleanup introduction needs actual Boot")
+                return
+            native = await self.native_bounded.introduce()
             self._station_inventory = (
-                sum(resource.kind == "profile" for resource in evidence.resources),
-                any(resource.key == "profile:7001" for resource in evidence.resources),
+                sum(resource.kind == "profile" for resource in native.physical.resources),
+                any(resource.key == "profile:7001" for resource in native.physical.resources),
             )
-            evidence.require_fresh(self.journal.identity)
-            await self.recovery.introduce(evidence, epoch)
-        except SecurityError, RecoveryRequiredError:
+        except (SecurityError, RecoveryRequiredError) as error:
+            if self.journal.get("managed_mode"):
+                self._introduction_refused_epoch = self.gateway._charger_epoch
+                self._introduction_refusal = ManagedRefusal(
+                    "native_authority_or_preservation_failed",
+                    {
+                        "type": diagnostic_type(error),
+                        "detail": str(error)[:1024],
+                        "at_epoch": time.time(),
+                    },
+                )
+                self._persist_introduction_refusal()
             if self.journal.get("trial_phase") not in ("rollback", "backend_restore_pending", "complete"):
                 self.journal.put("trial_phase", "blocked")
-            raise UnavailableError("native trial audit failed; controls remain blocked") from None
+            raise UnavailableError("native bounded introduction failed; positive controls remain blocked") from None
 
     # Retry only the failed atomic publication, retaining the proved refusal even if the device changes meanwhile.
     def _persist_introduction_refusal(self) -> None:
@@ -341,71 +276,45 @@ class TrialSession:
         self._introduction_refusal = None
         raise UnavailableError("native bounded introduction failed; positive controls remain blocked")
 
-    # Take a final native idle check immediately before binding; the charger then introduces itself through real Boot.
+    # Verify native admission or recovery before the listener opens; actual Boot still establishes readiness.
     async def start(self) -> None:
         phase = self.journal.get("trial_phase")
-        if self.native_bounded is not None:
-            if not self.started and self.journal.get("managed_mode"):
-                recover_unreported_local_start(self.journal)
-            if phase == "prepared":
-                await self.native_bounded.admit()
-            elif phase in ("active", "recovering", "blocked"):
-                try:
-                    native = await self.native_bounded.read()
-                except NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError:
-                    spec = self.native_bounded.spec
-                    if not recorded_timer_hold(self.journal, spec.digest, spec.boot_digest):
-                        raise
-                    # The listener starts inhibited. Fresh Boot and independent telemetry still gate a positive release.
-                else:
-                    if self.journal.get("trial_binding") is None:
-                        self.native_bounded.require_known_session(native)
-                    else:
-                        self.native_bounded.require_recovery_session(native)
-                    self.book.owned_present(native.physical)
-                control = self.journal.get("control", {})
-                self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
-                if self.journal.get("trial_binding") is None:
-                    self.native_bounded.spec.require_admission(native, self.journal.identity)
-                    if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
-                        raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
-                    self.journal.require_allocation()
-                    self.journal.put("trial_phase", "active")
-                    self.journal.put("trial_starting", True)
-                else:
-                    self.journal.put("trial_phase", "recovering")
-            elif phase == "rollback":
-                native = await self.native_bounded.read(closed=True)
-                if not self.book.owned_present(native.physical):
-                    return
-                self.connected_cleanup_only = True
-            else:
-                raise RecoveryRequiredError("native bounded restoration requires no new listener")
-            await self.runtime.start()
-            self.started = True
-            return
-        evidence = await (self.observe_initial() if phase == "prepared" else self.observe())
+        if not self.started and self.journal.get("managed_mode"):
+            recover_unreported_local_start(self.journal)
         if phase == "prepared":
-            self.book.require_profile_free_baseline()
-            evidence.require_unplugged(self.journal.identity)
-            if evidence.history is None:
-                raise SecurityError("fresh trial admission requires complete native transaction history")
-            initialize_allocation(
-                self.journal, evidence.history, self.prepared.config.identity, self.prepared.config.hardware_identity
-            )
-            self.book.activate(evidence)
-            self.journal.put("trial_starting", True)
-        elif phase in ("active", "recovering"):
-            self.recovery.admit(evidence)
-        elif phase == "blocked":
-            evidence.require_disconnected(self.journal.identity)
+            await self.native_bounded.admit()
+        elif phase in ("active", "recovering", "blocked"):
+            try:
+                native = await self.native_bounded.read()
+            except NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError:
+                spec = self.native_bounded.spec
+                if not recorded_timer_hold(self.journal, spec.digest, spec.boot_digest):
+                    raise
+                # The listener starts inhibited. Fresh Boot and independent telemetry still gate a positive release.
+            else:
+                if self.journal.get("trial_binding") is None:
+                    self.native_bounded.require_known_session(native)
+                else:
+                    self.native_bounded.require_recovery_session(native)
+                self.book.owned_present(native.physical)
             control = self.journal.get("control", {})
             self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
-            self.journal.put("trial_phase", "recovering")
-        elif phase in ("rollback", "backend_restore_pending"):
-            self.rollback.require_idle(evidence)
+            if self.journal.get("trial_binding") is None:
+                self.native_bounded.spec.require_admission(native, self.journal.identity)
+                if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
+                    raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
+                self.journal.require_allocation()
+                self.journal.put("trial_phase", "active")
+                self.journal.put("trial_starting", True)
+            else:
+                self.journal.put("trial_phase", "recovering")
+        elif phase == "rollback":
+            native = await self.native_bounded.read(closed=True)
+            if not self.book.owned_present(native.physical):
+                return
+            self.connected_cleanup_only = True
         else:
-            raise RecoveryRequiredError("completed or unrecognised trial cannot start")
+            raise RecoveryRequiredError("native bounded restoration requires no new listener")
         await self.runtime.start()
         self.started = True
 
@@ -420,7 +329,7 @@ class TrialSession:
                 "charger_connected": self.runtime.status.charger_connected,
                 "vendor_connected": self.runtime.status.vendor_connected,
                 "effective_ceiling_confirmed": self.gateway.controls.ready,
-                "native_bounded_handover": self.native_bounded.status() if self.native_bounded else None,
+                "native_bounded_handover": self.native_bounded.status(),
                 "station_capabilities": self.station.snapshot(),
                 "boot_observed": self.runtime.status.boot_observed,
                 "vendor_registered": self.gateway.vendor_registration == "Accepted",
@@ -447,22 +356,9 @@ class TrialSession:
             await self.gateway.stop()
             return {"stop_requested": True, "transaction_still_open": self.journal.active() is not None}
         if command == "native-bounded-handover":
-            if self.native_bounded is None:
-                raise UnavailableError("native bounded handover is not explicitly configured")
             return await self.native_bounded.cleanup(self.runtime.stop_vendor)
         if command == "native-bounded-resume":
-            if self.native_bounded is None:
-                raise UnavailableError("native bounded recovery is not explicitly configured")
             return await self.native_bounded.resume()
-        if self.native_bounded is not None and command in (
-            "rollback",
-            "rollback-plan",
-            "resume",
-            "confirm-original-backend",
-        ):
-            raise SecurityError("native bounded mode requires its separate handover and restoration checks")
-        if command == "resume":
-            return await self.recovery.resume()
         if command == "start":
             self.journal.require_allocation()
             if self.journal.get("trial_starting") or not self.gateway.controls.ready:
@@ -477,12 +373,6 @@ class TrialSession:
                 raise RecoveryRequiredError("release requires the current verified trial ceiling")
             await self.gateway.release()
             return {"local_owner_released": True, "ceiling_a": 6}
-        if command == "rollback-plan":
-            return await self.rollback.plan()
-        if command == "rollback":
-            return await self.rollback.run(self.runtime.stop_vendor)
-        if command == "confirm-original-backend":
-            return await self.rollback.confirm_original_backend()
         raise SecurityError("trial command is not supported")
 
     # Shutdown never removes an unverified hold; even a journal failure must retire both transport paths.

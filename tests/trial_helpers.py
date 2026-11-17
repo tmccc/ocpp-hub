@@ -17,7 +17,6 @@ from ocpp_hub_core.prototype.trial_allocation import initialize_allocation, obse
 from ocpp_hub_core.prototype.trial_config import TrialConfig
 from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_profile_projection, profile_projection
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
-from ocpp_hub_core.prototype.trial_rollback import Rollback
 from ocpp_hub_core.prototype.trial_session import save_private
 
 from tests.test_prototype import Rig
@@ -84,7 +83,6 @@ class TrialRig(Rig):
         self.book.activate(self.evidence())
         self.gateway.charger.before_send = self.book.before_send
         self.gateway.charger.after_result = self.book.after_result
-        self.rollback = Rollback(self.gateway, self.book, self.observe)
         self.gateway.attach_charger(self.charger_send)
 
     # Load a profile and its historical receipt as an older journal, without bypassing the new write gate at runtime.

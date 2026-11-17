@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Retire the plain commissioning session, recovery, rollback and observation controller. Require an explicit native
+  specification and keyword-only options; refuse unfinished ordinary journals before resource setup without changing
+  their evidence. Keep native-bounded commissioning Start/Release, cleanup/restoration and all daily managed controls.
+  Prepared journals still receive full native admission. Remove the plain capture/CLI commands and adapt shared
+  station, authentication, dispatch and resource tests to the retained native path.
+- Recheck owned inventory before reporting repeated native cleanup success at backend restoration. A profile that
+  reappears after verified absence retains the existing resource fault instead of receiving a stale success report.
+
 - Retire the experimental vehicle-pause handover controller, SEAT pause checker and physical-pause verifier,
   including their CLI commands and provider wiring. Refuse unfinished legacy handovers before opening a listener;
   preserve completed history, ordinary unplugged trials and the managed native-bounded service.

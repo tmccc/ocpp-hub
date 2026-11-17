@@ -45,10 +45,16 @@ unscoped local Start disabled, then creates `ManagedController` and `ManagementS
 
 Shared modules outside `prototype/` include `commands.py`, `control.py`, `frames.py`, `metering.py`, `model.py`,
 `readings.py` and `session.py`. Follow actual imports and calls rather than excluding their parent directory.
-Ordinary unplugged commissioning remains a separate mode; the experimental vehicle-pause tools are retired.
-Native-bounded mode keeps its native evidence parser and physical cleanup guard. The older HA layer and vendor mirror
-are a separate review domain;
-their directory location alone does not classify shared code as out of scope.
+TrialSession requires the explicit native-bounded specification for commissioning and managed operation. The plain
+commissioning and experimental vehicle-pause modes are retired. Native evidence, actual cleanup and original-backend
+restoration remain. The older HA layer and vendor mirror are a separate review domain; directory location alone does
+not classify shared code as out of scope.
+
+`TrialSession` constructs one native admission/introduction/recovery/cleanup owner. The old plain Recovery,
+Rollback and StableObserver are removed; `trial_rollback.py` retains only shared lifecycle prerequisites. The
+constructor refuses an admitted plain journal before resource setup, preserving its existing rows. A prepared
+journal still receives full native admission. Native commissioning retains Start and Release; `_resource_mutation_inflight`
+continues to protect daily supervision. The generic Gateway/resource test rig remains a boundary collaborator.
 
 ## Module map
 

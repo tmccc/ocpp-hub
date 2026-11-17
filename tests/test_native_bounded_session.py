@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 from ocpp_hub_core.prototype.native_bounded import NativeBoundedSpec, capture_native_bounded_baseline
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
+from ocpp_hub_core.prototype.station import StationChoice
 from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver
 from ocpp_hub_core.prototype.trial_session import PreparedTrial, TrialSession, preflight, save_private
@@ -67,6 +69,8 @@ async def connected_bench(
     listener_port: int,
     *,
     initial_history: list[dict[str, Any]] | None = None,
+    station: StationChoice | None = None,
+    incoming_mode: str = "basic",
 ) -> AsyncIterator[ConnectedBench]:
     bench = Bench()
     bench.cp, bench.connection = "B", "Plug"
@@ -86,6 +90,18 @@ async def connected_bench(
             bench.vendor, "127.0.0.1", 0, ssl=tls_contexts[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG
         ) as cloud:
             config, path = config_files(directory, listener_port, cloud.sockets[0].getsockname()[1])
+            if station is not None or incoming_mode != "basic":
+                value = json.loads(path.read_text())
+                if station is not None:
+                    value.update(
+                        station_profile_kind=station.kind,
+                        station_stack_level=station.stack,
+                        station_profile_start=station.start,
+                    )
+                    bench.firmware.configuration["ChargeProfileMaxStackLevel"] = str(station.stack)
+                if incoming_mode == "none":
+                    value.update(incoming_auth="none", incoming_secret=None)
+                save_private(path, value)
             observer = NativeObserver(config, native.sockets[0].getsockname()[1])
             snapshot = await observer.observe_handover()
             baseline = capture_native_bounded_baseline(snapshot, config.identity, config.hardware_identity)
@@ -125,12 +141,11 @@ async def test_connected_admission_requires_explicit_native6_spec(
     tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
 ) -> None:
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
-        session = rig.session(bounded=False)
-        with pytest.raises(SecurityError):
-            await session.start()
-        assert session.runtime._server is None
+        with pytest.raises(SecurityError, match="native bounded specification"):
+            rig.session(bounded=False)
+        assert not rig.sessions
         assert rig.bench.device_calls == [] and rig.bench.calls == []
-        assert session.journal.get("trial_phase") == "prepared"
+        assert not rig.prepared.config.journal.exists()
 
 
 # Intent: independent USER6 evidence permits closed connected admission, but only genuine Boot establishes readiness.

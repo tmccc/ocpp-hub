@@ -27,6 +27,8 @@ from ocpp_hub_core.prototype.trial_evidence import native_profile_projection, pr
 
 from tests.prototype_firmware import Firmware
 from tests.test_prototype import BOOT, START, Rig
+from tests.test_prototype_runtime import until
+from tests.test_prototype_tls import tls as tls
 from tests.trial_helpers import TrialRig
 
 ANCHOR = "2020-01-01T00:00:00Z"
@@ -104,40 +106,42 @@ def test_absolute_choice_requires_supported_utc_epoch(start: str | None) -> None
         StationChoice("Absolute", 1, start)
 
 
-# Intent: exact reported bounds authorize only the explicit stack/kind; the station hold still wins over a native timer.
-# Why: guessing stack16 or using a transaction profile would repeat the failed trial without station enforcement.
+# Intent: actual capability bounds select the explicit station kind/stack and retain zero through re-Boot and cleanup.
+# Why: native timers and transport replacement must not defeat the station hold or selective removal.
 @pytest.mark.parametrize("stack", [0, 1, 4])
 @pytest.mark.parametrize("kind", ["Relative", "Absolute"])
-async def test_station_discovery_and_zero_hold_use_reported_bounds(tmp_path: Path, stack: int, kind: str) -> None:
+async def test_station_discovery_and_zero_hold_use_reported_bounds(tmp_path, tls, unused_tcp_port, stack, kind):
+    from tests.test_native_bounded_handover import native_ready
+
     choice = StationChoice(kind, stack, ANCHOR if kind == "Absolute" else None)
-    rig = StationRig(tmp_path / "state.db", choice)
-    rig.firmware.configuration["ChargeProfileMaxStackLevel"] = str(stack)
-    try:
-        await rig.boot()
-        await rig.gateway.controls.ensure_ceiling()
-        frames = [f for f in rig.charger_frames if f[0] == 2]
-        assert [f[2] for f in frames[:6]] == ["GetConfiguration"] * 6
-        assert [f[3]["key"] for f in frames[:6]] == [[key] for key in CAPABILITY_KEYS]
-        assert rig.gateway.controls.ready
-        profile = rig.firmware.profiles[7001]
+    async with native_ready(tmp_path, tls, unused_tcp_port, station=choice) as (rig, session, charger):
+        frames = [frame for frame in rig.bench.device_calls if frame[0] == 2]
+        assert [frame[2] for frame in frames[:6]] == ["GetConfiguration"] * 6
+        assert [frame[3]["key"] for frame in frames[:6]] == [[key] for key in CAPABILITY_KEYS]
+        assert session.gateway.controls.ready
+        profile = rig.bench.firmware.profiles[7001]
         assert profile["stackLevel"] == stack and profile["chargingProfileKind"] == kind
         assert profile["chargingProfilePurpose"] == "ChargePointMaxProfile"
-        await rig.gateway.stop()
-        rig.firmware.fire_plan(9)
-        assert rig.firmware.current == 0
-        count = len(rig.charger_frames)
-        rig.gateway.attach_charger(rig.charger_send)
-        await rig.charger("reboot", "BootNotification", BOOT)
-        await rig.gateway.controls.ensure_ceiling()
-        later = [f for f in rig.charger_frames[count:] if f[0] == 2 and f[2] == "SetChargingProfile"]
-        assert later and all(
-            f[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0 for f in later
-        )
-        assert rig.discovery.choice == choice and rig.firmware.current == 0
-        await rig.rollback.run(rig.quiesce)
-        assert not rig.firmware.profiles and rig.firmware.plans[9]["limitCurrent"] == 32
-    finally:
-        await rig.close()
+        await session.gateway.stop()
+        rig.bench.firmware.fire_plan(9)
+        assert rig.bench.firmware.current == 0
+        count = len(rig.bench.device_calls)
+        await charger.close()
+        await until(lambda: session.gateway.charger.sender is None)
+        async with rig.charger(session) as replacement:
+            await rig.bench.call(replacement, "reboot", "BootNotification", BOOT)
+            await until(lambda: session.gateway.controls.ready)
+            await session.gateway.controls.ensure_ceiling()
+            later = [
+                frame for frame in rig.bench.device_calls[count:] if frame[0] == 2 and frame[2] == "SetChargingProfile"
+            ]
+            assert later and all(
+                frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+                for frame in later
+            )
+            assert session.station.choice == choice and rig.bench.firmware.current == 0
+            await session.command({"command": "native-bounded-handover"})
+            assert not rig.bench.firmware.profiles and rig.bench.firmware.plans[9]["limitCurrent"] == 32
 
 
 # Intent: unknown, unsupported or contradictory capabilities result in no physical station write.
@@ -246,29 +250,47 @@ async def test_changed_station_selection_keeps_failed_owner_operation_held(tmp_p
         await rig.close()
 
 
-# Intent: native inventory resolves a lost Absolute ACK while preserving the original plan and refusing anchor drift.
-# Why: a missing response must neither prevent safe cleanup nor turn a different profile into owned state.
+# Intent: complete native inventory resolves one lost Absolute Set reply and refuses later anchor drift.
+# Why: a missing reply cannot authorize another resource, and cleanup must still establish actual absence.
 @pytest.mark.parametrize("drift", [False, True])
-async def test_absolute_lost_ack_cleanup_and_anchor_drift(tmp_path: Path, drift: bool) -> None:
-    rig = StationRig(tmp_path / "state.db", StationChoice("Absolute", 1, ANCHOR))
-    original = copy.deepcopy(rig.firmware.plans[9])
-    try:
-        await rig.boot()
-        rig.drop_set = True
-        with pytest.raises(UnavailableError):
-            await rig.gateway.controls.ensure_ceiling()
-        assert 7001 in rig.firmware.profiles and not rig.gateway.controls.ready
+async def test_absolute_lost_ack_cleanup_and_anchor_drift(tmp_path, tls, unused_tcp_port, drift):
+    from tests.test_native_bounded_handover import native_ready
+
+    choice = StationChoice("Absolute", 1, ANCHOR)
+    async with native_ready(tmp_path, tls, unused_tcp_port, station=choice) as (rig, session, _):
+        original = copy.deepcopy(rig.bench.firmware.plans[9])
+        release = asyncio.Event()
+        lost = False
+
+        # Delay only the first positive Set reply; subsequent zero and Clear replies remain real and timely.
+        async def delay_reply(action, payload):
+            nonlocal lost
+            if action == "SetChargingProfile" and not lost:
+                lost = True
+                await release.wait()
+
+        rig.bench.before_reply = delay_reply
+        peer = session.gateway.charger
+        timeout = peer.timeout
+        peer.timeout = 0.05
+        try:
+            with pytest.raises(UnavailableError):
+                await peer.call("SetChargingProfile", choice.payload(6))
+        finally:
+            release.set()
+            peer.timeout = timeout
+            rig.bench.before_reply = None
+        assert lost and 7001 in rig.bench.firmware.profiles and not session.gateway.controls.ready
         if drift:
-            rig.firmware.profiles[7001]["chargingSchedule"]["startSchedule"] = "2020-01-01T00:00:01Z"
+            rig.bench.firmware.profiles[7001]["chargingSchedule"]["startSchedule"] = "2020-01-01T00:00:01Z"
             with pytest.raises(ValueError):
-                await rig.rollback.plan()
-            assert not rig.clear_order
+                session.book.owned_present((await rig.prepared.observer.observe_handover()).physical)
+            assert not any(frame[2] == "ClearChargingProfile" for frame in rig.bench.device_calls)
         else:
-            await rig.rollback.run(rig.quiesce)
-            assert rig.clear_order == [7001] and not rig.firmware.profiles
-        assert rig.firmware.plans[9] == original
-    finally:
-        await rig.close()
+            await session.command({"command": "native-bounded-handover"})
+            clears = [frame[3]["id"] for frame in rig.bench.device_calls if frame[2] == "ClearChargingProfile"]
+            assert clears == [7001] and not rig.bench.firmware.profiles
+        assert rig.bench.firmware.plans[9] == original
 
 
 # Intent: capability capacity accounts for the original inventory without counting plans as profile slots.

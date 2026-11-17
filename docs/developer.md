@@ -246,7 +246,19 @@ Callers still select their original profile-kind scope. Weaker physical-presence
 The experimental vehicle-pause handover and SEAT/physical-pause tools are retired. The session constructor rejects
 unfinished or malformed old handover records before resource setup or network work, closes its journal on refusal,
 and preserves completed historical records. `test_retired_handover.py` checks both remaining modes and every retired
-operator command. Native-bounded and ordinary unplugged commissioning retain their original entry points.
+operator command. Native-bounded commissioning retains its entry points.
+
+`TrialSession` now requires `native_bounded=NativeBoundedSpec(...)`; remaining options after `settings` are keyword-only.
+The plain commissioning Recovery/Rollback/StableObserver path and its old CLI commands are retired. The native
+controller still owns admission, introduction, recovery acknowledgement and cleanup, with all phase/Boot/resource
+checks and cleanup-only startup. An admitted plain journal is refused before resource setup; a prepared journal
+receives full fresh admission. No existing journal is migrated or marked reconciled. `test_native_only.py` verifies
+unchanged metadata/schema, missing specification, positional misuse, prepared admission and dormant CLI refusal.
+Native commissioning Start and Release, shared lifecycle helpers and the daily mutation-in-flight fence remain.
+
+The shared Gateway/resource tests retain their independent firmware evidence. Cleanup witnesses run the actual
+native controller with real HTTP/TLS; native station kind/stack and incoming-auth dimensions remain. At
+`backend_restore_pending`, repeated cleanup rechecks owned inventory so reappearance cannot receive success.
 
 ## Reference implementation
 

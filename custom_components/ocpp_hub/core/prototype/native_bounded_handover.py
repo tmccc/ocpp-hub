@@ -880,7 +880,9 @@ class NativeBoundedHandover:
         async with self.lock:
             gateway, journal = self.gateway, self.gateway.journal
             if journal.get("trial_phase") == "backend_restore_pending":
-                await self.read(closed=True)
+                native = await self.read(closed=True)
+                if self.book.owned_present(native.physical):
+                    raise RecoveryRequiredError("native bounded cleanup awaits independently verified profile absence")
                 return {"profiles_restored": True, "native_limit_a": 6, "complete": False}
             if journal.get("trial_phase") not in ("active", "recovering", "blocked", "rollback"):
                 raise RecoveryRequiredError("native bounded cleanup is not available in this phase")

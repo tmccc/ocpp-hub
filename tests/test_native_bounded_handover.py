@@ -15,6 +15,7 @@ import pytest
 from ocpp_hub_core import commands
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.station import StationChoice
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests.test_native_bounded_session import ConnectedBench, connected_bench
@@ -26,9 +27,16 @@ from tests.test_prototype_tls import tls as tls
 # Introduce the real connected device through both TLS legs, with the native HTTP peer retaining the USER6 guard.
 @asynccontextmanager
 async def native_ready(
-    directory: Path, contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path], port: int
+    directory: Path,
+    contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    port: int,
+    *,
+    station: StationChoice | None = None,
+    incoming_mode: str = "basic",
+    composite_reply_delay: float = 0,
 ) -> AsyncIterator[tuple[ConnectedBench, Any, Any]]:
-    async with connected_bench(directory, contexts, port) as rig:
+    async with connected_bench(directory, contexts, port, station=station, incoming_mode=incoming_mode) as rig:
+        rig.bench.composite_reply_delay = composite_reply_delay
         session = rig.session()
         await session.start()
         rig.route_to_trial()

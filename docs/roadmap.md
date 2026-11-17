@@ -43,11 +43,16 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] Keep shared restore sequencing directly in its owned driver and terminal mapping in the recovery policy.
   Retain live proof, publication and task boundaries, share wire zero rollback and remove obsolete adapters.
 - [x] Retire the experimental vehicle-pause handover, SEAT checker and physical-pause verifier with owner approval.
-  Keep ordinary unplugged commissioning and native-bounded daily controls. Reject unfinished old handovers before
+  Keep native-bounded commissioning and daily controls. Reject unfinished old handovers before
   startup, retain completed history, remove the restore phase interpreter and share seven station-zero predicates.
   Runtime is 1,558 physical lines smaller, including new guards and shared checks; test/doc deletions are excluded.
   Fast physical/terminal checks and the exact collection difference retain the active test scope. Full release
   qualification and deployment remain separate.
+- [x] Retire the remaining plain commissioning lifecycle and require the native specification for session startup.
+  Preserve native commissioning Start/Release, cleanup/restoration and daily controls. Refuse unfinished plain
+  journals without changing their evidence; retain shared physical/resource tests on the native path. Runtime is
+  480 physical lines smaller, including new guards and a repeated-cleanup inventory correction. Fast checks and
+  independent semantic review cover the implementation; full release qualification and deployment remain open.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties. Full four-suite qualification and deployment of this local candidate remain open.

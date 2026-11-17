@@ -9,15 +9,13 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
-from ocpp_hub_core.prototype.trial_session import TrialSession, preflight
 from websockets.asyncio.server import serve
 
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import FAST, Bench, until
+from tests.test_prototype import START
+from tests.test_prototype_runtime import Bench, until
 from tests.test_prototype_tls import admission as admission
 from tests.test_prototype_tls import tls as tls
 from tests.test_trial_session import Bench as TrialBench
-from tests.trial_helpers import config_files
 
 
 # Intent: an accepted profile replacement without a transaction remains clearable after the old session ends.
@@ -170,138 +168,115 @@ async def test_replaced_transaction_profile_keeps_mapping(
             await bench.close()
 
 
-# Intent: refusal at the final resource gate does not quarantine a command that was never dispatched.
+# Intent: refusal at the final resource gate does not quarantine a command never dispatched.
 # Why: an unsupported profile must not permanently disable every later valid cloud write.
-async def test_unsent_resource_refusal_does_not_poison_vendor_writes(tmp_path, tls, unused_tcp_port):
-    bench = TrialBench()
+async def test_unsent_resource_refusal_does_not_poison_vendor_writes(tmp_path, tls, unused_tcp_port, monkeypatch):
+    from tests.test_native_bounded_handover import native_ready
+
     connections = []
+    original_vendor = TrialBench.vendor
 
-    # Keep the independent cloud socket available for actual vendor CALLs.
-    async def vendor(connection):
+    # Expose the independent real cloud socket without replacing its protocol answers.
+    async def vendor(self, connection):
         connections.append(connection)
-        await bench.vendor(connection)
+        await original_vendor(self, connection)
 
-    async with serve(vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
-        _, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
-        session = TrialSession(preflight(path), FAST, bench.observe)
-        try:
-            await session.start()
-            async with bench.connection_to(session) as charger:
-                reader = asyncio.create_task(bench.read_charger(charger))
-                try:
-                    await bench.call(charger, "boot", "BootNotification", BOOT)
-                    await until(
-                        lambda: session.gateway.controls.ready and session.gateway.vendor_registration == "Accepted"
-                    )
+    monkeypatch.setattr(TrialBench, "vendor", vendor)
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
+        bench = rig.bench
+        await session.command({"command": "release"})
 
-                    # Submit real cloud requests and observe their correlated results on the wire.
-                    async def vendor_call(token, body):
-                        await connections[-1].send(build_call(token, "SetChargingProfile", body))
-                        await until(lambda: any(f[0] != 2 and f[1] == token for f in bench.calls))
-                        return next(f for f in bench.calls if f[0] != 2 and f[1] == token)
+        # Submit real cloud requests and observe their correlated results on the wire.
+        async def vendor_call(token, body):
+            await connections[-1].send(build_call(token, "SetChargingProfile", body))
+            await until(lambda: any(f[0] != 2 and f[1] == token for f in bench.calls))
+            return next(f for f in bench.calls if f[0] != 2 and f[1] == token)
 
-                    before = len(bench.device_calls)
-                    unsupported = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 111)
-                    unsupported["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"].append(
-                        {"startPeriod": 60, "limit": 6}
-                    )
-                    denied = await vendor_call("unsupported-profile", unsupported)
-                    assert denied[0] == 4 and denied[2] == "SecurityError"
-                    assert len(bench.device_calls) == before, "the resource rejection happened before physical dispatch"
-                    rows = [dict(row) for row in session.journal.db.execute("SELECT action,state FROM mutations")]
-                    result = await vendor_call(
-                        "supported-profile", commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 112)
-                    )
-                    print("UNSENT_MUTATIONS", rows)
-                    print("LATER_SUPPORTED_RESULT", result)
-                    print("DEVICE_CALLS_DURING_BOTH_REQUESTS", bench.device_calls[before:])
-                    assert result[0] == 3 and result[2]["status"] == "Accepted"
-                finally:
-                    reader.cancel()
-                    await asyncio.gather(reader, return_exceptions=True)
-        finally:
-            await session.close()
+        before = len(bench.device_calls)
+        unsupported = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 111)
+        unsupported["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"].append(
+            {"startPeriod": 60, "limit": 6}
+        )
+        denied = await vendor_call("unsupported-profile", unsupported)
+        assert denied[0] == 4 and denied[2] == "SecurityError"
+        assert len(bench.device_calls) == before, "the resource rejection happened before physical dispatch"
+        rows = [dict(row) for row in session.journal.db.execute("SELECT action,state FROM mutations")]
+        result = await vendor_call(
+            "supported-profile", commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 112)
+        )
+        print("UNSENT_MUTATIONS", rows)
+        print("LATER_SUPPORTED_RESULT", result)
+        print("DEVICE_CALLS_DURING_BOTH_REQUESTS", bench.device_calls[before:])
+        assert result[0] == 3 and result[2]["status"] == "Accepted"
 
 
-# Intent: interrupted or refused validation retires a prepared-only grant; attempted transport retains its debt.
-# Why: interrupted validation or acknowledgement cannot prove whether a Start reached the charger.
+# Intent: interrupted validation retires prepared-only grants; attempted transport retains its real debt.
+# Why: neither validation cancellation nor a lost acknowledgement proves that Start reached the device.
 @pytest.mark.parametrize("after_dispatch", [False, True], ids=["before-dispatch", "after-dispatch"])
 @pytest.mark.parametrize("failure", ["cancel", "denied", "native-security"])
 async def test_cancelled_vendor_start_retains_only_possible_dispatch(
     tmp_path, tls, unused_tcp_port, after_dispatch, failure
 ):
-    bench = TrialBench()
-    async with serve(bench.vendor, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG) as cloud:
-        _, path = config_files(tmp_path, unused_tcp_port, cloud.sockets[0].getsockname()[1])
-        session = TrialSession(preflight(path), FAST, bench.observe)
+    from tests.test_native_bounded_handover import native_ready
+
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
+        await session.command({"command": "release"})
         entered, release = asyncio.Event(), asyncio.Event()
         reserved_grants = []
         task = None
         try:
-            await session.start()
-            async with bench.connection_to(session) as charger:
-                reader = asyncio.create_task(bench.read_charger(charger))
-                try:
-                    await bench.call(charger, "boot", "BootNotification", BOOT)
-                    await until(
-                        lambda: session.gateway.controls.ready and session.gateway.vendor_registration == "Accepted"
-                    )
-                    gateway = session.gateway
-                    if after_dispatch:
-                        sender = gateway.charger.sender
-                        assert sender is not None
+            gateway = session.gateway
+            if after_dispatch:
+                sender = gateway.charger.sender
+                assert sender is not None
 
-                        # The actual socket send occurs; only its coroutine's return is delayed.
-                        async def blocked_sender(raw):
-                            await sender(raw)
-                            reserved_grants.append(bool(session.journal.get("vendor_start_grant")))
-                            entered.set()
-                            if failure != "cancel":
-                                error = DeniedError if failure == "denied" else SecurityError
-                                raise error("injected validation or transport failure")
-                            await release.wait()
+                # The actual socket send occurs; only its coroutine's return is delayed.
+                async def blocked_sender(raw):
+                    await sender(raw)
+                    reserved_grants.append(bool(session.journal.get("vendor_start_grant")))
+                    entered.set()
+                    if failure != "cancel":
+                        error = DeniedError if failure == "denied" else SecurityError
+                        raise error("injected validation or transport failure")
+                    await release.wait()
 
-                        gateway.charger.sender = blocked_sender
-                    else:
-                        validate = gateway.charger.validate_send
+                gateway.charger.sender = blocked_sender
+            else:
+                validate = gateway.charger.validate_send
 
-                        # Keep the real native validation result, delaying its return before physical dispatch.
-                        async def blocked_validation(action, payload) -> GateDecision | None:
-                            decision = None
-                            if validate is not None:
-                                decision = await validate(action, payload)
-                            reserved_grants.append(bool(session.journal.get("vendor_start_grant")))
-                            entered.set()
-                            if failure != "cancel":
-                                error = DeniedError if failure == "denied" else SecurityError
-                                raise error("injected validation or transport failure")
-                            await release.wait()
-                            return decision
+                # Keep the real native validation result, delaying its return before physical dispatch.
+                async def blocked_validation(action, payload) -> GateDecision | None:
+                    decision = None
+                    if validate is not None:
+                        decision = await validate(action, payload)
+                    reserved_grants.append(bool(session.journal.get("vendor_start_grant")))
+                    entered.set()
+                    if failure != "cancel":
+                        error = DeniedError if failure == "denied" else SecurityError
+                        raise error("injected validation or transport failure")
+                    await release.wait()
+                    return decision
 
-                        gateway.charger.validate_send = blocked_validation
-                    frame = [2, "cancelled-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "LOCAL_TEST"}]
-                    task = asyncio.create_task(gateway._vendor_call(frame, gateway._vendor_epoch))
-                    await asyncio.wait_for(entered.wait(), 2)
-                    assert reserved_grants == [True]
-                    if failure == "cancel":
-                        task.cancel()
-                        with pytest.raises(asyncio.CancelledError):
-                            await task
-                    elif failure == "native-security":
-                        answer = decode(await task)
-                        assert answer[0] == 4 and answer[2] == "InternalError"
-                    else:
-                        assert decode(await task)[0] == 4
-                    rows = session.journal.db.execute("SELECT state FROM mutations WHERE origin='vendor'").fetchall()
-                    assert [row[0] for row in rows] == (["uncertain"] if after_dispatch else [])
-                    assert bool(session.journal.get("vendor_start_grant")) is after_dispatch
-                    assert bool(session.journal.get("uncertain_vendor_command")) is after_dispatch
-                finally:
-                    release.set()
-                    if task is not None and not task.done():
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-                    reader.cancel()
-                    await asyncio.gather(reader, return_exceptions=True)
+                gateway.charger.validate_send = blocked_validation
+            frame = [2, "cancelled-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "LOCAL_TEST"}]
+            task = asyncio.create_task(gateway._vendor_call(frame, gateway._vendor_epoch))
+            await asyncio.wait_for(entered.wait(), 2)
+            assert reserved_grants == [True]
+            if failure == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif failure == "native-security":
+                answer = decode(await task)
+                assert answer[0] == 4 and answer[2] == "InternalError"
+            else:
+                assert decode(await task)[0] == 4
+            rows = session.journal.db.execute("SELECT state FROM mutations WHERE origin='vendor'").fetchall()
+            assert [row[0] for row in rows] == (["uncertain"] if after_dispatch else [])
+            assert bool(session.journal.get("vendor_start_grant")) is after_dispatch
+            assert bool(session.journal.get("uncertain_vendor_command")) is after_dispatch
         finally:
-            await session.close()
+            release.set()
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)

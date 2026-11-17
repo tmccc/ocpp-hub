@@ -12,12 +12,11 @@ from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal
-from ocpp_hub_core.prototype.trial_evidence import Evidence
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
-from ocpp_hub_core.prototype.trial_rollback import Rollback
 
 from tests.prototype_firmware import Firmware
 from tests.test_prototype import START
+from tests.test_prototype_tls import tls as tls
 from tests.trial_helpers import TrialRig
 
 
@@ -40,9 +39,9 @@ async def test_original_profiles_block_writes_and_legacy_clears(tmp_path: Path, 
         with pytest.raises(DeniedError):
             await rig.gateway.set_limit(6)
         assert not rig.charger_frames
-        assert (await rig.rollback.plan())["automatic_clear_blocked"]
+        assert rig.book.original_profile_count
         with pytest.raises(SecurityError):
-            await rig.rollback.run(rig.quiesce)
+            rig.book.require_profile_free_baseline()
         with pytest.raises(DeniedError):
             await rig.gateway.charger.call("ClearChargingProfile", {"id": 7001})
         assert not rig.clear_order and set(rig.firmware.profiles) == {42, 7001}
@@ -78,7 +77,7 @@ async def test_collateral_profile_loss_is_sticky_and_records_owned_absence(
         assert fault["missing"] == ["profile:42"] and not fault["changed"]
         assert rig.store.get("trial_phase") == "blocked"
         with pytest.raises(SecurityError):
-            await rig.rollback.run(rig.quiesce)
+            rig.book.owned_present(rig.evidence())
         assert rig.store.get("trial_phase") == "blocked" and not rig.clear_order
         assert rig.book.baseline is baseline and 9 in rig.firmware.plans
         assert rig.book.status()["preservation_failed"]
@@ -95,24 +94,31 @@ async def test_collateral_profile_loss_is_sticky_and_records_owned_absence(
         reopened.close()
 
 
-# Intent: restoring the visible inventory later does not silently reconcile a durable preservation fault.
-# Why: identical readbacks after an unexplained loss cannot prove that the saved settings were safely restored.
-async def test_preservation_fault_prevents_completion_after_inventory_returns(tmp_path: Path) -> None:
-    rig = TrialRig(tmp_path / "state.db")
-    try:
-        await rig.gateway.set_limit(6)
-        await rig.rollback.run(rig.quiesce)
-        plan = copy.deepcopy(rig.firmware.plans.pop(9))
+# Intent: repairing apparent inventory after a preservation fault cannot complete native restoration.
+# Why: identical later readbacks cannot prove that original settings survived an unexplained loss.
+async def test_preservation_fault_prevents_completion_after_inventory_returns(tmp_path, tls, unused_tcp_port):
+    from tests.test_native_bounded_handover import native_ready, restore_original_route, verify_original_backend
+
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
+        await session.command({"command": "native-bounded-handover"})
+        await restore_original_route(rig, session, charger)
+        await verify_original_backend(rig, session)
+        plan = copy.deepcopy(rig.bench.firmware.plans.pop(9))
         with pytest.raises(SecurityError):
-            rig.book.owned_present(rig.evidence())
-        rig.firmware.plans[9] = plan
-        rig.gateway.detach_charger(rig.gateway._charger_epoch)
+            session.book.owned_present((await rig.prepared.observer.observe_handover()).physical)
+        rig.bench.firmware.plans[9] = plan
+        patches = []
+
+        # A refused final proof must never reach even the independent fake USER writer.
+        async def patch(values):
+            patches.append(copy.deepcopy(values))
+            rig.peer.configuration.update(values)
+
         with pytest.raises(SecurityError, match="preservation"):
-            await rig.rollback.confirm_original_backend()
-        assert rig.store.get("trial_phase") == "backend_restore_pending"
-        assert rig.book.status()["preservation_failed"]
-    finally:
-        await rig.close()
+            await session.native_bounded.restore_settings(patch)
+        assert patches == [] and rig.peer.configuration["AmpLmt"] == "6"
+        assert session.journal.get("trial_phase") == "backend_restore_pending"
+        assert session.book.status()["preservation_failed"]
 
 
 # Intent: a preservation fault cannot prevent a recorded zero hold and the known active transaction's Stop.
@@ -136,32 +142,39 @@ async def test_legacy_preservation_fault_keeps_known_session_stop(tmp_path: Path
         await rig.close()
 
 
-# Intent: Stop after clean rollback cannot reinstall an absent profile, even while stopping a known transaction.
-# Why: frozen cleanup phases must not be reopened by the recovery zero-hold exception when no fault was recorded.
+# Intent: Stop after native cleanup cannot reinstall an absent profile, including for a known transaction.
+# Why: a frozen cleanup must not be reopened by the restrictive zero-hold exception.
 @pytest.mark.parametrize("known_session", [False, True])
-async def test_stop_after_clean_rollback_never_recreates_profile(tmp_path: Path, known_session: bool) -> None:
-    rig = TrialRig(tmp_path / "state.db")
-    try:
-        await rig.gateway.set_limit(6)
-        await rig.rollback.run(rig.quiesce)
-        checkpoint = len(rig.charger_frames)
-        control = rig.store.get("control")
+async def test_stop_after_clean_rollback_never_recreates_profile(tmp_path, tls, unused_tcp_port, known_session):
+    from tests.test_native_bounded_handover import native_ready, restore_original_route, verify_original_backend
+
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
+        await session.command({"command": "native-bounded-handover"})
+        checkpoint = len(rig.bench.device_calls)
+        control = session.journal.get("control")
         if known_session:
-            started = rig.store.start("historical-start", START)
-            rig.firmware.active = started["transactionId"]
+            started = session.journal.start("historical-start", START)
+            rig.bench.firmware.active = started["transactionId"]
         with pytest.raises(UnavailableError if known_session else DeniedError):
-            await rig.gateway.stop()
-        later = [frame for frame in rig.charger_frames[checkpoint:] if frame[0] == 2]
+            await session.gateway.stop()
+        later = [frame for frame in rig.bench.device_calls[checkpoint:] if frame[0] == 2]
         assert [frame[2] for frame in later] == (["RemoteStopTransaction"] if known_session else [])
-        assert not rig.firmware.profiles and not rig.gateway.controls.ready
-        assert not rig.store.get("trial_preservation_fault")
-        assert rig.store.get("trial_phase") == "backend_restore_pending"
-        assert rig.store.get("control")["uncertain"] if known_session else rig.store.get("control") == control
+        assert not rig.bench.firmware.profiles and not session.gateway.controls.ready
+        assert not session.journal.get("trial_preservation_fault")
+        assert session.journal.get("trial_phase") == "backend_restore_pending"
+        assert (
+            session.journal.get("control")["uncertain"] if known_session else session.journal.get("control") == control
+        )
         if not known_session:
-            rig.gateway.detach_charger(rig.gateway._charger_epoch)
-            assert (await rig.rollback.confirm_original_backend())["complete"]
-    finally:
-        await rig.close()
+            await restore_original_route(rig, session, charger)
+            await verify_original_backend(rig, session)
+
+            # Change only the fake native USER setting after the real route/backend proofs.
+            async def patch(values):
+                rig.peer.configuration.update(values)
+                rig.peer.runtime_user = int(rig.peer.configuration["AmpLmt"]) * 10
+
+            assert (await session.native_bounded.restore_settings(patch))["complete"]
 
 
 # Intent: independently observed disappearance invalidates readiness without allowing a second clear in active mode.
@@ -207,13 +220,8 @@ async def test_owned_inventory_mismatch_freezes_cached_readiness(tmp_path: Path,
             )
             evidence = replace(evidence, resources=resources)
 
-        # Supply only an independently retained native response; the rollback, journal and control logic remain real.
-        async def observation() -> Evidence:
-            return evidence
-
-        rollback = Rollback(rig.gateway, rig.book, observation)
         with pytest.raises(SecurityError):
-            await rollback.plan()
+            rig.book.owned_present(evidence)
         assert not rig.gateway.controls.ready and rig.store.get("trial_phase") == "blocked"
         assert rig.book.status()["inventory_failed"] and not rig.book.status()["preservation_failed"]
         assert rig.book.status()["uncertain_resources"] == 1
@@ -250,42 +258,39 @@ async def test_owned_inventory_fault_keeps_safety_stop(tmp_path: Path) -> None:
         await rig.close()
 
 
-# Intent: entering destructive rollback invalidates control readiness before any profile is physically cleared.
-# Why: cached confirmation must not authorize new charging work while the station's safety profile is being removed.
-async def test_rollback_invalidates_readiness_before_clear(tmp_path: Path) -> None:
-    rig = TrialRig(tmp_path / "state.db")
-    try:
-        await rig.gateway.set_limit(6)
-        assert rig.gateway.controls.ready
+# Intent: native cleanup invalidates readiness before any profile is physically cleared.
+# Why: cached confirmation cannot authorize charging while its safety profile is being removed.
+async def test_rollback_invalidates_readiness_before_clear(tmp_path, tls, unused_tcp_port):
+    from tests.test_native_bounded_handover import native_ready
 
-        # Observe the real transition before quiescing the fake cloud and before any device mutation.
-        async def inspect_freeze() -> None:
-            assert not rig.gateway.controls.ready and 7001 in rig.firmware.profiles
-            await rig.quiesce()
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, _):
+        assert session.gateway.controls.ready
+        witnessed = False
 
-        await rig.rollback.run(inspect_freeze)
-        assert not rig.firmware.profiles
-    finally:
-        await rig.close()
+        # Observe the real invalidation before vendor retirement and physical mutation.
+        async def inspect_freeze():
+            nonlocal witnessed
+            assert not session.gateway.controls.ready and 7001 in rig.bench.firmware.profiles
+            witnessed = True
+            await session.runtime.stop_vendor()
+
+        await session.native_bounded.cleanup(inspect_freeze)
+        assert witnessed and not rig.bench.firmware.profiles
 
 
-# Intent: even a direct clear during resumed cleanup cannot target a profile already verified absent.
-# Why: a durable old receipt is ownership history, not permission to repeat a potentially destructive deletion.
-async def test_resumed_rollback_rejects_direct_duplicate_clear(tmp_path: Path) -> None:
-    rig = TrialRig(tmp_path / "state.db")
-    try:
-        await rig.gateway.set_limit(6)
-        await rig.rollback.run(rig.quiesce)
+# Intent: a direct Clear after verified native cleanup cannot target an already absent profile.
+# Why: an old ownership receipt is history, not permission for a second destructive deletion.
+async def test_resumed_rollback_rejects_direct_duplicate_clear(tmp_path, tls, unused_tcp_port):
+    from tests.test_native_bounded_handover import native_ready
 
-        # Exercise the outbound boundary while the real rollback runner has frozen the journal for resumption.
-        async def duplicate_clear() -> None:
-            with pytest.raises(DeniedError):
-                await rig.gateway.charger.call("ClearChargingProfile", {"id": 7001})
-
-        await rig.rollback.run(duplicate_clear)
-        assert rig.clear_order == [7001] and not rig.firmware.profiles
-    finally:
-        await rig.close()
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, _):
+        await session.command({"command": "native-bounded-handover"})
+        with pytest.raises(SecurityError, match="exact next owned resource"):
+            await session.gateway.charger.call("ClearChargingProfile", {"id": 7001})
+        with pytest.raises(DeniedError):
+            session.book.before_send("ClearChargingProfile", {"id": 7001})
+        clears = [frame[3]["id"] for frame in rig.bench.device_calls if frame[2] == "ClearChargingProfile"]
+        assert clears == [7001] and not rig.bench.firmware.profiles
 
 
 # Intent: the two synthetic destructive-clear hypotheses have different effects on non-stale profiles.

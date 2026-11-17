@@ -146,8 +146,8 @@ settings and vehicle permission were restored with the lead still attached. All 
 alongside two genuine completed sessions totalling 129 Wh. This is capability evidence, not present permission.
 
 The experimental vehicle-pause handover controller and its SEAT/physical-pause tools were retired during the
-17 November 2026 simplification. Their historical trials do not grant current vehicle permission. Ordinary
-unplugged commissioning and the native-bounded strategy used by the managed service remain available.
+17 November 2026 simplification. Their historical trials do not grant current vehicle permission. Commissioning
+and the managed service now both require the explicit native-bounded strategy.
 
 The third trial verified ordinary Stop at 0 A and Release back to 6 A with accepted 60-second composites and the same
 accepted cloud session. Exact-id removal of the owned profile succeeded from a profile-free baseline; fresh native
@@ -311,31 +311,26 @@ are pinned in `requirements-trial.txt`; test/development dependencies remain in 
 
 ### Baseline and bounded operation
 
-The explicit `capture-baseline` action performs only the existing read-only LAN getters. It saves a private native
-profile/plan inventory and original configuration backup. It does not change the charger. The native reader uses the
-charger's existing LAN HTTP API at its exact IP, supports only the observed read-only requests, rejects duplicate JSON
-keys and bounds each response and the entire observation without leaving background worker threads.
-Ordinary audits inspect every current and power channel and the exact native session ID. Complete history is read only
-for fresh admission and first introduction; existing recovery does not depend on fetching or reseeding rolling history.
-After restart this firmware can report the exact missing `/tmp/Ioc/OCPP.json` envelope instead of an offline flag.
-Only that observed OCPP-specific reply becomes `online: false`; other failed getters remain errors, and absence can
-never establish successful original-backend restoration.
+The explicit `capture-bounded-baseline` action uses the existing read-only LAN getters to capture the original
+configuration, plans, complete history and a connected, closed station at zero. It changes no charger settings.
+The reader rejects duplicate JSON keys and bounds individual responses and the whole observation.
 
 ```bash
-python3.14 tools/trial_proxy.py capture-baseline --config /private/trial.json
+python3.14 tools/trial_proxy.py capture-bounded-baseline --config /private/trial.json
 ```
 
-A fresh first trial requires native CP A, unplugged, zero current/power and an actually closed transaction. It refuses
-all pre-existing profiles, including an inactive TxProfile, until selective clearing is proven. A baseline can still
-be captured and inspected without admitting a new trial. Original plans and profile 7001 collisions remain protected.
-A new private journal is required; an old journal can resume only with its exact original trial baseline.
+The original native specification records the exact baseline, trial connection fields, saved timetable, tested
+native-limit evidence and Boot identity. Admission independently verifies the saved/runtime USER6 limit, hardware
+ceiling, all current/power channels and closed session before reserving allocation. Existing original profiles block
+new admission until selective cleanup is proven. Actual Boot repeats the native audit and establishes a zero hold.
 
-Only the explicit `run` action opens the trial connections. It is restricted to a 6 A single-phase ceiling and a
-60–1800 second duration, defaulting to 900 seconds. Its duration includes startup. No trial service is installed or
-started by this repository or by preflight.
+Only `run` opens the commissioning connections. It requires `--native-bounded-spec`, a 6 A ceiling and a
+60–1800 second duration, defaulting to 900 seconds. Its duration includes startup. Default `check` remains dormant
+and may validate the package without a specification; it opens no journal or socket.
 
 ```bash
-python3.14 tools/trial_proxy.py run --config /private/trial.json --duration 900 --interactive
+python3.14 tools/trial_proxy.py run --config /private/trial.json \
+  --native-bounded-spec /private/native-spec.json --duration 900 --interactive
 ```
 
 The optional terminal interface accepts one JSON object per line:
@@ -345,23 +340,25 @@ The optional terminal interface accepts one JSON object per line:
 {"command":"start"}
 {"command":"stop"}
 {"command":"release"}
-{"command":"rollback-plan"}
-{"command":"rollback"}
-{"command":"confirm-original-backend"}
+{"command":"native-bounded-resume"}
+{"command":"native-bounded-handover"}
 {"command":"exit"}
 ```
 
-Local Start requires exactly one explicitly approved owner tag. Start/stop/ceiling operations retain their original
-priority and ownership checks. Status separates transport connection, actual Boot, vendor registration, effective
-composite confirmation, local hold and blocked history delivery. The service also writes a private status file.
-A timer expiry or shutdown attempts a zero-current hold and known-session Stop, retains uncertainty if either cannot
-be confirmed, and leaves its journal intact. It does not automatically restore the manufacturer's connection.
+Local Start requires exactly one explicitly approved owner tag. Native-bounded commissioning retains its Start,
+Stop and Release operations and their original priority, physical and ownership checks. The managed service disables
+that unscoped Start and exposes its separate guarded management controls. Status distinguishes actual Boot,
+transport/cloud registration, effective composite confirmation, local hold and delivery debt.
+Shutdown attempts zero and the exact known-session Stop, preserves uncertainty and leaves the journal intact.
+It never automatically restores the manufacturer's connection.
 
-The trial permits only constant ampere profiles, an explicit Relative/Absolute station choice, and the bounded
-metadata, Fast/Eco/EcoPlus and delayed-stop commands described below. Plan editing remains disabled in this trial path. New profiles cannot replace
-any original connector/purpose scope, including a different transaction at that scope: actual iCS captures showed that
-setting a new TxProfile can replace an older one. The existing offline codecs and tests still cover those wider app
-shapes; enabling them live requires independently proven restoration semantics.
+The plain commissioning mode, its `resume`/`rollback` commands and `capture-baseline` action are retired.
+A session requires an explicit parsed native specification; optional arguments are keyword-only. An unfinished plain
+journal cannot acquire native admission: it is refused before resource setup or observation, with its evidence
+unchanged. A merely prepared journal still undergoes full native admission and allocation verification.
+
+The commissioning path permits constant ampere profiles with explicit Relative/Absolute station choices. Native
+plans and original resource scopes remain protected; broader codecs do not grant live editing permission.
 
 ### Authorisation behaviour
 
@@ -379,37 +376,29 @@ Start/Stop reply metadata is committed with the original lifecycle fact and reta
 Actual acknowledgement metadata updates the book atomically. Stop without an idTag never guesses which tag its
 optional cloud metadata describes. Late cloud rejection of an already local Start retains the event and installs zero.
 
-### Rollback and recovery
+### Cleanup and recovery
 
-Rollback records resource intent before every write and keeps those receipts after normal transaction/profile aliases
-retire. Adopted or original native resources are never treated as trial-owned. After verified deletion, an id which
-reappears cannot become owned again without a new recorded trial intent.
+Native cleanup records exact resource intent and retains receipts after transaction/profile aliases retire.
+`native-bounded-handover` freezes positive controls, establishes zero and stops only actual known work, waits for
+real lifecycle delivery, then removes independently matching owned profiles with station profile 7001 last.
+Every Clear is checked against fresh physical inventory. A lost reply is reconciled from actual absence; an ACK
+alone cannot prove deletion. Reappearance after verified absence blocks a repeated cleanup success report.
+Original-resource or inventory discrepancies remain durable blockers after apparently matching later reads.
 
-`rollback-plan` observes the complete native inventory. `rollback` requires fresh native unplugged/zero-power evidence,
-an actual closed session, no pending Start and reconciled mutating/lifecycle outcomes. It freezes charging-capable work
-before auditing. If the idle audit fails, safety Stop and cloud history delivery remain
-available. After proving idle it retires the cloud runner while retaining the local receiver, removes only independently
-matching owned profiles when the original baseline has no profiles, and
-clears station profile 7001 last. Every deletion is checked against a fresh physical inventory, including after a lost
-ACK/restart. An ACK without actual removal cannot complete cleanup; reconnect cannot automatically reinstall a cleared cap.
-An original-resource discrepancy remains a durable blocker even after connection restoration or matching later reads.
-
-Resource cleanup ends in `backend_restore_pending`. Restore the charger's original connection profile from its private
-backup as a separate operation. `confirm-original-backend` succeeds only once the proxy charger socket has retired and
-fresh native readings show the original configuration, original resources, no owned profiles and a connected backend.
-Configuration restoration alone cannot prove that reconnection has happened. History and any unsent observations remain
-in the journal; they are not erased to make rollback look successful.
+Cleanup ends in `backend_restore_pending`. Native route restoration, independent offline-to-online backend proof
+and final USER32 restoration are separate explicitly supervised operations described below. No history, pending
+Start or delivery obligation is erased to make cleanup look complete. New listeners cannot reapply a cleared cap.
 
 #### Retired vehicle-pause experiments
 
 The experimental vehicle-pause handover, read-only SEAT pause checker and reversible physical-pause verifier are
 retired. Their operator commands and `--car-pause-config` option are no longer supported. They were separate from
-the commissioned managed controls and the native-bounded recovery described below. The ordinary unplugged trial
-mode, native-bounded cleanup and original-backend restoration remain supported.
+the commissioned managed controls and the native-bounded recovery described below. Native-bounded cleanup and
+original-backend restoration remain supported.
 
 An unfinished or malformed `connected_handover` record refuses session construction before any native read or
 listener starts. Recover that old operation using its original implementation; this version neither migrates nor
-settles its vehicle obligation. Completed historical records remain untouched and part of native observation identity.
+settles its vehicle obligation. Completed historical records remain untouched. The native observer retains its existing authority and supersession checks.
 
 The normal-backend experiment on 2026-11-09 observed two positive-offer zero windows, with real charging between
 them, and restored the original USER32 configuration and schedule. That historical result established sampled
@@ -436,7 +425,7 @@ the exact four trial connection fields, saved-plan digest and commissioned nativ
 Admission reserves fresh transaction numbers with the original route under independently read-back saved USER6,
 runtime USER60/HWCFG320, closed SESSION and all seven meter channels at zero. Actual Boot after routing repeats the
 native audit and installs a local zero hold. Reconnection retains zero; positive sends recheck native6 inside the
-outgoing RPC gate. Ordinary unplugged admission retains its separate guards.
+outgoing RPC gate. Both commissioning and daily managed operation now use this explicit native contract.
 
 This strategy permits unexpected charging at nominal6A; it never labels zero consumption as a paused vehicle.
 `native-bounded-handover` freezes positive controls, stops only actual known transactions, drains lifecycle delivery,

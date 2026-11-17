@@ -13,7 +13,7 @@ from tests.test_prototype_tls import tls as tls
 
 # Intent: incomplete or malformed retired state is refused before a listener, observation or command can start.
 # Why: removing an old recovery owner must not let its unresolved obligation become ordinary admission.
-@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("bounded", [True])
 @pytest.mark.parametrize(
     "record",
     [{}, [], "complete", {"stage": "planned"}, {"stage": "clearing"}, {"stage": "vehicle_restore_intent"}],
@@ -39,7 +39,7 @@ async def test_incomplete_retired_handover_refuses_startup(tmp_path, tls, unused
 
 # Intent: a completed historical record remains byte-for-byte evidence in either remaining mode.
 # Why: retiring the capability must not migrate completed history or change native-observation fingerprints.
-@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("bounded", [True])
 async def test_completed_retired_handover_remains_readable(tmp_path, tls, unused_tcp_port, bounded):
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         record = {"stage": "complete", "vehicle": {"old": [1, 2, 3]}, "sentinel": "preserved"}
@@ -52,7 +52,7 @@ async def test_completed_retired_handover_remains_readable(tmp_path, tls, unused
 
 # Intent: every retired operator command is unsupported in the remaining session modes.
 # Why: deleting a controller must leave no fallback that silently grants a different restoration capability.
-@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("bounded", [True])
 @pytest.mark.parametrize(
     "command",
     [

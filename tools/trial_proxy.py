@@ -40,7 +40,6 @@ from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.store import fingerprint  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver  # noqa: E402
-from ocpp_hub_core.prototype.trial_resources import Baseline  # noqa: E402
 from ocpp_hub_core.prototype.trial_session import PreparedTrial, TrialSession, preflight, save_private  # noqa: E402
 
 
@@ -96,12 +95,11 @@ async def run(
     terminal: bool,
     native_bounded_config: Path | None = None,
 ) -> int:
+    if native_bounded_config is None:
+        raise SecurityError("commissioning run requires --native-bounded-spec")
     prepared = preflight(config_path)
-    bounded = native_spec(native_bounded_config, prepared) if native_bounded_config is not None else None
-    options: dict[str, Any] = {}
-    if bounded is not None:
-        options["native_bounded"] = bounded
-    session = TrialSession(prepared, **options)
+    bounded = native_spec(native_bounded_config, prepared)
+    session = TrialSession(prepared, native_bounded=bounded)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -140,17 +138,12 @@ async def run(
 
 
 # A separate explicit action captures a fresh read-only baseline and original configuration backup.
-def capture(path: Path, bounded: bool = False) -> int:
+def capture(path: Path) -> int:
     config = TrialConfig.load(path)
     observer = NativeObserver(config)
-    if bounded:
-        native = asyncio.run(observer.observe_handover())
-        baseline = capture_native_bounded_baseline(native, config.identity, config.hardware_identity)
-        original = native.configuration
-    else:
-        evidence = observer.snapshot()
-        baseline = Baseline.capture(config.identity, evidence)
-        original = observer.configuration_snapshot
+    native = asyncio.run(observer.observe_handover())
+    baseline = capture_native_bounded_baseline(native, config.identity, config.hardware_identity)
+    original = native.configuration
     save_private(config.baseline, baseline.value())
     save_private(config.baseline.with_suffix(".original-config.json"), original)
     emit(
@@ -167,9 +160,7 @@ def capture(path: Path, bounded: bool = False) -> int:
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "action", nargs="?", choices=("check", "capture-baseline", "capture-bounded-baseline", "run"), default="check"
-    )
+    parser.add_argument("action", nargs="?", choices=("check", "capture-bounded-baseline", "run"), default="check")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--interactive", action="store_true")
@@ -177,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not 60 <= args.duration <= 1800:
         parser.error("duration must be 60 to 1800 seconds")
+    if args.action == "run" and args.native_bounded_spec is None:
+        parser.error("run requires --native-bounded-spec")
     try:
         if args.action == "check":
             prepared = preflight(args.config)
@@ -184,10 +177,8 @@ def main(argv: list[str] | None = None) -> int:
                 native_spec(args.native_bounded_spec, prepared)
             emit({**prepared.summary(), "native_bounded_strategy_configured": args.native_bounded_spec is not None})
             return 0
-        if args.action == "capture-baseline":
-            return capture(args.config)
         if args.action == "capture-bounded-baseline":
-            return capture(args.config, bounded=True)
+            return capture(args.config)
         return asyncio.run(run(args.config, args.duration, args.interactive, args.native_bounded_spec))
     except Exception as error:
         # This outer boundary must never turn a parser/TLS/network error into a credential-bearing traceback.
