@@ -150,10 +150,10 @@ class ManagementServer:
                 result["api_version"] = 1
                 result = health_snapshot(result)
                 result["can_pause"] = not self.controller.stopping
-                result["can_start_test"] = result["healthy"] and self.controller.tests.available(
+                result["can_start_test"] = result["healthy"] and self.controller.charging.available(
                     self.controller.latest_native
                 )
-                result["can_start"] = result["local_healthy"] and self.controller.tests.available(
+                result["can_start"] = result["local_healthy"] and self.controller.charging.available(
                     self.controller.latest_native, normal=True
                 )
                 result["requested_current_a"] = self.controller.current.selected()
@@ -166,7 +166,7 @@ class ManagementServer:
                     and result.get("local_hold_verified") is True
                     and not self.controller.requests.return_in_progress()
                     and not self.controller.current.pending()
-                    and not self.controller.tests.return_blocked()
+                    and not self.controller.charging.return_blocked()
                     and self.controller.requests.has_capacity()
                 )
                 result["sessions"] = session_history(self.controller.session.journal)

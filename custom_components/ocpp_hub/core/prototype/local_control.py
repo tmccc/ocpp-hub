@@ -231,23 +231,12 @@ class LocalControl:
         elif phase not in (None, "active"):
             raise DeniedError("trial local controls are frozen")
         ticket = uuid.uuid4().hex
-        state = {
-            **previous,
-            "owner": "local",
-            "inhibit": inhibit,
-            "uncertain": True,
-            "ticket": ticket,
-            "stop_epoch": previous.get("stop_epoch", 0) + int(stopping),
-            "resume_limit": previous.get("resume_limit", self.policy.max_current_a),
-        }
-        self.journal.put("control", state)
+        self.journal.control.claim(previous, ticket, inhibit, stopping, self.policy.max_current_a)
         return self.epoch(), ticket
 
     # Complete only this operation; a retired response cannot release a newer stop's hold.
     def _complete(self, ticket: str, **changes: Any) -> None:
-        state = self.journal.get("control", {})
-        if state.get("ticket") == ticket:
-            self.journal.put("control", {**state, **changes})
+        self.journal.control.complete(ticket, **changes)
 
     # The journal's Start owner binds evidence inside the actual lifecycle transaction.
     def bind_start(self, tag: str, local: int) -> None:

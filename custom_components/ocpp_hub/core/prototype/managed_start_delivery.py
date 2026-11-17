@@ -33,7 +33,7 @@ def latch_start_delivery_fault(j: Journal) -> None:
         raise RecoveryRequiredError("Start delivery fault must share its quarantine transaction")
     if j.get("managed_mode") is not None and not j.get("managed_control_fault"):
         control = j.get("control", {})
-        j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+        j.control.hold(control)
         j.put(
             "managed_control_fault", {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()}
         )
@@ -188,7 +188,7 @@ def record_start_denial(j: Journal, item: Delivery, response: dict[str, Any]) ->
         },
     )
     control = j.get("control", {})
-    j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+    j.control.hold(control)
 
 
 # Every supported active operator proof may retain its exact original generic fault; readiness stays separate.

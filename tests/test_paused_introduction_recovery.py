@@ -26,7 +26,7 @@ from tests.test_prototype_tls import tls as tls
 
 # Retire each actual service with its own socket still available; tested process loss explicitly uses crash instead.
 async def retire(session, controller):
-    await controller.tests.close()
+    await controller.charging.close()
     if controller.pause_task is not None:
         await asyncio.gather(controller.pause_task, return_exceptions=True)
     await session.close()
@@ -96,7 +96,7 @@ async def test_partial_paused_introduction_recovers_after_genuine_stop(
                 b.controller.command(pause_id, "pause", b.controller.requests.intent().revision)
                 await b.controller.pause_task
                 assert rig.bench.firmware.effective_limit() == 0 and b.session.journal.active() == local
-                await b.controller.tests.close()
+                await b.controller.charging.close()
                 await crash(b.session)
                 b, gate = await reconnect(stack, rig, monkeypatch, fault)
                 c, g, j = b.controller, b.session.gateway, b.session.journal

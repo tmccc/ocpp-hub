@@ -42,10 +42,10 @@ async def test_stop_delivery_sequences(tmp_path, model_tls, monkeypatch, capsys,
             await mp.healthy(c)
             if case.origin != "daily":
                 c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-                await c.tests.settle()
+                await c.charging.settle()
             local = await positive_flow(ChargeRig(rig, s, c, sock), "daily" if case.origin == "daily" else "local")
             if case.origin == "local-unobserved":
-                assert c.tests.state()["local_transaction"] == local
+                assert c.charging.state()["local_transaction"] == local
                 rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
             else:
                 await mp.healthy(c)

@@ -31,14 +31,14 @@ async def test_start_preflight_failure_settles_before_optional_diagnostic(tmp_pa
         c.command(request, "start", intent.revision)
         try:
             await asyncio.wait_for(reached.wait(), 3)
-            await asyncio.wait_for(c.tests.settle(), 3)
+            await asyncio.wait_for(c.charging.settle(), 3)
             assert attempts and peer.failed_reads.qsize() >= 1
             assert c.requests.intent() == intent and j.get("control") == control
             assert b.rig.bench.device_calls == wires and starts(b.rig) == []
-            assert j.get("local_start_receipt") is None and c.tests.lease is None
+            assert j.get("local_start_receipt") is None and c.charging.lease is None
             receipt = c.requests.receipt(request)
             assert receipt["state"] == "failed" and receipt["result"]["classification"] == "preflight_refused_unsent"
-            cause = c.tests.state()["failure"]
+            cause = c.charging.state()["failure"]
             assert (cause["id"], cause["action"], cause["revision"], cause["effects_started"]) == (
                 request,
                 "start",
@@ -53,8 +53,8 @@ async def test_start_preflight_failure_settles_before_optional_diagnostic(tmp_pa
         finally:
             peer.unavailable = False
             j.db.execute("DROP TRIGGER IF EXISTS review_cleanup_unavailable")
-            if c.tests.worker is not None:
-                await asyncio.wait_for(asyncio.gather(c.tests.worker, return_exceptions=True), 3)
+            if c.charging.worker is not None:
+                await asyncio.wait_for(asyncio.gather(c.charging.worker, return_exceptions=True), 3)
 
 
 # Intent: the same service reconciles a lost unsent task, while cancellation after real dispatch retains unknown debt.
@@ -104,19 +104,19 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
                 await asyncio.wait_for(wire_entered.wait(), 3)
                 assert len(starts(rig)) == 1 and s.journal.get("local_start_receipt")["stage"] == "issued"
                 victims[0].cancel()
-            await asyncio.wait_for(asyncio.gather(c.tests.worker, *victims, return_exceptions=True), 3)
-            assert c.tests.worker.cancelled() and len(victims) == 1 and victims[0].cancelled()
+            await asyncio.wait_for(asyncio.gather(c.charging.worker, *victims, return_exceptions=True), 3)
+            assert c.charging.worker.cancelled() and len(victims) == 1 and victims[0].cancelled()
         finally:
             loop.set_task_factory(factory)
             release.set()
             rig.bench.before_reply = None
-        assert c.tests.state()["start_attempted"] is issued
-        assert c.tests.state()["start_rpc_accepted"] is False
+        assert c.charging.state()["start_attempted"] is issued
+        assert c.charging.state()["start_rpc_accepted"] is False
         if not issued:
             status = await c.tick()
             assert status["state"] == "healthy" and status["station_ceiling_a"] == 6
             assert c.requests.intent() == original_intent and not s.journal.get("managed_control_fault")
-            assert c.requests.receipt(request)["state"] == "failed" and c.tests.lease is None
+            assert c.requests.receipt(request)["state"] == "failed" and c.charging.lease is None
             assert not starts(rig) and not rig.bench.remote_stop.is_set()
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         await asyncio.wait_for(c.tick(), 3)
@@ -132,7 +132,7 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
             assert c.requests.receipt(request)["state"] in ("accepted", "running", "uncertain")
             assert len(starts(rig)) == 1
             await until(lambda: c.requests.receipt(request)["state"] == "uncertain")
-            assert c.tests.timer.done()
+            assert c.charging.timer.done()
             local = await positive_flow(b)
             assert rig.bench.firmware.current == 0
             for _ in range(3):

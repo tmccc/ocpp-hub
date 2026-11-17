@@ -68,12 +68,12 @@ class RecoveryCoordinator:
     def obligations(self) -> RecoveryFacts:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         intent = c.requests.intent()
-        change, start, timer = j.get("managed_current_change", {}), c.tests.state(), j.get(KEY, {})
+        change, start, timer = j.get("managed_current_change", {}), c.charging.state(), j.get(KEY, {})
         pending_return = c.requests.pending_return()
         obligations = []
         if change.get("state") == "recovering":
             obligations.append(RecoveryObligation(RecoveryWork.CURRENT, str(change.get("id"))))
-        if c.tests.scoped_normal_stop():
+        if c.charging.scoped_normal_stop():
             obligations.append(RecoveryObligation(RecoveryWork.EXPIRED_START, str(start.get("id"))))
         if supervised_timer(timer):
             obligations.append(RecoveryObligation(RecoveryWork.TIMER_DEADLINE, str(timer.get("id"))))
@@ -98,7 +98,7 @@ class RecoveryCoordinator:
                 if pending is not None:
                     return pending
             elif work is RecoveryWork.EXPIRED_START:
-                if await c.tests.reconcile_expired() and c.requests.intent().mode == "app":
+                if await c.charging.reconcile_expired() and c.requests.intent().mode == "app":
                     return Pending(Prerequisite.LIFECYCLE, "expired Start recovery remains pending")
             elif work is RecoveryWork.TIMER_DEADLINE:
                 await c.schedule.protect_deadline(j.get(KEY, {}))
@@ -262,7 +262,7 @@ class RecoveryCoordinator:
                 continuing_local is not None
                 and not current_recovery
                 and not c.ordinary.active()
-                and not (c.tests.scoped_normal_stop() and c.tests.current_daily(continuing_local))
+                and not (c.charging.scoped_normal_stop() and c.charging.current_daily(continuing_local))
                 and (
                     not current_source(g, timer)
                     or c.schedule.needs_source(timer)
@@ -302,7 +302,7 @@ class RecoveryCoordinator:
             return RestoreProgress(RestoreState.WAITING, decision)
         if j.get("trial_phase") == "recovering":
             resumed = await c.native.resume_result(
-                continuing_local=continuing_local, preserve_expired_start=c.tests.preserve_debt
+                continuing_local=continuing_local, preserve_expired_start=c.charging.preserve_debt
             )
             if isinstance(resumed, Pending):
                 return RestoreProgress(RestoreState.WAITING, resumed)

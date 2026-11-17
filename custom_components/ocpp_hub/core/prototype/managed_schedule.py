@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..control import HUB_PROFILE_ID
 from .connection_scope import current_scope
+from .control_state import ControlState
 from .gateway import NativeStartReport, timestamp
 from .ics_writes import validate_write
 from .local_control import local_start_receipt
@@ -1165,7 +1166,7 @@ class ManagedSchedule:
                 or c.requests.return_in_progress()
                 or g.controls._operations
                 or c.current.pending()
-                or c.tests.lease is not None
+                or c.charging.lease is not None
                 or j.get("vendor_start_grant")
                 or not c.session.runtime.status.vendor_connected
                 or g.vendor_registration != "Accepted"
@@ -1400,8 +1401,7 @@ class ManagedSchedule:
                 or old_ticket != attempt.ticket
                 or g.controls._release_ticket != old_ticket
                 or control.get("ticket") != new_ticket
-                or control.get("owner") != "local"
-                or control.get("inhibit") is not True
+                or not ControlState(control).explicit_local_hold
                 or g.controls.desired() != 0
                 or operation is None
                 or operation not in g.controls._operations
@@ -1455,8 +1455,7 @@ class ManagedSchedule:
             or attempt.intent != proof.intent
             or attempt.ticket != proof.old_ticket
             or control.get("ticket") != proof.new_ticket
-            or control.get("owner") != "local"
-            or control.get("inhibit") is not True
+            or not ControlState(control).explicit_local_hold
             or g.controls.desired() != 0
             or j.active() not in proof.allowed_local
             or lease.get("id") != proof.occurrence

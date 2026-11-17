@@ -43,7 +43,7 @@ async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, be
         b.rig.bench.before_reply = incoming
         owner_request = uuid.uuid4().hex
         b.c.command(owner_request, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         b.rig.bench.before_reply = None
         daily = await daily_job if daily_job is not None else await b.start_plan(9, demand=demand)
         owner_tag = starts(b.rig)[0][3]["idTag"]
@@ -76,7 +76,7 @@ async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, be
         assert (await healthy(b.c))["local_hold_verified"]
         b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
         assert (await healthy(b.c))["station_ceiling_a"] == 6
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
         b.session.gateway.policy = g.policy
@@ -146,7 +146,7 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
         premature = b.c.requests.receipt(pause)["state"] == "completed"
         replacements = AsyncExitStack()
         if restart:
-            await b.c.tests.close()
+            await b.c.charging.close()
             await crash(b.session)
             b.session = managed_session(b.rig)
             await b.session.start()
@@ -206,7 +206,7 @@ async def test_same_tag_lifecycles_close_between_polls(tmp_path, tls, unused_tcp
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         b.clock.now = int(datetime(2026, 11, 11, tzinfo=ZONE).timestamp())
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         tag = starts(b.rig)[0][3]["idTag"]
         assert tag == b.device.plans[9]["idTag"]
         daily = await b.start_plan(9, demand=False)

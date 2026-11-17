@@ -311,7 +311,7 @@ async def process_rig(directory, tls, listener, management, monkeypatch, current
         strategy = strategy_file(rig, directory)
         assert rig.spec.digest == digest
         save_private(directory / "process-strategy.json", json.loads(strategy.read_text()))
-        await original.controller.tests.close()
+        await original.controller.charging.close()
         await crash(original.session)
         child = ServiceProcess(rig, directory, management)
         try:

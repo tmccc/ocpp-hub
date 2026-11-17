@@ -27,14 +27,14 @@ async def test_open_introduction_retries_only_zero(tmp_path, tls, unused_tcp_por
         owner_tag(b)
         request = uuid.uuid4().hex
         b.c.command(request, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9)
         await healthy(b.c)
         receipt = b.session.journal.get("local_start_receipt")
         intent = b.c.requests.intent()
         assert receipt["stage"] == "accepted" and receipt["local"] is None
         await expire(b)
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
         await b.session.start()
@@ -88,7 +88,7 @@ async def test_open_introduction_retries_only_zero(tmp_path, tls, unused_tcp_por
             b.rig.bench.before_reply = previous_hook
         await until(lambda: g.controls.ready and g.vendor_registration == "Accepted")
         status = await healthy(b.c)
-        assert status["station_ceiling_a"] == 6 and b.c.tests.current_daily(daily)
+        assert status["station_ceiling_a"] == 6 and b.c.charging.current_daily(daily)
         assert j.get("local_start_receipt") == receipt and j.get("control")["start_pending"]
         assert b.c.requests.receipt(request)["state"] == "uncertain"
         assert len(starts(b.rig)) == 1

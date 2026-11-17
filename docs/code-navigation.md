@@ -1,7 +1,7 @@
 # Code navigation and review guide
 
 This is the reading map for the standalone iCS proxy and its tests. Start from the requested source commit and
-actual entry point. Historical names such as `prototype`, `TrialSession` and `ManagedChargeTests` do not mean that
+actual entry point. Historical names such as `prototype` and `TrialSession` do not mean that
 their code is unused. This guide describes source relationships; it is not a live status report or a test result.
 
 ## Read first
@@ -41,7 +41,7 @@ flowchart LR
 
 The diagram shows ownership and communication, not every call. The service creates `TrialSession` with the legacy
 unscoped local Start disabled, then creates `ManagedController` and `ManagementServer`. Explicit guarded management
-`start` is supported through `ManagedChargeTests`; do not mistake it for that disabled legacy Start.
+`start` is supported through `ManagedCharging`; do not mistake it for that disabled legacy Start.
 
 Shared modules outside `prototype/` include `commands.py`, `control.py`, `frames.py`, `metering.py`, `model.py`,
 `readings.py` and `session.py`. Follow actual imports and calls rather than excluding their parent directory.
@@ -66,9 +66,11 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | Process and connections | [`trial_session.py`](../custom_components/ocpp_hub/core/prototype/trial_session.py), `TrialSession`; `trial_transport.py`; `runtime.py`, `ConnectionRuntime`; `tools/managed_proxy.py` | `test_managed_service_cli.py`, `test_service_observation_recovery.py`, `test_managed_boot_supersession.py` |
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
+| Physical control authority | [`control_state.py`](../custom_components/ocpp_hub/core/prototype/control_state.py), `ControlState` and `Journal.control`; the sole serializer for ownership, holds, ticket completion and current/Start projections | `test_control_authority.py`, `test_bound_owner_retirement.py`, `test_release_publication.py` |
+| Live supervision and health | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `_tick()`; `supervision.py`, pure authority/health assessment; `managed_view.py`, shared public views | `test_supervision.py`, `test_managed_proxy.py`, `test_managed_observed_freshness.py` |
 | Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions and terminal progress; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
 | Start lifecycle and settlement | [`start_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/start_lifecycle.py), `StartLifecycle`, typed persisted identity, receipt/pending/metadata writes and the lease slot; `start_settlement.py`, pure failure/retirement policy, shared evidence and scoped candidates | `test_start_lifecycle.py`, `test_start_settlement.py`, `test_control_slice_peer.py` |
-| Start and cancellation | [`managed_test_charge.py`](../custom_components/ocpp_hub/core/prototype/managed_test_charge.py), `ManagedChargeTests`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
+| Start and cancellation | [`managed_charging.py`](../custom_components/ocpp_hub/core/prototype/managed_charging.py), `ManagedCharging`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
 | Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
 | Native evidence and resources | [`native_bounded_handover.py`](../custom_components/ocpp_hub/core/prototype/native_bounded_handover.py), `NativeBoundedHandover`; `trial_evidence.py`, `NativeObserver`; `native_http.py`; `native_history.py`; `trial_resources.py`, `ResourceBook` | `test_native_read_supersession.py`, `test_native_optional_storage.py`, `test_native_repair_strict_conflict.py` |
 | Persistence and cloud replies | [`store.py`](../custom_components/ocpp_hub/core/prototype/store.py), `Journal`; `delivery_reply.py`; `managed_start_delivery.py`; `managed_stop_delivery.py`; `vendor_read_recovery.py` | `test_stop_saved_reply_recovery.py`, `test_worker_storage_recovery.py`, `test_managed_start_delivery_recovery.py` |
@@ -80,7 +82,20 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 Read recovery siblings alongside their callers. The small modules divide proof and settlement across files; a
 function that returns successfully may only advance one boundary, leaving an actual command or receipt pending.
 
-`Journal.starts` is the synchronous Start lifecycle owner. It reads the existing journal keys into a typed
+`Journal.control` is the only production writer of the existing physical-authority record. `ControlState` preserves
+raw extra fields and missing-key defaults; its shared/hold predicates distinguish legacy truthy flags from explicit
+Boolean proof. Admission replaces the record; claim, hold, current selection and Start projection transitions merge
+the caller's existing preimage. Exact-ticket completion cannot publish a late result over a newer Pause. Callers
+keep their transactions and fresh physical checks; the owner adds no cache, migration, socket or transaction.
+
+The main poll reads top to bottom: settle owned work, maintain faults, supervise recovery/native evidence, assess
+authority, publish a view. `_supervise()` keeps native and recovery effects explicit. `ControlFacts` and `assess()`
+in `supervision.py` make the health decision pure; the controller still performs the fault latch and Return
+completion. Optional cloud-grant decoding remains lazy after valid local authority. A status is no permission
+across an await. Public pending and observed status shapes share their common fields in `managed_view.py`.
+
+`Journal.starts` is the synchronous Start lifecycle owner; pending-bit updates use `Journal.control`. It reads
+the existing journal keys into a typed
 `ChargeStart`, treats the current wire receipt as canonical, and checks metadata projections before correlating
 local closure. Published acceptance, actual wire outcome, stored pending obligation and the current in-memory
 lease remain distinct. Normal, timed and cloud tests share the metadata key, so their writes pass through this

@@ -128,7 +128,7 @@ async def running(rig, label, *, owner_tag=None, release_on_exit=True):
         finally:
             if release_on_exit and getattr(rig.bench, "stop_gate", None) is not None:
                 rig.bench.stop_gate.set()
-            await c.tests.close()
+            await c.charging.close()
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             await crash(s)
@@ -216,7 +216,7 @@ async def test_stop_retry_requires_exact_evidence_then_wire_ack(
                 j.get("next_transaction"),
                 dict(j.db.execute("SELECT * FROM transactions WHERE local=?", (local,)).fetchone()),
             )
-            await c.tests.close()
+            await c.charging.close()
             await crash(s)
         before = list(rig.bench.device_calls)
         assert await operator.run("inspect", config, strategy, None, port, kind="stop-delivery") == 0

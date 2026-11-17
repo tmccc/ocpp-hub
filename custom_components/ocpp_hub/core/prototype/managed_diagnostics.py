@@ -182,7 +182,7 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
             "commands_truncated": count > len(commands),
             "workers": {
                 "current": worker_state(c.current.worker),
-                "start": worker_state(c.tests.worker),
+                "start": worker_state(c.charging.worker),
                 "owned_io_pending": bool(gateway.controls._operations or gateway.charger._pending),
             },
             "protocol": protocol_snapshot(c),

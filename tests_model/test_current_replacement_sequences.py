@@ -70,7 +70,7 @@ async def test_current_replacement_sequences(tmp_path, model_tls, monkeypatch, r
             c.current.worker.cancel()
             await asyncio.gather(c.current.worker, return_exceptions=True)
             peer.release.set()
-            await c.tests.close()
+            await c.charging.close()
             await crash(s)
             s = managed_session(b.rig)
             await s.start()
@@ -89,7 +89,7 @@ async def test_current_replacement_sequences(tmp_path, model_tls, monkeypatch, r
         finally:
             peer.release.set()
             await c.current.settle()
-            await c.tests.close()
+            await c.charging.close()
             await s.close()
             record_property("model_case", case.identifier)
             record_property("model_family", "current_replacement")

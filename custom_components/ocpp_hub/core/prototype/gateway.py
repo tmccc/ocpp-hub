@@ -158,7 +158,7 @@ class Gateway:
         if self.journal.get("trial_phase") == "active" and self.journal.get("trial_binding") is not None:
             with self.journal.atomic():
                 control = self.journal.get("control", {})
-                self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+                self.journal.control.hold(control)
                 self.journal.put("trial_phase", "recovering")
 
     # Attach only an already admitted transport; the gateway never opens sockets itself.

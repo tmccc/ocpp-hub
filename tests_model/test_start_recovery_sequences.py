@@ -134,7 +134,7 @@ async def test_start_failure_recovery_sequences(tmp_path, model_tls, monkeypatch
         monkeypatch.setattr(firmware, "answer", answer)
         monkeypatch.setattr(sock, "send", reply)
         c.command(uuid.uuid4().hex, case.action, c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         if c.pause_task is not None:
             await c.pause_task
         if case.fault == "preflight":
@@ -162,7 +162,7 @@ async def test_start_failure_recovery_sequences(tmp_path, model_tls, monkeypatch
                         await observe(c)
                     elif event == "restart-ready":
                         # Workers failed; cleanup may remain unresolved. Do not drain debt before replacement.
-                        await c.tests.close()
+                        await c.charging.close()
                         if c.pause_task is not None:
                             await c.pause_task
                         await crash(s)
@@ -204,7 +204,7 @@ async def test_start_failure_recovery_sequences(tmp_path, model_tls, monkeypatch
                 suffix_complete = True
             finally:
                 peer.unavailable = False
-                await c.tests.close()
+                await c.charging.close()
                 if c.pause_task is not None:
                     await c.pause_task
                 await s.close()

@@ -125,5 +125,5 @@ async def test_pending_paused_selection_restarts_at_previous_current(
                 assert not starts(b.rig)
         finally:
             await recovered.current.settle()
-            await recovered.tests.close()
+            await recovered.charging.close()
             await replacement.close()

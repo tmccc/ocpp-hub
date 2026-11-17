@@ -104,7 +104,7 @@ async def test_current_selection_confirms_real_profile_and_persists_revision(
             assert test.rig.peer.configuration["maxOutCurrent0"] == "32"
             assert not starts(test.rig) and test.session.journal.active() is None
             if current > 6:
-                assert not test.controller.tests.available(test.controller.latest_native)
+                assert not test.controller.charging.available(test.controller.latest_native)
 
 
 # Intent: changing current during a verified pause changes the future setting without raising the actual zero hold.
@@ -126,7 +126,7 @@ async def test_paused_current_selection_preserves_zero_until_explicit_start(
         assert status["requested_current_a"] == 16 and status["station_ceiling_a"] == 0
         assert test.rig.bench.received_limits == before and not starts(test.rig)
         test.controller.command(uuid.uuid4().hex, "start", test.controller.requests.intent().revision)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         assert (await healthy(test.controller))["current_a"] == 16
         test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
@@ -146,7 +146,7 @@ async def test_explicit_start_delivers_the_selected_current_and_refuses_adjustme
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         await select(test, current)
         test.controller.command(uuid.uuid4().hex, "start", test.controller.requests.intent().revision)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         status = await healthy(test.controller)
         assert status["current_a"] == current and status["power_w"] == current * 240
@@ -347,7 +347,7 @@ async def test_selected_current_survives_restart_without_losing_paused_zero(
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         await healthy(test.controller)
         await select(test, 16)
-        await test.controller.tests.close()
+        await test.controller.charging.close()
         await test.controller.current.settle()
         await crash(test.session)
         replacement = managed_session(test.rig)
@@ -364,7 +364,7 @@ async def test_selected_current_survives_restart_without_losing_paused_zero(
                 assert not starts(test.rig)
         finally:
             await recovered.current.settle()
-            await recovered.tests.close()
+            await recovered.charging.close()
             await replacement.close()
 
 
@@ -406,7 +406,7 @@ async def test_actual_current_above_selected_limit_is_not_healthy_under_user32(
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         await select(test, 16)
         test.controller.command(uuid.uuid4().hex, "start", test.controller.requests.intent().revision)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         await positive_flow(test)
         assert (await healthy(test.controller))["current_a"] == 16
         actual = test.rig.peer.native
@@ -447,7 +447,7 @@ async def test_offline_local_start_and_stop_then_real_cloud_backfill(
         assert not status["cloud_connected"] and status["normal_start_ready"]
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", test.controller.requests.intent().revision)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         reply = await test.rig.bench.call(
             test.charger, "real-offline-local-start", "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
         )

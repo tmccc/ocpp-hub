@@ -127,7 +127,7 @@ async def next_daily(b, current, saved, stops=(), starts_count=0):
 async def replace_controller(b):
     await until(lambda: b.session.journal.next_delivery() is None and not b.session.gateway.vendor._pending)
     policy = b.session.gateway.policy
-    await b.c.tests.close()
+    await b.c.charging.close()
     await crash(b.session)
     from tests.test_managed_proxy import managed_session
 

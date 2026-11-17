@@ -33,7 +33,7 @@ async def test_normal_start_retires_unconfirmed_pause(tmp_path, tls, unused_tcp_
             assert rig.bench.firmware.effective_limit() == 0 and c.requests.receipt(old)["state"] == "accepted"
             start = uuid.uuid4().hex
             c.command(start, "start", c.requests.intent().revision)
-            await c.tests.settle()
+            await c.charging.settle()
             receipt = c.requests.receipt(old)
             assert receipt["state"] == "failed" and receipt["result"] == {
                 "classification": "superseded_by_start",

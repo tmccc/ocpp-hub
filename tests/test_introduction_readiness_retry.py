@@ -96,7 +96,7 @@ async def test_first_boot_readiness_wait_recovers_on_same_boot(
                 assert rig.peer.configuration == configuration and rig.bench.firmware.plans == plans
         finally:
             rig.peer.permission_enabled = False
-            await c.tests.close()
+            await c.charging.close()
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             await session.close()

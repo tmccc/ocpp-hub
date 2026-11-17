@@ -32,11 +32,11 @@ def owner_tag(b: TimerBench) -> None:
 
 # Expire only the monotonic wait after real command dispatch, ACK and independent native observations.
 async def expire(b: TimerBench) -> None:
-    lease = b.c.tests.lease
+    lease = b.c.charging.lease
     assert lease is not None
     lease.deadline = asyncio.get_running_loop().time() - 1
-    b.c.tests.changed.set()
-    await until(lambda: b.c.tests.timer is not None and b.c.tests.timer.done())
+    b.c.charging.changed.set()
+    await until(lambda: b.c.charging.timer is not None and b.c.charging.timer.done())
     if b.c.pause_task is not None:
         await b.c.pause_task
 
@@ -118,7 +118,7 @@ async def test_daily_survives_owner_start_timeout_and_following_nights(
         b.rig.bench.before_reply = before_reply
         request = uuid.uuid4().hex
         b.c.command(request, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         b.rig.bench.before_reply = None
         daily = await daily_job if daily_job is not None else await b.start_plan(9, demand=demand)
         status = await healthy(b.c)
@@ -207,7 +207,7 @@ async def test_automatic_pause_return_survives_delayed_owner_and_both_closure_or
 ) -> None:
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         if native_first:
             provisional = b.session.journal.get("next_transaction") + 1
             b.device.active = provisional
@@ -253,7 +253,7 @@ async def test_unidentified_daily_at_timeout_holds_zero_without_guessed_stop(
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         local = await b.start_plan(9, demand=demand)
         b.rig.peer.plan_session = (local, 987654)
         await b.c.native.read()
@@ -280,7 +280,7 @@ async def test_timeout_rechecks_previously_identified_daily_without_persistent_p
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9, demand=demand)
         await healthy(b.c)
         intent = b.c.requests.intent()
@@ -315,7 +315,7 @@ async def test_explicit_pause_still_owns_daily_and_supersedes_return(
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9)
         await healthy(b.c)
         await expire(b)
@@ -353,7 +353,7 @@ async def test_explicit_pause_preempts_expired_daily_restoration(
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9)
         await healthy(b.c)
         b.c.native.last_verified_at = 0
@@ -385,7 +385,7 @@ async def test_unknown_source_at_daily_release_gate_retains_zero_and_recovers(
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9)
         await healthy(b.c)
         b.c.native.last_verified_at = 0
@@ -423,12 +423,12 @@ async def test_replacement_preserves_expired_daily_and_eventual_owner_closure(
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9, demand=demand)
         await healthy(b.c)
         await expire(b)
         intent = b.c.requests.intent()
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
         await b.session.start()

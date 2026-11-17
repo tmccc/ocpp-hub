@@ -51,7 +51,7 @@ async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, 
             tag = "NATIVE_TIMER"
             if case.source == "local":
                 c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-                await c.tests.settle()
+                await c.charging.settle()
                 tag = mp.starts(rig)[-1][3]["idTag"]
             expected_starts = len(mp.starts(rig))
             response = await rig.bench.call(sock, uuid.uuid4().hex, "StartTransaction", START | {"idTag": tag})
@@ -100,7 +100,7 @@ async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, 
                 elif event == "pause":
                     await pause(c)
                 else:
-                    await c.tests.close()
+                    await c.charging.close()
                     await crash(s)
                     await stack.aclose()
                     stack = AsyncExitStack()

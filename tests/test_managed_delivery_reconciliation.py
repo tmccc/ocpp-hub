@@ -128,7 +128,7 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
                 await healthy(c)
             if local_owner:
                 c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-                await c.tests.settle()
+                await c.charging.settle()
                 tag = starts(rig)[-1][3]["idTag"]
             else:
                 assert (
@@ -147,7 +147,7 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
             assert rig.bench.firmware.current == selected
             if local_owner:
                 await healthy(c)
-                assert c.tests.state()["state"] == "running"
+                assert c.charging.state()["state"] == "running"
             await until(lambda: session.runtime.status.delivery_blocked, timeout=12)
             for _ in range(3):
                 await c.tick()

@@ -7,6 +7,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
 from .managed_cutoffs import supervised_timer
@@ -36,10 +37,10 @@ class OrdinaryRecovery:
     # A verified normal local Start may join ordinary supervision only after its exact request really completed.
     def verified_normal(self) -> bool:
         c, j = self.c, self.c.session.journal
-        state, receipt = c.tests.state(), local_start_receipt(j)
+        state, receipt = c.charging.state(), local_start_receipt(j)
         local = state.get("local_transaction")
         if (
-            c.tests.lease is not None
+            c.charging.lease is not None
             or state.get("kind") != "normal"
             or state.get("source") != "local"
             or state.get("state") != "running"
@@ -78,8 +79,8 @@ class OrdinaryRecovery:
                 supervised_timer(lease) or lease.get("state") == "requested" for lease in occurrences(j).values()
             )
             and not c.current.pending()
-            and c.tests.lease is None
-            and (c.tests.state().get("state") in (None, "completed") or self.verified_normal())
+            and c.charging.lease is None
+            and (c.charging.state().get("state") in (None, "completed") or self.verified_normal())
             and j.get("managed_current_change", {}).get("state") not in ("interrupted", "uncertain")
         )
 
@@ -111,7 +112,7 @@ class OrdinaryRecovery:
             return None
         tag = json.loads(row["start"])["idTag"].casefold()
         digest = fingerprint(tag)
-        state = self.c.tests.state()
+        state = self.c.charging.state()
         local_source = (
             state.get("native_source") if state.get("local_transaction") == local and self.verified_normal() else None
         )
@@ -343,8 +344,7 @@ class OrdinaryRecovery:
             return decision
         if (
             any(v != 0 for v in native.currents_a + native.powers_w)
-            or control.get("owner") != "local"
-            or control.get("inhibit") is not True
+            or not ControlState(control).explicit_local_hold
             or not g.controls.ready
             or g.controls.desired() != 0
             or not c.session.book.confirmed_station_zero(station, row)
@@ -457,8 +457,7 @@ class OrdinaryRecovery:
                 or not g.current_boot_seen(epoch)
                 or current != control
                 or current.get("ticket") != ticket
-                or current.get("owner") != "local"
-                or current.get("inhibit") is not True
+                or not ControlState(current).explicit_local_hold
                 or not g.controls.ready
                 or g.controls.desired() != 0
                 or (tuple(current_station) if current_station is not None else None) != receipt

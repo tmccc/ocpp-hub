@@ -143,6 +143,23 @@ four-suite twenty-worker qualification.
 
 ## Control transitions and Start settlement
 
+Physical authority has one writer, `Journal.control` in `core/prototype/control_state.py`. Intent/revision stays
+with `ManagedRequests`, and actual Start outcomes stay with `Journal.starts`. Admission replaces the control
+record; claim, hold, current selection and pending-Start projection preserve their existing captured preimages.
+An operation completes only its current ticket. The owner preserves unknown fields, adds no schema or cache,
+performs no I/O beyond the existing journal write and joins its caller's transaction without nesting one.
+
+`ManagedController._tick()` is the orchestration: pending work, fault maintenance, supervised observation,
+assessment and view publication. The effect-bearing methods retain their original ordering. `ControlFacts` and
+`assess()` in `supervision.py` explain when a completed observation needs a fault and how authority, local health
+and cloud health differ. A fault or shutdown removes authority labels while retaining physical evidence. Shared
+and local-hold predicates distinguish legacy falsey flags from explicit Boolean confirmations. Optional cloud
+authorization is read only after local readiness, preserving fault precedence. A snapshot never grants permission
+for a later send; exact native/Boot/ticket checks remain at the actual effect and COMMIT boundaries.
+
+`ManagedCharging` and `ChargeLease` in `managed_charging.py` own normal charging and bounded local/cloud tests.
+The historical `managed_test_charge` journal key and public test command/status names remain unchanged.
+
 `ManagedRequests` owns durable control-intent serialization and Pause/Return request transitions. Domain recovery
 uses `write_intent(journal, current, mode)` with its original captured intent and transaction; constructing a
 request owner during native admission would prematurely normalize requests. `ControlIntent.next` owns revision
@@ -163,8 +180,9 @@ The legacy healthy/app status path still completes only its selected accepted Re
 `test_control_lifecycle_peer.py` drives the real engine through healthy status, busy/stopping and queue-full entry.
 The unused controller exception wrappers are removed; callers use typed decisions and `RecoveryCoordinator.restore`.
 
-`Journal.starts` (`core/prototype/start_lifecycle.py`) owns Start receipt, pending-bit and shared managed-charge
-metadata writes, local Start outcomes and the sole process-local lease slot. `ChargeStart` loads the current
+`Journal.starts` (`core/prototype/start_lifecycle.py`) owns Start receipt and shared managed-charge metadata writes,
+local Start outcomes and the sole process-local lease slot; pending-bit changes go through `Journal.control`.
+`ChargeStart` loads the current
 request, wire receipt, metadata projections and actual ledger. An older receipt remains historical until the new
 request prepares. Receipt tag/local identity is usable only with matching projections and current-request or
 explicit published legacy provenance; contradictory stored copies never become corrected permission.

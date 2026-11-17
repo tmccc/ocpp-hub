@@ -4,8 +4,8 @@ import sqlite3
 import uuid
 
 import pytest
+from ocpp_hub_core.prototype.managed_charging import ChargeLease as StartLease
 from ocpp_hub_core.prototype.managed_intent import ManagedRequests
-from ocpp_hub_core.prototype.managed_test_charge import TestLease as StartLease
 from ocpp_hub_core.prototype.start_settlement import RetirementCandidate, RetirementDecision, RetirementRule
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 

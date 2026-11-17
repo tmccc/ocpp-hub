@@ -71,7 +71,7 @@ async def running_service(tmp_path, tls, ports, monkeypatch, current):
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(tmp_path, tls, ports(), monkeypatch, current, cli_route=True) as original:
         await original.controller.current.close()
-        await original.controller.tests.close()
+        await original.controller.charging.close()
         await crash(original.session)
         rig, sessions, controllers, callbacks = original.rig, [], [], {}
         loop = asyncio.get_running_loop()

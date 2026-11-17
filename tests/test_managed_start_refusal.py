@@ -25,7 +25,7 @@ async def refuse_unsent_start(b, action):
     before = list(b.rig.bench.device_calls)
     identifier = uuid.uuid4().hex
     b.controller.command(identifier, action, b.controller.requests.intent().revision)
-    await b.controller.tests.settle()
+    await b.controller.charging.settle()
     assert b.controller.requests.receipt(identifier)["state"] == "failed"
     assert b.rig.bench.device_calls == before and not starts(b.rig)
     assert b.controller.requests.intent().mode == "app"
@@ -50,7 +50,7 @@ async def test_outage_after_unsent_refusal(tmp_path, tls, unused_tcp_port, monke
                     {
                         "case": action or "normal_control",
                         "ordinary": b.controller.ordinary.ordinary(),
-                        "test_state": b.controller.tests.state().get("state"),
+                        "test_state": b.controller.charging.state().get("state"),
                         "status": statuses[-1]["state"],
                         "native_unavailable": b.controller.native_unavailable,
                         "effective_limit": b.rig.bench.firmware.effective_limit(),
@@ -82,7 +82,7 @@ async def test_reconnect_after_unsent_refusal(tmp_path, tls, unused_tcp_port, mo
                         {
                             "case": action or "normal_control",
                             "ordinary": b.controller.ordinary.ordinary(),
-                            "test_state": b.controller.tests.state().get("state"),
+                            "test_state": b.controller.charging.state().get("state"),
                             "status": statuses[-1]["state"],
                             "effective_limit": b.rig.bench.firmware.effective_limit(),
                         }

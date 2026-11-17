@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_cutoffs import supervised_timer
 from .managed_occurrences import occurrences
@@ -116,8 +117,7 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
         or intent.get("mode") != "paused"
         or type(intent.get("revision")) is not int
         or not 0 <= intent["revision"] < 2**53
-        or control.get("owner") != "local"
-        or control.get("inhibit") is not True
+        or not ControlState(control).explicit_local_hold
         or control.get("start_pending")
         or type(control.get("resume_limit")) not in (int, float)
         or not 6 <= control["resume_limit"] <= ceiling

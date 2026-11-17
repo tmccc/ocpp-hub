@@ -1311,14 +1311,14 @@ async def test_remote_start_serialized_with_timer(tmp_path, tls, unused_tcp_port
         assert set(b.device.plans) == {9}
         if source == "local":
             b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-            await b.c.tests.settle()
+            await b.c.charging.settle()
         else:
             reply = await b.rig.bench.cloud_call(
                 "owner-start-after-cleanup", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
             )
             assert reply[0] == 3 and reply[2]["status"] == "Accepted"
         assert len(starts(b.rig)) == 1
-        await b.c.tests.close()
+        await b.c.charging.close()
 
 
 # Intent: honor an independently accepted Start from an older release while actual transaction reporting is delayed.
@@ -1336,7 +1336,7 @@ async def test_previously_accepted_start_before_timer_retirement(
         try:
             if source == "local":
                 b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-                await b.c.tests.settle()
+                await b.c.charging.settle()
             else:
                 reply = await b.rig.bench.cloud_call(
                     "prior-owner-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
@@ -1372,7 +1372,7 @@ async def test_previously_accepted_start_before_timer_retirement(
         await b.close_transaction(local)
         await healthy(b.c)
         assert set(b.device.plans) == {9} and not b.stops()
-        await b.c.tests.close()
+        await b.c.charging.close()
 
 
 # Intent: a rejected recovery Stop retains the validated Boot and retries only the identified transaction.

@@ -69,20 +69,20 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 identifier = uuid.uuid4().hex
                 c.command(identifier, "start_test" if source == "local" else "arm_cloud_test", 0)
                 if source == "local":
-                    await c.tests.settle()
+                    await c.charging.settle()
                 else:
                     await owner_start(b)
                 local = await positive_flow(b, source)
                 await healthy(c)
-                lease = c.tests.lease
+                lease = c.charging.lease
                 assert lease is not None and not lease.normal
-                assert c.tests.state()["state"] == "charging"
+                assert c.charging.state()["state"] == "charging"
                 # Existing live-deadline pattern: the real independent task owns Pause/zero/Stop.
                 lease.deadline = time.monotonic() - 1
-                c.tests.changed.set()
+                c.charging.changed.set()
                 await asyncio.wait_for(b.rig.bench.remote_stop.wait(), 3)
-                assert c.tests.state()["state"] == "stopping"
-                assert c.requests.intent().mode == "paused" and c.tests.lease is lease
+                assert c.charging.state()["state"] == "stopping"
+                assert c.requests.intent().mode == "paused" and c.charging.lease is lease
                 reply = await b.rig.bench.call(
                     b.charger,
                     uuid.uuid4().hex,
@@ -99,7 +99,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 assert j.active() is None and pending is not None and pending.action == "StopTransaction"
                 assert pending.state not in ("ambiguous", "rejected") and g.vendor._pending
                 assert targets and not release_ack.is_set() and not j.get("managed_control_fault")
-                assert c.tests.lease is lease and c.tests.state()["state"] == "stopping"
+                assert c.charging.lease is lease and c.charging.state()["state"] == "stopping"
                 assert b.rig.bench.firmware.active is None and b.rig.bench.firmware.effective_limit() == 0
                 # Do NOT call healthy()/tick()/actual_stop() between this prefix and the target tick.
                 intent, receipt = c.requests.intent(), copy.deepcopy(c.requests.receipt(identifier))
@@ -113,7 +113,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 fresh_code = trial_evidence.Evidence.require_fresh.__code__
                 pause_code = type(c).require_paused.__code__
                 tick_code = type(c)._tick.__code__
-                observed_code = type(c.tests).observed.__code__
+                observed_code = type(c.charging).observed.__code__
 
                 # Supply wall time only; inspect real call/sample identity without replacing a validator.
                 def scoped_time():
@@ -145,12 +145,12 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                         elif (
                             caller is not None
                             and caller.f_code is observed_code
-                            and caller.f_locals.get("self") is c.tests
+                            and caller.f_locals.get("self") is c.charging
                         ):
                             matches = (
                                 len(seen_tick) == 1
                                 and sample == seen_tick[0][0]
-                                and c.tests.lease is lease
+                                and c.charging.lease is lease
                                 and not seen_observed
                             )
                             if matches:
@@ -175,7 +175,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 assert len(seen_tick) == len(seen_observed) == 1 and not mismatches
                 assert seen_tick[0][0] == seen_observed[0][0]
                 assert 0 <= seen_tick[0][1] <= 5 < seen_observed[0][1] and offset == 6
-                assert c.tests.lease is lease and c.tests.state()["state"] == "stopping"
+                assert c.charging.lease is lease and c.charging.state()["state"] == "stopping"
                 assert c.requests.intent() == intent and c.requests.receipt(identifier) == receipt
                 assert not release_ack.is_set() and j.next_delivery().action == "StopTransaction"
                 assert b.rig.bench.firmware.effective_limit() == b.rig.bench.firmware.current == 0
@@ -192,7 +192,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 release_ack.set()
                 await until(lambda: j.next_delivery() is None and not g.vendor._pending)
                 assert (await healthy(c))["local_hold_verified"]
-                assert c.tests.state()["state"] == "completed" and c.tests.lease is None
+                assert c.charging.state()["state"] == "completed" and c.charging.lease is None
                 assert c.requests.receipt(identifier) == receipt and c.requests.intent() == intent
                 assert b.rig.bench.firmware.effective_limit() == 0 and len(starts(b.rig)) == start_count
             finally:

@@ -114,16 +114,16 @@ async def test_actual_service_recovers_cancelled_start_initial_zero(
             response = await call(service.api, "start", id=request, revision=intent.revision)
             assert response["ok"]
             await asyncio.wait_for(captured.wait(), 3)
-            await asyncio.wait_for(asyncio.gather(c.tests.worker, *victims, return_exceptions=True), 3)
+            await asyncio.wait_for(asyncio.gather(c.charging.worker, *victims, return_exceptions=True), 3)
         finally:
             loop.set_task_factory(factory)
-        assert c.tests.worker.cancelled() and len(victims) == 1
+        assert c.charging.worker.cancelled() and len(victims) == 1
         assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
         boundary, zero_mark = time.time(), len(rig.bench.received_limits)
         recovered = await service.published(boundary, state="healthy", desired="app")
         assert c.requests.intent() == intent and recovered["station_ceiling_a"] == current
         assert rig.bench.firmware.effective_limit() == current
         assert current in rig.bench.received_limits[zero_mark:]
-        assert c.requests.receipt(request)["state"] == "failed" and c.tests.lease is None
+        assert c.requests.receipt(request)["state"] == "failed" and c.charging.lease is None
         assert not s.journal.get("managed_control_fault") and not rig.bench.remote_stop.is_set()
         assert s.journal.get("local_start_receipt") is None and not starts(rig)

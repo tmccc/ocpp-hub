@@ -299,7 +299,7 @@ async def test_n06_unexpired_start_daily_restart(
         b.rig.bench.before_reply = before_reply
         try:
             b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-            await b.c.tests.settle()
+            await b.c.charging.settle()
             daily = await daily_job if daily_job is not None else await b.start_plan(9, demand=demand)
         finally:
             b.rig.bench.before_reply = None

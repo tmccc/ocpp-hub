@@ -64,7 +64,7 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                     if frame.f_code is LocalControl._start.__code__ and frame.f_locals.get("self") is g.controls:
                         start = {key: frame.f_locals.get(key) for key in ("request_id", "ticket", "scope")}
                     frame = frame.f_back
-                lease = c.tests.lease
+                lease = c.charging.lease
                 observations.append(
                     {
                         "attempt": attempt,
@@ -131,13 +131,13 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                 child_done=child.done(),
                 child_cancelled=child.cancelled(),
                 child_error=repr(child.exception()) if child.done() and not child.cancelled() else None,
-                worker_pending=c.tests.worker is not None and not c.tests.worker.done(),
+                worker_pending=c.charging.worker is not None and not c.charging.worker.done(),
                 require_parent_pending=require_parent_pending,
                 control=copy.deepcopy(j.get("control")),
                 receipt=copy.deepcopy(j.get("local_start_receipt")),
                 intent=c.requests.intent(),
                 owner_pause=copy.deepcopy(j.get("managed_owner_pause")),
-                state=copy.deepcopy(c.tests.state()),
+                state=copy.deepcopy(c.charging.state()),
                 in_transaction=j.db.in_transaction,
                 actual_limit=rig.bench.firmware.effective_limit(),
                 wire=len(rig.bench.device_calls),
@@ -240,7 +240,7 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                 assert not [item for item in zero_writers if not item["after_new_owner"]]
             else:
                 # Do not inject Boot during rollback: the genuine failed child first verifies zero under its own A.
-                await asyncio.wait_for(c.tests.settle(), 5)
+                await asyncio.wait_for(c.charging.settle(), 5)
                 assert not callback_errors and len(observations) == 1
                 cut = observations[0]
                 attempt, child = cut["attempt"], cut["child"]
@@ -258,8 +258,11 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                     assert j.db.execute("SELECT COUNT(*) FROM start_boot_child").fetchone()[0] == 0
                 assert c.requests.intent() == initial_intent and c.released_epoch == released
                 assert cut["lease"].mode == initial_intent.mode and cut["lease"].revision == initial_intent.revision
-                assert c.tests.state()["state"] == "stopping" and c.tests.state()["failure"]["type"] == "IntegrityError"
-                assert not c.tests.state().get("start_rpc_accepted")
+                assert (
+                    c.charging.state()["state"] == "stopping"
+                    and c.charging.state()["failure"]["type"] == "IntegrityError"
+                )
+                assert not c.charging.state().get("start_rpc_accepted")
                 assert c.requests.receipt(identifier)["state"] == "uncertain"
                 assert rig.bench.firmware.effective_limit() == 0 and current_scope(g) == scope_a
                 assert j.get("local_start_receipt")["stage"] == "accepted"
@@ -308,12 +311,12 @@ async def test_current_pause_protects_post_child_matching_boot_return(
             assert witness["pending_return"] == (returning, intent.revision)
             assert rig.peer.unavailable and j.active() is None and len(starts(rig)) == 1
             clear_publication_cut()
-            await asyncio.wait_for(c.tests.settle(), 4)
-            assert c.tests.state()["state"] == "stopping"
+            await asyncio.wait_for(c.charging.settle(), 4)
+            assert c.charging.state()["state"] == "stopping"
             if storage_failure == "none":
-                assert c.tests.state()["failure"]["type"] == "DeniedError"
+                assert c.charging.state()["failure"]["type"] == "DeniedError"
             else:
-                assert c.tests.state()["failure"]["type"] == "IntegrityError"
+                assert c.charging.state()["failure"]["type"] == "IntegrityError"
             assert c.requests.receipt(identifier)["state"] == "uncertain" and c.pause_task is not None
             await asyncio.wait_for(asyncio.shield(c.pause_task), 4)
             failed_reads = [await asyncio.wait_for(rig.peer.failed_reads.get(), 3)]
@@ -397,8 +400,8 @@ async def test_current_pause_protects_post_child_matching_boot_return(
             clear_publication_cut()
             monkeypatch.setattr(b.charger, "send", original_send)
             rig.peer.unavailable = False
-            if c.tests.worker is not None:
-                await asyncio.gather(c.tests.worker, return_exceptions=True)
+            if c.charging.worker is not None:
+                await asyncio.gather(c.charging.worker, return_exceptions=True)
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             if not boot_reply.done():

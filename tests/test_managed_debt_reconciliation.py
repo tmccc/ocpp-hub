@@ -107,7 +107,7 @@ async def test_vendor_error_operator_reconciliation(tmp_path, tls, unused_tcp_po
                 await operator.run("inspect", config, strategy, None, native_port, kind="vendor-write")
             counter = s.journal.get("next_transaction")
             pause_revision = c.requests.intent().revision
-            await c.tests.close()
+            await c.charging.close()
             await crash(s)
         before = list(rig.bench.device_calls)
         assert await operator.run("inspect", config, strategy, None, native_port, kind="vendor-write") == 0
@@ -223,9 +223,9 @@ async def test_unattributed_start_requires_exact_operator_evidence(tmp_path, tls
             await healthy(c)
             request = uuid.uuid4().hex
             c.command(request, "start", c.requests.intent().revision)
-            await c.tests.settle()
+            await c.charging.settle()
             tag = starts(rig)[0][3]["idTag"]
-            original_deadline = c.tests.state()["hard_deadline_epoch"]
+            original_deadline = c.charging.state()["hard_deadline_epoch"]
             local_ids = []
             for number in range(2):
                 stamp = datetime.fromtimestamp(time.time() + number, UTC).isoformat()
@@ -252,7 +252,7 @@ async def test_unattributed_start_requires_exact_operator_evidence(tmp_path, tls
                 )[0] == 3
                 await until(lambda: s.journal.next_delivery() is None)
             assert s.journal.get("control")["start_pending"]
-            assert c.tests.state().get("local_transaction") is None
+            assert c.charging.state().get("local_transaction") is None
             pause = uuid.uuid4().hex
             c.command(pause, "pause", c.requests.intent().revision)
             await c.pause_task
@@ -261,7 +261,7 @@ async def test_unattributed_start_requires_exact_operator_evidence(tmp_path, tls
             await asyncio.sleep(max(0, original_deadline - time.time()) + 0.1)
             await c.tick()
             assert s.journal.get("control")["start_pending"] and len(starts(rig)) == 1
-            await c.tests.close()
+            await c.charging.close()
             await crash(s)
         before = list(rig.bench.device_calls)
         assert await operator.run("inspect", config, strategy, None, native_port, kind="local-start") == 0
@@ -386,7 +386,7 @@ async def test_legacy_observation_recovery_preserves_queued_lifecycle(
                 c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
                 await c.pause_task
                 await c.tick()
-                await c.tests.close()
+                await c.charging.close()
                 await crash(s)
             gate["armed"] = False
             gate["release"].set()

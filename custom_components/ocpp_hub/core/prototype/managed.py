@@ -1,19 +1,21 @@
-"""Persistent app/schedule supervision without assistant-initiated Start or fabricated recovery outcomes."""
+"""Daily charging supervision with verified native limits and durable owner requests."""
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
 import time
+from dataclasses import replace
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
 from .connection_scope import current_scope
+from .control_state import ControlState
 from .local_control import local_start_receipt
+from .managed_charging import ManagedCharging
 from .managed_current import (
     ManagedCurrentLimits,
     current_session_decision,
-    managed_current_ceiling,
 )
 from .managed_current_recovery import capture_interrupted_collision
 from .managed_faults import latch_managed_fault
@@ -36,8 +38,7 @@ from .managed_settlement import (
     require_settled_debt,
 )
 from .managed_start_binding import ManagedStartBinding
-from .managed_test_charge import ManagedChargeTests
-from .managed_view import summarize_charger_history
+from .managed_view import observed_status, poll_base, poll_status
 from .native_bounded import readiness_decision
 from .native_bounded_handover import AuditSupersededError
 from .native_faults import (
@@ -54,6 +55,7 @@ from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .store import RecoveryRequiredError, encoded, fingerprint
+from .supervision import ControlFacts, HealthVerdict, Observation, PollStatus, assess
 from .trial_evidence import profile_projection
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import lifecycle_decision
@@ -99,13 +101,13 @@ class ManagedController:
         self.schedule = ManagedSchedule(self)
         self.native.schedule_changed = self.schedule.changed.set
         self.current = ManagedCurrentLimits(self)
-        self.tests = ManagedChargeTests(self)
+        self.charging = ManagedCharging(self)
         self.ordinary = OrdinaryRecovery(self)
         self.recovery = RecoveryCoordinator(self)
         self.native.ordinary_source_observer = self.ordinary.observe
         self.native.positive_guard = self.positive_decision
         self.native.continuation_guard = self.continuation_decision
-        self.native.recovery_zero_only = self.tests.scoped_normal_stop
+        self.native.recovery_zero_only = self.charging.scoped_normal_stop
         binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest)
         session.gateway.defer_command_binding = binding.defer
         self.native.command_source_observer = binding.observe
@@ -126,11 +128,11 @@ class ManagedController:
         if current_a is not None:
             raise SecurityError("current is only supported by the current-selection command")
         if action in ("start", "start_test", "arm_cloud_test"):
-            return self.tests.accept(identifier, action, revision)
+            return self.charging.accept(identifier, action, revision)
         previous = self.requests.existing(identifier, action, revision)
         if previous is not None:
             return previous
-        if action == "app_control" and self.tests.return_blocked():
+        if action == "app_control" and self.charging.return_blocked():
             raise RecoveryRequiredError("return awaits timed test settlement")
         if action == "app_control" and self.current.pending():
             raise RecoveryRequiredError("return awaits the current-setting outcome")
@@ -154,7 +156,7 @@ class ManagedController:
     # The current persistent Pause may reclaim only the shared ticket of its exact retired normal Start.
     def reclaim_failed_start_pause(self) -> None:
         g, j = self.session.gateway, self.session.journal
-        intent, state = self.requests.intent(), self.tests.state()
+        intent, state = self.requests.intent(), self.charging.state()
         failure = state.get("failure")
         if (
             intent.mode != "paused"
@@ -185,9 +187,7 @@ class ManagedController:
             or receipt.get("stage") not in ("issued", "accepted")
             or not receipt.get("ticket")
             or control.get("ticket") != receipt["ticket"]
-            or control.get("owner") != "shared"
-            or control.get("inhibit") is not False
-            or control.get("uncertain") is not False
+            or not ControlState(control).confirmed_shared
             or owner_pause.get("revision") != intent.revision
         ):
             return
@@ -197,14 +197,14 @@ class ManagedController:
             return (
                 not self.stopping
                 and not j.get("managed_control_fault")
-                and self.tests.lease is None
+                and self.charging.lease is None
                 and not g.controls._operations
                 and not g.charger._pending
                 and self.requests.intent() == intent
                 and current_scope(g) == scope
                 and g.controls._revision == revision
                 and j.get("trial_phase") == "active"
-                and self.tests.state() == state
+                and self.charging.state() == state
                 and local_start_receipt(j) == receipt
                 and j.get("control") == control
                 and j.get("managed_owner_pause") == owner_pause
@@ -239,8 +239,7 @@ class ManagedController:
                 or self.requests.intent() != intent
                 or not ticket
                 or control.get("ticket") != ticket
-                or control.get("owner") != "local"
-                or control.get("inhibit") is not True
+                or not ControlState(control).explicit_local_hold
                 or g._charger_epoch != epoch
                 or scope is None
                 or current_scope(g) != scope
@@ -265,8 +264,8 @@ class ManagedController:
 
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
-        if self.tests.scoped_normal_stop():
-            await self.tests.reconcile_expired()
+        if self.charging.scoped_normal_stop():
+            await self.charging.reconcile_expired()
             return
         await self.ensure_pause_zero()
         try:
@@ -304,8 +303,7 @@ class ManagedController:
                     return  # LocalControl checks once before synchronously taking its restrictive claim.
                 if (
                     control.get("stop_epoch") != stop_epoch + 1
-                    or control.get("owner") != "local"
-                    or control.get("inhibit") is not True
+                    or not ControlState(control).explicit_local_hold
                     or not isinstance(control.get("ticket"), str)
                     or control["ticket"] != g.controls._stop_ticket
                     or stop_ticket not in (None, control["ticket"])
@@ -333,7 +331,7 @@ class ManagedController:
             controls = g.controls
             if not native.physical.transaction_open and controls.ready and controls.desired() == 0:
                 self.require_paused(native)
-                self.tests.observed(native)
+                self.charging.observed(native)
                 controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
                 return
             if not controls.stop_acknowledged(local):
@@ -353,8 +351,7 @@ class ManagedController:
             or self.native.introduced_revision != g.controls._revision
             or not g.controls.ready
             or g.controls.desired() != 0
-            or j.get("control", {}).get("owner") != "local"
-            or not j.get("control", {}).get("inhibit")
+            or not ControlState(j.get("control", {})).local_hold
             or not timer_cleanup
             and j.get("control", {}).get("start_pending")
             or j.get("uncertain_vendor_command")
@@ -375,8 +372,7 @@ class ManagedController:
             native.physical.transaction_open
             or not self.session.gateway.controls.ready
             or self.session.gateway.controls.desired() != 0
-            or self.session.journal.get("control", {}).get("owner") != "local"
-            or not self.session.journal.get("control", {}).get("inhibit")
+            or not ControlState(self.session.journal.get("control", {})).local_hold
         ):
             await self._stop_requested()
             raise RecoveryRequiredError("requested pause awaits actual physical closure")
@@ -405,7 +401,7 @@ class ManagedController:
                         g.controls._complete(j.get("control")["ticket"], uncertain=False)
                 if any(record.key == "managed_test_charge" for record in records):
                     j.starts.set_lease(None)
-                    self.tests.changed.set()
+                    self.charging.changed.set()
         if self.current.failed_idle_hold():
             # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
             g.controls._complete(j.get("control")["ticket"], uncertain=False)
@@ -502,8 +498,7 @@ class ManagedController:
                 or not fault
                 or j.get("managed_control_fault") != fault
                 or j.get("control", {}) != control
-                or control.get("owner") != "local"
-                or control.get("inhibit") is not True
+                or not ControlState(control).explicit_local_hold
                 or g.controls.desired() != 0
                 or j.get("trial_phase") not in ("active", "blocked", "recovering")
                 or g.charger.sender is None
@@ -549,7 +544,7 @@ class ManagedController:
             return current_session_decision(self.session.gateway, native, local)
         elif self.ordinary.active():
             return self.ordinary.session_decision(native, local)
-        elif not (self.tests.scoped_normal_stop() and self.tests.independent_daily(native, local)):
+        elif not (self.charging.scoped_normal_stop() and self.charging.independent_daily(native, local)):
             return continuing_session_decision(j, native, local)
         return ALLOW
 
@@ -557,7 +552,7 @@ class ManagedController:
     def positive_decision(self, native: HandoverEvidence) -> GateDecision:
         if self.session._introduction_refusal is not None:
             raise RecoveryRequiredError("strict introduction refusal awaits durable diagnostic")
-        decision = self.tests.positive_decision(native)
+        decision = self.charging.positive_decision(native)
         if isinstance(decision, Pending):
             return decision
         if self.ordinary.active():
@@ -598,7 +593,7 @@ class ManagedController:
             decision = lifecycle_decision(
                 g,
                 continuing_local=continuing_local,
-                preserve_expired_start=self.tests.preserve_debt(native, continuing_local),
+                preserve_expired_start=self.charging.preserve_debt(native, continuing_local),
             )
             if isinstance(decision, Pending):
                 return decision
@@ -641,7 +636,7 @@ class ManagedController:
         if expected.revision != revision:
             self.requests.finish(identifier, "failed", {"classification": "stale_revision"})
             return
-        if self.tests.return_blocked():
+        if self.charging.return_blocked():
             return  # An already accepted Return survives until observation completes the timed test under Pause.
         j = self.session.journal
         control = j.get("control", {})
@@ -739,78 +734,47 @@ class ManagedController:
             status.update(state="degraded", fault=problem, temporary_schedule=self.schedule.summary())
         return status
 
-    # Retain ordinary recovery and owner-control supervision while schedule alarms are reported separately.
+    # A poll first joins owned work, then supervises, assesses current authority and publishes one view.
     async def _tick(self) -> dict[str, Any]:
+        pending = await self._pending_work()
+        if pending is not None:
+            self.latest_native = None
+            return poll_status(self, PollStatus("stopping" if self.stopping else "reconciling", pending), pending=True)
+        base = poll_base(self)
+        gate = await self._poll_gate()
+        if gate is not None:
+            return poll_status(self, gate, base=base)
+        observed = await self._supervise(base)
+        if isinstance(observed, PollStatus):
+            return poll_status(self, observed, base=base)
+        verdict = self._assess_observation(observed)
+        if isinstance(verdict, PollStatus):
+            return poll_status(self, verdict, base=base)
+        return observed_status(self, base, observed.native, verdict)
+
+    # Pending owned completions retain their existing settlement priority before any new native audit.
+    async def _pending_work(self) -> str | None:
         pending = None
         if not await self.current.settle_for_poll():
             pending = "current_update_pending"
-        elif not await self.tests.settle_for_poll():
+        elif not await self.charging.settle_for_poll():
             pending = "start_operation_pending"
         elif self.recovery.pending():
             pending = "owner_release_pending"
-        if pending is not None:
-            self.latest_native = None
-            intent = self.requests.intent()
-            g, runtime = self.session.gateway, self.session.runtime.status
-            return {
-                "checked_at": time.time(),
-                "mode": "app_schedule",
-                "state": "stopping" if self.stopping else "reconciling",
-                "fault": pending,
-                "desired_control": intent.mode,
-                "control_revision": intent.revision,
-                "local_start_disabled": not g.policy.allow_local_start,
-                "charger_connected": runtime.charger_connected,
-                "cloud_connected": runtime.vendor_connected and g.vendor_registration == "Accepted",
-                "boot_verified": g.current_boot_seen(g._charger_epoch),
-                "cloud_start_pending": g.authorisation.pending(),
-                "owner_control_enabled": False,
-                "local_hold_verified": False,
-                "native_observed_at": None,
-                "native_limit_a": None,
-                "current_a": None,
-                "power_w": None,
-                "station_ceiling_a": None,
-                "charging_session_open": None,
-                "vehicle_drawing_power": None,
-            }
+        return pending
+
+    # Fault maintenance retains its restrictive work before an ordinary observation can establish fresh health.
+    async def _poll_gate(self) -> PollStatus | None:
         s, g, j = self.session, self.session.gateway, self.session.journal
-        base = {
-            "checked_at": time.time(),
-            "mode": "app_schedule",
-            "local_start_disabled": not g.policy.allow_local_start,
-            "charger_connected": s.runtime.status.charger_connected,
-            "cloud_connected": s.runtime.status.vendor_connected and g.vendor_registration == "Accepted",
-            "boot_verified": g.current_boot_seen(g._charger_epoch),
-            "cloud_start_pending": g.authorisation.pending(),
-            "phase": j.get("trial_phase"),
-            "pending_lifecycle_events": j.db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
-            ).fetchone()[0],
-            "pending_observations": j.db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
-            ).fetchone()[0],
-            "automatic_charge_restart": False,
-            "vendor_write_uncertain": j.db.execute(
-                "SELECT COUNT(*) FROM mutations WHERE origin='vendor' AND state!='confirmed'"
-            ).fetchone()[0],
-            "operator_reconciliation_required": bool(j.get("uncertain_vendor_command"))
-            or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed'").fetchone()
-            is not None,
-            "desired_control": self.requests.intent().mode,
-            "control_revision": self.requests.intent().revision,
-            "local_hold_verified": False,
-            "owner_control_enabled": False,
-        }
         if self.stopping:
-            return {**base, "state": "stopping", "owner_control_enabled": False}
+            return PollStatus("stopping")
         if s._introduction_refusal is not None:
             classification = s._introduction_refusal.classification
             try:
                 s._persist_introduction_refusal()
             except UnavailableError:
                 pass  # Retain the proved strict refusal while its atomic diagnostic latch awaits storage.
-            return {**base, "state": "attention", "fault": classification}
+            return PollStatus("attention", classification)
         if j.get("managed_control_fault"):
             await self.hold_fault()
             if (
@@ -820,19 +784,24 @@ class ManagedController:
                 and not g.charger._pending
             ):
                 await self._stop_requested()
-            await self.tests.retire_closed_after_fault()
+            await self.charging.retire_closed_after_fault()
             try:
                 await reconcile_owner_release(self)
             except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
                 pass  # The exact fault remains latched until a new Pause and every independent zero proof agree.
             if not j.get("managed_control_fault"):
-                return {**base, "state": "reconciling", "owner_control_enabled": False}
-            return {**base, "state": "attention", "fault": j.get("managed_control_fault")["classification"]}
+                return PollStatus("reconciling")
+            return PollStatus("attention", j.get("managed_control_fault")["classification"])
+        return None
+
+    # Native observation, recovery and diagnostic escalation retain their original await and effect order.
+    async def _supervise(self, base: dict[str, Any]) -> Observation | PollStatus:
+        g, j = self.session.gateway, self.session.journal
         timer = self.schedule.arm_idle_cutoff()
         pending_timer = supervised_timer(timer)
         cutoff_hold = pending_timer and "hold_since" in timer
         if not base["charger_connected"] or not base["boot_verified"]:
-            return {**base, "state": "starting", "owner_control_enabled": False}
+            return PollStatus("starting")
         if self.requests.intent().mode == "paused" and (self.pause_task is None or self.pause_task.done()):
             await self.ensure_pause_zero()
         current_hold = j.get("managed_current_change", {}).get("state") == "recovering"
@@ -849,7 +818,7 @@ class ManagedController:
                     await self.schedule.retry_recovery_zero()
                 except DeniedError, UnavailableError, RecoveryRequiredError:
                     pass
-            return {**base, "state": "starting", "owner_control_enabled": False}
+            return PollStatus("starting")
         verified_pause = False
         verified_idle_hold = False
         try:
@@ -857,17 +826,10 @@ class ManagedController:
             recovery_pending = await self.recovery.advance()
             if recovery_pending is not None:
                 if recovery_pending.reason is Prerequisite.NATIVE:
-                    return {
-                        **base,
-                        "state": "degraded",
-                        "fault": "native_observation_unavailable",
-                        "owner_control_enabled": False,
-                    }
-                return {
-                    **base,
-                    "state": "waiting_for_cloud" if recovery_pending.reason is Prerequisite.CLOUD else "reconciling",
-                    "owner_control_enabled": False,
-                }
+                    return PollStatus("degraded", "native_observation_unavailable")
+                return PollStatus(
+                    "waiting_for_cloud" if recovery_pending.reason is Prerequisite.CLOUD else "reconciling"
+                )
             native = await self.settled_native()
             await self.schedule.observe(native)
             if j.get(KEY, {}).get("idle_cutoff_hold"):
@@ -888,7 +850,7 @@ class ManagedController:
                 self.require_paused(native)
                 verified_pause = True
             previous_intent = self.requests.intent()
-            self.tests.observed(native)
+            self.charging.observed(native)
             observed_intent = self.requests.intent()
             intent_changed = observed_intent != previous_intent
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
@@ -925,24 +887,14 @@ class ManagedController:
                         self.fault("native_authority_or_preservation_failed")
                     except DeniedError, UnavailableError, RecoveryRequiredError:
                         pass  # The admitted zero remains the only retry; no positive authority was created.
-            return {
-                **base,
-                "state": "degraded",
-                "owner_control_enabled": False,
-                "fault": "native_observation_unavailable",
-            }
+            return PollStatus("degraded", "native_observation_unavailable")
         except UnavailableError, TimeoutError:
-            return {
-                **base,
-                "state": "stopping" if self.stopping else "degraded",
-                "owner_control_enabled": False,
-                "fault": "native_observation_unavailable",
-            }
+            return PollStatus("stopping" if self.stopping else "degraded", "native_observation_unavailable")
         except RecoveryRequiredError:
-            return {**base, "state": "reconciling", "owner_control_enabled": False}
+            return PollStatus("reconciling")
         except (SecurityError, DeniedError) as error:
             if self.stopping:
-                return {**base, "state": "stopping", "owner_control_enabled": False}
+                return PollStatus("stopping")
             # Only a fully settled typed measurement can make this entire hard-failure run recoverable.
             measured_only = isinstance(error, MeasuredOutputLimitError)
             self.strict_failure_seen = self.strict_failure_seen or not measured_only
@@ -963,19 +915,18 @@ class ManagedController:
                 self.fault(classification, diagnostic=diagnostic)
             else:
                 self.record_optional_native_failure(diagnostic)
-            return {**base, "state": "degraded", "fault": classification}
+            return PollStatus("degraded", classification)
         self.failures = 0
         self.strict_failure_seen = False
         self.native_unavailable = 0
         self.latest_native = native
         if intent_changed:
-            return {
-                **base,
-                "state": "pausing",
-                "owner_control_enabled": False,
-                "desired_control": observed_intent.mode,
-                "control_revision": observed_intent.revision,
-            }
+            return PollStatus("pausing", intent=observed_intent)
+        return Observation(native, verified_pause, verified_idle_hold)
+
+    # The pure verdict requests a latch; the controller still owns its actual write and Return completion.
+    def _assess_observation(self, observed: Observation) -> HealthVerdict | PollStatus:
+        s, g, j = self.session, self.session.gateway, self.session.journal
         control = j.get("control", {})
         if (
             self.current.applying()
@@ -989,82 +940,39 @@ class ManagedController:
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
         ):
             intent = self.requests.intent()
-            return {
-                **base,
-                "state": "reconciling",
-                "owner_control_enabled": False,
-                "desired_control": intent.mode,
-                "control_revision": intent.revision,
-            }
-        shared = control.get("owner") == "shared" and not control.get("inhibit") and not control.get("uncertain")
+            return PollStatus("reconciling", intent=intent)
         paused = self.requests.intent().mode == "paused"
-        delivery_uncertain = s.runtime.status.delivery_blocked and (
-            s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain
+        facts = ControlFacts(
+            ControlState(control),
+            observed.verified_pause,
+            observed.verified_idle_hold,
+            s.runtime.status.delivery_blocked
+            and (s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain),
+            False,
         )
-        if (
-            not (shared or verified_pause or verified_idle_hold)
-            or delivery_uncertain
-            or j.get("uncertain_vendor_command")
-        ):
-            if not self.stopping:
-                self.fault("owner_control_or_delivery_uncertain")
-        shared = shared and not j.get("managed_control_fault") and not self.stopping
-        verified_pause = verified_pause and not j.get("managed_control_fault") and not self.stopping
-        verified_idle_hold = verified_idle_hold and not j.get("managed_control_fault") and not self.stopping
+        if not facts.requires_fault:
+            facts = replace(facts, vendor_uncertain=bool(j.get("uncertain_vendor_command")))
+        if facts.requires_fault and not self.stopping:
+            self.fault("owner_control_or_delivery_uncertain")
+        faulted = facts.has_authority and bool(j.get("managed_control_fault"))
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )
-        local_healthy = (
-            (shared or verified_pause or verified_idle_hold)
-            and j.get("trial_phase") == "active"
-            and not control.get("uncertain")
-            and not s.runtime.status.delivery_blocked
-            and not g.authorisation.pending()
+        active = facts.authority_valid(faulted, self.stopping) and j.get("trial_phase") == "active"
+        local_ready = facts.locally_ready(
+            faulted=faulted, stopping=self.stopping, active=active, delivery_blocked=s.runtime.status.delivery_blocked
         )
-        healthy = local_healthy and cloud
-        if healthy and not paused:
+        verdict = assess(
+            facts,
+            faulted=faulted,
+            stopping=self.stopping,
+            active=active,
+            delivery_blocked=s.runtime.status.delivery_blocked,
+            cloud_pending=local_ready and g.authorisation.pending(),
+            cloud_ready=cloud,
+        )
+        if verdict.healthy and not paused:
             pending_return = self.requests.pending_return()
             if pending_return is not None:
                 self.requests.returned(pending_return[0])
-        history = summarize_charger_history(native.history)
-        return {
-            **base,
-            "local_healthy": bool(local_healthy),
-            "checked_at": time.time(),
-            "phase": j.get("trial_phase"),
-            "cloud_connected": cloud,
-            "state": "stopping"
-            if self.stopping
-            else "healthy"
-            if healthy
-            else "local_only"
-            if local_healthy
-            else "degraded",
-            "owner_control_enabled": shared,
-            "desired_control": self.requests.intent().mode,
-            "control_revision": self.requests.intent().revision,
-            "local_hold_verified": verified_pause or verified_idle_hold,
-            "native_observed_at": native.physical.observed_at,
-            "native_limit_a": native.runtime_user_a,
-            "requested_current_a": self.current.selected(),
-            "current_capability": managed_current_ceiling(j, self.native.spec) == 32,
-            "can_set_current": self.current.available(native),
-            "station_ceiling_a": g.controls.desired(),
-            "current_a": native.physical.current_a,
-            "power_w": native.physical.power_w,
-            "charging_session_open": native.physical.transaction_open,
-            "vehicle_connected": native.physical.connection != "Unplug",
-            "history_records": len(native.history),
-            "test_charge": self.tests.summary(),
-            "test_start_ready": self.tests.available(native),
-            "local_charge": self.tests.normal_summary(),
-            "normal_start_ready": self.tests.available(native, normal=True),
-            "history_archive": j.get("native_history_summary"),
-            "history_warning": "records_absent_from_charger"
-            if j.get("native_history_summary", {}).get("missing_records", 0)
-            else None,
-            "charger_sessions": history.sessions,
-            "charger_history_complete": history.complete,
-            "temporary_schedule": self.schedule.summary(),
-            "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
-        }
+        return verdict

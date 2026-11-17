@@ -60,7 +60,7 @@ async def test_real_native503_before_remote_start(tmp_path, tls, unused_tcp_port
         assert g.charger.validate_send.__func__ is type(c.native).validate_send
         native.journal, native.armed = j, fail
         c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         if fail:
             assert len(native.failures) == 1 and native.failures[0]["stage"] == "prepared"
             assert native.failures[0]["request"]["action"] == "getConfig"

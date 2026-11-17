@@ -7,9 +7,14 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .store import Journal
+from .supervision import HealthVerdict, PollStatus
+
+if TYPE_CHECKING:
+    from .managed import ManagedController
+    from .trial_handover_evidence import HandoverEvidence
 
 
 # Reject booleans and non-finite values before calculating status ages or certificate coverage.
@@ -153,3 +158,114 @@ def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHis
 # Callers needing just the bounded archive retain the same redacted list contract.
 def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
     return summarize_charger_history(records).sessions
+
+
+# Both poll shapes share connection and intent fields; pending work deliberately omits durable-history fields.
+def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
+    intent = c.requests.intent()
+    g, runtime = c.session.gateway, c.session.runtime.status
+    value: dict[str, Any] = {
+        "checked_at": time.time(),
+        "mode": "app_schedule",
+        "desired_control": intent.mode,
+        "control_revision": intent.revision,
+        "local_start_disabled": not g.policy.allow_local_start,
+        "charger_connected": runtime.charger_connected,
+        "cloud_connected": runtime.vendor_connected and g.vendor_registration == "Accepted",
+        "boot_verified": g.current_boot_seen(g._charger_epoch),
+        "cloud_start_pending": g.authorisation.pending(),
+        "owner_control_enabled": False,
+        "local_hold_verified": False,
+    }
+    if pending:
+        value.update(
+            {
+                key: None
+                for key in (
+                    "native_observed_at",
+                    "native_limit_a",
+                    "current_a",
+                    "power_w",
+                    "station_ceiling_a",
+                    "charging_session_open",
+                    "vehicle_drawing_power",
+                )
+            }
+        )
+    else:
+        j = c.session.journal
+        value.update(
+            phase=j.get("trial_phase"),
+            pending_lifecycle_events=j.db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
+            ).fetchone()[0],
+            pending_observations=j.db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
+            ).fetchone()[0],
+            automatic_charge_restart=False,
+            vendor_write_uncertain=j.db.execute(
+                "SELECT COUNT(*) FROM mutations WHERE origin='vendor' AND state!='confirmed'"
+            ).fetchone()[0],
+            operator_reconciliation_required=bool(j.get("uncertain_vendor_command"))
+            or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed'").fetchone()
+            is not None,
+        )
+    return value
+
+
+# A stopped pass publishes its named state and no verified owner authority.
+def poll_status(
+    c: ManagedController, result: PollStatus, *, base: dict[str, Any] | None = None, pending: bool = False
+) -> dict[str, Any]:
+    value = poll_base(c, pending=pending) if base is None else dict(base)
+    value["state"] = result.state
+    if result.fault is not None:
+        value["fault"] = result.fault
+    if result.intent is not None:
+        value.update(desired_control=result.intent.mode, control_revision=result.intent.revision)
+    return value
+
+
+# Render the complete fresh observation using the single health verdict; readiness retains its domain guards.
+def observed_status(
+    c: ManagedController, base: dict[str, Any], native: HandoverEvidence, verdict: HealthVerdict
+) -> dict[str, Any]:
+    from .managed_current import managed_current_ceiling
+
+    j, g = c.session.journal, c.session.gateway
+    history = summarize_charger_history(native.history)
+    return {
+        **base,
+        "local_healthy": verdict.local_healthy,
+        "checked_at": time.time(),
+        "phase": j.get("trial_phase"),
+        "cloud_connected": verdict.cloud_ready,
+        "state": verdict.state,
+        "owner_control_enabled": verdict.shared,
+        "desired_control": c.requests.intent().mode,
+        "control_revision": c.requests.intent().revision,
+        "local_hold_verified": verdict.hold_verified,
+        "native_observed_at": native.physical.observed_at,
+        "native_limit_a": native.runtime_user_a,
+        "requested_current_a": c.current.selected(),
+        "current_capability": managed_current_ceiling(j, c.native.spec) == 32,
+        "can_set_current": c.current.available(native),
+        "station_ceiling_a": g.controls.desired(),
+        "current_a": native.physical.current_a,
+        "power_w": native.physical.power_w,
+        "charging_session_open": native.physical.transaction_open,
+        "vehicle_connected": native.physical.connection != "Unplug",
+        "history_records": len(native.history),
+        "test_charge": c.charging.summary(),
+        "test_start_ready": c.charging.available(native),
+        "local_charge": c.charging.normal_summary(),
+        "normal_start_ready": c.charging.available(native, normal=True),
+        "history_archive": j.get("native_history_summary"),
+        "history_warning": "records_absent_from_charger"
+        if j.get("native_history_summary", {}).get("missing_records", 0)
+        else None,
+        "charger_sessions": history.sessions,
+        "charger_history_complete": history.complete,
+        "temporary_schedule": c.schedule.summary(),
+        "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
+    }

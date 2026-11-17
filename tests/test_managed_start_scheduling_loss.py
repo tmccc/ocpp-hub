@@ -56,18 +56,18 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
             c.command(identifier, action, c.requests.intent().revision)
             if loss != "preparation-write":
                 await asyncio.wait_for(interrupted.wait(), 3)
-                await asyncio.gather(c.tests.worker, *victims, return_exceptions=True)
+                await asyncio.gather(c.charging.worker, *victims, return_exceptions=True)
                 assert len(victims) == 1 and victims[0].cancelled()
             else:
-                await c.tests.settle()
+                await c.charging.settle()
                 assert c.requests.receipt(identifier)["state"] == "uncertain"
                 assert c.requests.receipt(identifier)["result"]["classification"] == "start_not_confirmed"
                 s.journal.db.execute("DROP TRIGGER fail_start_marker")
         finally:
             loop.set_task_factory(original_factory)
-        assert c.tests.state()["start_attempted"] is False and c.tests.state()["start_rpc_accepted"] is False
+        assert c.charging.state()["start_attempted"] is False and c.charging.state()["start_rpc_accepted"] is False
         assert s.journal.get("local_start_receipt") is None and not starts(rig)
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
         replacement = managed_session(rig)
         await replacement.start()
@@ -90,11 +90,11 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
                     with pytest.raises(sqlite3.IntegrityError, match="synthetic unsent retirement failure"):
                         await c.pause_task
                     assert c.requests.receipt(identifier)["state"] == "uncertain"
-                    assert c.tests.state()["state"] == "interrupted" and rig.bench.firmware.effective_limit() == 0
+                    assert c.charging.state()["state"] == "interrupted" and rig.bench.firmware.effective_limit() == 0
                     replacement.journal.db.execute("DROP TRIGGER fail_unsent_retire")
                 c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
                 assert (await healthy(c))["local_hold_verified"]
-                assert c.tests.state()["state"] == "completed"
+                assert c.charging.state()["state"] == "completed"
                 assert c.requests.receipt(identifier)["state"] == "failed"
                 c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
                 assert (await healthy(c))["normal_start_ready"]
@@ -110,5 +110,5 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
                 assert not starts(rig)
         finally:
             rig.peer.unavailable = False
-            await c.tests.close()
+            await c.charging.close()
             await replacement.close()

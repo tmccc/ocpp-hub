@@ -29,7 +29,7 @@ def latch_managed_fault(gateway: Gateway, reason: str, *, diagnostic: dict[str, 
                 fault["native_failure_digest"] = fingerprint(diagnostic)
             journal.put("managed_control_fault", fault)
             control = journal.get("control", {})
-            journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+            journal.control.hold(control)
             if journal.get("trial_phase") in ("active", "recovering", "blocked"):
                 journal.put("trial_phase", "blocked")
         gateway.controls.invalidate()

@@ -56,6 +56,11 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties. Full four-suite qualification and deployment of this local candidate remain open.
+- [x] Centralize physical control writes in `Journal.control`, replacing 27 sites across 11 modules with named
+  transitions. Share authority predicates and the pure health decision; make the live poll's stages explicit and
+  name its production charging owner `ManagedCharging`. Preserve raw stored formats, public status and actual
+  effect/commit/task boundaries. The first grouped check passed 242 tests; broader verification is separate.
+  This improves ownership and navigation but adds runtime lines; no physical code-size reduction is claimed.
 
 ## iCS implementation history — 15 November 2026
 

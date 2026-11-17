@@ -29,8 +29,8 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             await mp.healthy(c)
             identifier = uuid.uuid4().hex
             c.command(identifier, "start", c.requests.intent().revision)
-            await c.tests.settle()
-            lease = c.tests.lease
+            await c.charging.settle()
+            lease = c.charging.lease
             assert lease is not None and lease.identifier == identifier and lease.normal
             rig.bench.start_replies = ["silent"]
             tag = mp.starts(rig)[-1][3]["idTag"]
@@ -55,7 +55,7 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             j = s.journal
             if legacy_metadata:
                 # Older releases committed completed metadata before their separate request update: retain that input.
-                j.put("managed_test_charge", {**c.tests.state(), "state": "completed"})
+                j.put("managed_test_charge", {**c.charging.state(), "state": "completed"})
                 assert c.requests.receipt(identifier)["state"] in ("accepted", "running", "uncertain")
             if boundary == "commit":
                 j.db.execute("CREATE TABLE owner_parent(id INTEGER PRIMARY KEY)")
@@ -71,7 +71,7 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
                 )
                 effect = "SELECT RAISE(ABORT,'synthetic owner retirement refusal')"
             j.db.execute(f"CREATE TRIGGER fail_owner_retire {trigger} BEGIN {effect}; END")
-            state, receipt = copy.deepcopy(c.tests.state()), c.requests.receipt(identifier)
+            state, receipt = copy.deepcopy(c.charging.state()), c.requests.receipt(identifier)
             retained, fault = (
                 [tuple(row) for row in j.db.execute("SELECT * FROM outbox")],
                 j.get("managed_control_fault"),
@@ -79,22 +79,30 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
             assert c.pause_task is not None
             await c.pause_task
-            assert c.tests.lease is lease and c.tests.state() == state and c.requests.receipt(identifier) == receipt
+            assert (
+                c.charging.lease is lease
+                and c.charging.state() == state
+                and c.requests.receipt(identifier) == receipt
+            )
             assert not j.db.in_transaction and rig.bench.firmware.effective_limit() == 0
             native = await c.native.read()
             c.require_paused(native)
             with pytest.raises(sqlite3.IntegrityError):
                 await c.tick()
-            assert c.tests.lease is lease and c.tests.state() == state and c.requests.receipt(identifier) == receipt
+            assert (
+                c.charging.lease is lease
+                and c.charging.state() == state
+                and c.requests.receipt(identifier) == receipt
+            )
             assert [tuple(row) for row in j.db.execute("SELECT * FROM outbox")] == retained
             assert j.get("managed_control_fault") == fault and j.vendor_id(local) is None
             j.db.execute("DROP TRIGGER fail_owner_retire")
             await c.tick()
             assert (
-                c.tests.lease is None
-                and c.tests.state()["state"] == c.requests.receipt(identifier)["state"] == "completed"
+                c.charging.lease is None
+                and c.charging.state()["state"] == c.requests.receipt(identifier)["state"] == "completed"
             )
-            assert c.tests.state()["start_rpc_accepted"] is state["start_rpc_accepted"] is True
+            assert c.charging.state()["start_rpc_accepted"] is state["start_rpc_accepted"] is True
             assert j.get("local_start_receipt")["stage"] == "accepted"
             assert [tuple(row) for row in j.db.execute("SELECT * FROM outbox")] == retained
             assert j.get("managed_control_fault") == fault and j.vendor_id(local) is None

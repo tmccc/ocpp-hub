@@ -90,6 +90,6 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
         if fault is not None and fault.get("classification") == "owner_control_or_delivery_uncertain":
             journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
         write_intent(journal, ControlIntent(intent["mode"], intent["revision"]), "paused", coalesce=True)
-        journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+        journal.control.hold(control)
         journal.put("trial_phase", "recovering")
         return True

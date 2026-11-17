@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
+from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_intent import ControlIntent, write_intent
 from .native_bounded import NativeBoundedSpec
@@ -113,7 +114,7 @@ def _reconcile(
         raise RecoveryRequiredError("history reconciliation requires the matching native fault and a settled journal")
     spec.require_boot(journal.get("boot"))
     control = journal.get("control", {})
-    if control.get("owner") != "local" or not control.get("inhibit") or control.get("start_pending"):
+    if not ControlState(control).local_hold or control.get("start_pending"):
         raise RecoveryRequiredError("history acknowledgement requires the existing inhibited zero hold")
     with journal.atomic():
         present = book.owned_present(native.physical)
@@ -196,5 +197,5 @@ def _reconcile(
             )
         journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
         journal.put("trial_phase", "recovering")
-        journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+        journal.control.hold(control)
     return {**summary, "fault_cleared": True, "charging_started": False}

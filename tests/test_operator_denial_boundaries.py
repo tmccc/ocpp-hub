@@ -36,7 +36,7 @@ async def recorded_operator_denial(tmp_path, tls, port, monkeypatch, capsys):
         source = copy.deepcopy(s.journal.get("managed_control_fault"))
         await pause(c)
         await c.current.close()
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
         await approve_retry(rig, tmp_path, capsys)
         rig.bench.start_replies = []
@@ -207,7 +207,7 @@ async def test_operator_proof_without_prior_fault_completes(tmp_path, tls, unuse
         await c.pause_task
         assert s.journal.get("managed_control_fault") is None
         assert rig.bench.firmware.effective_limit() == 0
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
         args = tmp_path / "trial.json", strategy
         native_port = rig.prepared.observer.port

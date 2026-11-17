@@ -24,7 +24,7 @@ from .start_settlement import (
 from .store import RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
-    from .managed_test_charge import TestLease
+    from .managed_charging import ChargeLease
     from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
 
@@ -35,7 +35,7 @@ class StartLifecycle:
     # One object belongs to one locked journal; no connection or process-local lease is restored from disk.
     def __init__(self, journal: Journal) -> None:
         self.journal = journal
-        self.lease: TestLease | None = None
+        self.lease: ChargeLease | None = None
 
     # Preserve the established fallback for journals written before a separate wire receipt existed.
     def receipt(self) -> dict[str, Any]:
@@ -111,7 +111,7 @@ class StartLifecycle:
 
     # One pure rule selects current evidence; each rule reads only the independent runtime fences it needs.
     def retirement(
-        self, rule: RetirementRule, *, worker_pending: bool = False, lease: TestLease | None = None
+        self, rule: RetirementRule, *, worker_pending: bool = False, lease: ChargeLease | None = None
     ) -> RetirementCandidate | None:
         j = self.journal
         if rule is RetirementRule.REFUSED and (
@@ -155,23 +155,21 @@ class StartLifecycle:
         return record is not None and idle_receipt_ended(record)
 
     # Compatibility callers can release or publish the sole lease slot without maintaining another copy.
-    def set_lease(self, lease: TestLease | None) -> None:
+    def set_lease(self, lease: ChargeLease | None) -> None:
         self.lease = lease
 
     # Only this effect's current control claim may arm the pending bit before dispatch.
     def armed(self, ticket: str) -> None:
         j, control = self.journal, self.journal.get("control", {})
         if control.get("ticket") == ticket:
-            j.put("control", {**control, "inhibit": False, "start_pending": True})
+            j.control.complete(ticket, base=control, inhibit=False, start_pending=True)
 
     # A proven operator outcome clears only the Start projection while retaining the supplied restrictive claim.
     def operator_control(self, control: dict[str, Any]) -> None:
-        self.journal.put(
-            "control", {**control, "owner": "local", "inhibit": True, "uncertain": True, "start_pending": False}
-        )
+        self.journal.control.hold(control, start_pending=False)
 
     # Admission owns the new metadata and receipt row, while retaining an older wire receipt until preparation.
-    def admit(self, lease: TestLease, action: str, startup: float, duration: float) -> None:
+    def admit(self, lease: ChargeLease, action: str, startup: float, duration: float) -> None:
         j = self.journal
         with j.atomic():
             j.put(
@@ -197,7 +195,7 @@ class StartLifecycle:
         self.lease = lease
 
     # Initial preparation joins the wire child's transaction after the caller's live permission check.
-    def prepared_metadata(self, lease: TestLease, digest: str) -> None:
+    def prepared_metadata(self, lease: ChargeLease, digest: str) -> None:
         j = self.journal
         state = j.get("managed_test_charge", {})
         if state.get("id") != lease.identifier:
@@ -205,7 +203,7 @@ class StartLifecycle:
         j.put("managed_test_charge", {**state, "tag_digest": digest, "start_attempted": True})
 
     # The caller owns scope/intent publication; this owner joins its exact accepted metadata to the same COMMIT.
-    def published(self, lease: TestLease, context: StartHandoffContext, intent: ControlIntent) -> StartPublication:
+    def published(self, lease: ChargeLease, context: StartHandoffContext, intent: ControlIntent) -> StartPublication:
         j, receipt = self.journal, self.receipt()
         if (
             not j.db.in_transaction
@@ -229,7 +227,7 @@ class StartLifecycle:
         return StartPublication(lease.identifier, intent, lease.epoch)
 
     # Permission memory follows successful publication rather than receipt of an Accepted wire reply.
-    def committed(self, lease: TestLease, publication: StartPublication) -> None:
+    def committed(self, lease: ChargeLease, publication: StartPublication) -> None:
         if lease.normal:
             lease.revision, lease.mode = publication.intent.revision, publication.intent.mode
 
@@ -242,7 +240,7 @@ class StartLifecycle:
         self.lease = None
 
     # Expiry bookkeeping retains accepted/unknown evidence and cannot grant any physical Stop permission.
-    def expire(self, lease: TestLease, reason: str, preserve: bool, failure: dict[str, Any] | None) -> None:
+    def expire(self, lease: ChargeLease, reason: str, preserve: bool, failure: dict[str, Any] | None) -> None:
         j = self.journal
         j.put(
             "managed_test_charge",
@@ -283,7 +281,7 @@ class StartLifecycle:
         self.journal.put("managed_test_charge", {**state, "independent_seen": True})
 
     # Lifecycle binding remains physical evidence; current permission separately controls its managed projection.
-    def managed_bound(self, lease: TestLease | None, local: int, tag: Any, guard: Callable[[], None]) -> None:
+    def managed_bound(self, lease: ChargeLease | None, local: int, tag: Any, guard: Callable[[], None]) -> None:
         j, state = self.journal, self.journal.get("managed_test_charge", {})
         if (
             lease is None
@@ -329,7 +327,7 @@ class StartLifecycle:
         }
 
     # The lease's known real closure is sufficient even when native polling did not observe the open session.
-    def finish_closed(self, lease: TestLease) -> bool:
+    def finish_closed(self, lease: ChargeLease) -> bool:
         if self.journal.db.in_transaction:
             raise RecoveryRequiredError("lease completion must own its COMMIT")
         record = self.closed()
@@ -427,7 +425,7 @@ class StartLifecycle:
             settled = stage == "rejected" and receipt.get("local") is None and control.get("ticket") == ticket
             j.put("local_start_receipt", {**receipt, "stage": stage, **({"settled_ticket": ticket} if settled else {})})
             if settled:
-                j.put("control", {**control, "start_pending": False})
+                j.control.project(control, start_pending=False)
 
     # Proven unissued preparation retires independently of whichever later owner currently holds zero.
     def retire_prepared(self, ticket: str | None) -> None:
@@ -447,7 +445,7 @@ class StartLifecycle:
                     "pause_revision": intent.get("revision") if intent.get("mode") == "paused" else None,
                 },
             )
-            j.put("control", {**control, "start_pending": False})
+            j.control.project(control, start_pending=False)
 
     # Old journals may have managed acceptance without a separate receipt; normalize only exact unbound evidence.
     def recover_legacy(self) -> None:
@@ -475,7 +473,7 @@ class StartLifecycle:
             return
         with j.atomic():
             j.put("local_start_receipt", {"digest": owner["tag_digest"], "stage": "accepted", "local": None})
-            j.put("control", {**control, "start_pending": True})
+            j.control.project(control, start_pending=True)
 
     # Binding joins the genuine StartTransaction commit and never grants positive permission to its old caller.
     def bind(self, tag: str, local: int) -> None:
@@ -497,7 +495,7 @@ class StartLifecycle:
                     "pause_revision": intent.get("revision") if intent.get("mode") == "paused" else None,
                 },
             )
-            j.put("control", {**control, "start_pending": False})
+            j.control.project(control, start_pending=False)
 
     # A current physical Pause proof may annotate the exact existing wire evidence without rewriting its outcome.
     def pause_verified(self, receipt: dict[str, Any], revision: int) -> None:

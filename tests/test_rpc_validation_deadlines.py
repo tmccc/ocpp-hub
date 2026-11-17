@@ -120,11 +120,11 @@ async def test_native_audit_and_wire_reply_have_independent_budgets(
         test.rig.bench.before_reply = before_reply
         request = uuid.uuid4().hex
         c.command(request, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         assert peer.selected_count == 1 and peer.selected_request["action"] == "getConfig"
         assert len(starts(test.rig)) == 1
         assert test.session.journal.get("local_start_receipt")["stage"] == "accepted"
-        assert c.tests.state()["start_rpc_accepted"] is True
+        assert c.charging.state()["start_rpc_accepted"] is True
         assert c.requests.intent().mode == "app"
         assert not test.session.journal.get("managed_test_failure")
         assert_retired(g.charger)
@@ -154,7 +154,7 @@ async def test_pause_cancels_held_native_audit_before_start(tmp_path, tls, unuse
             c.command(pause, "pause", c.requests.intent().revision)
             assert c.pause_task is not None
             await asyncio.wait_for(asyncio.shield(c.pause_task), 1)
-            await asyncio.wait_for(c.tests.settle(), 1)
+            await asyncio.wait_for(c.charging.settle(), 1)
             await asyncio.wait_for(peer.client_closed.wait(), 1)
             assert not peer.release.is_set()
             assert not starts(test.rig) and test.rig.bench.firmware.effective_limit() == 0
@@ -166,7 +166,7 @@ async def test_pause_cancels_held_native_audit_before_start(tmp_path, tls, unuse
             assert c.requests.receipt(pause)["state"] == "completed"
         finally:
             peer.release.set()
-            await c.tests.settle()
+            await c.charging.settle()
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             await asyncio.wait_for(peer.finished.wait(), 2)

@@ -126,7 +126,7 @@ async def test_denial_and_other_start_retry_recover_together(
         assert s.journal.get("managed_control_fault") == first_fault
         assert s.journal.get(DENIALS)[str(ids[0])]["completed"] is None
         await c.current.close()
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
         await approve_retry(rig, tmp_path, capsys)
         if fault in ("lost-again", "exhaust-again"):

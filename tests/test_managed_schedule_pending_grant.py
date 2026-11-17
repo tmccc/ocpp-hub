@@ -120,16 +120,16 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
         g.remote_start_guard = None
         try:
             b.c.command("e1dec715d70a414d82a57fec3bd160bb", "start", b.c.requests.intent().revision)
-            await b.c.tests.settle()
+            await b.c.charging.settle()
         finally:
             g.remote_start_guard = guard
         owner_tag = starts(b.rig)[0][3]["idTag"]
         assert owner_tag.casefold() != b.device.plans[9]["idTag"].casefold()
-        assert j.get("control")["start_pending"] and b.c.tests.state()["start_rpc_accepted"]
+        assert j.get("control")["start_pending"] and b.c.charging.state()["start_rpc_accepted"]
         if pre_cutoff_timer:
             b.clock.now = b.start
             temporary = await b.fire(b.timer)
-            assert j.get("control")["start_pending"] and b.c.tests.state().get("local_transaction") is None
+            assert j.get("control")["start_pending"] and b.c.charging.state().get("local_transaction") is None
             await b.c.native.read()
             b.clock.now += 60
             await b.close_transaction(temporary)
@@ -160,7 +160,7 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
         await b.close_transaction(owner_local)
         await healthy(b.c)
         assert not b.c.schedule.awaiting_start()
-        await b.c.tests.close()
+        await b.c.charging.close()
 
 
 # Intent: an unverified or matching pending command cannot become evidence of a distinct earlier owner.
@@ -219,11 +219,11 @@ async def test_normal_start_debt_before_hold(tmp_path, tls, unused_tcp_port, mon
 
         b.rig.bench.before_reply = incoming
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         b.rig.bench.before_reply = None
         daily = await daily_job if daily_job is not None else await b.start_plan(9, demand=demand)
         assert j.get("local_start_receipt")["stage"] == "accepted" and j.get("control")["start_pending"]
-        assert b.c.tests.state().get("local_transaction") is None
+        assert b.c.charging.state().get("local_transaction") is None
         pause = uuid.uuid4().hex
         b.c.command(pause, "pause", b.c.requests.intent().revision)
         await b.c.pause_task
@@ -236,7 +236,7 @@ async def test_normal_start_debt_before_hold(tmp_path, tls, unused_tcp_port, mon
             j.put("local_start_receipt", {})
             j.put("control", {**j.get("control"), "start_pending": False})
         if restart != "none":
-            await b.c.tests.close()
+            await b.c.charging.close()
             await crash(b.session)
             b.session = managed_session(b.rig)
             b.session.gateway.policy = g.policy
@@ -270,7 +270,7 @@ async def test_normal_start_debt_before_hold(tmp_path, tls, unused_tcp_port, mon
             assert b.c.requests.receipt(pause)["state"] == "completed"
             await healthy(b.c)
             assert b.c.requests.receipt(returning)["state"] == "completed" and b.device.effective_limit() == selected
-            await b.c.tests.close()
+            await b.c.charging.close()
             next_day = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
             assert next_day not in (None, local, daily) and (await healthy(b.c))["power_w"] > 0
             assert len(starts(b.rig)) == 1 and next_day not in b.stops()
@@ -293,13 +293,13 @@ async def test_ack_after_owner_pause(tmp_path, tls, unused_tcp_port, monkeypatch
 
         b.rig.bench.before_reply = pause_before_reply
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         b.rig.bench.before_reply = None
         await b.c.pause_task
         assert j.get("local_start_receipt")["stage"] == "accepted" and j.get("control")["start_pending"]
         assert b.c.requests.intent().mode == "paused" and b.device.effective_limit() == 0
         if restart:
-            await b.c.tests.close()
+            await b.c.charging.close()
             await crash(b.session)
             b.session = managed_session(b.rig)
             await b.session.start()
@@ -328,7 +328,7 @@ async def test_ack_after_owner_pause(tmp_path, tls, unused_tcp_port, monkeypatch
                 await b.c.tick()
             assert b.c.requests.receipt(pause)["state"] == "completed"
             assert (await healthy(b.c))["local_hold_verified"]
-            await b.c.tests.close()
+            await b.c.charging.close()
             b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
             assert (await healthy(b.c))["station_ceiling_a"] == 6
             next_day = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
@@ -356,7 +356,7 @@ async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypat
             return owner
 
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         local = await report_owner()
         await healthy(b.c)
         b.clock.now += 20
@@ -368,7 +368,7 @@ async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypat
             j.put("managed_test_charge", {**old, "local_transaction": None, "state": "awaiting_power"})
         j.put("local_start_receipt", {})
         assert not j.get("control")["start_pending"]
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
         await b.session.start()
@@ -382,14 +382,14 @@ async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypat
                 b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
                 await healthy(b.c)
             b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-            await b.c.tests.settle()
+            await b.c.charging.settle()
             b.clock.now += 20
             later = await report_owner()
             assert later != local and j.get("local_start_receipt")["local"] == later
             await b.close_transaction(later)
             await healthy(b.c)
             assert not j.get("control")["start_pending"]
-            await b.c.tests.close()
+            await b.c.charging.close()
 
 
 # Intent: a late or rejected local RPC cannot fabricate a new positive grant, even across replacement.
@@ -415,12 +415,12 @@ async def test_late_or_rejected_local_start(tmp_path, tls, unused_tcp_port, monk
         b.device.answer = refuse
         b.rig.bench.before_reply = late
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         b.rig.bench.before_reply = None
         await b.c.pause_task
         assert b.session.journal.get("control")["start_pending"] is (outcome == "late")
         assert b.device.effective_limit() == 0 and len(starts(b.rig)) == 1
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         if outcome == "late":
             b.device.active = 987654
@@ -486,9 +486,9 @@ async def test_replacement_after_prepared_local_start(tmp_path, tls, unused_tcp_
                 b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
             finally:
                 proceed.set()
-            await b.c.tests.settle()
+            await b.c.charging.settle()
             await b.c.pause_task
-            await b.c.tests.close()
+            await b.c.charging.close()
             await crash(b.session)
             with closing(sqlite3.connect(old_path)) as restored:
                 snapshot.backup(restored)
@@ -516,9 +516,9 @@ async def test_return_after_automatic_start_timeout_waits_for_real_owner_closure
 ):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
-        b.c.tests.lease.deadline = asyncio.get_running_loop().time() - 1
-        b.c.tests.changed.set()
+        await b.c.charging.settle()
+        b.c.charging.lease.deadline = asyncio.get_running_loop().time() - 1
+        b.c.charging.changed.set()
         async with asyncio.timeout(3):
             while b.c.requests.intent().mode != "paused":
                 await asyncio.sleep(0.01)

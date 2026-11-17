@@ -44,7 +44,7 @@ async def test_idle_timer_deadline_supersedes_unsent_release(tmp_path, tls, unus
         plan, configuration = copy.deepcopy(b.device.plans[9]), copy.deepcopy(b.rig.peer.configuration)
         # This is a fresh actual introduction before the separate original06:00 cutoff, not a forged timer state.
         b.clock.now = END - 1
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
         await b.session.start()

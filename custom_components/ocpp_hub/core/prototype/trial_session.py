@@ -298,7 +298,7 @@ class TrialSession:
                     self.native_bounded.require_recovery_session(native)
                 self.book.owned_present(native.physical)
             control = self.journal.get("control", {})
-            self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+            self.journal.control.hold(control)
             if self.journal.get("trial_binding") is None:
                 self.native_bounded.spec.require_admission(native, self.journal.identity)
                 if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
@@ -393,7 +393,7 @@ class TrialSession:
                 try:
                     if self.gateway.charger.sender is None:
                         control = self.journal.get("control", {})
-                        self.journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+                        self.journal.control.hold(control)
                         raise UnavailableError("charger disconnected before the final physical hold")
                     await self.gateway.stop()
                     async with asyncio.timeout(5):

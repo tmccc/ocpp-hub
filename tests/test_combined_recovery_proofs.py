@@ -216,7 +216,7 @@ async def mixed_proofs(tmp_path, tls, port, monkeypatch, capsys, selected, first
         assert second["token"] == s.journal.next_delivery().token
         assert second["answer"]["idTagInfo"]["status"] == "Accepted"
         cloud_id, evidence_digest = second["answer"]["transactionId"], fingerprint(second)
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
         commands = copy.deepcopy(rig.bench.device_calls)
         args, native_port = (tmp_path / "trial.json", strategy_file(rig, tmp_path)), rig.prepared.observer.port

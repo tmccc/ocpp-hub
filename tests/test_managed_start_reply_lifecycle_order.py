@@ -66,13 +66,15 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
                     and frame.f_locals.get("payload") == burst["payload"]
                     and not entries
                 ):
-                    worker = c.tests.worker
+                    worker = c.charging.worker
                     entries.append(
                         {
                             "intent": c.requests.intent(),
                             "control": copy.deepcopy(j.get("control")),
-                            "metadata": copy.deepcopy(c.tests.state()),
-                            "lease": None if c.tests.lease is None else (c.tests.lease.mode, c.tests.lease.revision),
+                            "metadata": copy.deepcopy(c.charging.state()),
+                                "lease": None
+                                if c.charging.lease is None
+                                else (c.charging.lease.mode, c.charging.lease.revision),
                             "positive": rig.bench.firmware.effective_limit() == 6,
                             "pending_worker": worker is not None and not worker.done(),
                             "shield_wait": worker is not None
@@ -120,9 +122,9 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
                 assert entry["receipt_stage"] in ("issued", "accepted"), entry
                 assert burst["reply"][2]["status"] == "Accepted" and len(starts(rig)) == 1
                 assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted", answer
-                await c.tests.settle()
+                await c.charging.settle()
                 assert c.requests.intent().mode == "app" and c.requests.intent().revision == requested_revision + 1
-                assert j.get("control")["owner"] == "shared" and c.tests.state()["start_rpc_accepted"]
+                assert j.get("control")["owner"] == "shared" and c.charging.state()["start_rpc_accepted"]
                 # Apply only this genuine accepted lifecycle to the independent physical peer, as Bench.call does.
                 local = answer[2]["transactionId"]
                 rig.bench.firmware.active = local

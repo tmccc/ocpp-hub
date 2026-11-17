@@ -7,6 +7,7 @@ import math
 import time
 from typing import TYPE_CHECKING, Any
 
+from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
@@ -190,8 +191,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or j.get("vendor_start_grant")
             or control.get("ticket") != ticket
             or not ticket
-            or control.get("owner") != "local"
-            or control.get("inhibit") is not True
+            or not ControlState(control).explicit_local_hold
             or control.get("start_pending")
             or not g.controls.ready
             or g.controls.desired() != 0
@@ -296,7 +296,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 ),
             )
             j.db.execute("DELETE FROM meta WHERE key=?", (INTERRUPTED,))
-        j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+        j.control.hold(control)
         j.put("trial_phase", "recovering")
         j.put("trial_starting", False)
     # fault() invalidated the old revision. This complete closed proof re-establishes only current zero introduction.
@@ -306,5 +306,5 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     c.released_epoch = None
     if terminal_test is not None:
         c.session.journal.starts.set_lease(None)
-        c.tests.changed.set()
+        c.charging.changed.set()
     return True

@@ -71,7 +71,7 @@ async def test_return_during_start_ack_restores_zero_without_native_http(
         try:
             assert c.command(identifier, "start", intent.revision)["state"] == "accepted"
             await asyncio.wait_for(start_seen.wait(), 4)
-            assert len(starts(rig)) == 1 and not c.tests.worker.done()
+            assert len(starts(rig)) == 1 and not c.charging.worker.done()
             owned = [task for task in g.controls._operations if not task.done()]
             assert len(owned) == 1 and owned[0].get_coro().cr_code is LocalControl._start_owned.__code__
             start_child = owned[0]
@@ -95,20 +95,20 @@ async def test_return_during_start_ack_restores_zero_without_native_http(
             accepted = c.command(returning, "app_control", intent.revision)
             assert accepted["id"] == returning and accepted["state"] == "accepted"
             assert c.requests.return_in_progress() and c.requests.pending_return() == (returning, intent.revision)
-            assert c.requests.intent() == intent and not c.tests.worker.done()
+            assert c.requests.intent() == intent and not c.charging.worker.done()
             wire = len(rig.bench.device_calls)
             rig.peer.unavailable = True
             release_start.set()
             if boot_reply is not None:
                 assert (await asyncio.wait_for(asyncio.shield(boot_reply), 2))[2]["status"] == "Accepted"
             # The real Accepted reply retains debt; old-scope rollback yields to the current persistent Pause.
-            await asyncio.wait_for(c.tests.settle(), 4)
-            assert c.tests.worker.done() and not c.tests.worker.cancelled()
+            await asyncio.wait_for(c.charging.settle(), 4)
+            assert c.charging.worker.done() and not c.charging.worker.cancelled()
             accepted_start = j.get("local_start_receipt")
             assert accepted_start["request_id"] == identifier and accepted_start["stage"] == "accepted"
             assert accepted_start["ticket"] == receipt["ticket"] and accepted_start.get("local") is None
-            assert c.tests.state()["state"] == "stopping"
-            assert c.tests.state()["failure"]["type"] == ("UnavailableError" if matching_boot else "DeniedError")
+            assert c.charging.state()["state"] == "stopping"
+            assert c.charging.state()["failure"]["type"] == ("UnavailableError" if matching_boot else "DeniedError")
             assert c.requests.receipt(identifier)["state"] == "uncertain"
             assert c.pause_task is not None
             await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
@@ -137,7 +137,7 @@ async def test_return_during_start_ack_restores_zero_without_native_http(
             assert zeros, {
                 "control": j.get("control"),
                 "accepted_start": j.get("local_start_receipt"),
-                "failure": c.tests.state().get("failure"),
+                "failure": c.charging.state().get("failure"),
                 "actual_limit": rig.bench.firmware.effective_limit(),
                 "wire_after_accepted_return": rig.bench.device_calls[wire:],
             }
@@ -154,8 +154,8 @@ async def test_return_during_start_ack_restores_zero_without_native_http(
             release_start.set()
             rig.peer.unavailable = False
             rig.bench.before_reply = old_hook
-            if c.tests.worker is not None:
-                await asyncio.gather(c.tests.worker, return_exceptions=True)
+            if c.charging.worker is not None:
+                await asyncio.gather(c.charging.worker, return_exceptions=True)
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             if boot_reply is not None:

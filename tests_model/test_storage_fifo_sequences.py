@@ -412,7 +412,7 @@ async def test_storage_fifo_sequences(tmp_path, model_tls, monkeypatch, capsys, 
                 assert fw.effective_limit() == 0
                 events.append("head-refused")
                 calls_at_pause = len(bench.device_calls)
-                await c.tests.close()
+                await c.charging.close()
                 await crash(s)
                 # Install the exact fault only while stopped; the rejected head is already durable.
                 j = Journal(rig.prepared.config.journal, rig.prepared.config.identity)

@@ -149,11 +149,11 @@ async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port,
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9, demand=demand)
         await healthy(b.c)
         assert b.session.journal.get("managed_test_charge")["independent_seen"]
-        await b.c.tests.close()
+        await b.c.charging.close()
         # Freeze this restart after the daily Start's actual cloud acknowledgement has reached the ledger.
         await until(lambda: b.session.journal.next_delivery() is None)
         vendor = b.session.journal.vendor_id(daily)

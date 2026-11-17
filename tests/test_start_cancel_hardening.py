@@ -77,16 +77,16 @@ async def test_cancelled_unprepared_retirement_sql_wait_preserves_daily(
     async with selected_source(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
         c, j, rig = b.controller, b.session.journal, b.rig
         identifier, intent = await cancel_outer_before_execution(b)
-        lease = c.tests.lease
+        lease = c.charging.lease
         assert lease is not None
-        original_state, original_row = copy.deepcopy(c.tests.state()), request_row(j, identifier)
+        original_state, original_row = copy.deepcopy(c.charging.state()), request_row(j, identifier)
         local, stop_time, stop_meter = await daily_after_history(b)
         attempts = refuse_cancelled_retirement(j, identifier, failure)
         try:
             while asyncio.get_running_loop().time() <= lease.deadline + 0.05:
                 await asyncio.wait_for(c.tick(), 1)
-                assert c.requests.intent() == intent and c.tests.lease is lease
-                assert c.tests.state() == original_state and request_row(j, identifier) == original_row
+                assert c.requests.intent() == intent and c.charging.lease is lease
+                assert c.charging.state() == original_state and request_row(j, identifier) == original_row
                 assert j.get("local_start_receipt") is None and not j.db.in_transaction
                 assert j.active() == local and rig.bench.firmware.effective_limit() == current
                 assert rig.bench.firmware.current == current
@@ -97,18 +97,18 @@ async def test_cancelled_unprepared_retirement_sql_wait_preserves_daily(
             before_passive = len(attempts)
             await asyncio.sleep(0.25)
             assert len(attempts) > before_passive, "the actual expired timer must retry while no poll assists it"
-            assert c.requests.intent() == intent and c.tests.lease is lease
-            assert c.tests.state() == original_state and request_row(j, identifier) == original_row
+            assert c.requests.intent() == intent and c.charging.lease is lease
+            assert c.charging.state() == original_state and request_row(j, identifier) == original_row
             assert rig.bench.firmware.effective_limit() == rig.bench.firmware.current == current
-            assert not c.tests.timer.done() and attempts and not j.db.in_transaction
+            assert not c.charging.timer.done() and attempts and not j.db.in_transaction
         finally:
             j.db.execute("DROP TRIGGER cancelled_retirement_refusal")
         if failure == "commit":
             assert j.db.execute("SELECT COUNT(*) FROM cancelled_retirement_child").fetchone()[0] == 0
         assert (await mp.healthy(c))["station_ceiling_a"] == current
-        assert c.requests.receipt(identifier)["state"] == "failed" and c.tests.state()["state"] == "completed"
-        assert c.tests.lease is None and c.requests.intent() == intent
-        await until(lambda: c.tests.timer.done())
+        assert c.requests.receipt(identifier)["state"] == "failed" and c.charging.state()["state"] == "completed"
+        assert c.charging.lease is None and c.requests.intent() == intent
+        await until(lambda: c.charging.timer.done())
         assert await witnessed_native_loss(b, current, local) >= 3
         await close_daily(b, local, "ledger", timestamp=stop_time, meter_stop=stop_meter)
         await finish_recovery(b, identifier, current)
@@ -124,12 +124,12 @@ async def cancel_outer_with_old_receipt(b, prior_receipt):
 
     # Select only this exact outer managed task and preserve normal scheduling of all real control children.
     def cancel_outer(loop, coroutine, **kwargs):
-        from ocpp_hub_core.prototype.managed_test_charge import ManagedChargeTests
+        from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 
         task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
         if (
-            getattr(coroutine, "cr_code", None) is ManagedChargeTests._start.__code__
-            and coroutine.cr_frame.f_locals.get("self") is c.tests
+            getattr(coroutine, "cr_code", None) is ManagedCharging._start.__code__
+            and coroutine.cr_frame.f_locals.get("self") is c.charging
         ):
             task.cancel()
             victims.append(task)
@@ -138,11 +138,11 @@ async def cancel_outer_with_old_receipt(b, prior_receipt):
     try:
         loop.set_task_factory(cancel_outer)
         c.command(identifier, "start", original_intent.revision)
-        await asyncio.gather(c.tests.worker, return_exceptions=True)
+        await asyncio.gather(c.charging.worker, return_exceptions=True)
     finally:
         loop.set_task_factory(factory)
-    assert victims == [c.tests.worker] and c.tests.worker.cancelled()
-    assert c.tests.state()["start_attempted"] is False and not c.tests.state()["start_rpc_accepted"]
+    assert victims == [c.charging.worker] and c.charging.worker.cancelled()
+    assert c.charging.state()["start_attempted"] is False and not c.charging.state()["start_rpc_accepted"]
     assert j.get("local_start_receipt") == prior_receipt and b.rig.bench.device_calls == original_calls
     return identifier, original_intent
 
@@ -157,7 +157,7 @@ async def test_cancelled_unprepared_preserves_genuine_older_owner_receipt(
         c, j, rig = b.controller, b.session.journal, b.rig
         previous = uuid.uuid4().hex
         c.command(previous, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         owner = await positive_flow(b)
         await mp.healthy(c)
         await natural_stop(b, owner)
@@ -170,9 +170,9 @@ async def test_cancelled_unprepared_preserves_genuine_older_owner_receipt(
         identifier, intent = await cancel_outer_with_old_receipt(b, old_receipt)
         local, stop_time, stop_meter = await daily_after_history(b)
         assert (await mp.healthy(c))["station_ceiling_a"] == current
-        await until(lambda: c.tests.timer.done())
+        await until(lambda: c.charging.timer.done())
         assert c.requests.intent() == intent and c.requests.receipt(identifier)["state"] == "failed"
-        assert c.tests.state()["state"] == "completed" and j.get("local_start_receipt") == old_receipt
+        assert c.charging.state()["state"] == "completed" and j.get("local_start_receipt") == old_receipt
         assert c.requests.receipt(previous) == old_result
         assert dict(j.db.execute("SELECT * FROM transactions WHERE local=?", (owner,)).fetchone()) == old_transaction
         assert await witnessed_native_loss(b, current, local) >= 3
@@ -219,7 +219,7 @@ async def test_cancelled_outer_waits_for_real_shielded_unstarted_child(
             ):
                 task = asyncio.Task(delayed_child(coroutine), loop=loop, eager_start=False, **kwargs)
                 children.append(task)
-                c.tests.worker.cancel()
+                c.charging.worker.cancel()
                 child_created.set()
                 return task
             return asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
@@ -235,9 +235,9 @@ async def test_cancelled_outer_waits_for_real_shielded_unstarted_child(
             loop.set_task_factory(hold_child_and_cancel_parent)
             c.command(identifier, "start", intent.revision)
             await asyncio.wait_for(child_created.wait(), 3)
-            await asyncio.gather(c.tests.worker, return_exceptions=True)
+            await asyncio.gather(c.charging.worker, return_exceptions=True)
             loop.set_task_factory(old_factory)
-            assert c.tests.worker.cancelled() and len(children) == 1 and not children[0].done()
+            assert c.charging.worker.cancelled() and len(children) == 1 and not children[0].done()
             assert children[0] in s.gateway.controls._operations
             before_diagnostic = s.journal.db.total_changes, c.requests.intent(), list(rig.bench.device_calls)
             diagnostic = diagnostic_snapshot(c, {"state": "reconciling", "fault": "start_operation_pending"})
@@ -245,28 +245,28 @@ async def test_cancelled_outer_waits_for_real_shielded_unstarted_child(
             assert diagnostic["workers"]["owned_io_pending"] is True
             assert diagnostic["pending_commands"][0]["confirmation"] == "pending"
             assert (s.journal.db.total_changes, c.requests.intent(), rig.bench.device_calls) == before_diagnostic
-            assert c.tests.state()["start_attempted"] is False and s.journal.get("local_start_receipt") is None
-            lease, state, row = c.tests.lease, copy.deepcopy(c.tests.state()), request_row(s.journal, identifier)
+            assert c.charging.state()["start_attempted"] is False and s.journal.get("local_start_receipt") is None
+            lease, state, row = c.charging.lease, copy.deepcopy(c.charging.state()), request_row(s.journal, identifier)
             for _ in range(2):
                 await asyncio.wait_for(c.tick(), 1)
-                assert c.tests.lease is lease and c.tests.state() == state
+                assert c.charging.lease is lease and c.charging.state() == state
                 assert request_row(s.journal, identifier) == row and c.requests.intent() == intent
                 assert s.journal.get("local_start_receipt") is None and not mp.starts(rig)
             allow_child.set()
             await asyncio.wait_for(issued.wait(), 3)
             receipt = s.journal.get("local_start_receipt")
             assert receipt["request_id"] == identifier and receipt["stage"] == "issued"
-            assert c.tests.state()["start_attempted"] is True and len(mp.starts(rig)) == 1
+            assert c.charging.state()["start_attempted"] is True and len(mp.starts(rig)) == 1
             assert c.requests.receipt(identifier)["state"] in ("accepted", "running", "uncertain")
             status = await asyncio.wait_for(c.tick(), 1)
             witness = {
                 "boundary": "genuine issued child with actual correlated reply still held",
-                "outer_cancelled": c.tests.worker.cancelled(),
+                "outer_cancelled": c.charging.worker.cancelled(),
                 "child_done": children[0].done(),
                 "child_owned": children[0] in s.gateway.controls._operations,
                 "actual_pending_rpc_count": len(s.gateway.charger._pending),
                 "local_start_receipt": s.journal.get("local_start_receipt"),
-                "state": c.tests.state(),
+                "state": c.charging.state(),
                 "request": c.requests.receipt(identifier),
                 "actual_start_wire": mp.starts(rig),
                 "fault_after_poll": s.journal.get("managed_control_fault"),
@@ -287,7 +287,7 @@ async def test_cancelled_outer_waits_for_real_shielded_unstarted_child(
             await asyncio.gather(*children, return_exceptions=True)
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         await c.tick()
-        await until(lambda: c.tests.timer.done(), timeout=5)
+        await until(lambda: c.charging.timer.done(), timeout=5)
         assert c.requests.receipt(identifier)["state"] == "uncertain"
         local = await positive_flow(b)
         assert rig.bench.firmware.current == 0

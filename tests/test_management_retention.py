@@ -158,10 +158,10 @@ async def test_real_test_charge_and_immediate_pause_ignore_terminal_history(
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=10) as test:
         journal = test.session.journal
         seed_requests(journal, 4095, "completed", "pause")
-        assert test.controller.tests.available(test.controller.latest_native)
+        assert test.controller.charging.available(test.controller.latest_native)
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start_test", test.controller.requests.intent().revision)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         assert (await healthy(test.controller))["current_a"] == 6
         pause = uuid.uuid4().hex

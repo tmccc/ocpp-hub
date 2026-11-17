@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
-from ocpp_hub_core.prototype import managed_test_charge as charge_tests
+from ocpp_hub_core.prototype import managed_charging as charge_tests
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
@@ -91,7 +91,7 @@ async def replacement_offline(
         previous = first.controller.requests.intent()
         transactions = first.session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         await first.controller.current.close()
-        await first.controller.tests.close()
+        await first.controller.charging.close()
         profile_index = len(first.rig.bench.received_limits)
         await crash(first.session)
 
@@ -129,7 +129,7 @@ async def replacement_offline(
             finally:
                 controller.request_stop()
                 await controller.current.close()
-                await controller.tests.close()
+                await controller.charging.close()
                 if controller.pause_task is not None:
                     await asyncio.gather(controller.pause_task, return_exceptions=True)
                 await replacement.close()
@@ -474,8 +474,8 @@ async def test_normal_start_after_offline_pause_retires_startup_budget(
         monkeypatch.setattr(charge_tests, "STARTUP_BUDGET", 2)
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", before.revision)
-        await c.tests.settle()
-        lease = c.tests.lease
+        await c.charging.settle()
+        lease = c.charging.lease
         assert lease is not None and lease.normal
         startup_deadline = lease.deadline
         assert len(starts(rig)) == 1
@@ -499,14 +499,14 @@ async def test_normal_start_after_offline_pause_retires_startup_budget(
                 break
             await asyncio.sleep(0.02)
         assert c.requests.receipt(identifier)["state"] == "completed"
-        assert c.tests.lease is None and c.tests.state()["state"] == "running"
+        assert c.charging.lease is None and c.charging.state()["state"] == "running"
         assert j.active() == local and status["power_w"] > 0
 
         # Crossing the original monotonic budget must not expire an already verified regular session.
         await asyncio.sleep(max(0, startup_deadline - time.monotonic()) + 0.1)
         status = await c.tick()
         assert c.requests.intent().mode == "app" and c.requests.intent().revision == before.revision + 1
-        assert c.requests.receipt(identifier)["state"] == "completed" and c.tests.lease is None
+        assert c.requests.receipt(identifier)["state"] == "completed" and c.charging.lease is None
         assert j.active() == local and rig.bench.firmware.current == 16
         assert status["local_healthy"] and not status["cloud_connected"]
         assert j.next_delivery() is not None and test.session.journal.vendor_id(local) is None
@@ -560,7 +560,7 @@ async def test_normal_start_owner_epoch_persistence_failure_keeps_pause_authorit
         identifier = uuid.uuid4().hex
         try:
             c.command(identifier, "start", before.revision)
-            await c.tests.settle()
+            await c.charging.settle()
         finally:
             j.db.execute("DROP TRIGGER review_owner_epoch_refusal")
         if c.pause_task is not None:
@@ -571,10 +571,10 @@ async def test_normal_start_owner_epoch_persistence_failure_keeps_pause_authorit
         assert c.requests.intent() == before and before.mode == "paused"
         assert c.requests.receipt(identifier)["state"] == "uncertain"
         assert c.requests.receipt(identifier)["result"]["classification"] == "start_not_confirmed"
-        state = c.tests.state()
+        state = c.charging.state()
         assert state["start_attempted"] and not state["start_rpc_accepted"]
         assert state["failure"]["type"] == "IntegrityError" and state["failure"]["effects_started"]
-        assert c.tests.lease is None and j.active() is None
+        assert c.charging.lease is None and j.active() is None
         assert j.get("local_start_receipt")["stage"] == "accepted"
         assert len(starts(rig)) == 1
         assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)

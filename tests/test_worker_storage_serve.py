@@ -139,7 +139,7 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 6, cli_route=True) as original:
         await original.controller.current.close()
-        await original.controller.tests.close()
+        await original.controller.charging.close()
         await crash(original.session)
         rig = original.rig
         sessions, callbacks = [], {}

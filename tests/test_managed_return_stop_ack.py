@@ -69,7 +69,7 @@ async def test_return_with_pending_stop_ack(tmp_path, tls, unused_tcp_port, monk
             g.controls.policy = g.policy
             identifier = uuid.uuid4().hex
             b.c.command(identifier, "start", b.c.requests.intent().revision)
-            await b.c.tests.settle()
+            await b.c.charging.settle()
             tag = starts(b.rig)[0][3]["idTag"]
             reply = await b.rig.bench.call(
                 b.sock,
@@ -129,7 +129,7 @@ async def test_return_with_pending_stop_ack(tmp_path, tls, unused_tcp_port, monk
                 await b.c.tick()
                 assert b.c.requests.receipt(returning)["state"] != "completed"
                 assert b.device.effective_limit() == 0 and len(starts(b.rig)) == 1
-                await b.c.tests.close()
+                await b.c.charging.close()
                 return
             await until(lambda: j.next_delivery() is None and not g.vendor._pending)
             status = await healthy(b.c)
@@ -139,6 +139,6 @@ async def test_return_with_pending_stop_ack(tmp_path, tls, unused_tcp_port, monk
             )
             assert b.device.effective_limit() == (0 if outcome == "new_pause" else 6)
             assert len(starts(b.rig)) == 1
-            await b.c.tests.close()
+            await b.c.charging.close()
     finally:
         release_ack.set()

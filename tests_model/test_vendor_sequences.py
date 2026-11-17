@@ -71,7 +71,7 @@ async def test_vendor_debt_sequences(tmp_path, model_tls, monkeypatch, capsys, r
                     stack = AsyncExitStack()
                     s, c, sock = await stack.enter_async_context(running(rig, "vendor-debt-replacement"))
                 assert s.journal.get(marker) == saved and len(mp.starts(rig)) == 1
-                assert not c.tests.available(c.latest_native, normal=True)
+                assert not c.charging.available(c.latest_native, normal=True)
                 events.append(event)
             await pause(c)
             assert rig.bench.firmware.effective_limit() == 0 and s.journal.active() is None

@@ -5,11 +5,12 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
+from .control_state import ControlState
 from .start_settlement import RetirementCandidate, RetirementRule
 from .store import Journal, fingerprint
 
 if TYPE_CHECKING:
-    from .managed_test_charge import ManagedChargeTests, TestLease
+    from .managed_charging import ChargeLease, ManagedCharging
 
 
 class CancellationRetirement(Enum):
@@ -21,20 +22,19 @@ class CancellationRetirement(Enum):
 
 
 # Cancellation selects with its explicit live lease and retains its original metadata/request/raw-receipt preimage.
-def unprepared_start(j: Journal, lease: TestLease) -> RetirementCandidate | None:
+def unprepared_start(j: Journal, lease: ChargeLease) -> RetirementCandidate | None:
     return j.starts.retirement(RetirementRule.CANCELLED, lease=lease)
 
 
 # Only the exact initial zero may request ordinary re-verification of the still-current original app authority.
-def initial_zero_recovery(owner: ManagedChargeTests, lease: TestLease) -> bool:
+def initial_zero_recovery(owner: ManagedCharging, lease: ChargeLease) -> bool:
     c, j, g = owner.controller, owner.journal, owner.controller.session.gateway
     control, intent = j.get("control", {}), c.requests.intent()
     return (
         lease.initial_zero_ticket is not None
         and control.get("ticket") == lease.initial_zero_ticket
         and control.get("stop_epoch") == lease.initial_zero_stop_epoch
-        and control.get("owner") == "local"
-        and control.get("inhibit") is True
+        and ControlState(control).explicit_local_hold
         and not control.get("start_pending")
         and lease.mode == intent.mode == "app"
         and lease.revision == intent.revision
@@ -56,7 +56,7 @@ def initial_zero_recovery(owner: ManagedChargeTests, lease: TestLease) -> bool:
 
 
 # Settle an actually cancelled no-dispatch request; any initial zero requires fresh ordinary recovery before release.
-def retire_cancelled_start(owner: ManagedChargeTests, lease: TestLease) -> CancellationRetirement:
+def retire_cancelled_start(owner: ManagedCharging, lease: ChargeLease) -> CancellationRetirement:
     worker = owner.worker
     if worker is None or not worker.done() or not worker.cancelled() or owner.lease is not lease:
         return CancellationRetirement.NOT_APPLICABLE

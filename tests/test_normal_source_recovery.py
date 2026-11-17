@@ -34,13 +34,13 @@ async def test_verified_normal_source_outage_and_closure(
         c, s, rig, sock = b.controller, b.session, b.rig, b.charger
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         local = await positive_flow(b)
         if not demand:
             rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
         await healthy(c)
-        assert c.requests.receipt(identifier)["state"] == "completed" and c.tests.lease is None
-        assert c.tests.state()["state"] == "running"
+        assert c.requests.receipt(identifier)["state"] == "completed" and c.charging.lease is None
+        assert c.charging.state()["state"] == "running"
         rig.peer.unavailable = True
         await observe(c, 5)
         assert rig.bench.firmware.effective_limit() == 0 and s.journal.active() == local
@@ -58,7 +58,7 @@ async def test_verified_normal_source_outage_and_closure(
                 assert rig.bench.firmware.effective_limit() == current
             fresh = ChargeRig(rig, s, c, sock)
             await close_daily(fresh, local, closure)
-            assert not s.journal.get("managed_control_fault") and c.tests.state()["state"] == "completed"
+            assert not s.journal.get("managed_control_fault") and c.charging.state()["state"] == "completed"
             next_local = await positive_flow(
                 fresh, "daily", call_id=uuid.uuid4().hex, meter_start=1100, timestamp="2026-01-01T00:02:00Z"
             )
@@ -85,7 +85,7 @@ async def test_normal_recovery_requires_unchanged_exact_completed_source(tmp_pat
         c, j, rig = b.controller, b.session.journal, b.rig
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         local = await positive_flow(b)
         await healthy(c)
         rig.peer.unavailable = True
@@ -129,7 +129,7 @@ async def test_old_normal_source_does_not_block_new_external_session(tmp_path, m
     ) as b:
         c, rig = b.controller, b.rig
         c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         old_local = await positive_flow(b)
         await healthy(c)
         rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
@@ -140,7 +140,7 @@ async def test_old_normal_source_does_not_block_new_external_session(tmp_path, m
             {"transactionId": old_local, "timestamp": START["timestamp"], "meterStop": 1100},
         )
         await until(lambda: b.session.journal.next_delivery() is None)
-        assert c.tests.state()["state"] == "running" and c.tests.lease is None
+        assert c.charging.state()["state"] == "running" and c.charging.lease is None
         if source == "cloud":
             await owner_start(b)
         local = await positive_flow(
@@ -152,6 +152,6 @@ async def test_old_normal_source_does_not_block_new_external_session(tmp_path, m
         assert rig.bench.firmware.effective_limit() == 0
         rig.peer.unavailable = False
         assert (await healthy(c))["station_ceiling_a"] == 6
-        assert b.session.journal.active() == local and c.tests.state()["state"] == "completed"
+        assert b.session.journal.active() == local and c.charging.state()["state"] == "completed"
         assert not any(row[2] == "RemoteStopTransaction" for row in rig.bench.device_calls)
         await close_daily(b, local, "native", timestamp="2026-01-01T00:03:00Z", meter_stop=1200)

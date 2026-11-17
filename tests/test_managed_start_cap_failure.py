@@ -109,14 +109,14 @@ async def test_positive_cap_failure_recovers_and_supervises_next_daily(
         monkeypatch.setattr(b.rig.bench.firmware, "answer", answer)
         monkeypatch.setattr(b.charger, "send", reply)
         c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         assert failed or b.rig.peer.failures
         assert not starts(b.rig)
         if c.pause_task is not None:
             await c.pause_task
         s, sock = b.session, b.charger
         if replace:
-            await c.tests.close()
+            await c.charging.close()
             await crash(s)
             s = managed_session(b.rig)
             await s.start()
@@ -131,7 +131,7 @@ async def test_positive_cap_failure_recovers_and_supervises_next_daily(
                 c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
                 status = await healthy(c)
                 assert status["normal_start_ready"]
-                assert c.tests.state()["state"] == "completed"
+                assert c.charging.state()["state"] == "completed"
                 fresh = ChargeRig(b.rig, s, c, sock)
                 local = await positive_flow(fresh, "daily")
                 await healthy(c)
@@ -144,7 +144,7 @@ async def test_positive_cap_failure_recovers_and_supervises_next_daily(
             finally:
                 b.rig.peer.unavailable = False
                 if replace:
-                    await c.tests.close()
+                    await c.charging.close()
                     await s.close()
 
 
@@ -154,7 +154,7 @@ async def test_positive_cap_failure_recovers_and_supervises_next_daily(
 async def test_failed_native_startup_recovers_without_premature_controller(tmp_path, model_tls, monkeypatch, current):
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", BeforeCapFailurePeer)
     async with commissioned(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, current) as b:
-        await b.controller.tests.close()
+        await b.controller.charging.close()
         await crash(b.session)
         b.rig.peer.unavailable = True
         s = managed_session(b.rig)
@@ -174,7 +174,7 @@ async def test_failed_native_startup_recovers_without_premature_controller(tmp_p
                 assert (await healthy(c))["local_hold_verified"]
                 c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
                 assert (await healthy(c))["station_ceiling_a"] == current and not starts(b.rig)
-                await c.tests.close()
+                await c.charging.close()
         finally:
             b.rig.peer.unavailable = False
             await s.close()

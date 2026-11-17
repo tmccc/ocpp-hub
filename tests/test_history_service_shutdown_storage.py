@@ -62,7 +62,7 @@ async def test_service_history_commit_failure_allows_zero_stop_and_uncertainty(
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 32, cli_route=True) as original:
         await original.controller.current.close()
-        await original.controller.tests.close()
+        await original.controller.charging.close()
         await crash(original.session)
         rig, sessions, callbacks = original.rig, [], {}
         loop = asyncio.get_running_loop()

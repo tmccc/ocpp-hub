@@ -114,7 +114,7 @@ async def test_exhausted_start_refusal_storage_failure_retains_zero_and_supporte
         await close_local(b, local, 3)
         await pause(b.controller)
         assert j.get("managed_control_fault") and b.rig.bench.firmware.effective_limit() == 0
-        await b.controller.tests.close()
+        await b.controller.charging.close()
         await crash(b.session)
         args, port = (tmp_path / "trial.json", strategy), b.rig.prepared.observer.port
         assert await operator.run("inspect", *args, None, port, kind="start-delivery") == 0

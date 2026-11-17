@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from .control_state import ControlState
 from .managed_current import current_failure, managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
 from .store import Journal
@@ -46,8 +47,7 @@ def capture_interrupted_collision(j: Journal, spec: NativeBoundedSpec) -> None:
             and intent.get("revision", -1) > row["revision"] + 1
             and pause.get("revision") == intent["revision"]
             and bool(pause.get("ticket"))
-            and control.get("owner") == "local"
-            and control.get("inhibit") is True
+            and ControlState(control).explicit_local_hold
         )
     ):
         return

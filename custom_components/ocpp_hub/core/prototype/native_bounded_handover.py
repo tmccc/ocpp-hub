@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from .. import commands
 from ..control import HUB_PROFILE_ID
 from .connection_scope import ConnectionLineage, current_scope
+from .control_state import ControlState
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
@@ -407,7 +408,7 @@ class NativeBoundedHandover:
         with journal.atomic():
             self.book.activate_bounded(native, self.spec.hardware_identity)
             self.save("admitted", original_history=list(native.history))
-            journal.put("control", {"owner": "local", "inhibit": True, "uncertain": False})
+            journal.control.admit()
             journal.put("trial_starting", True)
 
     # Live introduction bodies retain their pending restrictive effects through all awaited cleanup.
@@ -487,7 +488,7 @@ class NativeBoundedHandover:
             self.book.owned_present(native.physical)
             if binding is not None or journal.get("control", {}).get("uncertain"):
                 control = journal.get("control", {})
-                journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+                journal.control.hold(control)
                 if first_zero:
                     # Stay in initial admission until its first zero succeeds, including a genuinely unapplied refusal.
                     ticket = journal.get("control", {}).get("ticket")
@@ -503,8 +504,7 @@ class NativeBoundedHandover:
                             latest.get("mode") != "paused"
                             or latest.get("revision", 0) <= intent.get("revision", 0)
                             or control.get("ticket") == ticket
-                            or control.get("owner") != "local"
-                            or control.get("inhibit") is not True
+                            or not ControlState(control).explicit_local_hold
                             or gateway.controls.desired() != 0
                         ):
                             raise
@@ -602,8 +602,7 @@ class NativeBoundedHandover:
             or g.charger.sender is None
             or not g.controls.ready
             or g.controls.desired() != 0
-            or j.get("control", {}).get("owner") != "local"
-            or not j.get("control", {}).get("inhibit")
+            or not ControlState(j.get("control", {})).local_hold
             or j.get("control", {}).get("start_pending")
             or j.get("uncertain_vendor_command")
             or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
@@ -769,7 +768,7 @@ class NativeBoundedHandover:
                 raise RecoveryRequiredError("local recovery intent changed during native verification")
             journal.require_allocation()
             with journal.atomic():
-                journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": False})
+                journal.control.hold(control, uncertain=False)
                 journal.put("trial_phase", "active")
             self.acknowledged_lineage = scope.lineage
             return {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}

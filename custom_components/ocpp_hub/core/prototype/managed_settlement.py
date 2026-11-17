@@ -77,7 +77,7 @@ def current_candidate(c: ManagedController) -> TerminalRecord | None:
 
 # Closed lifecycle or exact known-unsent provenance distinguishes obsolete test metadata from unbound Start debt.
 def charge_test_candidate(c: ManagedController) -> RetirementCandidate | None:
-    worker = c.tests.worker
+    worker = c.charging.worker
     return c.session.journal.starts.retirement(
         RetirementRule.GENERIC, worker_pending=worker is not None and not worker.done()
     )

@@ -169,7 +169,7 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
         try:
             if controller is not None:
                 await controller.current.close()
-                await controller.tests.close()
+                await controller.charging.close()
                 if controller.pause_task is not None:
                     await asyncio.gather(controller.pause_task, return_exceptions=True)
             await session.close()

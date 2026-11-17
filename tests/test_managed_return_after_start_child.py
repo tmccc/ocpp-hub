@@ -49,7 +49,7 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
                     child_done=child.done(),
                     child_cancelled=child.cancelled(),
                     child_error=repr(child.exception()) if child.done() and not child.cancelled() else None,
-                    worker_pending=c.tests.worker is not None and not c.tests.worker.done(),
+                    worker_pending=c.charging.worker is not None and not c.charging.worker.done(),
                     control=copy.deepcopy(j.get("control")),
                     receipt=copy.deepcopy(j.get("local_start_receipt")),
                     intent=c.requests.intent(),
@@ -111,7 +111,7 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
             assert control["inhibit"] is False and control["uncertain"] is False and control["start_pending"] is True
             assert witness["actual_limit"] == 6 and witness["intent"].mode == "app"
             assert witness["intent"].revision == intent.revision + 1
-            assert c.tests.state()["start_rpc_accepted"]
+            assert c.charging.state()["start_rpc_accepted"]
             assert witness["pause"]["id"] == new_pause and witness["pause"]["state"] == "accepted"
             assert witness["owner_pause"] == owner_pause
             assert witness["return"]["id"] == returning and witness["return"]["state"] == "accepted"
@@ -120,8 +120,8 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
             assert witness["paused_intent"].revision == witness["intent"].revision + 1
             intent, owner_pause = witness["paused_intent"], witness["current_owner_pause"]
             assert len(starts(rig)) == 1 and j.active() is None
-            await asyncio.wait_for(c.tests.settle(), 4)
-            assert c.tests.state()["state"] == "stopping" and c.tests.state()["failure"]["type"] == "DeniedError"
+            await asyncio.wait_for(c.charging.settle(), 4)
+            assert c.charging.state()["state"] == "stopping" and c.charging.state()["failure"]["type"] == "DeniedError"
             assert c.requests.receipt(identifier)["state"] == "uncertain" and c.pause_task is not None
             await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
             failed = await asyncio.wait_for(rig.peer.failed_reads.get(), 2)
@@ -193,7 +193,7 @@ async def test_return_after_start_child_commit_restores_zero_without_native_http
         finally:
             j.db.set_trace_callback(None)
             rig.peer.unavailable = False
-            if c.tests.worker is not None:
-                await asyncio.gather(c.tests.worker, return_exceptions=True)
+            if c.charging.worker is not None:
+                await asyncio.gather(c.charging.worker, return_exceptions=True)
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)

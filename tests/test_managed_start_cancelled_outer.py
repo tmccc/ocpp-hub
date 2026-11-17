@@ -7,8 +7,8 @@ import uuid
 from contextlib import asynccontextmanager
 
 import pytest
-from ocpp_hub_core.prototype import managed_test_charge
-from ocpp_hub_core.prototype.managed_test_charge import ManagedChargeTests
+from ocpp_hub_core.prototype import managed_charging
+from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 
 from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
@@ -35,7 +35,7 @@ async def selected_source(tmp_path, tls, port, monkeypatch, current):
     )
     async with factory as b:
         # This declared admission budget is configured before acceptance; no existing lease/deadline is rewritten.
-        monkeypatch.setattr(managed_test_charge, "STARTUP_BUDGET", 3)
+        monkeypatch.setattr(managed_charging, "STARTUP_BUDGET", 3)
         yield b
 
 
@@ -51,8 +51,8 @@ async def cancel_outer_before_execution(b):
     def cancel_only_outer(loop, coroutine, **kwargs):
         task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
         if (
-            getattr(coroutine, "cr_code", None) is ManagedChargeTests._start.__code__
-            and coroutine.cr_frame.f_locals.get("self") is c.tests
+            getattr(coroutine, "cr_code", None) is ManagedCharging._start.__code__
+            and coroutine.cr_frame.f_locals.get("self") is c.charging
         ):
             task.cancel()
             victims.append(task)
@@ -62,13 +62,13 @@ async def cancel_outer_before_execution(b):
         loop.set_task_factory(cancel_only_outer)
         accepted = c.command(identifier, "start", before_intent.revision)
         assert accepted["id"] == identifier and accepted["state"] == "accepted"
-        worker = c.tests.worker
+        worker = c.charging.worker
         assert worker is not None
         await asyncio.gather(worker, return_exceptions=True)
     finally:
         loop.set_task_factory(original_factory)
     assert victims == [worker] and worker.cancelled()
-    assert c.tests.state()["start_attempted"] is False and c.tests.state()["start_rpc_accepted"] is False
+    assert c.charging.state()["start_attempted"] is False and c.charging.state()["start_rpc_accepted"] is False
     assert j.get("local_start_receipt") is None and b.rig.bench.device_calls == original_calls
     assert not mp.starts(b.rig) and c.requests.intent() == before_intent
     return identifier, before_intent
@@ -78,10 +78,10 @@ async def cancel_outer_before_execution(b):
 def save_first_poll(tmp_path, b, identifier, intent, status, local):
     j, c, rig = b.session.journal, b.controller, b.rig
     value = {
-        "cancelled_coroutine": "ManagedChargeTests._start",
-        "outer_worker_cancelled": c.tests.worker.cancelled(),
+        "cancelled_coroutine": "ManagedCharging._start",
+        "outer_worker_cancelled": c.charging.worker.cancelled(),
         "request": c.requests.receipt(identifier),
-        "state": c.tests.state(),
+        "state": c.charging.state(),
         "local_start_receipt": j.get("local_start_receipt"),
         "original_intent": {"mode": intent.mode, "revision": intent.revision},
         "after_intent": {"mode": c.requests.intent().mode, "revision": c.requests.intent().revision},
@@ -104,7 +104,7 @@ async def finish_recovery(b, identifier, current):
     c.command(pause, "pause", c.requests.intent().revision)
     assert (await mp.healthy(c))["local_hold_verified"]
     assert c.requests.receipt(pause)["state"] == "completed"
-    assert c.requests.receipt(identifier)["state"] == "failed" and c.tests.state()["state"] == "completed"
+    assert c.requests.receipt(identifier)["state"] == "failed" and c.charging.state()["state"] == "completed"
     assert j.get("local_start_receipt") is None and not mp.starts(rig)
     c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
     assert (await mp.healthy(c))["station_ceiling_a"] == current
@@ -127,7 +127,7 @@ async def test_unstarted_cancelled_outer_cannot_pause_independent_daily(
         if not demand:
             rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
         assert rig.peer.plan_session == (local, 9) and j.vendor_id(local) is not None
-        assert c.tests.state().get("independent_seen") is not True
+        assert c.charging.state().get("independent_seen") is not True
         assert rig.bench.firmware.effective_limit() == current
         assert rig.bench.firmware.current == (current if demand else 0)
         status = await c.tick()
@@ -136,7 +136,7 @@ async def test_unstarted_cancelled_outer_cannot_pause_independent_daily(
         assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
         assert rig.bench.firmware.effective_limit() == current
         assert (await mp.healthy(c))["current_a"] == (current if demand else 0)
-        await until(lambda: c.tests.timer.done())
+        await until(lambda: c.charging.timer.done())
         assert c.requests.intent() == intent and not mp.starts(rig)
         assert await witnessed_native_loss(b, current, local) >= 3
         await close_daily(b, local, "ledger")

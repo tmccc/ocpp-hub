@@ -92,7 +92,7 @@ async def test_unbound_vendor_start_requires_evidence_and_new_pause(
             assert j.db.execute("SELECT 1 FROM mutations WHERE token=?", (mutation,)).fetchone()
             revision = c.requests.intent().revision
             counter = j.get("next_transaction")
-            await c.tests.close()
+            await c.charging.close()
             await crash(session)
         before = list(rig.bench.device_calls)
         assert await operator.run("inspect", config, strategy, None, native_port, kind="vendor-start") == 0

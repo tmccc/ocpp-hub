@@ -10,6 +10,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
 from .managed_intent import write_intent
@@ -181,7 +182,7 @@ class ManagedCurrentLimits:
             if change.get("mode") == "app" and controller.requests.intent().mode == "paused":
                 # A durable explicit Pause already owns its ticket; the interrupted increase cannot replace it.
                 with self.journal.atomic():
-                    self.journal.put("control", {**self.journal.get("control"), "resume_limit": previous})
+                    self.journal.control.project(self.journal.get("control"), resume_limit=previous)
                     self.journal.put("managed_current_change", {**change, "state": "cancelled"})
                 return
             if controller.requests.intent().mode == "app":
@@ -195,7 +196,7 @@ class ManagedCurrentLimits:
                 write_intent(self.journal, intent, "paused")
                 claim_internal_pause(controller, "current", change["id"])
                 control = self.journal.get("control")
-                self.journal.put("control", {**control, "resume_limit": previous})
+                self.journal.control.project(control, resume_limit=previous)
                 state = "uncertain" if change.get("mode") == "paused" else "interrupted"
                 self.journal.put("managed_current_change", {**change, "state": state})
 
@@ -257,8 +258,7 @@ class ManagedCurrentLimits:
             and change.get("source_boot") == g.boot_observation
             and g.current_boot_seen(g._charger_epoch)
             and j.active() is None
-            and control.get("owner") == "local"
-            and control.get("inhibit") is True
+            and ControlState(control).explicit_local_hold
             and control.get("uncertain") is True
             and isinstance(control.get("ticket"), str)
             and re.fullmatch(r"[a-f0-9]{32}", control["ticket"]) is not None
@@ -267,8 +267,8 @@ class ManagedCurrentLimits:
             and not j.get("vendor_start_grant")
             and not j.get("uncertain_vendor_command")
             and not c.requests.return_in_progress()
-            and c.tests.lease is None
-            and c.tests.state().get("state") in (None, "completed", "failed", "cancelled")
+            and c.charging.lease is None
+            and c.charging.state().get("state") in (None, "completed", "failed", "cancelled")
             and j.get(KEY, {}).get("state") not in OBSERVABLE
             and receipt.get("stage") not in ("prepared", "issued")
             and (
@@ -398,11 +398,9 @@ class ManagedCurrentLimits:
                 and c.requests.intent().mode == "app"
                 and timer.get("idle_cutoff_hold") is True
                 and g.controls.desired() == 0
-                and j.get("control", {}).get("owner") == "local"
-                and j.get("control", {}).get("inhibit") is True
+                and ControlState(j.get("control", {})).explicit_local_hold
                 or c.requests.intent().mode == "paused"
-                and j.get("control", {}).get("owner") == "local"
-                and j.get("control", {}).get("inhibit") is True
+                and ControlState(j.get("control", {})).explicit_local_hold
             )
             and not j.get("vendor_start_grant")
             and not j.get("uncertain_vendor_command")
@@ -410,7 +408,7 @@ class ManagedCurrentLimits:
             and not j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             and not c.requests.return_in_progress()
-            and c.tests.lease is None
+            and c.charging.lease is None
             and c.requests.has_capacity()
             and native is not None
             and 0 <= time.time() - native.physical.observed_at <= 15
@@ -459,14 +457,7 @@ class ManagedCurrentLimits:
                 (identifier, "set_current", revision, json.dumps({"accepted_at": time.time()})),
             )
             control = j.get("control", {})
-            j.put(
-                "control",
-                {
-                    **control,
-                    # Only the guarded worker may make a pending increase available to a live station.
-                    **({"owner": "local", "uncertain": True} if intent.mode == "app" else {"resume_limit": value}),
-                },
-            )
+            j.control.select(control, value, app=intent.mode == "app")
         expected = c.requests.intent()
         self.worker = asyncio.create_task(
             self._apply(identifier, value, previous_value, expected.mode, expected.revision)
@@ -576,7 +567,7 @@ class ManagedCurrentLimits:
                         claim_internal_pause(c, "current", identifier)
                     control = j.get("control", {})
                     if control.get("inhibit") is True and j.get("managed_current_change", {}).get("id") == identifier:
-                        j.put("control", {**control, "resume_limit": previous_value})
+                        j.control.project(control, resume_limit=previous_value)
                     j.put(
                         "managed_current_change",
                         {
@@ -635,7 +626,7 @@ class ManagedCurrentLimits:
                     **({"failure": failure} if failure is not None else {}),
                 },
             )
-            j.put("control", {**j.get("control", {}), "resume_limit": previous})
+            j.control.project(j.get("control", {}), resume_limit=previous)
             c.session.gateway.controls._claim(True, stopping=True)
             c.released_epoch = None
             c.requests.finish(identifier, "failed", {"classification": reason})
@@ -696,7 +687,7 @@ class ManagedCurrentLimits:
                 intent = c.requests.intent()
                 write_intent(j, intent, "paused")
                 claim_internal_pause(c, "current", change["id"])
-                j.put("control", {**j.get("control"), "resume_limit": change["previous_a"]})
+                j.control.project(j.get("control"), resume_limit=change["previous_a"])
                 j.put("managed_current_change", {**j.get("managed_current_change"), "state": "interrupted"})
             return None
         local = j.active()
@@ -765,11 +756,10 @@ class ManagedCurrentLimits:
                 j.put(KEY, timer)
             c.schedule.begin_hold(timer)
             control = j.get("control", {})
-            j.put("control", {**control, "resume_limit": previous})
+            j.control.project(control, resume_limit=previous)
             ticket = None
             if not (
-                control.get("owner") == "local"
-                and control.get("inhibit") is True
+                ControlState(control).explicit_local_hold
                 and isinstance(control.get("ticket"), str)
                 and re.fullmatch(r"[a-f0-9]{32}", control["ticket"]) is not None
             ):
@@ -813,8 +803,7 @@ class ManagedCurrentLimits:
                 or change.get("id") != identifier
                 or change.get("state") != "cancelled"
                 or self.selected() != previous
-                or control.get("owner") != "local"
-                or control.get("inhibit") is not True
+                or not ControlState(control).explicit_local_hold
                 or g.controls.desired() != 0
             ):
                 raise RecoveryRequiredError("cancelled current timer hold was superseded")
@@ -833,7 +822,7 @@ class ManagedCurrentLimits:
                     or j.get("vendor_start_grant")
                     or j.get("uncertain_vendor_command")
                     or local_start_receipt(j).get("stage") in ("prepared", "issued")
-                    or c.tests.lease is not None
+                    or c.charging.lease is not None
                     or c.requests.return_in_progress()
                 ):
                     g.controls._complete(ticket, uncertain=False)

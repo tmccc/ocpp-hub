@@ -70,7 +70,7 @@ async def test_regular_start_continues_until_explicit_pause(
         before = controller.requests.intent()
         identifier = uuid.uuid4().hex
         controller.command(identifier, "start", before.revision)
-        await controller.tests.settle()
+        await controller.charging.settle()
         assert controller.requests.intent().mode == "app"
         assert controller.requests.intent().revision == before.revision + 1
         assert len(starts(test.rig)) == 1
@@ -82,7 +82,7 @@ async def test_regular_start_continues_until_explicit_pause(
         assert controller.requests.intent().mode == "app"
         assert test.rig.bench.firmware.current == 6 and test.session.journal.active() == local
         assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
-        assert controller.tests.lease is None
+        assert controller.charging.lease is None
         assert not test.session.gateway.policy.allow_local_start
         with pytest.raises(DeniedError, match="local Start is disabled"):
             await test.session.command({"command": "start"})
@@ -102,14 +102,14 @@ async def test_regular_start_confirms_known_zero_power_session_without_invented_
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         assert test.controller.requests.receipt(identifier)["state"] == "accepted"
         local = await zero_power_session(test)
         status = await healthy(test.controller)
         receipt = test.controller.requests.receipt(identifier)
         assert status["charging_session_open"] and status["power_w"] == status["current_a"] == 0
         assert receipt["state"] == "completed" and not receipt["result"].get("positive_power_verified", False)
-        assert test.controller.tests.lease is None
+        assert test.controller.charging.lease is None
         test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
         assert (await actual_stop(test, local))["local_hold_verified"]
 
@@ -125,7 +125,7 @@ async def test_no_session_startup_timeout_holds_zero_without_guessed_stop(
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.4) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         assert len(starts(test.rig)) == 1 and test.session.journal.active() is None
         await until(lambda: test.controller.requests.intent().mode == "paused")
         await until(lambda: test.rig.bench.firmware.effective_limit() == 0)
@@ -149,7 +149,7 @@ async def test_regular_start_duplicate_and_stale_revision_do_not_repeat_rpc(
         identifier = uuid.uuid4().hex
         accepted = test.controller.command(identifier, "start", 0)
         assert test.controller.command(identifier, "start", 0) == accepted
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await zero_power_session(test)
         await healthy(test.controller)
         completed = test.controller.requests.receipt(identifier)
@@ -209,7 +209,7 @@ async def test_newer_pause_preempts_regular_start(
             test.controller.command(uuid.uuid4().hex, "pause", revision)
             limits = len(test.rig.bench.received_limits)
             proceed.set()
-            await test.controller.tests.settle()
+            await test.controller.charging.settle()
             await until(lambda: test.rig.bench.firmware.effective_limit() == 0)
             if test.controller.pause_task is not None:
                 await test.controller.pause_task
@@ -240,7 +240,7 @@ async def test_natural_session_stop_keeps_app_control_without_forced_pause(
 ) -> None:
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         test.controller.command(uuid.uuid4().hex, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
         intent = test.controller.requests.intent()
@@ -250,7 +250,7 @@ async def test_natural_session_stop_keeps_app_control_without_forced_pause(
         assert test.controller.requests.intent() == intent and intent.mode == "app"
         assert status["owner_control_enabled"] and status["station_ceiling_a"] == 6
         assert status["power_w"] == 0 and not status["charging_session_open"]
-        assert test.controller.tests.state()["state"] == "completed"
+        assert test.controller.charging.state()["state"] == "completed"
         assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls[calls:])
         assert len(starts(test.rig)) == 1
 
@@ -265,11 +265,11 @@ async def test_between_poll_app_session_is_not_attributed_to_completed_local_sta
 ) -> None:
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         test.controller.command(uuid.uuid4().hex, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         previous = await positive_flow(test)
         await healthy(test.controller)
-        assert test.controller.tests.state()["local_transaction"] == previous
-        assert test.controller.tests.state()["state"] == "running"
+        assert test.controller.charging.state()["local_transaction"] == previous
+        assert test.controller.charging.state()["state"] == "running"
         intent = test.controller.requests.intent()
 
         # Both real lifecycles occur before the next service tick observes native state.
@@ -293,7 +293,7 @@ async def test_between_poll_app_session_is_not_attributed_to_completed_local_sta
         status = await healthy(test.controller)
         assert status["power_w"] == 1440 and status["charging_session_open"]
         assert status["local_charge"] == {"state": "completed", "charging": False}
-        assert test.controller.tests.state()["local_transaction"] == previous
+        assert test.controller.charging.state()["local_transaction"] == previous
         assert test.controller.requests.intent() == intent and intent.mode == "app"
         assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
         assert len(starts(test.rig)) == 2 and test.session.journal.active() == current
@@ -313,9 +313,9 @@ async def test_complete_local_lifecycle_before_first_poll_retires_startup_withou
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
-        assert test.controller.tests.state()["local_transaction"] == local
+        assert test.controller.charging.state()["local_transaction"] == local
         await natural_stop(test, local)
         assert test.controller.requests.receipt(identifier)["state"] == "accepted"
 
@@ -326,7 +326,7 @@ async def test_complete_local_lifecycle_before_first_poll_retires_startup_withou
         receipt = test.controller.requests.receipt(identifier)
         assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
         assert receipt["result"]["charging"] is False
-        assert test.controller.tests.lease is None
+        assert test.controller.charging.lease is None
 
         await asyncio.sleep(0.75)
         assert test.controller.requests.intent().mode == "app"
@@ -348,9 +348,9 @@ async def test_complete_lifecycle_then_external_start_before_first_poll_keeps_ne
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         previous = await positive_flow(test)
-        assert test.controller.tests.state()["local_transaction"] == previous
+        assert test.controller.charging.state()["local_transaction"] == previous
         await natural_stop(test, previous)
         intent = test.controller.requests.intent()
 
@@ -374,7 +374,7 @@ async def test_complete_lifecycle_then_external_start_before_first_poll_keeps_ne
         await until(
             lambda: test.session.journal.vendor_id(current) is not None and test.session.journal.next_delivery() is None
         )
-        assert test.controller.tests.state()["local_transaction"] == previous
+        assert test.controller.charging.state()["local_transaction"] == previous
         test.rig.peer.paused, test.rig.peer.permission_enabled = False, True
         test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
         test.rig.bench.firmware.fire_plan(9)
@@ -386,7 +386,7 @@ async def test_complete_lifecycle_then_external_start_before_first_poll_keeps_ne
         assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
         assert receipt["result"]["charging"] is False
         assert test.controller.requests.intent() == intent and intent.mode == "app"
-        assert test.controller.tests.lease is None
+        assert test.controller.charging.lease is None
         await asyncio.sleep(0.1)
         assert test.rig.bench.firmware.current == 6 and test.session.journal.active() == current
         assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
@@ -407,17 +407,17 @@ async def test_closed_lifecycle_retired_by_timer_without_any_poll_or_pause(
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.8) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         await natural_stop(test, local)
         intent = test.controller.requests.intent()
         assert test.controller.requests.receipt(identifier)["state"] == "accepted"
 
         # The independent startup timer must complete this request without any call to controller.tick().
-        await until(lambda: test.controller.tests.lease is None)
+        await until(lambda: test.controller.charging.lease is None)
         receipt = test.controller.requests.receipt(identifier)
         assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
-        assert test.controller.tests.normal_summary() == {"state": "completed", "charging": False}
+        assert test.controller.charging.normal_summary() == {"state": "completed", "charging": False}
         assert test.controller.requests.intent() == intent and intent.mode == "app"
         assert test.rig.bench.firmware.effective_limit() == 6
         assert test.controller.pause_task is None and not test.session.journal.get("control")["inhibit"]
@@ -436,17 +436,17 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
-        await test.controller.tests.close()
+        await test.controller.charging.close()
         await crash(test.session)
         replacement = managed_session(test.rig)
         await replacement.start()
         recovered = ManagedController(replacement)
         try:
             assert recovered.requests.intent().mode == "paused"
-            assert recovered.tests.normal_summary()["charging"] is False
+            assert recovered.charging.normal_summary()["charging"] is False
             async with test.rig.charger(replacement) as charger:
                 await introduced(test.rig, replacement, charger, "normal-start-replacement")
                 recovered_test = ChargeRig(test.rig, replacement, recovered, charger)
@@ -454,9 +454,9 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
                 assert stopped["local_hold_verified"] and stopped["power_w"] == 0
                 assert stopped["local_charge"]["charging"] is False
                 assert len(starts(test.rig)) == 1 and test.rig.bench.firmware.effective_limit() == 0
-                assert recovered.requests.intent().mode == "paused" and recovered.tests.lease is None
+                assert recovered.requests.intent().mode == "paused" and recovered.charging.lease is None
         finally:
-            await recovered.tests.close()
+            await recovered.charging.close()
             if recovered.pause_task is not None:
                 await asyncio.gather(recovered.pause_task, return_exceptions=True)
             await replacement.close()
@@ -481,7 +481,7 @@ async def test_normal_start_and_pause_remain_available_after_terminal_history(
             )
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
         assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == count + 1

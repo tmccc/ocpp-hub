@@ -36,12 +36,12 @@ async def cancelled_child(b, boundary):
         loop.set_task_factory(cancel_selected)
         c.command(identifier, "start", intent.revision)
         await asyncio.wait_for(captured.wait(), 3)
-        await asyncio.wait_for(asyncio.gather(c.tests.worker, *victims, return_exceptions=True), 3)
+        await asyncio.wait_for(asyncio.gather(c.charging.worker, *victims, return_exceptions=True), 3)
     finally:
         loop.set_task_factory(factory)
-    assert c.tests.worker.cancelled() and len(victims) == 1
-    assert c.tests.state()["start_attempted"] is False and not starts(b.rig)
-    assert c.tests.lease.initial_zero_ticket == b.session.journal.get("control")["ticket"]
+    assert c.charging.worker.cancelled() and len(victims) == 1
+    assert c.charging.state()["start_attempted"] is False and not starts(b.rig)
+    assert c.charging.lease.initial_zero_ticket == b.session.journal.get("control")["ticket"]
     return identifier, intent
 
 
@@ -91,7 +91,7 @@ async def test_cancelled_initial_hold_respects_exact_or_newer_intent(
             intent = c.requests.intent()
         status = await healthy(c)
         assert c.requests.intent() == intent and not j.get("managed_control_fault")
-        assert c.requests.receipt(identifier)["state"] == "failed" and c.tests.lease is None
+        assert c.requests.receipt(identifier)["state"] == "failed" and c.charging.lease is None
         assert rig.bench.firmware.effective_limit() == (0 if newer_pause else current)
         assert not starts(rig) and not rig.bench.remote_stop.is_set()
         assert j.get("local_start_receipt") is None
@@ -108,12 +108,12 @@ async def test_cancelled_zero_retirement_storage_is_atomic(tmp_path, tls, unused
     async with selected_source(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
         c, j, rig = b.controller, b.session.journal, b.rig
         identifier, intent = await cancelled_child(b, "start_child")
-        state, request, phase = c.tests.state(), c.requests.receipt(identifier), j.get("trial_phase")
+        state, request, phase = c.charging.state(), c.requests.receipt(identifier), j.get("trial_phase")
         with refused_retirement(j, identifier, boundary):
             status = await c.tick()
             assert status["fault"] == "start_operation_pending" and not status.get("local_hold_verified")
-            assert c.tests.state() == state and c.requests.receipt(identifier) == request
-            assert j.get("trial_phase") == phase and c.tests.lease is not None
+            assert c.charging.state() == state and c.requests.receipt(identifier) == request
+            assert j.get("trial_phase") == phase and c.charging.lease is not None
             assert c.requests.intent() == intent and rig.bench.firmware.effective_limit() == 0
             assert not starts(rig) and not rig.bench.remote_stop.is_set()
         assert (await healthy(c))["station_ceiling_a"] == 6 and c.requests.intent() == intent

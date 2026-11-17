@@ -52,12 +52,12 @@ async def test_same_socket_fault_retires_closed_local_start(
         c, j, g, peer = b.controller, b.session.journal, b.session.gateway, b.rig.peer
         identifier = uuid.uuid4().hex
         c.command(identifier, action, c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         local = await positive_flow(b)
         assert (await healthy(c))["current_a"] == 6
         historical = copy.deepcopy(c.requests.receipt(identifier))
         assert historical["state"] == "completed"
-        assert c.tests.state()["state"] == ("running" if action == "start" else "charging")
+        assert c.charging.state()["state"] == ("running" if action == "start" else "charging")
         epoch, boot = g._charger_epoch, g.boot_observation
         actual_native = peer.native
 
@@ -93,7 +93,7 @@ async def test_same_socket_fault_retires_closed_local_start(
                 key: copy.deepcopy(j.get(key))
                 for key in ("managed_control_fault", ACK, "managed_test_charge", "control")
             }
-            introduced_revision, lease = c.native.introduced_revision, c.tests.lease
+            introduced_revision, lease = c.native.introduced_revision, c.charging.lease
             j.db.execute(
                 "CREATE TRIGGER refuse_terminal_settlement BEFORE INSERT ON meta "
                 "WHEN NEW.key='managed_test_charge' AND json_extract(NEW.value,'$.state')='completed' "
@@ -105,7 +105,7 @@ async def test_same_socket_fault_retires_closed_local_start(
             finally:
                 j.db.execute("DROP TRIGGER refuse_terminal_settlement")
             assert {key: j.get(key) for key in before} == before
-            assert c.native.introduced_revision == introduced_revision and c.tests.lease is lease
+            assert c.native.introduced_revision == introduced_revision and c.charging.lease is lease
             assert c.requests.receipt(identifier) == historical
 
         for _ in range(10):
@@ -115,7 +115,7 @@ async def test_same_socket_fault_retires_closed_local_start(
             if j.get("managed_control_fault") is None:
                 break
         assert j.get("managed_control_fault") is None
-        assert c.tests.state()["state"] == "completed" and c.tests.lease is None
+        assert c.charging.state()["state"] == "completed" and c.charging.lease is None
         assert c.requests.receipt(identifier) == historical
         assert g._charger_epoch == epoch and g.boot_observation == boot
         assert c.native.introduced_revision == g.controls._revision
@@ -140,7 +140,7 @@ async def test_interrupted_test_retires_after_real_closed_zero(tmp_path, tls, un
         identifier = uuid.uuid4().hex
         b.controller.command(identifier, "start_test" if source == "local" else "arm_cloud_test", 0)
         if source == "local":
-            await b.controller.tests.settle()
+            await b.controller.charging.settle()
         elif source == "cloud":
             await owner_start(b)
         local = None
@@ -151,13 +151,13 @@ async def test_interrupted_test_retires_after_real_closed_zero(tmp_path, tls, un
         assert historical["state"] == "completed"
         expected_starts = 0 if source == "cloud-arm" else 1
         assert len(starts(b.rig)) == expected_starts
-        await b.controller.tests.close()
+        await b.controller.charging.close()
         await crash(b.session)
         replacement = managed_session(b.rig)
         await replacement.start()
         recovered = ManagedController(replacement)
         try:
-            assert recovered.tests.state()["state"] == "interrupted"
+            assert recovered.charging.state()["state"] == "interrupted"
             assert recovered.requests.intent().mode == "paused"
             async with b.rig.charger(replacement) as charger:
                 await introduced(b.rig, replacement, charger, "closed-test-replacement-" + source)
@@ -166,15 +166,15 @@ async def test_interrupted_test_retires_after_real_closed_zero(tmp_path, tls, un
                     # This is a real natural device Stop and cloud ACK, not a synthetic controller completion.
                     await close_session(b.rig, replacement, charger, local)
                 await settled_without_another_command(recovered)
-                assert recovered.tests.state()["state"] == "completed"
-                assert recovered.tests.lease is None
+                assert recovered.charging.state()["state"] == "completed"
+                assert recovered.charging.lease is None
                 assert recovered.requests.receipt(identifier) == historical
                 assert len(starts(b.rig)) == expected_starts
                 assert b.rig.bench.firmware.effective_limit() == 0
                 await two_later_sessions(fresh, selected=6, original_starts=expected_starts)
                 assert recovered.requests.receipt(identifier) == historical
         finally:
-            await recovered.tests.close()
+            await recovered.charging.close()
             if recovered.pause_task is not None:
                 await asyncio.gather(recovered.pause_task, return_exceptions=True)
             await replacement.close()
@@ -201,19 +201,19 @@ async def test_interrupted_request_retains_its_action_outcome(tmp_path, tls, unu
                     c.command(identifier, action, c.requests.intent().revision)
             finally:
                 j.db.execute("DROP TRIGGER refuse_arm_confirmation")
-            assert c.tests.state()["state"] == "armed"
+            assert c.charging.state()["state"] == "armed"
         else:
             c.command(identifier, action, c.requests.intent().revision)
-            await c.tests.settle()
+            await c.charging.settle()
             local = await positive_flow(b)
             # The actual device has flowed, but no supervisor observation has published that proof.
-            assert c.tests.state()["state"] == "awaiting_power"
-            assert not c.tests.state().get("start_source_verified")
-            assert "flow_started_at" not in c.tests.state()
+            assert c.charging.state()["state"] == "awaiting_power"
+            assert not c.charging.state().get("start_source_verified")
+            assert "flow_started_at" not in c.charging.state()
         assert c.requests.receipt(identifier)["state"] == "accepted"
         expected_starts = int(local is not None)
         assert len(starts(b.rig)) == expected_starts
-        await c.tests.close()
+        await c.charging.close()
         await crash(b.session)
         replacement = managed_session(b.rig)
         await replacement.start()
@@ -239,12 +239,12 @@ async def test_interrupted_request_retains_its_action_outcome(tmp_path, tls, unu
                         else {"armed": True, "charging_started": False}
                     )
                 assert not terminal["result"].get("positive_power_verified")
-                assert recovered.tests.state()["state"] == "completed" and recovered.tests.lease is None
+                assert recovered.charging.state()["state"] == "completed" and recovered.charging.lease is None
                 assert len(starts(b.rig)) == expected_starts
                 await two_later_sessions(fresh, selected=6, original_starts=expected_starts)
                 assert recovered.requests.receipt(identifier) == terminal
         finally:
-            await recovered.tests.close()
+            await recovered.charging.close()
             if recovered.pause_task is not None:
                 await asyncio.gather(recovered.pause_task, return_exceptions=True)
             await replacement.close()
@@ -311,8 +311,8 @@ async def test_internal_pause_recovers_after_first_read_failure(tmp_path, tls, u
 
             b.rig.bench.before_reply = drop_after_zero
             c.command(identifier, "start_test", c.requests.intent().revision)
-            await c.tests.settle()
-            assert c.tests.state()["state"] == "stopping"
+            await c.charging.settle()
+            assert c.charging.state()["state"] == "stopping"
         else:
             # Last health/native evidence is genuinely fresh, so admission succeeds before the first failing read.
             b.rig.peer.unavailable = True
@@ -357,7 +357,7 @@ async def test_explicit_rejected_start_settles_its_current_ticket(tmp_path, tls,
         b.rig.bench.before_reply = fail_follow_up
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         if c.pause_task is not None:
             await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
         assert j.get("local_start_receipt")["stage"] == "rejected"

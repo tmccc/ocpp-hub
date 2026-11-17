@@ -81,7 +81,7 @@ async def test_storage_cleanup_preserves_new_pause_and_boot(
             c.requests.intent().revision,
             **({} if operation == "start" else {"current_a": 16}),
         )
-        worker = c.tests.worker if operation == "start" else c.current.worker
+        worker = c.charging.worker if operation == "start" else c.current.worker
         try:
             await asyncio.wait_for(reached.wait(), 3)
             assert len(attempts) >= 2 and worker is not None and not worker.done()

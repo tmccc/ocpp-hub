@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Give physical control authority one journal owner, replacing 27 direct writes across 11 modules. Name shared
+  authority and restrictive holds explicitly, retaining legacy and strict Boolean evidence rules. Structure live
+  polling as owned-work settlement, supervision, assessment and status publication; share the health decision and
+  public status fields. Rename the production charging owner to `ManagedCharging`. Keep existing stored formats,
+  public commands, actual wire/commit boundaries and daily charging behavior.
+
 - Retire the plain commissioning session, recovery, rollback and observation controller. Require an explicit native
   specification and keyword-only options; refuse unfinished ordinary journals before resource setup without changing
   their evidence. Keep native-bounded commissioning Start/Release, cleanup/restoration and all daily managed controls.

@@ -34,7 +34,7 @@ async def test_cloud_start_reply_ordering(tmp_path, tls, unused_tcp_port, monkey
             tag = "NATIVE_TIMER"
             if source == "local":
                 c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-                await c.tests.settle()
+                await c.charging.settle()
                 tag = mp.starts(rig)[-1][3]["idTag"]
             original_starts = len(mp.starts(rig))
             rig.bench.start_replies, rig.bench.start_reply_gate = [reply], gate

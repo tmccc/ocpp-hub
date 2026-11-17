@@ -54,7 +54,7 @@ async def test_initial_history_refusal_precedes_closed_zero_readiness(tmp_path, 
         finally:
             rig.bench.history = history
             rig.peer.permission_enabled = False
-            await c.tests.close()
+            await c.charging.close()
             await session.close()
 
 

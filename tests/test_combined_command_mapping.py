@@ -247,7 +247,7 @@ async def test_actual_combined_tool_and_individual_controls(
     completed = observe_completed_commands(monkeypatch)
     async with selected_service(tmp_path, tls, unused_tcp_port, monkeypatch, selected) as seed:
         rig = seed.rig
-        await seed.controller.tests.close()
+        await seed.controller.charging.close()
         await crash(seed.session)
         for number in range(2 if uncertain_command and lost_delivery else 1):
             async with running(rig, f"combined-prefix-{number}") as (s, c, sock):
@@ -295,7 +295,7 @@ async def test_combined_tool_atomic_failures_then_exact_recovery(
     completed = observe_completed_commands(monkeypatch)
     async with selected_service(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as seed:
         rig = seed.rig
-        await seed.controller.tests.close()
+        await seed.controller.charging.close()
         await crash(seed.session)
         async with running(rig, "combined-atomic-prefix") as (s, c, sock):
             await healthy(c)
@@ -432,7 +432,7 @@ async def test_prior_denial_composes_with_combined_and_refused_stop_recovery(
     completed = observe_completed_commands(monkeypatch)
     async with selected_service(tmp_path, tls, unused_tcp_port, monkeypatch, selected) as seed:
         rig = seed.rig
-        await seed.controller.tests.close()
+        await seed.controller.charging.close()
         await crash(seed.session)
         async with running(rig, "denial-before-combined") as (s, c, sock):
             await healthy(c)

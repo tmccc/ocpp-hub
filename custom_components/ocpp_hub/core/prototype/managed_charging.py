@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .connection_scope import CloudAttemptScope, current_scope
+from .control_state import ControlState
 from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_intent import ControlIntent, write_intent
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
@@ -40,7 +41,7 @@ ACTIVE = frozenset({"armed", "starting", "awaiting_power", "charging", "running"
 
 
 @dataclass
-class TestLease:
+class ChargeLease:
     """A live request belongs to one actual introduction, revision, Stop generation and monotonic budget."""
 
     identifier: str
@@ -63,8 +64,8 @@ class TestLease:
     start_scope: CloudAttemptScope | None = None
 
 
-class ManagedChargeTests:
-    """The generic Start policy stays disabled; this one-shot test has no caller-selected current/tag/duration."""
+class ManagedCharging:
+    """One owner supervises normal charging and bounded local/cloud tests without replaying Start."""
 
     # Construction may retire an interrupted permission, but never sends a Start or renews a persisted deadline.
     def __init__(self, controller: ManagedController) -> None:
@@ -106,12 +107,12 @@ class ManagedChargeTests:
 
     # The shared lifecycle owner holds the only active lease slot; callers retain their exact object identity.
     @property
-    def lease(self) -> TestLease | None:
+    def lease(self) -> ChargeLease | None:
         return self.journal.starts.lease
 
     # Compatibility callers publish or retire memory only after their owning transaction commits.
     @lease.setter
-    def lease(self, value: TestLease | None) -> None:
+    def lease(self, value: ChargeLease | None) -> None:
         self.journal.starts.set_lease(value)
 
     # Private provenance includes identifiers; the public summary below exposes only source, state and timing.
@@ -248,7 +249,7 @@ class ManagedChargeTests:
             raise RecoveryRequiredError("test requires current shared six-ampere authority and no pending work")
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"
-        lease = TestLease(
+        lease = ChargeLease(
             identifier,
             source,
             revision,
@@ -273,7 +274,7 @@ class ManagedChargeTests:
         return c.requests.receipt(identifier)
 
     # Pause, deadline, shutdown, introduction, permission changes and a replaced request all revoke positive sends.
-    def guard(self, lease: TestLease, *, stopping: bool = False) -> None:
+    def guard(self, lease: ChargeLease, *, stopping: bool = False) -> None:
         c, j = self.controller, self.journal
         g, intent = c.session.gateway, c.requests.intent()
         if (
@@ -308,7 +309,7 @@ class ManagedChargeTests:
             raise DeniedError("managed test Start permission expired or was superseded")
 
     # The service owns the worker after client disappearance; failures revoke only this Start's authority.
-    async def _start(self, lease: TestLease) -> None:
+    async def _start(self, lease: ChargeLease) -> None:
         c, j = self.controller, self.journal
         previous_current = current_candidate(c) if lease.normal else None
         effects = False
@@ -329,8 +330,7 @@ class ManagedChargeTests:
                     return  # LocalControl checks once before synchronously making its own claim.
                 if (
                     control.get("stop_epoch") != lease.stop_epoch + 1
-                    or control.get("owner") != "local"
-                    or control.get("inhibit") is not True
+                    or not ControlState(control).explicit_local_hold
                     or not isinstance(control.get("ticket"), str)
                     or lease.initial_zero_ticket not in (None, control["ticket"])
                     or lease.initial_zero_boot not in (None, g.boot_observation)
@@ -414,7 +414,7 @@ class ManagedChargeTests:
             await self._failed_start(lease, error, effects)
 
     # Settle the exact failed operation before optional diagnostics; a newer restrictive winner remains intact.
-    async def _failed_start(self, lease: TestLease, error: Exception, effects: bool) -> None:
+    async def _failed_start(self, lease: ChargeLease, error: Exception, effects: bool) -> None:
         c, j = self.controller, self.journal
         while not self._closing and not c.stopping:
             try:
@@ -477,7 +477,7 @@ class ManagedChargeTests:
                 return
 
     # A real bound Start/Stop pair completes without changing current authority or stopping a later app session.
-    def finish_closed_normal(self, lease: TestLease) -> bool:
+    def finish_closed_normal(self, lease: ChargeLease) -> bool:
         finished = self.journal.starts.finish_closed(lease)
         if finished:
             self.changed.set()
@@ -830,7 +830,7 @@ class ManagedChargeTests:
             self.changed.set()
 
     # A failed normal Start can reclaim only zero from its own unchanged ticket beneath the original owner Pause.
-    def failed_start_zero_needed(self, lease: TestLease, reason: str, failure: dict[str, Any] | None) -> bool:
+    def failed_start_zero_needed(self, lease: ChargeLease, reason: str, failure: dict[str, Any] | None) -> bool:
         c, j, g = self.controller, self.journal, self.controller.session.gateway
         intent, state, receipt, control = (
             c.requests.intent(),
@@ -866,7 +866,7 @@ class ManagedChargeTests:
         )
 
     # Normal expiry retains separate reporting debt; only an explicit Pause can Stop an independent daily.
-    def stop(self, lease: TestLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
+    def stop(self, lease: ChargeLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
         if self.lease is not lease or self.state().get("state") == "stopping":
             return
         c, j = self.controller, self.journal
@@ -894,7 +894,7 @@ class ManagedChargeTests:
         self.changed.set()
 
     # A monotonic deadline owns Stop independently of HA, the initiating socket, native reads and service polling.
-    async def _deadline(self, lease: TestLease) -> None:
+    async def _deadline(self, lease: ChargeLease) -> None:
         while self.lease is lease:
             try:
                 if self.state().get("state") == "stopping":

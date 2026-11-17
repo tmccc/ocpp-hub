@@ -256,7 +256,7 @@ async def replacement(b, label):
             await mp.introduced(b.rig, session, charger, label)
             yield ChargeRig(b.rig, session, c, charger)
         finally:
-            await c.tests.close()
+            await c.charging.close()
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             await session.close()
@@ -264,7 +264,7 @@ async def replacement(b, label):
 
 # Recover only from saved wire evidence or independently verified actual cloud mapping.
 async def replace_and_recover(stack, b, fault, held, action, tmp_path, capsys, cycle):
-    await b.controller.tests.close()
+    await b.controller.charging.close()
     await crash(b.session)
     j = Journal(b.rig.prepared.config.journal, b.rig.prepared.config.identity)
     try:
@@ -285,7 +285,7 @@ async def replace_and_recover(stack, b, fault, held, action, tmp_path, capsys, c
     await pause(fresh.controller)
     assert fresh.session.journal.get("managed_control_fault")
     assert wire_count(b.rig, held.token) == 1
-    await fresh.controller.tests.close()
+    await fresh.controller.charging.close()
     await crash(fresh.session)
     strategy_file(b.rig, tmp_path)
     args = (tmp_path / "trial.json", tmp_path / "native-spec.json")
@@ -449,7 +449,7 @@ async def test_negative_cloud_reply_storage_keeps_quarantine(
                 await b.controller.tick()
                 assert j.get("managed_control_fault")
             if replaced:
-                await b.controller.tests.close()
+                await b.controller.charging.close()
                 await crash(b.session)
                 j = Journal(b.rig.prepared.config.journal, b.rig.prepared.config.identity)
                 try:
@@ -483,7 +483,7 @@ async def test_negative_cloud_reply_storage_keeps_quarantine(
             assert not mp.starts(b.rig)
         finally:
             held.release.set()
-            await b.controller.tests.close()
+            await b.controller.charging.close()
             await crash(b.session)
 
 
@@ -576,7 +576,7 @@ async def test_malformed_start_reply_cache_quarantines_without_replay(
         assert b.session.runtime.status.delivery_blocked_cause == "reconciliation"
         assert b.session.journal.next_delivery().state == "ambiguous"
         if replaced:
-            await b.controller.tests.close()
+            await b.controller.charging.close()
             await crash(b.session)
             b = await stack.enter_async_context(replacement(b, "malformed-reply-replacement"))
             await until(lambda: b.session.runtime.status.delivery_blocked)

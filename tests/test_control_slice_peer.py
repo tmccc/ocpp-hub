@@ -100,7 +100,7 @@ async def test_real_late_accepted_after_new_pause_keeps_authority_and_debt(tmp_p
             shadow = step(shadow, AuthorityChanged(before, newer)).state
 
             release.set()
-            await asyncio.wait_for(c.tests.settle(), 5)
+            await asyncio.wait_for(c.charging.settle(), 5)
             if c.pause_task is not None:
                 await asyncio.wait_for(asyncio.shield(c.pause_task), 4)
             assert [3, wire_id, {"status": "Accepted"}] in replies
@@ -149,7 +149,7 @@ async def test_real_late_accepted_after_new_pause_keeps_authority_and_debt(tmp_p
         finally:
             release.set()
             rig.bench.before_reply, g.charger.timeout = old_hook, old_timeout
-            if c.tests.worker is not None:
-                await asyncio.gather(c.tests.worker, return_exceptions=True)
+            if c.charging.worker is not None:
+                await asyncio.gather(c.charging.worker, return_exceptions=True)
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)

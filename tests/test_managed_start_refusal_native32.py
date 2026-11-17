@@ -37,7 +37,7 @@ async def commissioned(tmp_path, tls, port, monkeypatch, current, *, owner_tag=N
             native_writer(prior, writes),
         )
         assert writes == [{"AmpLmt": "32"}]
-        await prior.controller.tests.close()
+        await prior.controller.charging.close()
         await crash(prior.session)
         session = managed_session(prior.rig)
         if owner_tag is not None:
@@ -59,7 +59,7 @@ async def commissioned(tmp_path, tls, port, monkeypatch, current, *, owner_tag=N
             try:
                 yield b
             finally:
-                await c.tests.close()
+                await c.charging.close()
                 if c.pause_task is not None:
                     await asyncio.gather(c.pause_task, return_exceptions=True)
                 await session.close()
@@ -85,7 +85,7 @@ async def test_prepared_native32_outage(tmp_path, tls, unused_tcp_port, monkeypa
                         "selected_a": current,
                         "case": action or "normal_control",
                         "effective_limit": b.rig.bench.firmware.effective_limit(),
-                        "test_state": b.controller.tests.state().get("state"),
+                        "test_state": b.controller.charging.state().get("state"),
                     }
                 )
             )
@@ -104,9 +104,9 @@ async def test_preflight_failure_survives_replacement(tmp_path, tls, unused_tcp_
         await refuse_unsent_start(b, action)
         if action == "start":
             # Reproduce the old persisted failed lifecycle while retaining its actual no-effects management receipt.
-            legacy = {key: value for key, value in b.controller.tests.state().items() if key != "start_attempted"}
+            legacy = {key: value for key, value in b.controller.charging.state().items() if key != "start_attempted"}
             b.session.journal.put("managed_test_charge", {**legacy, "state": "failed"})
-        await b.controller.tests.close()
+        await b.controller.charging.close()
         await crash(b.session)
         s = managed_session(b.rig)
         await s.start()
@@ -127,7 +127,7 @@ async def test_preflight_failure_survives_replacement(tmp_path, tls, unused_tcp_
                             "replaced": True,
                             "case": action or "normal_control",
                             "effective_limit": b.rig.bench.firmware.effective_limit(),
-                            "test_state": c.tests.state().get("state"),
+                            "test_state": c.charging.state().get("state"),
                         }
                     )
                 )
@@ -135,5 +135,5 @@ async def test_preflight_failure_survives_replacement(tmp_path, tls, unused_tcp_
             finally:
                 b.rig.peer.unavailable = False
                 await close_session(b.rig, s, sock, local)
-                await c.tests.close()
+                await c.charging.close()
                 await s.close()

@@ -38,7 +38,7 @@ async def test_expired_debt_preserves_verified_daily(
             await healthy(b.c)
         request = uuid.uuid4().hex
         b.c.command(request, "start", b.c.requests.intent().revision)
-        await b.c.tests.settle()
+        await b.c.charging.settle()
         daily = await b.start_plan(9, demand=demand)
         await healthy(b.c)
         receipt = b.session.journal.get("local_start_receipt")
@@ -56,7 +56,7 @@ async def test_expired_debt_preserves_verified_daily(
                 observer.port = port
         else:
             await expire(b)
-            await b.c.tests.close()
+            await b.c.charging.close()
             await crash(b.session)
             b.session = managed_session(b.rig)
             await b.session.start()
@@ -67,7 +67,7 @@ async def test_expired_debt_preserves_verified_daily(
             await introduced(b.rig, b.session, b.sock, "expired-debt-recovery")
         for _ in range(3):
             await b.c.tick()
-        assert b.c.tests.current_daily(daily)
+        assert b.c.charging.current_daily(daily)
         assert b.device.effective_limit() == selected
         assert b.session.journal.get("local_start_receipt") == receipt
         assert b.session.journal.get("control")["start_pending"] and not b.stops()

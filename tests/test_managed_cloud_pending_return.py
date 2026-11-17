@@ -60,17 +60,17 @@ async def test_return_waits_for_timed_test_settlement(
         c, j = b.controller, b.session.journal
         c.command(uuid.uuid4().hex, "start_test" if source == "local" else "arm_cloud_test", 0)
         if source == "local":
-            await c.tests.settle()
+            await c.charging.settle()
         else:
             await owner_start(b)
         local = await positive_flow(b, source)
         await healthy(c)
         # Advance the live monotonic lease so the real independent deadline task owns Stop for both sources.
-        assert c.tests.lease is not None
-        c.tests.lease.deadline = time.monotonic() - 1
-        c.tests.changed.set()
+        assert c.charging.lease is not None
+        c.charging.lease.deadline = time.monotonic() - 1
+        c.charging.changed.set()
         await asyncio.wait_for(b.rig.bench.remote_stop.wait(), 3)
-        assert c.tests.state()["state"] == "stopping" and c.requests.intent().mode == "paused"
+        assert c.charging.state()["state"] == "stopping" and c.requests.intent().mode == "paused"
         reply = await b.rig.bench.call(
             b.charger, "test-closed-before-return", "StopTransaction",
             {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
@@ -87,12 +87,12 @@ async def test_return_waits_for_timed_test_settlement(
             c.requests.accept(identifier, "app_control", revision)
             await c.tick()
             assert c.requests.receipt(identifier)["state"] == "accepted"
-            assert c.requests.intent().mode == "paused" and c.tests.state()["state"] == "completed"
+            assert c.requests.intent().mode == "paused" and c.charging.state()["state"] == "completed"
         else:
             with pytest.raises(RecoveryRequiredError, match="test settlement"):
                 c.command(identifier, "app_control", revision)
             await healthy(c)
-            assert c.tests.state()["state"] == "completed"
+            assert c.charging.state()["state"] == "completed"
         assert all(limit == 0 for limit in b.rig.bench.received_limits[count:])
         if not legacy_return:
             c.command(identifier, "app_control", revision)

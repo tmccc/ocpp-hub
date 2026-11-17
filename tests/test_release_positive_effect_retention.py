@@ -38,7 +38,7 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
         plan, configuration = copy.deepcopy(b.device.plans[9]), copy.deepcopy(b.rig.peer.configuration)
         # A real new introduction before the remaining cutoff reaches the ordinary automatic idle restoration.
         b.clock.now = END - 1
-        await b.c.tests.close()
+        await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
         await b.session.start()

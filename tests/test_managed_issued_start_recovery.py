@@ -61,11 +61,11 @@ async def test_ordinary_issued_start_exact_recovery(tmp_path, tls, unused_tcp_po
             rig.bench.before_reply = delay_reply
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
-        await c.tests.settle()
+        await c.charging.settle()
         rig.bench.before_reply = None
         assert len(starts(rig)) == 1
         receipt = s.journal.get("local_start_receipt")
-        state = c.tests.state()
+        state = c.charging.state()
         assert receipt["stage"] == "issued" and state["start_rpc_accepted"] is False
         assert s.journal.get("control")["start_pending"] is True
         await asyncio.sleep(max(0, state["hard_deadline_epoch"] - time.time()) + 0.05)
@@ -81,7 +81,7 @@ async def test_ordinary_issued_start_exact_recovery(tmp_path, tls, unused_tcp_po
         assert c.requests.receipt(returned)["state"] == "failed"
         strategy = strategy_file(rig, tmp_path)
         config, port = tmp_path / "trial.json", rig.prepared.observer.port
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
         assert await operator.run("inspect", config, strategy, None, port, kind="local-start") == 0
         candidate = json.loads(capsys.readouterr().out.splitlines()[-1])["candidate"]

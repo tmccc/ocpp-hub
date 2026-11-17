@@ -39,7 +39,7 @@ async def test_unissued_start_has_no_lifecycle_debt(tmp_path, tls, unused_tcp_po
         monkeypatch.setattr(b.rig.bench.firmware, "answer", answer)
         identifier = uuid.uuid4().hex
         b.controller.command(identifier, action, b.controller.requests.intent().revision)
-        await b.controller.tests.settle()
+        await b.controller.charging.settle()
         if not refuse:
             local = await positive_flow(b)
             await healthy(b.controller)
@@ -64,7 +64,7 @@ async def test_unissued_start_has_no_lifecycle_debt(tmp_path, tls, unused_tcp_po
                 {
                     "action": action,
                     "initial_zero_rejected": refuse,
-                    "state": b.controller.tests.state()["state"],
+                    "state": b.controller.charging.state()["state"],
                     "local_start_receipt": b.session.journal.get("local_start_receipt"),
                     "normal_start_ready": status["normal_start_ready"],
                     "physical_starts": len(starts(b.rig)),
@@ -96,13 +96,13 @@ async def test_zero_refusal_cleanup_survives_replacement(tmp_path, tls, unused_t
 
         monkeypatch.setattr(b.rig.bench.firmware, "answer", answer)
         b.controller.command(uuid.uuid4().hex, "start", b.controller.requests.intent().revision)
-        await b.controller.tests.settle()
+        await b.controller.charging.settle()
         if b.controller.pause_task is not None:
             await b.controller.pause_task
         assert refused and not starts(b.rig)
-        assert b.controller.tests.state()["state"] == "stopping"
-        assert b.controller.tests.state()["start_attempted"] is False
-        await b.controller.tests.close()
+        assert b.controller.charging.state()["state"] == "stopping"
+        assert b.controller.charging.state()["start_attempted"] is False
+        await b.controller.charging.close()
         await crash(b.session)
         b.rig.peer.unavailable = False
         s = managed_session(b.rig)
@@ -112,7 +112,7 @@ async def test_zero_refusal_cleanup_survives_replacement(tmp_path, tls, unused_t
             try:
                 await introduced(b.rig, s, charger, "unissued-cleanup-replacement")
                 await healthy(c)
-                assert c.tests.state()["state"] == "completed"
+                assert c.charging.state()["state"] == "completed"
                 c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
                 await healthy(c)
                 c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
@@ -129,5 +129,5 @@ async def test_zero_refusal_cleanup_survives_replacement(tmp_path, tls, unused_t
                     b.rig.peer.unavailable = False
                     await close_session(b.rig, s, charger, local)
             finally:
-                await c.tests.close()
+                await c.charging.close()
                 await s.close()

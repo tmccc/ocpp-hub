@@ -32,11 +32,11 @@ async def test_stop_rejection_replacement_retains_recovery(
             await mp.healthy(c)
             if origin.startswith("local"):
                 c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
-                await c.tests.settle()
+                await c.charging.settle()
             local = await positive_flow(ChargeRig(rig, s, c, sock), "local" if origin.startswith("local") else "daily")
             if origin.startswith("local"):
                 assert s.journal.get("local_start_receipt")["local"] == local
-                assert c.tests.state()["local_transaction"] == local
+                assert c.charging.state()["local_transaction"] == local
             if origin != "local-unobserved":
                 await mp.healthy(c)
             else:
@@ -93,7 +93,7 @@ async def test_bound_lifecycle_before_start_success_publication(
             await until(lambda: bool(retained))
             local = await positive_flow(ChargeRig(rig, s, c, sock))
             assert s.journal.get("local_start_receipt")["local"] == local
-            assert c.tests.state()["local_transaction"] == local
+            assert c.charging.state()["local_transaction"] == local
             rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
             await rig.bench.call(
                 sock,
@@ -107,10 +107,10 @@ async def test_bound_lifecycle_before_start_success_publication(
             if answer == "unknown":
                 raw = build_call_error(decode(raw)[1], "InternalError", "synthetic uncertain Start reply")
             await send(raw)
-            await c.tests.settle()
+            await c.charging.settle()
             if c.pause_task is not None:
                 await c.pause_task
-            assert c.tests.state()["start_rpc_accepted"] is False
+            assert c.charging.state()["start_rpc_accepted"] is False
             assert s.journal.get("local_start_receipt")["stage"] == ("accepted" if answer == "accepted" else "issued")
             if not replace_process:
                 await verify_bound_result(rig, s, c, identifier, answer)
@@ -126,9 +126,9 @@ async def verify_bound_result(rig, s, c, identifier, answer):
         await c.tick()
         await asyncio.sleep(0)
     assert rig.bench.firmware.effective_limit() == 0 and len(mp.starts(rig)) == 1
-    assert c.tests.state()["state"] == "completed"
+    assert c.charging.state()["state"] == "completed"
     assert c.requests.receipt(identifier)["state"] == "completed"
-    assert c.tests.state()["start_rpc_accepted"] is False
+    assert c.charging.state()["start_rpc_accepted"] is False
     assert s.journal.get("local_start_receipt")["stage"] == ("accepted" if answer == "accepted" else "issued")
     c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
     assert (await mp.healthy(c))["normal_start_ready"]
@@ -143,9 +143,9 @@ async def test_closed_session_retirement_is_atomic(tmp_path, model_tls, monkeypa
             await mp.healthy(c)
             identifier = uuid.uuid4().hex
             c.command(identifier, "start", c.requests.intent().revision)
-            await c.tests.settle()
+            await c.charging.settle()
             local = await positive_flow(ChargeRig(rig, s, c, sock))
-            assert c.tests.state()["local_transaction"] == local
+            assert c.charging.state()["local_transaction"] == local
             rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
             await rig.bench.call(
                 sock,
@@ -157,7 +157,7 @@ async def test_closed_session_retirement_is_atomic(tmp_path, model_tls, monkeypa
         async with running(rig, "closed-atomic-replacement") as (s, c, sock):
             native = await c.native.read()
             c.require_paused(native)
-            state, receipt = copy.deepcopy(c.tests.state()), c.requests.receipt(identifier)
+            state, receipt = copy.deepcopy(c.charging.state()), c.requests.receipt(identifier)
             assert receipt["state"] == "uncertain"
             sql = (
                 "BEFORE UPDATE ON managed_requests WHEN NEW.id='" + identifier + "'"
@@ -170,11 +170,11 @@ async def test_closed_session_retirement_is_atomic(tmp_path, model_tls, monkeypa
                 + " BEGIN SELECT RAISE(ABORT,'synthetic closed retirement write failure'); END"
             )
             with pytest.raises(sqlite3.IntegrityError, match="synthetic closed retirement"):
-                c.tests.retire_closed_at_zero(native)
-            assert c.tests.state() == state and c.requests.receipt(identifier) == receipt
+                c.charging.retire_closed_at_zero(native)
+            assert c.charging.state() == state and c.requests.receipt(identifier) == receipt
             assert rig.bench.firmware.effective_limit() == 0
             s.journal.db.execute("DROP TRIGGER fail_closed_retire")
-            c.tests.retire_closed_at_zero(native)
-            assert c.tests.state()["state"] == c.requests.receipt(identifier)["state"] == "completed"
+            c.charging.retire_closed_at_zero(native)
+            assert c.charging.state()["state"] == c.requests.receipt(identifier)["state"] == "completed"
             c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
             assert (await mp.healthy(c))["normal_start_ready"]

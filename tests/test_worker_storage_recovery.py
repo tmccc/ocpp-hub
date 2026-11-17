@@ -73,16 +73,16 @@ async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unus
             c.command(identifier, "start", c.requests.intent().revision)
             tick = asyncio.create_task(c.tick()) if tick_awaits else None
             await asyncio.wait_for(reached.wait(), 3)
-            assert attempts and c.tests.worker is not None
-            await asyncio.wait_for(asyncio.shield(c.tests.worker), 3)
-            assert c.tests.state()["failure"]["id"] == identifier
+            assert attempts and c.charging.worker is not None
+            await asyncio.wait_for(asyncio.shield(c.charging.worker), 3)
+            assert c.charging.state()["failure"]["id"] == identifier
             assert starts(b.rig) == []
             assert j.get("local_start_receipt")["stage"] in ("prepared", "unsent")
             # Real restrictive tasks drive zero while the diagnostic write remains continuously refused.
             await until(lambda: b.rig.bench.firmware.effective_limit() == 0)
             j.db.execute("DROP TRIGGER review_worker_boundary")
             j.db.execute("DROP TRIGGER review_cleanup_unavailable")
-            await asyncio.wait_for(asyncio.shield(c.tests.worker), 3)
+            await asyncio.wait_for(asyncio.shield(c.charging.worker), 3)
             if tick is not None:
                 await asyncio.wait_for(tick, 3)
             if c.pause_task is not None:

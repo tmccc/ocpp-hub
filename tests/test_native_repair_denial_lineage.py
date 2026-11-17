@@ -98,7 +98,7 @@ async def test_real_stop_fault_bridge_retains_denial_native_repair_lineage(
         assert j.get(DENIALS)[str(ids[0])]["completed"] is None
         original_markers = copy.deepcopy(j.get(REVOCATIONS)), copy.deepcopy(j.get(AUDITS))
         await c.current.close()
-        await c.tests.close()
+        await c.charging.close()
         await crash(s)
 
         # The real exclusive tool verifies the existing genuine Stop receipt and builds every proof header itself.

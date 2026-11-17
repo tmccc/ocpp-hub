@@ -59,7 +59,7 @@ async def test_start_child_publishes_all_authority_or_retains_accepted_debt(
             observations.append(
                 {
                     "attempt": owned,
-                    "lease": c.tests.lease,
+                    "lease": c.charging.lease,
                     "transaction": j.db.in_transaction,
                     "intent": c.requests.intent(),
                     "receipt": copy.deepcopy(j.get("local_start_receipt")),
@@ -96,7 +96,7 @@ async def test_start_child_publishes_all_authority_or_retains_accepted_debt(
         )
         try:
             c.command(identifier, "start", intent.revision)
-            await asyncio.wait_for(c.tests.settle(), 5)
+            await asyncio.wait_for(c.charging.settle(), 5)
             assert len(observations) == 1 and observations[0]["transaction"]
             witness = observations[0]
             attempt, lease = witness["attempt"], witness["lease"]
@@ -114,7 +114,7 @@ async def test_start_child_publishes_all_authority_or_retains_accepted_debt(
                 assert c.requests.intent().mode == lease.mode == "app"
                 assert c.requests.intent().revision == lease.revision == intent.revision + 1
                 assert control["owner"] == "shared" and not control["inhibit"] and not control["uncertain"]
-                assert c.tests.state()["state"] == "awaiting_power" and c.tests.state()["start_rpc_accepted"]
+                assert c.charging.state()["state"] == "awaiting_power" and c.charging.state()["start_rpc_accepted"]
                 assert c.released_epoch == g._charger_epoch
                 assert c.requests.receipt(identifier)["state"] == "accepted"
             else:
@@ -123,7 +123,7 @@ async def test_start_child_publishes_all_authority_or_retains_accepted_debt(
                 assert c.requests.intent() == intent and lease.mode == intent.mode and lease.revision == intent.revision
                 assert c.released_epoch == released
                 assert control["owner"] == "local" and control["inhibit"] and control["uncertain"]
-                assert c.tests.state()["state"] == "stopping" and not c.tests.state().get("start_rpc_accepted")
+                assert c.charging.state()["state"] == "stopping" and not c.charging.state().get("start_rpc_accepted")
                 assert c.requests.receipt(identifier)["state"] == "uncertain"
                 assert receipt["stage"] == ("issued" if boundary == "accepted_commit" else "accepted")
                 assert b.rig.bench.firmware.effective_limit() == 0

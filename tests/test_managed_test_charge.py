@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from ocpp_hub_core.prototype import managed_test_charge as charge_tests
+from ocpp_hub_core.prototype import managed_charging as charge_tests
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
@@ -71,7 +71,7 @@ async def ready(
             try:
                 yield ChargeRig(rig, session, controller, charger)
             finally:
-                await controller.tests.close()
+                await controller.charging.close()
                 if controller.pause_task is not None:
                     await asyncio.gather(controller.pause_task, return_exceptions=True)
                 await session.close()
@@ -148,7 +148,7 @@ async def test_local_charge_confirms_power_then_stops_without_further_tick(
         receipt = controller.command(identifier, "start_test", 0)
         assert receipt["state"] == "accepted"
         assert controller.command(identifier, "start_test", 0) == receipt
-        await controller.tests.settle()
+        await controller.charging.settle()
         assert len(starts(test.rig)) == 1 and session.gateway.controls.desired() == 6
         assert controller.requests.receipt(identifier)["state"] == "accepted"
         count = len(test.rig.bench.device_calls)
@@ -160,16 +160,16 @@ async def test_local_charge_confirms_power_then_stops_without_further_tick(
         assert status["power_w"] == 1440 and status["current_a"] == status["native_limit_a"] == 6
         assert controller.requests.receipt(identifier)["state"] == "completed"
         assert controller.requests.receipt(identifier)["result"]["positive_power_verified"]
-        assert controller.tests.state()["state"] == "charging"
+        assert controller.charging.state()["state"] == "charging"
 
         # No service tick runs between positive-flow verification and the actual independently timed Stop.
         await asyncio.wait_for(test.rig.bench.remote_stop.wait(), 3)
         assert controller.requests.intent().mode == "paused"
-        assert controller.tests.state()["stop_reason"] == "deadline"
+        assert controller.charging.state()["stop_reason"] == "deadline"
         stopped = await actual_stop(test, local)
         assert stopped["local_hold_verified"] and stopped["power_w"] == 0
         assert not stopped["charging_session_open"] and stopped["station_ceiling_a"] == 0
-        assert controller.tests.state()["state"] == "completed"
+        assert controller.charging.state()["state"] == "completed"
         assert len(starts(test.rig)) == 1 and not session.gateway.policy.allow_local_start
 
 
@@ -185,14 +185,14 @@ async def test_cloud_arm_waits_for_real_cloud_start_and_positive_native_power(
         identifier = uuid.uuid4().hex
         reply = test.controller.command(identifier, "arm_cloud_test", 0)
         assert reply["result"] == {"armed": True, "charging_started": False}
-        assert test.controller.tests.state()["state"] == "armed" and not starts(test.rig)
+        assert test.controller.charging.state()["state"] == "armed" and not starts(test.rig)
         await owner_start(test)
         assert len(starts(test.rig)) == 1
         local = await positive_flow(test, "cloud")
         status = await healthy(test.controller)
-        assert status["power_w"] == 1440 and test.controller.tests.state()["state"] == "charging"
-        assert test.controller.tests.state()["start_source_verified"]
-        assert test.controller.tests.summary()["source"] == "cloud"
+        assert status["power_w"] == 1440 and test.controller.charging.state()["state"] == "charging"
+        assert test.controller.charging.state()["start_source_verified"]
+        assert test.controller.charging.summary()["source"] == "cloud"
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         assert (await actual_stop(test, local))["local_hold_verified"]
         assert len(starts(test.rig)) == 1
@@ -268,7 +268,7 @@ async def test_pause_preempts_queued_start_before_actual_send(
             test.controller.command(uuid.uuid4().hex, "pause", 0)
             count = len(test.rig.bench.received_limits)
             proceed.set()
-            await test.controller.tests.settle()
+            await test.controller.charging.settle()
             if boundary == "native_send":
                 await until(lambda: test.rig.bench.firmware.effective_limit() == 0)
                 if test.controller.pause_task is not None:
@@ -324,7 +324,7 @@ async def test_fresh_native_admission_failure_has_no_external_control_effects(
         before = copy.deepcopy(test.session.journal.get("control"))
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start_test", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         assert test.controller.requests.receipt(identifier)["state"] == "failed"
         assert test.rig.bench.device_calls == calls and not starts(test.rig)
         assert test.session.journal.get("control") == before
@@ -348,12 +348,12 @@ async def test_deadline_stop_has_reserved_capacity_after_last_request_slot_is_us
             )
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start_test", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
         assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 4096
         assert (await actual_stop(test, local))["local_hold_verified"]
-        assert test.controller.tests.state()["stop_reason"] == "deadline"
+        assert test.controller.charging.state()["stop_reason"] == "deadline"
         assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 4096
         assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
 
@@ -369,7 +369,7 @@ async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.3) as test:
         journal = test.session.journal
         test.controller.command(uuid.uuid4().hex, "start_test", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
         before = copy.deepcopy(journal.get("control"))
@@ -393,11 +393,11 @@ async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
         await asyncio.wait_for(failure.wait(), 3)
         assert journal.get("control") == before
         assert test.controller.requests.intent().mode == "app"
-        assert test.controller.tests.state()["state"] == "charging"
-        lease = test.controller.tests.lease
+        assert test.controller.charging.state()["state"] == "charging"
+        lease = test.controller.charging.lease
         assert lease is not None and lease.deadline <= time.monotonic()
         with pytest.raises(DeniedError):
-            test.controller.tests.guard(lease)
+            test.controller.charging.guard(lease)
 
         # No tick performs recovery: the timer itself repeats the atomic hold and launches the ordinary Stop.
         assert (await actual_stop(test, local))["local_hold_verified"]
@@ -438,8 +438,8 @@ async def test_unrelated_timer_flow_cannot_prove_cloud_start(
         assert authorize[2]["idTagInfo"]["status"] == "Accepted"
         local = await positive_flow(test, "daily")
         assert (await healthy(test.controller))["power_w"] == 1440
-        assert test.controller.tests.state()["state"] == "armed"
-        assert not test.controller.tests.state().get("start_source_verified")
+        assert test.controller.charging.state()["state"] == "armed"
+        assert not test.controller.charging.state().get("start_source_verified")
         assert not test.controller.requests.receipt(identifier)["result"].get("positive_power_verified")
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         assert (await actual_stop(test, local))["local_hold_verified"]
@@ -458,7 +458,7 @@ async def test_start_guard_rejects_wrong_bindings_and_revoked_tag(
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start_test", 0)
-        lease = test.controller.tests.lease
+        lease = test.controller.charging.lease
         assert lease is not None
         before = len(test.rig.bench.device_calls)
         if binding in ("identity", "spec"):
@@ -467,7 +467,7 @@ async def test_start_guard_rejects_wrong_bindings_and_revoked_tag(
             setattr(lease, binding, getattr(lease, binding) + 1)
         else:
             test.session.gateway.auth_info.put("NATIVE_TIMER", {"status": "Blocked"})
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         assert not starts(test.rig)
         assert test.controller.requests.receipt(identifier)["state"] != "completed"
         if binding != "tag_revoked":
@@ -499,7 +499,7 @@ async def test_client_disappearance_leaves_one_service_owned_start_and_deadline(
         await accepted.wait()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         assert len(starts(test.rig)) == 1
         local = await positive_flow(test)
         await healthy(test.controller)
@@ -525,22 +525,22 @@ async def test_late_first_flow_respects_startup_and_immutable_hard_deadline(
         identifier = uuid.uuid4().hex
         action = "start_test" if source == "local" else "arm_cloud_test"
         test.controller.command(identifier, action, 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         if source == "cloud":
             await owner_start(test)
         local = await positive_flow(test, source)
-        lease = test.controller.tests.lease
+        lease = test.controller.charging.lease
         assert lease is not None and lease.deadline == 1060 and lease.hard_deadline == 1180
         clock[0] += elapsed
         native = await test.controller.native.read()
-        test.controller.tests.observed(native)
+        test.controller.charging.observed(native)
         if elapsed == 59:
-            assert test.controller.tests.state()["state"] == "charging"
+            assert test.controller.charging.state()["state"] == "charging"
             assert lease.deadline == (1179 if source == "local" else 1180)
             assert lease.deadline <= lease.hard_deadline == 1180
             test.controller.command(uuid.uuid4().hex, "pause", 0)
         else:
-            assert test.controller.tests.state()["state"] == "stopping"
+            assert test.controller.charging.state()["state"] == "stopping"
             assert test.controller.requests.intent().mode == "paused"
             assert lease.deadline == 1060 and lease.hard_deadline == 1180
             assert not test.controller.requests.receipt(identifier)["result"].get("positive_power_verified")
@@ -567,27 +567,27 @@ async def test_replacement_retires_accepted_test_without_replaying_start(
                 await healthy(controller)
                 identifier = uuid.uuid4().hex
                 controller.command(identifier, "start_test", 0)
-                await controller.tests.settle()
+                await controller.charging.settle()
                 assert len(starts(rig)) == 1
-                await controller.tests.close()
+                await controller.charging.close()
                 await crash(first)
             replacement = managed_session(rig)
             await replacement.start()
             recovered = ManagedController(replacement)
             try:
                 assert recovered.requests.intent().mode == "paused"
-                assert recovered.tests.state()["state"] == "interrupted"
+                assert recovered.charging.state()["state"] == "interrupted"
                 assert recovered.requests.receipt(identifier)["state"] == "uncertain"
                 async with rig.charger(replacement) as charger:
                     await introduced(rig, replacement, charger, "interrupted-test-replacement")
                     assert rig.bench.firmware.effective_limit() == 0
-                    assert len(starts(rig)) == 1 and recovered.tests.lease is None
+                    assert len(starts(rig)) == 1 and recovered.charging.lease is None
                     assert recovered.requests.intent().mode == "paused"
             finally:
-                await recovered.tests.close()
+                await recovered.charging.close()
                 await replacement.close()
         finally:
-            await controller.tests.close()
+            await controller.charging.close()
 
 
 # Intent: a crash between cloud-arm acceptance and its reply retires the unacknowledged receipt as uncertain.
@@ -602,7 +602,7 @@ async def test_cloud_arm_acceptance_gap_recovers_without_start(
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "arm_cloud_test", 0)
         test.session.journal.db.execute("UPDATE managed_requests SET state='accepted' WHERE id=?", (identifier,))
-        await test.controller.tests.close()
+        await test.controller.charging.close()
         await crash(test.session)
         replacement = managed_session(test.rig)
         await replacement.start()
@@ -610,10 +610,10 @@ async def test_cloud_arm_acceptance_gap_recovers_without_start(
         try:
             assert recovered.requests.receipt(identifier)["state"] == "uncertain"
             assert recovered.requests.intent().mode == "paused"
-            assert recovered.tests.state()["state"] == "interrupted"
-            assert not starts(test.rig) and recovered.tests.lease is None
+            assert recovered.charging.state()["state"] == "interrupted"
+            assert not starts(test.rig) and recovered.charging.lease is None
         finally:
-            await recovered.tests.close()
+            await recovered.charging.close()
             await replacement.close()
 
 
@@ -639,7 +639,7 @@ async def test_local_test_selects_currently_allowed_tag_without_erasing_expired_
 
         identifier = uuid.uuid4().hex
         test.controller.command(identifier, "start_test", 0)
-        await test.controller.tests.settle()
+        await test.controller.charging.settle()
         assert len(starts(test.rig)) == 1 and starts(test.rig)[0][3]["idTag"] == "NATIVE_TIMER"
         local = await positive_flow(test)
         assert (await healthy(test.controller))["power_w"] == 1440

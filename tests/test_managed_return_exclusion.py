@@ -124,7 +124,7 @@ async def test_running_return_keeps_positive_admission_closed(
                     fields = {"current_a": 16} if action == "set_current" else {}
                     assert (await call(socket, action, revision=c.requests.intent().revision, **fields))["ok"]
                     if action == "start":
-                        await c.tests.settle()
+                        await c.charging.settle()
                         assert len(starts(b.rig)) == 1 and b.rig.bench.firmware.effective_limit() == 6
                     else:
                         await c.current.settle()

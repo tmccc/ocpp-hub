@@ -29,7 +29,7 @@ async def test_start_diagnostic_refusal_does_not_block_native_recovery(
         reached, attempts = failing_cleanup(j, "managed_test_failure", minimum_attempts=1)
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
-        worker = c.tests.worker
+        worker = c.charging.worker
         try:
             await asyncio.wait_for(reached.wait(), 3)
             assert attempts and starts(b.rig) == []
