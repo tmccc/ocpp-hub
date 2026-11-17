@@ -54,7 +54,8 @@ namespaces, read-only source/runtime, task-owned scratch, four spare CPUs and a 
 immutable image IDs and optional SSH worker settings are explicit arguments. Output belongs outside the repository.
 The engine/model phase uses `--suite engine-model`; the other required phases are `ha-proxy`, `ha-legacy` and
 `ha-proxy-legacy`. Use each phase's matching provisioned virtualenv/image and the exact package pins in its requirements
-file. Host-runtime mode explicitly mounts the worker's `/usr` and virtualenv; image-runtime mode uses the image's
+file. Run the three HA suites first so client failures surface before the expensive engine/model phase.
+Host-runtime mode explicitly mounts the worker's `/usr` and virtualenv; image-runtime mode uses the image's
 interpreter/libraries and mounts its matching virtualenv at `/venv`. Package/interpreter identity and the mounted
 virtualenv digest are recorded and checked; source and executed harness bytes are checked before and after the run.
 
@@ -134,6 +135,10 @@ four-suite twenty-worker qualification.
 - Put protocol logic in `core/`, and keep `core/` free of Home Assistant imports. If a function needs `hass`, it belongs in the layer above.
 - Prefer small pure modules: they are cheap to test and to mutation-check (`tools/mutation_check.py <module> <test file>`; a surviving mutant is a missing test).
 - Name data shapes (dataclasses) instead of passing loose dictionaries around.
+- Managed restoration uses `RecoveryCoordinator`; check `RestoreProgress.shared` before settling domain records.
+  Forward named `Pending` results through typed guards, retaining strict, storage and cancellation failures.
+  Follow the [recovery ownership map](code-navigation.md#module-map) for compatibility adapters and actual effect
+  boundaries.
 - Never write to a charger from tests against a real device. The engine is tested with a fake charger over a real websocket.
 
 ## Reference implementation

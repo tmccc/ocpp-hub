@@ -27,6 +27,8 @@
 - Publish reconnect introduction completion after its pending zero work ends.
   Keep audited admission separate so a newer Pause can finish its own closed-zero
   recovery without an unfinished introduction competing with positive restoration.
+- Check diagnostic client versions against the installed HA integration in tests,
+  retaining freshness and redaction checks across release bumps.
 - Separate independent peer mutation/reply and native timer support from test
   providers, preserving existing factory overrides, callers and model identities.
 

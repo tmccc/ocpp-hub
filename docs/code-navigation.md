@@ -80,8 +80,15 @@ covers repeated read-only probes; `test_managed_cached_authorization.py` and
 `test_managed_cloud_pending_return.py` cover cloud decisions, retained permissions and timed-test Return settlement.
 
 For introduction, follow `TrialSession._before_ceiling()`, `NativeBoundedHandover.introduce()` and the runtime's
-typed deferred retry loop. `managed_faults.py` shares the strict diagnostic latch with ordinary supervision.
-`test_introduction_readiness_retry.py` separates pending prerequisites from simultaneous content contradictions.
+typed deferred retry loop. `audited_epoch` records completed admission auditing; `introduced_epoch` and
+`introduced_revision` record completed setup under the current authority. `introduction_pending` includes live
+native bodies and the runtime's introduction service through probe creation, retry sleeps and joined retirement.
+Ordinary zero repair cannot publish completion while that work remains pending. A newer Pause may use audited
+provenance only after the work retires and its own fresh closed-zero proof succeeds. Completed setup alone does
+not prove zero or publish shared authority. `managed_faults.py` shares the strict diagnostic latch with ordinary
+supervision.
+`test_introduction_readiness_retry.py` separates pending prerequisites from simultaneous content contradictions;
+`test_introduction_completion.py` covers foreground zero, a newer Pause and the retry-sleep gap at 6 A and 32 A.
 For command timing, follow `Peer._validate()` through its priority gate and then the independent send/reply deadline;
 `test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch.
 
@@ -174,6 +181,7 @@ Follow other imported helpers too. A shared setup shortcut can weaken many appar
 | `tests/release_outcome_helpers.py` | Whole-release effect assertions and explicitly requested owner Pause/closure/Return recovery. Assertions do not silently issue owner commands to repair an unexpected fault. |
 | `tests/recovery_barriers.py` | Exact request UUID/revision, physical condition and completion checks; a generic healthy snapshot is not completion of a named request. |
 | `tests/native_fault_support.py` | Actual HTTP gates and read-only coroutine witnesses. A moved implementation requires a new selector witness, not a skipped failure cut. |
+| `tests/test_introduction_storage_retry.py` | Owns the independent `GatedIntroductionPeer` HTTP gate and `current_probe` task witness, also used by `test_introduction_completion.py`. The witness observes the real probe without replacing its result. |
 
 Inspect failure injection and the oracle independently: what actually failed, whether the peer changed, which reply
 arrived, whether the database rolled back, and what proves later recovery. Include setup, timeout, teardown and

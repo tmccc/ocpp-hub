@@ -8,7 +8,15 @@ The repository has two deployment domains: the standalone iCS proxy with its thi
 older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
 Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
-## Current iCS implementation — 15 November 2026
+## Current iCS implementation — 17 November 2026
+
+- [~] Version0.2.3 implements shared recovery coordination, explicit permission/result/effect contracts, atomic
+  Start/Return authority publication and owned shutdown. Reconnect completion remains separate from admission
+  auditing and verified zero. The README, navigation guide and recovery coverage describe these boundaries and
+  their regressions. Final qualification is in progress; service/HA deployment is pending. No new live charging trial
+  is claimed.
+
+## iCS implementation history — 15 November 2026
 
 - [~] Introduction readiness and RPC deadline corrections distinguish retryable closed-zero/lifecycle waits from
   strict content refusals, and unsent validation from dispatched uncertainty. Focused regressions and all HA suites

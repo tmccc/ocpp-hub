@@ -126,7 +126,7 @@ which wire, native, lifecycle or SQLite event supplied those inputs.
 | T06 — failed cleanup | Rejected/lost zero or real SQL cleanup refusal prevents a safe wait or completion. Preserve both the original boundary and the later cleanup failure; strict/storage cleanup cannot disappear during cancellation. |
 | T07 — deadline supersession | Only the actual scoped timer/occurrence claim can supersede an unsent automatic release. Its new ticket and allowed local session do not borrow a pending zero ACK or prove physical zero. Deadline zero remains independently required. |
 | T08 — newer owner request | A newer Pause or Return retains its exact UUID, revision and ticket. Old work cannot reacquire permission, complete that newer request, clear its fault or overwrite its authority. |
-| T09 — Boot and introduction | Same-lineage Boot observations still change exact proof scope. Failed scope A cannot authorize B, and acknowledged introduction origin cannot rearm. Resume acknowledges only after its real guarded COMMIT; replacement does not inherit process-local origin. |
+| T09 — Boot and introduction | Same-lineage Boot observations still change exact proof scope. Failed scope A cannot authorize B, and acknowledged introduction origin cannot rearm. Audited admission is separate from completed setup; pending native bodies and the runtime retry service cannot be hidden by foreground zero repair. Resume acknowledges only after its real guarded COMMIT; replacement does not inherit process-local origin. |
 | T10 — owned Start handoff | Genuine Accepted evidence remains separate from atomic app/lease/shared publication. After successful child COMMIT those authorities agree; a later Boot cannot borrow old Start proof, and a newer Pause retains its own current zero claim. Accepted lifecycle debt remains fenced. |
 | T11 — publication storage | Real statement and deferred-COMMIT refusal roll back joined authority/receipt/lease writes and prevent memory publication. Accepted or issued Start evidence remains truthful. Later supported recovery does not replay Start or erase independent cloud/history debt. |
 | T12 — fresh operation | A completed earlier release does not poison a new temporary hold. Fresh current proof may restore automatically; a failed same-attempt positive release instead retains its specific fault until owner reconciliation. |
@@ -187,6 +187,10 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
 - `test_introduction_readiness_retry.py` repeats first-Boot and reconnect readiness waits at6/32A, verifies same-Boot
   recovery after genuine native closure, and retains strict configuration/history/owned-profile refusals even when
   readiness also fails. Persistent unknown sessions never gain Start, Stop or positive-release authority.
+- `test_introduction_completion.py` covers reconnects at 6 A and 32 A with a held native HTTP response, a newer Pause
+  while a late-zero reply is held, and a real 503 retry sleep. Foreground zero cannot publish unfinished setup;
+  after the work retires, fresh Pause/closure and separate Return retain their own evidence requirements.
+  Its nested native-owner check establishes a separate unit contract.
 - `test_rpc_validation_deadlines.py` uses independently delayed HTTP and TLS replies to separate audit and wire
   budgets. Held audits cover Pause, caller cancellation and charger retirement; missing dispatched replies retain
   unknown outcomes. Deadline and priority negative controls check correlation cleanup and gate reuse. These are

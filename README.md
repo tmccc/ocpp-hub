@@ -918,8 +918,10 @@ The timed test button and fresh progress are published on the charger dashboard;
 
 Home Assistant also exposes **Start charging** for a regular locally issued session at the selected current. Legacy
 six-ampere operation remains the default until the explicit current capability below is commissioned. Start can run
-from idle app control or a freshly verified local pause. The original intent/revision remains authoritative through
-every Start await; only a guarded actual Accepted reply commits the new app/shared revision. Pause always wins a race. An actual
+from idle app control or a freshly verified local pause. Start rechecks the current intent, Boot and control claim
+before sending and publishing its result. It records a genuine Accepted reply before committing the new app intent,
+lease and shared authority together. That commit belongs to the Start operation even if its original caller
+disappears. A newer Pause always wins; accepted command evidence survives a failed handoff. An actual
 accepted StartTransaction is bound atomically to this one-shot request, and fresh known-session proof completes the
 receipt even when the car initially draws0W. The dashboard reports **Local session** separately from measured **Local
 charging**. The60second startup permission retires after session confirmation; regular charging has no two-minute
@@ -1024,6 +1026,10 @@ retries share the cloud decision and the accepted transaction number.
 If the charger does not send Boot after reconnecting, the enabled read-only Boot request retries with bounded
 backoff on that connection. A refused request, lost reply or Accepted reply without Boot cannot strand it permanently.
 Only a genuine Boot permits introduction; retries stop when it arrives or the connection ends.
+
+Reconnect setup must finish its outstanding native work before automatic current restoration. A completed native
+audit alone does not confirm zero or restore app authority. If a newer Pause supersedes setup, it can complete only
+after that work retires and its own fresh closed-zero proof succeeds.
 
 An ordinary temporary zero hold on the existing connection preserves the saved app
 choice during a cloud outage. Offline replacement retains the documented Pause
