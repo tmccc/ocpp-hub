@@ -13,6 +13,7 @@ import pytest
 from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
 from ocpp_hub_core.prototype.gateway import Gateway, decode
+from ocpp_hub_core.prototype.local_control import ControlSupersededError
 from ocpp_hub_core.prototype.policy import DeniedError, Policy
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.store import ConflictError, Journal, RecoveryRequiredError
@@ -739,13 +740,34 @@ async def test_prototype_old_completion_cannot_clear_new_stop_uncertainty(tmp_pa
     rig.gateway.attach_charger(wait_send)
     start = asyncio.create_task(rig.gateway.start())
     await entered.wait()
+    issued = rig.store.get("local_start_receipt")
+    assert issued["stage"] == "issued" and issued["local"] is None
     stop = asyncio.create_task(rig.gateway.stop())
     await asyncio.sleep(0)
+    claimed = rig.store.get("control")
+    assert claimed["ticket"] != issued["ticket"]
+    assert claimed["inhibit"] and claimed["uncertain"] and claimed["start_pending"]
+    before_completion = len(rig.charger_frames)
     finish.set()
-    assert (await start)[2]["status"] == "Accepted"
+    with pytest.raises(ControlSupersededError):
+        await start
+    assert rig.store.get("local_start_receipt") == {**issued, "stage": "accepted"}
+    assert rig.store.get("control") == claimed
     with pytest.raises(UnavailableError):
         await stop
     control = rig.store.get("control")
-    assert control["inhibit"] and control["uncertain"]
+    assert control == claimed
+    assert len([frame for frame in rig.charger_frames if frame[0] == 2 and frame[2] == "RemoteStartTransaction"]) == 1
+    assert not any(frame[0] == 2 and frame[2] == "RemoteStopTransaction" for frame in rig.charger_frames)
+    zero_profiles = [
+        frame
+        for frame in rig.charger_frames[before_completion:]
+        if frame[0] == 2 and frame[2] == "SetChargingProfile"
+    ]
+    assert zero_profiles and all(
+        period["limit"] == 0
+        for frame in zero_profiles
+        for period in frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+    )
     assert not rig.gateway.controls.ready
     await rig.close()
