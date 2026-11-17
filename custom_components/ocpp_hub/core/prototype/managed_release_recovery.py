@@ -164,6 +164,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
         control = j.get("control", {})
         if (
             c.stopping
+            or c.native.introduction_pending
             or repair_pending(j, fault)
             or repair_revoked(j, fault)
             or c.requests.intent() != intent
@@ -300,8 +301,8 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
         j.put("trial_starting", False)
     # fault() invalidated the old revision. This complete closed proof re-establishes only current zero introduction.
     # Never assign a newer revision before every binding/Boot/debt/closed-zero check and the durable commit succeed.
-    c.native.introduced_epoch = epoch
-    c.native.introduced_revision = revision
+    c.native.audited_epoch = epoch
+    c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
     c.released_epoch = None
     if terminal_test is not None:
         c.tests.lease = None

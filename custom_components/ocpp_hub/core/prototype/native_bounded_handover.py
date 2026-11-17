@@ -6,7 +6,8 @@ import asyncio
 import json
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from .. import commands
@@ -92,6 +93,9 @@ class NativeBoundedHandover:
         self.continuation_guard: Callable[[HandoverEvidence, int], GateDecision] | None = None
         self.recovery_zero_only: Callable[[], bool] | None = None
         self.positive_guard: Callable[[HandoverEvidence], GateDecision] | None = None
+        self.audited_epoch: int | None = None
+        self._introductions: set[object] = set()
+        self.introduction_service_pending: Callable[[], bool] | None = None
         self.introduced_epoch: int | None = None
         self.introduced_revision: int | None = None
         self.introduction_lineage: ConnectionLineage | None = None
@@ -408,152 +412,171 @@ class NativeBoundedHandover:
             journal.put("control", {"owner": "local", "inhibit": True, "uncertain": False})
             journal.put("trial_starting", True)
 
+    # Live introduction bodies retain their pending restrictive effects through all awaited cleanup.
+    @property
+    def introduction_pending(self) -> bool:
+        return bool(self._introductions) or (
+            self.introduction_service_pending is not None and self.introduction_service_pending()
+        )
+
+    # Every invocation owns its own token, so finishing one cannot hide another live introducer.
+    @contextmanager
+    def _introduction_work(self) -> Iterator[None]:
+        token = object()
+        self._introductions.add(token)
+        try:
+            yield
+        finally:
+            self._introductions.discard(token)
+
     # Bind only an actual fresh Boot after routing under six amps; reconnects return to a zero hold.
     async def introduce(self) -> HandoverEvidence:
-        gateway, journal = self.gateway, self.gateway.journal
-        epoch = gateway._charger_epoch
-        if journal.get("trial_phase") not in ("active", "recovering", "blocked"):
-            raise RecoveryRequiredError("native bounded introduction cannot rearm frozen cleanup")
-        if not gateway.current_boot_seen(epoch) or fingerprint(journal.get("boot")) != self.spec.boot_digest:
-            raise SecurityError("native bounded introduction requires the commissioned actual Boot")
-        binding = journal.get("trial_binding")
-        scope = current_scope(gateway)
-        if binding is not None and scope is not None:
-            self.introduction_lineage = scope.lineage
-        first_zero = binding is None or bool(journal.get("trial_starting"))
-        try:
-            native = await self.read(closed=first_zero, owned=True, initial=binding is None)
-        except (
-            NativeReadinessError,
-            NativeTransportUnavailableError,
-            StaleEvidenceError,
-            UnavailableError,
-            TimeoutError,
-            sqlite3.Error,
-        ) as error:
-            # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
-            raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
-        gateway._require_epoch("charger", epoch)
-        if binding is None:
-            if (
-                journal.get("trial_phase") != "active"
-                or journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone()
-            ):
-                raise RecoveryRequiredError("initial native bounded introduction cannot adopt existing resources")
-            if native.physical.history is None:
-                raise SecurityError("actual Boot introduction requires complete current history")
-            verify_initial_history(journal, native.physical.history, journal.identity, self.spec.hardware_identity)
-            journal.put(
-                "trial_binding",
-                {
-                    "configuration_digest": self.binding_digest(native),
-                    "station": self.choice.value(),
-                    "boot_digest": self.spec.boot_digest,
-                },
-            )
-        elif binding != {
-            "configuration_digest": self.binding_digest(native),
-            "station": self.choice.value(),
-            "boot_digest": self.spec.boot_digest,
-        }:
-            raise SecurityError("native bounded introduction binding changed")
-        try:
+        with self._introduction_work():
+            gateway, journal = self.gateway, self.gateway.journal
+            epoch = gateway._charger_epoch
+            if journal.get("trial_phase") not in ("active", "recovering", "blocked"):
+                raise RecoveryRequiredError("native bounded introduction cannot rearm frozen cleanup")
+            if not gateway.current_boot_seen(epoch) or fingerprint(journal.get("boot")) != self.spec.boot_digest:
+                raise SecurityError("native bounded introduction requires the commissioned actual Boot")
+            binding = journal.get("trial_binding")
+            scope = current_scope(gateway)
+            if binding is not None and scope is not None:
+                self.introduction_lineage = scope.lineage
+            first_zero = binding is None or bool(journal.get("trial_starting"))
+            try:
+                native = await self.read(closed=first_zero, owned=True, initial=binding is None)
+            except (
+                NativeReadinessError,
+                NativeTransportUnavailableError,
+                StaleEvidenceError,
+                UnavailableError,
+                TimeoutError,
+                sqlite3.Error,
+            ) as error:
+                # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
+                raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
+            gateway._require_epoch("charger", epoch)
             if binding is None:
-                self.require_known_session(native)
-            else:
-                self.require_recovery_session(native)
-        except NativeSessionPendingError as error:
-            raise IntroductionDeferredError("introduction awaits native lifecycle reconciliation") from error
-        self.book.owned_present(native.physical)
-        if binding is not None or journal.get("control", {}).get("uncertain"):
-            control = journal.get("control", {})
-            journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
-            if first_zero:
-                # Stay in initial admission until its first zero succeeds, including a genuinely unapplied refusal.
-                ticket = journal.get("control", {}).get("ticket")
-                intent = journal.get("managed_control_intent", {})
-                try:
-                    await gateway.controls.ensure_ceiling()
-                except (UnavailableError, TimeoutError) as error:
-                    # Only this zero may have been sent; reread the binding and owned receipt before retrying.
-                    raise IntroductionDeferredError("initial introduction awaits its restrictive zero") from error
-                except DeniedError as error:
-                    latest, control = journal.get("managed_control_intent", {}), journal.get("control", {})
-                    if (
-                        latest.get("mode") != "paused"
-                        or latest.get("revision", 0) <= intent.get("revision", 0)
-                        or control.get("ticket") == ticket
-                        or control.get("owner") != "local"
-                        or control.get("inhibit") is not True
-                        or gateway.controls.desired() != 0
-                    ):
-                        raise
-                    raise IntroductionDeferredError("initial zero was superseded by a newer owner Pause") from error
-                gateway._require_epoch("charger", epoch)
-            journal.put("trial_phase", "recovering")
-        self.introduced_epoch = epoch
-        verified_revision = gateway.controls._revision
-        journal.put("trial_starting", False)
-        if binding is not None and native.physical.transaction_open:
-            lease = journal.get("managed_temporary_schedule", {})
-            if journal.get("managed_current_change", {}).get("state") == "recovering":
-                pass  # This operation owns only zero; fresh supervision must identify the independent session.
-            elif not supervised_timer(lease):
                 if (
-                    journal.get("managed_mode")
-                    and journal.get("managed_control_intent", {}).get("mode") == "app"
-                    or self.recovery_zero_only is not None
-                    and self.recovery_zero_only()
+                    journal.get("trial_phase") != "active"
+                    or journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone()
                 ):
-                    try:
-                        await gateway.controls.ensure_ceiling()
-                    except UnavailableError, TimeoutError:
-                        pass  # The completed audit hands only zero retries to the runtime after final authority checks.
-                    else:
-                        if lease and journal.active() is not None:
-                            journal.put(
-                                "managed_temporary_schedule",
-                                {
-                                    **lease,
-                                    "recovery_session": True,
-                                    "unidentified_local": journal.active(),
-                                    "hold_since": time.time(),
-                                },
-                            )
-                elif journal.active() is not None:
-                    await gateway.stop()
-            elif (
-                lease.get("native_plan_confirmed")
-                and native.physical.native_transaction_id == journal.active() == lease.get("bound_local")
-                and native.session_plan_id == lease["body"]["planId"]
-            ):
-                # Introduction remains verified if this restrictive RPC fails. Its durable hold supervises retries.
-                def same_boot() -> bool:
-                    return (
-                        gateway.current_boot_seen(epoch)
-                        and verified_revision == gateway.controls._revision
-                        and fingerprint(journal.get("boot")) == self.spec.boot_digest
-                    )
-
-                try:
-                    await request_timer_stop(gateway, lease, same_boot)
-                except UnavailableError, RecoveryRequiredError, DeniedError:
-                    pass
-            elif journal.active() is not None:
-                # Preserve any other open transaction under the recovery zero until its provenance is verified.
+                    raise RecoveryRequiredError("initial native bounded introduction cannot adopt existing resources")
+                if native.physical.history is None:
+                    raise SecurityError("actual Boot introduction requires complete current history")
+                verify_initial_history(journal, native.physical.history, journal.identity, self.spec.hardware_identity)
                 journal.put(
-                    "managed_temporary_schedule",
+                    "trial_binding",
                     {
-                        **lease,
-                        "unidentified_local": journal.active(),
-                        "hold_since": lease.get("hold_since", time.time()),
+                        "configuration_digest": self.binding_digest(native),
+                        "station": self.choice.value(),
+                        "boot_digest": self.spec.boot_digest,
                     },
                 )
-        gateway._require_epoch("charger", epoch)
-        if verified_revision != gateway.controls._revision:
-            raise UnavailableError("the verified charger introduction was superseded")
-        self.introduced_revision = verified_revision
-        return native
+            elif binding != {
+                "configuration_digest": self.binding_digest(native),
+                "station": self.choice.value(),
+                "boot_digest": self.spec.boot_digest,
+            }:
+                raise SecurityError("native bounded introduction binding changed")
+            try:
+                if binding is None:
+                    self.require_known_session(native)
+                else:
+                    self.require_recovery_session(native)
+            except NativeSessionPendingError as error:
+                raise IntroductionDeferredError("introduction awaits native lifecycle reconciliation") from error
+            self.book.owned_present(native.physical)
+            if binding is not None or journal.get("control", {}).get("uncertain"):
+                control = journal.get("control", {})
+                journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
+                if first_zero:
+                    # Stay in initial admission until its first zero succeeds, including a genuinely unapplied refusal.
+                    ticket = journal.get("control", {}).get("ticket")
+                    intent = journal.get("managed_control_intent", {})
+                    try:
+                        await gateway.controls.ensure_ceiling()
+                    except (UnavailableError, TimeoutError) as error:
+                        # Only this zero may have been sent; reread the binding and owned receipt before retrying.
+                        raise IntroductionDeferredError("initial introduction awaits its restrictive zero") from error
+                    except DeniedError as error:
+                        latest, control = journal.get("managed_control_intent", {}), journal.get("control", {})
+                        if (
+                            latest.get("mode") != "paused"
+                            or latest.get("revision", 0) <= intent.get("revision", 0)
+                            or control.get("ticket") == ticket
+                            or control.get("owner") != "local"
+                            or control.get("inhibit") is not True
+                            or gateway.controls.desired() != 0
+                        ):
+                            raise
+                        raise IntroductionDeferredError("initial zero was superseded by a newer owner Pause") from error
+                    gateway._require_epoch("charger", epoch)
+                journal.put("trial_phase", "recovering")
+            self.audited_epoch = epoch
+            verified_revision = gateway.controls._revision
+            journal.put("trial_starting", False)
+            if binding is not None and native.physical.transaction_open:
+                lease = journal.get("managed_temporary_schedule", {})
+                if journal.get("managed_current_change", {}).get("state") == "recovering":
+                    pass  # This operation owns only zero; fresh supervision must identify the independent session.
+                elif not supervised_timer(lease):
+                    if (
+                        journal.get("managed_mode")
+                        and journal.get("managed_control_intent", {}).get("mode") == "app"
+                        or self.recovery_zero_only is not None
+                        and self.recovery_zero_only()
+                    ):
+                        try:
+                            await gateway.controls.ensure_ceiling()
+                        except UnavailableError, TimeoutError:
+                            # The completed audit hands only zero retries to the runtime after final authority checks.
+                            pass
+                        else:
+                            if lease and journal.active() is not None:
+                                journal.put(
+                                    "managed_temporary_schedule",
+                                    {
+                                        **lease,
+                                        "recovery_session": True,
+                                        "unidentified_local": journal.active(),
+                                        "hold_since": time.time(),
+                                    },
+                                )
+                    elif journal.active() is not None:
+                        await gateway.stop()
+                elif (
+                    lease.get("native_plan_confirmed")
+                    and native.physical.native_transaction_id == journal.active() == lease.get("bound_local")
+                    and native.session_plan_id == lease["body"]["planId"]
+                ):
+                    # Introduction remains verified if this restrictive RPC fails. Its durable hold supervises retries.
+                    def same_boot() -> bool:
+                        return (
+                            gateway.current_boot_seen(epoch)
+                            and verified_revision == gateway.controls._revision
+                            and fingerprint(journal.get("boot")) == self.spec.boot_digest
+                        )
+
+                    try:
+                        await request_timer_stop(gateway, lease, same_boot)
+                    except UnavailableError, RecoveryRequiredError, DeniedError:
+                        pass
+                elif journal.active() is not None:
+                    # Preserve any other open transaction under the recovery zero until its provenance is verified.
+                    journal.put(
+                        "managed_temporary_schedule",
+                        {
+                            **lease,
+                            "unidentified_local": journal.active(),
+                            "hold_since": lease.get("hold_since", time.time()),
+                        },
+                    )
+            gateway._require_epoch("charger", epoch)
+            if verified_revision != gateway.controls._revision:
+                raise UnavailableError("the verified charger introduction was superseded")
+            self.introduced_epoch, self.introduced_revision = epoch, verified_revision
+            return native
 
     # Finish a paused introduction only from a fresh complete closed-zero proof, never a failed RPC or marker alone.
     def confirm_paused_introduction(self, native: HandoverEvidence) -> None:
@@ -568,7 +591,8 @@ class NativeBoundedHandover:
             "boot_digest": self.spec.boot_digest,
         }
         if (
-            self.introduced_epoch != epoch
+            self.audited_epoch != epoch
+            or self.introduction_pending
             or j.get("trial_starting")
             or j.get("trial_phase") not in ("active", "recovering")
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"

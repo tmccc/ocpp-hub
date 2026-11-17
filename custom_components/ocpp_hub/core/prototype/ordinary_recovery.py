@@ -317,6 +317,8 @@ class OrdinaryRecovery:
     # A zero-only introduction acknowledges current proof without replaying Start, Stop or another domain's duty.
     def zero_introduction_decision(self, native: HandoverEvidence, local: int | None) -> GateDecision:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
+        if c.native.introduction_pending or c.native.introduced_epoch != g._charger_epoch:
+            return Pending(Prerequisite.ZERO_PROOF, "ordinary recovery awaits completed charger introduction")
         decision = self.authority_decision(local, introduced=False)
         if isinstance(decision, Pending):
             return decision

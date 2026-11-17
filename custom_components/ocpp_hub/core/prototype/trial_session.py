@@ -250,6 +250,7 @@ class TrialSession:
                 else None
             )
             if self.native_bounded is not None:
+                self.native_bounded.introduction_service_pending = lambda: self.runtime.introduction_pending
                 self.gateway.charger.validate_send = self.native_bounded.validate_send
             elif self.journal.get("native_bounded_handover"):
                 raise SecurityError("native bounded journal requires its explicit original mode specification")

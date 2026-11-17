@@ -103,12 +103,18 @@ class ConnectionRuntime:
         self._server: Server | None = None
         self._runner: asyncio.Task[None] | None = None
         self._session_tasks: set[asyncio.Task[None]] = set()
+        self._introductions: set[object] = set()
         self._charger: ServerConnection | None = None
         self._charger_lock = asyncio.Lock()
         self._closing = False
         self.vendor_enabled: Callable[[], bool] = lambda: True
         self.vendor_session_enabled: Callable[[], bool] = lambda: self.vendor_enabled()
         self.ceiling_enabled: Callable[[], bool] = lambda: True
+
+    # Introduction owns future restrictive work through retry sleeps and until its actual probe retires.
+    @property
+    def introduction_pending(self) -> bool:
+        return bool(self._introductions)
 
     # Expose only the ephemeral test port after startup.
     @property
@@ -142,6 +148,8 @@ class ConnectionRuntime:
         async with self._charger_lock:
             previous = self._charger
             epoch = self.gateway.attach_charger(self._sender(connection))
+            introduction = object()
+            self._introductions.add(introduction)
             self._charger = connection
             self.status.charger_connected = True
             self.status.boot_observed = False
@@ -150,6 +158,7 @@ class ConnectionRuntime:
             if previous is not None:
                 await previous.close(code=1012)
             probe = asyncio.create_task(self._boot_probe(epoch))
+            probe.add_done_callback(lambda _: self._introductions.discard(introduction))
             async for raw in connection:
                 await self.gateway.receive("charger", raw, epoch)
         except (ConnectionClosed, UnavailableError, DeniedError) as error:
@@ -159,6 +168,7 @@ class ConnectionRuntime:
             if probe is not None:
                 probe.cancel()
                 await asyncio.gather(probe, return_exceptions=True)
+            self._introductions.discard(introduction)
             try:
                 self.gateway.detach_charger(epoch)
             except sqlite3.Error as error:
