@@ -38,7 +38,7 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] Consolidate durable control intent and Pause/Return request transitions in `ManagedRequests`. Start and
   Return share the current-intent transaction check; one completion owns Return disposition, including prelaunch
   queue refusal. Retain the legacy status completion and distinct physical/claim proofs. Remove unused adapters
-  and duplicate reads/disposition. Runtime is four physical lines smaller than the preceding milestone; most of
+  and duplicate reads/disposition. Runtime is two physical lines smaller than the preceding milestone; most of
   that milestone's increase remains, so the broader code-size reduction goal is still open.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain

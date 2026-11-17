@@ -169,6 +169,7 @@ class RecoveryCoordinator:
         *,
         continuing_local: int | None = None,
         return_request: str | None = None,
+        claim_return: bool = False,
     ) -> RestoreProgress:
         if self.c.stopping:
             return RestoreProgress(
@@ -180,14 +181,15 @@ class RecoveryCoordinator:
                 Pending(Prerequisite.OWNED_OPERATION, "the current owned recovery completion remains pending"),
             )
         expected = expected_intent or self.c.requests.intent()
-        if return_request is not None:
+        # The request driver claims running; the existing direct restore API retains accepted until publication.
+        if claim_return and return_request is not None:
             self.c.requests.return_started(return_request)
         try:
             self._task = self.c.session.gateway.controls.launch_completion(
                 self._restore_owned(expected, continuing_local=continuing_local, return_request=return_request)
             )
         except DeniedError:
-            if return_request is not None:
+            if claim_return and return_request is not None:
                 self.c.requests.return_waiting(return_request, expected, unconfirmed=True)
             raise
         progress = await asyncio.shield(self._task)

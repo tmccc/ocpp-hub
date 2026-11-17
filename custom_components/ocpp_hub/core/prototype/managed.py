@@ -674,7 +674,7 @@ class ManagedController:
         ):
             return  # The same Return survives the real Start and both closure reports under its Pause.
         try:
-            await self.recovery.restore(expected, return_request=identifier)
+            await self.recovery.restore(expected, return_request=identifier, claim_return=True)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             return  # The owned completion retains the exact request disposition when its caller disappears.
 

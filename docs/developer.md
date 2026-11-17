@@ -154,6 +154,8 @@ Its post-COMMIT memory notification stays with the existing handoff.
 
 Return's running claim follows the recovery owner's busy/stopping exits and precedes completion launch. Queue
 refusal retains `return_not_confirmed`; once launched, the owned completion alone requeues or records uncertainty.
+The management request driver selects this claim; direct restore retains its existing accepted-before-publication
+contract. Both entry points keep the same exact request guard and owned completion.
 Stale revision, domain admission, physical Pause/native proof and each send/publication recheck remain distinct
 moments. `return_in_progress` can restrict its existing accepted/running lookup to a particular revision for timers.
 The legacy healthy/app status path still completes only its selected accepted Return without changing intent.

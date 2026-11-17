@@ -93,8 +93,9 @@ never consumes independent cloud delivery debt.
 writes use `write_intent`, including admission-time recovery on a bare journal; that function performs no request
 startup sweep. Its pure `ControlIntent.next` advances revisions or explicitly coalesces legacy read recovery.
 `ManagedRequests` shares the transaction/current-intent check for Start and Return app publication,
-while their separate request outcomes and original callback order remain. Return claims after busy/stopping waits
-and before completion launch; queue refusal records uncertainty, and the owned completion settles later waits or
+while their separate request outcomes and original callback order remain. The management driver claims Return
+after busy/stopping waits and before completion launch; direct restore keeps its accepted-before-publication
+contract. Queue refusal records uncertainty, and the owned completion settles later waits or
 failures. Controller/native/send guards, owner Pause/Stop markers, independent cloud debt and task lifetime remain
 separate responsibilities. `test_control_lifecycle.py` covers stored transitions and real SQL/COMMIT rollback;
 `test_control_lifecycle_peer.py` covers actual scheduling, capacity and the retained legacy healthy-status path.
