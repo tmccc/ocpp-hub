@@ -10,12 +10,12 @@ from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 from tests_model.test_start_recovery_sequences import close_daily, observe
 
 

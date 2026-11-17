@@ -12,14 +12,14 @@ from ocpp_hub_core.prototype.trial_session import save_private
 from tests import test_managed_proxy as managed_bench_module
 from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench
+from tests.model_tls_support import model_tls as model_tls
+from tests.model_tls_support import tls_for_case
 from tests.peer_start_ledger import PeerStartLedger
 from tests.process_helpers import process_rig
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import starts
 from tests_model.catalog import input_digest
 from tests_model.review_cases import issued_start_candidates
-from tests_model.test_schedule_sequences import model_tls as model_tls
-from tests_model.test_schedule_sequences import tls_for_case
 from tools import reconcile_managed_debt as operator
 
 

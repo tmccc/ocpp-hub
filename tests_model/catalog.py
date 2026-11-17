@@ -30,7 +30,6 @@ from tests_model.review_cases import (
     issued_start_candidates,
     observation_candidates,
 )
-from tests_model.schedule_cases import candidates, exclusion, source_candidates, source_exclusion
 from tests_model.storage_debt_cases import storage_fifo_candidates
 
 SCHEMA = 2
@@ -177,26 +176,6 @@ FAMILIES = (
         2916,
         524,
         ("CURRENT-DOMAIN", "CURRENT-IDEMPOTENCY", "NEXT-SESSION"),
-    ),
-    Family(
-        "two_receipt",
-        ("engine-model",),
-        "tests_model/test_schedule_sequences.py::test_two_receipt_event_sequences",
-        candidates,
-        exclusion,
-        11520,
-        6240,
-        ("TIMER-ORDER", "SOURCE-OWNERSHIP"),
-    ),
-    Family(
-        "source_proof",
-        ("engine-model",),
-        "tests_model/test_source_sequences.py::test_source_proof_event_sequences",
-        source_candidates,
-        source_exclusion,
-        1920,
-        960,
-        ("SOURCE-REVOCATION", "RESTART"),
     ),
     Family(
         "start_recovery",

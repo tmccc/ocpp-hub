@@ -28,8 +28,6 @@ through the full validator before attaching execution claims. Generated reports 
 | `process_overlap` | 8 | 8 engine | Both6/32A directions, held native before/after applied target, both demands; real SIGKILL with mapped original session, automatic prior-cap restoration and atomic receipt retirement, original outage, new selection before Pause/Return, exact old UUID replay and two later sessions/outages. |
 | `process_current` | 36 | 36 engine | Six directed6/16/32A changes, app/paused, request commit and both sides of success COMMIT; real SIGKILL, previous/committed selection, two later sessions/outages. |
 | `storage_fifo` | 192 | 192 engine |6/32A, proof/ACK write or deferred-COMMIT failure twice,1/3 queued real pairs, changed malformed/CALLERROR reply, all repair/Pause/replacement orders; exact new proofs/ACKs, new Pause/Return and two later sessions/outages. |
-| `two_receipt` | 11,520 | 6,240 engine | Existing timer/source/cutoff/cancel grammar; original plans and next daily occurrence. |
-| `source_proof` | 1,920 | 960 engine | Source loss/restoration, observation, cutoff, replacement; fresh continuation proof. |
 | `start_recovery` | 25,920 | 4,320 engine | Normal/fixed test,6/16/32A, nine actual refusal/native/protocol failures, demand, both closure orders, restore/Pause/successful-restart/observe/replay orders; later daily, outage and open-session reconnect. |
 | `boot_reply` | 192 | 192 engine |6/16/32A, app/paused, real held zero/profile or composite reply, demand, reply/Boot/Pause orders and no-Boot controls; two later sessions/outages. |
 | `boot_retry` | 72 | 72 engine | Real observed503,6/16/32A, app/paused, demand, all heal/Boot/Pause orders; zero proof and two later sessions/outages. |
@@ -40,7 +38,7 @@ through the full validator before attaching execution claims. Generated reports 
 | `ha_receipt` | 200 | 120 each HA runtime | Five controls including16A selection, initial/first/second/third response, five identity shapes; both terminals for matching IDs, completed false-success sentinel for invalid IDs; exact UUID, one mutation, readable status. |
 | `ha_outage_lifecycle` | 384 | 240 each HA runtime | True first setup/failed reload, reload/unload/remove/disable-enable, stale healthy/fault callback, admitted retry/deadline/stale/lifecycle orders; recovery and second outage/deadline/recovery. |
 
-Engine totals: **46,634 raw / 16,402 admitted**. Each HA client runtime has **584 raw / 360 admitted**.
+Engine totals: **33,194 raw / 9,202 admitted**. Each HA client runtime has **584 raw / 360 admitted**.
 Legacy HA has no registered finite family; its complete ordinary suite remains required. Ordinary functional tests
 are additional executions and are counted separately by collection. The generated registry must agree with these totals.
 
@@ -77,7 +75,7 @@ production-five-second polling control. Pending Pause tests retain positive inde
 zero event. Shared manual recovery helpers require the exact completed Return receipt and at least three fresh actual
 failed getConfig reads per outage; manual ticks or an older healthy paused status cannot satisfy those obligations.
 
-Excluded inputs remain in the full manifest with exact reasons. Existing timer/source causal exclusions remain.
+Excluded inputs remain in the full manifest with exact reasons. The retired one-off timer/source families no longer contribute cases or exclusions.
 Start replay follows an accepted Pause; fixed timed tests require6A; `restart-ready` means successful listener startup
 and real Boot response, so native restoration precedes it. Real unavailable startup/restoration has a separate test
 with no premature controller. HA cannot retry setup after terminal unload/removal/disable without reactivation. Excluded
@@ -124,7 +122,6 @@ which wire, native, lifecycle or SQLite event supplied those inputs.
 | T04 — unknown positive reply | Prove actual positive application, caller expiry and any forwarded late reply. Rollback zero cannot erase earlier dispatch or make it a no-positive wait; replacement retains the fault. |
 | T05 — later unsent/read failure | After an actual positive Accepted, a later withheld call or failed read retains the whole operation's positive effects. Confirmed rollback alone does not complete the release. A fully verified and published release remains the opposite case. |
 | T06 — failed cleanup | Rejected/lost zero or real SQL cleanup refusal prevents a safe wait or completion. Preserve both the original boundary and the later cleanup failure; strict/storage cleanup cannot disappear during cancellation. |
-| T07 — deadline supersession | Only the actual scoped timer/occurrence claim can supersede an unsent automatic release. Its new ticket and allowed local session do not borrow a pending zero ACK or prove physical zero. Deadline zero remains independently required. |
 | T08 — newer owner request | A newer Pause or Return retains its exact UUID, revision and ticket. Old work cannot reacquire permission, complete that newer request, clear its fault or overwrite its authority. |
 | T09 — Boot and introduction | Same-lineage Boot observations still change exact proof scope. Failed scope A cannot authorize B, and acknowledged introduction origin cannot rearm. Audited admission is separate from completed setup; pending native bodies and the runtime retry service cannot be hidden by foreground zero repair. Resume acknowledges only after its real guarded COMMIT; replacement does not inherit process-local origin. |
 | T10 — owned Start handoff | Genuine Accepted evidence remains separate from atomic app/lease/shared publication. After successful child COMMIT those authorities agree; a later Boot cannot borrow old Start proof, and a newer Pause retains its own current zero claim. Accepted lifecycle debt remains fenced. |
@@ -136,12 +133,11 @@ which wire, native, lifecycle or SQLite event supplied those inputs.
 Owned completion includes result interpretation and final publication even when the
 original poll or management client disappears. Session retirement first revokes
 positive permission and waits for every owned journal user before closing SQLite;
-repeated cancellation cannot shorten that lifetime. Urgent timer zero does not wait
-for a global coordinator I/O lock.
+repeated cancellation cannot shorten that lifetime. Restrictive Pause retains its independent owned operation.
 
 Explicit Return retains its separate request policy: after prior Pause/test
 settlement, a native prerequisite failure in its own release preflight makes that
-request unconfirmed, rather than granting automatic replay. Only named source, timer-cleanup, owner-return and actual
+request unconfirmed, rather than granting automatic replay. Only named source, owner-return and actual
 cloud-acknowledgement waits leave the same request accepted. Cloud connection
 failure, zero-proof debt, reconciliation and generic lifecycle blockage make it
 unconfirmed. This differs from automatic owned waiting after confirmed own zero,
@@ -199,11 +195,11 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
   numbers0/1, exact positive local IDs, closed/unknown mappings and sequential reuse.
 - Automatic-release regressions retain whole-operation dispatch, actual zero confirmation and cleanup outcomes.
   Before-positive source/native waits can retry after verified rollback; a charger-refused positive release or a
-  failed attempt after positive dispatch retains its fault. The post-positive source tests and the four restore
-  cases in `test_managed_schedule_mutation_scenarios.py` prove new Pause, real closure and separate Return recovery.
-  Their fake peer distinguishes an actual `Rejected` without application from application followed by a reply
-  delayed beyond its deadline. These focused failures are not extra registered model dimensions; existing source,
-  timer and process-overlap families retain their successful automatic recovery and original denominators.
+  failed attempt after positive dispatch retains its fault. The post-positive source tests and retained restore
+  cases in the ordinary release/current recovery tests prove new Pause, real closure and separate Return recovery.
+  Their peers distinguish actual `Rejected` without application from application followed by a late reply.
+  One-off timer histories and their two registered model families are retired; ordinary process-overlap and
+  current-replacement families keep their denominators and independent recovery assertions.
 - `test_qualification_collection.py` expands real dynamic parameters without running test bodies. Full-mode controls
   consistently omit an ordinary parameter or file while retaining every model case; the independent denominator
   rejects them. Filtering, executor selection and configured mount boundaries have separate negative controls.
@@ -212,7 +208,7 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
   actual service reaches zero, observes real native HTTP loss, heals and completes two later sessions. The bounded
   current/Start polling and management read tests separately retain honest unknown status and real read failures.
 - Its current-update case refuses native HTTP at the first real diagnostic SQL failure, before automatic Pause
-  verification can run. `test_current_failed_idle_hold.py` rejects23 altered request/cause/Boot/control bindings;
+  verification can run. `test_current_failed_idle_hold.py` rejects altered request/cause/Boot/control bindings;
   fresh closed-zero verification preserves the failed current receipt and issues no Start or Stop.
 - The measured-current, mixed-cause and native-repair tests separate fully validated measurement excess from
   configuration/history/resource/wire contradictions and ordinary unavailable/stale/closure waits. Real SQL refusal,

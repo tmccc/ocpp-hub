@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests.native_schedule_support import timer_bench
 from tests.test_managed_proxy import healthy, pending_cloud_offer, starts
-from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls

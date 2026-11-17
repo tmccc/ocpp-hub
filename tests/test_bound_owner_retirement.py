@@ -9,11 +9,11 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests import test_managed_proxy as mp
 from tests.cloud_start_helpers import StartReplyBench
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_stop_reply_recovery import running
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # Intent: each real SQLite refusal retains the exact local lease/request and all cloud evidence until one commit.

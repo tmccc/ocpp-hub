@@ -7,6 +7,8 @@ import uuid
 import pytest
 
 from tests import test_native_bounded_session as native_bench
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy
 from tests.test_managed_start_refusal_native32 import commissioned
@@ -14,8 +16,6 @@ from tests_model.catalog import input_digest
 from tests_model.control_helpers import ordinary_recovery
 from tests_model.current_obligations import require_completed_current
 from tests_model.deep_cases import current_domain_candidates, current_domain_exclusion
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # Explicit local development sampling is forbidden by the final qualification validator.

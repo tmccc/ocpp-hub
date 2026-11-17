@@ -120,19 +120,14 @@ class Gateway:
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
-        self.boot_observer: Callable[[], None] | None = None
-        self.status_observer: Callable[[str, dict[str, Any]], None] | None = None
         self.prepare_report_hold: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self.held_start_report: Callable[[str], bool] | None = None
         self.native_start_report: Callable[[dict[str, Any]], Awaitable[NativeStartReport | None]] | None = None
-        self.remote_start_guard: Callable[[], bool] | None = None
-        self.tag_guard: Callable[[str], bool] | None = None
         self.defer_command_binding: Callable[[int, str], bool] | None = None
         self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
-        self.timer_retry_after: dict[tuple[str, str], float] = {}
         self._flush_lock = asyncio.Lock()
         self._delivery_reply: DeliveryReply | None = None
         self.delivery_outcome_uncertain = False
@@ -426,8 +421,6 @@ class Gateway:
             self.boot_observation = uuid.uuid4().hex
             self.controls.forget_stop_ack()
             self._boot_seen.set()
-            if self.boot_observer is not None:
-                self.boot_observer()
             return {
                 "status": "Accepted",
                 "interval": 60,
@@ -500,8 +493,6 @@ class Gateway:
                 published = self._observations.accept(self._charger_epoch, token.partition(":")[2], action, payload)
                 if action == "StatusNotification":
                     self.journal.put("last_status", payload)
-                    if self.status_observer is not None:
-                        self.status_observer(token, payload)
                 elif published and action == "MeterValues" and type(payload.get("transactionId")) is int:
                     rows = payload.get("meterValue", [])
                     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
@@ -520,9 +511,7 @@ class Gateway:
     ) -> bool:
         if not isinstance(tag, str):
             return False
-        inhibited = (
-            self.journal.get("control", {}).get("inhibit") or self.tag_guard is not None and not self.tag_guard(tag)
-        )
+        inhibited = self.journal.get("control", {}).get("inhibit")
         phase = self.journal.get("trial_phase")
         held_report = (
             lifecycle
@@ -563,10 +552,6 @@ class Gateway:
     def _local_start_allowed(self, tag: str) -> bool:
         if (
             not self._local_tag(tag)
-            or self.remote_start_guard is not None
-            and not self.remote_start_guard()
-            or self.tag_guard is not None
-            and not self.tag_guard(tag)
             or self.journal.get("trial_phase") not in (None, "active")
             or self.journal.get("trial_starting")
         ):
@@ -581,7 +566,7 @@ class Gateway:
             return info
         return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
 
-    # A native timer can ask the cloud again after its cached decision expired or previously denied permission.
+    # A native daily schedule can renew a cloud decision that expired or previously denied permission.
     async def _renew_direct_start(self, payload: dict[str, Any], epoch: int, *, held_native: bool = False) -> None:
         tag = payload.get("idTag")
         if (
@@ -930,8 +915,6 @@ class Gateway:
             and (control.get("owner") == "local" or control.get("inhibit"))
         ):
             raise DeniedError("explicit local control has priority")
-        if action == "RemoteStartTransaction" and self.remote_start_guard is not None and not self.remote_start_guard():
-            raise DeniedError("an outstanding native timer must finish before a separate remote Start")
         if action == "RemoteStartTransaction" and (
             self.journal.active() is not None or self.journal.get("control", {}).get("start_pending")
         ):

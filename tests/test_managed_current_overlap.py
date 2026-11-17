@@ -15,8 +15,8 @@ from ocpp_hub_core.prototype.recovery_contracts import FailureKind, GateDecision
 from ocpp_hub_core.prototype.rpc import UnavailableError
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import ZONE, timer_bench
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
 
@@ -24,11 +24,6 @@ pytestmark = pytest.mark.asyncio
 
 
 # Complete the independent one-off before selecting current, leaving only the original daily plan installed.
-async def complete_timer(b):
-    await b.arm()
-    b.clock.now = b.start + 601
-    await healthy(b.c)
-    assert b.c.schedule.summary()["state"] == "complete" and set(b.device.plans) == {9}
 
 
 # Hold one actual native observation before or after the station has physically applied the requested increase.
@@ -85,15 +80,12 @@ async def assert_daily_recovery(b, local, original, demand, prior_stops=()):
 
 
 # Intent: all eight idle-increase overlaps preserve app intent, the old six-ampere selection and independent daily work.
-# Why: a failed current request cannot acquire owner Pause authority after a one-off has completed or without one.
-@pytest.mark.parametrize("completed_timer", [False, True])
+# Why: a failed current request cannot acquire owner Pause authority over an independent daily session.
 @pytest.mark.parametrize("applied", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
-async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, applied, demand):
+async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
-        if completed_timer:
-            await complete_timer(b)
         async with interrupted_increase(b, applied) as (request, release):
             local = await b.start_plan(9, demand=demand)
             await b.c.native.read()
@@ -105,17 +97,14 @@ async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeyp
 
 # Intent: native-first original activity remains at zero until its genuine OCPP Start and positive plan identification.
 # Why: native activity alone is neither a local transaction nor permission to Stop or restore a positive ceiling.
-@pytest.mark.parametrize("completed_timer", [False, True])
 @pytest.mark.parametrize("applied", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("restart", [False, True])
 async def test_native_first_awaits_real_daily_report(
-    tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, applied, demand, restart
+    tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand, restart
 ):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
-        if completed_timer:
-            await complete_timer(b)
         async with interrupted_increase(b, applied) as (request, release):
             provisional = b.session.journal.get("next_transaction") + 1
             b.device.active = provisional
@@ -156,16 +145,13 @@ async def test_native_first_awaits_real_daily_report(
 
 # Intent: process loss before a pending increase completes cannot turn it into Pause or Stop an independent daily.
 # Why: both unapplied and physically applied writes must recover the previous verified ceiling from durable state.
-@pytest.mark.parametrize("completed_timer", [False, True])
 @pytest.mark.parametrize("applied", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
 async def test_restart_during_pending_increase(
-    tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, applied, demand
+    tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand
 ):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
-        if completed_timer:
-            await complete_timer(b)
         async with interrupted_increase(b, applied) as (_, release):
             local = await b.start_plan(9, demand=demand)
             await b.c.native.read()
@@ -285,14 +271,11 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
 
 # Intent: an accepted daily lifecycle with missing or conflicting native plan evidence stays at zero until identified.
 # Why: an open zero-draw session and a daily tag alone cannot establish which operation owns the physical activity.
-@pytest.mark.parametrize("completed_timer", [False, True])
 @pytest.mark.parametrize("plan", [None, 987654])
 @pytest.mark.parametrize("demand", [False, True])
-async def test_unknown_source_holds_zero(tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, plan, demand):
+async def test_unknown_source_holds_zero(tmp_path, tls, unused_tcp_port, monkeypatch, plan, demand):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
-        if completed_timer:
-            await complete_timer(b)
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9, demand=demand)
             b.rig.peer.plan_session = (local, plan)
@@ -308,16 +291,13 @@ async def test_unknown_source_holds_zero(tmp_path, tls, unused_tcp_port, monkeyp
 
 # Intent: owner Pause retains unrestricted Stop authority during an overlapping selection and its zero recovery.
 # Why: automatic cancellation must preserve the daily, but an explicit owner Pause must still stop and hold it.
-@pytest.mark.parametrize("completed_timer", [False, True])
 @pytest.mark.parametrize("applied", [False, True])
 @pytest.mark.parametrize("during_worker", [False, True])
 async def test_explicit_pause_preempts_current_recovery(
-    tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, applied, during_worker
+    tmp_path, tls, unused_tcp_port, monkeypatch, applied, during_worker
 ):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
-        if completed_timer:
-            await complete_timer(b)
         pause = uuid.uuid4().hex
         async with interrupted_increase(b, applied) as (_, release):
             local = await b.start_plan(9)
@@ -345,40 +325,16 @@ async def test_explicit_pause_preempts_current_recovery(
 
 # Intent: after a real one-off cutoff and physical cleanup, a later failed increase preserves both daily windows.
 # Why: historical timer completion must not create or remove authority over unrelated future daily transactions.
-@pytest.mark.parametrize("demand", [False, True])
-async def test_next_window_after_real_cutoff(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        original = copy.deepcopy(b.device.plans[9])
-        await b.arm()
-        b.clock.now = b.start
-        temporary = await b.fire(b.timer, demand=False)
-        await healthy(b.c)
-        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-        await b.c.tick()
-        assert b.stops() == [temporary]
-        await b.close_transaction(temporary)
-        await healthy(b.c)
-        assert b.c.schedule.summary()["state"] == "complete" and b.device.plans == {9: original}
-        b.clock.now = int(datetime(2026, 11, 11, 23, 59, tzinfo=ZONE).timestamp())
-        async with interrupted_increase(b, True) as (_, release):
-            b.clock.now += 60
-            daily = await b.fire(9, demand=demand)
-            await b.c.native.read()
-            release.set()
-        assert b.c.current.selected() == 6 and b.device.effective_limit() == 0
-        await assert_daily_recovery(b, daily, original, demand, (temporary,))
 
 
 # Intent: source changes during final send validation revoke positive recovery and retain zero until reidentified.
 # Why: an earlier matching native plan cannot authorize a release after fresher evidence contradicts its source.
-@pytest.mark.parametrize("completed_timer,reject_rollback", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("reject_rollback", [False, True])
 async def test_source_changes_before_positive_send(
-    tmp_path, tls, unused_tcp_port, monkeypatch, completed_timer, reject_rollback
+    tmp_path, tls, unused_tcp_port, monkeypatch, reject_rollback
 ):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         original = copy.deepcopy(b.device.plans[9])
-        if completed_timer:
-            await complete_timer(b)
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9)
             await b.c.native.read()

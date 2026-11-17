@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from ocpp_hub_core.prototype.diagnostics import STAGES, FaultDiagnostics
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
-from ocpp_hub_core.prototype.managed_diagnostics import FAULTS, snapshot
+from ocpp_hub_core.prototype.managed_diagnostics import FAULTS
 from ocpp_hub_core.prototype.managed_view import health_snapshot
 
 from tests.test_managed_current import adjustable
@@ -297,19 +297,6 @@ def test_fault_vocabulary_is_accepted_by_client():
 
 # Intent: each actual temporary-schedule alarm remains a current diagnostic fault.
 # Why: a useful base alarm must not become an empty support-download cause.
-@pytest.mark.parametrize(
-    "alarm",
-    [
-        "temporary_schedule_cleanup_unconfirmed",
-        "temporary_schedule_awaiting_start_report",
-        "temporary_schedule_stop_unconfirmed",
-    ],
-)
-async def test_temporary_schedule_current_fault_is_preserved(tmp_path, tls, unused_tcp_port, monkeypatch, alarm):
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        value = snapshot(b.controller, (await healthy(b.controller)) | {"fault": alarm})
-        assert value["available"] and value["current_fault"] == alarm
-        assert client_projection().diagnostics(value)["current_fault"] == alarm
 
 
 # Intent: absent pending-operation connection facts remain unknown without creating positive health.

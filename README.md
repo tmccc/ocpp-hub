@@ -947,49 +947,14 @@ and native specification arguments. It checks the matching schedule attempt, nat
 zero hold and settled journal, then records a paused intent. Verify Pause after restart before using Return
 to restore the previous app/schedule permission.
 
-An authenticated `temporary_schedule` request takes a fresh control revision and a future UTC Unix
-`start_epoch` on a whole minute later on the charger's current local date. Under commissioned managed32
-authority, the proxy installs a one-off plan using the daily timer's tag and at most the selected current.
-The start must be before 06:00. The duration is the elapsed time to 06:00 on that local date, including
-clock changes. For example, a 03:45 start lasts 135 minutes. The original daily plan stays in place.
-An accepted timer waits while an ordinary cloud acknowledgement is pending, within the same installation window.
-Disconnect, a newer Pause, replacement or expiry still cancels an unsent installation.
-The service verifies the complete two-plan readback. An observed unplug retires the temporary timer.
-A connector-1 Available event also retires it if the car reconnects between polls. A retired timer's
-tag cannot authorize another Start before cleanup. Changing the selected current while the timer is armed
-preserves it. A current change overtaken by a disconnect is cancelled and the previous selection is restored.
-At 06:00, if the identified temporary session is still open, the service holds the station at zero and
-requests closure of that transaction over OCPP. A separate deadline task runs while telemetry is slow or
-unavailable and while an owner Pause is pending. It waits for
-both the charger’s Stop event and independent readings showing a closed session and zero output.
-If the source of an open session is unknown at cutoff, the proxy holds the station at 0 A. A fresh
-native plan ID or a distinct accepted transaction tag can identify an independent session and let it
-continue. Only the identified temporary session receives the timer’s Stop. New local or cloud
-RemoteStart commands are unavailable while a one-off timer is outstanding. The original native daily
-plan remains enabled, and the proxy preserves a separate Start already acknowledged by an older release.
-An independent continuation depends on that transaction's current source evidence; it cannot exempt
-later unidentified activity from protection. A newly observed unidentified session is held at zero before
-06:00 as well. Reconnect recovery continues reading the source until identification can complete.
-Cancelling a later timer before installation preserves
-an earlier unresolved cutoff. A current change interrupted by the temporary Start rolls back to the
-previous selected current and preserves the remaining timer window after source verification.
-An expired manual Start retains its own reporting obligation while ordinary daily charging can continue.
-That includes a daily session using the same tag: fresh evidence must identify the exact recurring plan
-and transaction before restoring its selected current after an outage or restart. A newer explicit Pause
-still takes priority. Temporary zero-profile verification does not disconnect an established cloud
-lifecycle channel or discard an acknowledgement already in flight. Changed Boot metadata revokes that
-cloud introduction even when the charger's socket stays connected.
-Reporting the earlier Boot metadata again does not restore the revoked registration.
-Its delayed report is held at zero before the proxy binds it to that command. A report with one matching
-unnumbered native history record can be recorded under verified zero when its plan ID is missing;
-recording it does not identify its charging source or authorize positive current. A contradictory plan ID
-remains blocked.
-Once actual closure and zero output are verified, it removes its timer, verifies the complete original
-timetable and restores the owner's selected ceiling in app mode. If no matching session appears within
-ten minutes of the start, or by 06:00 if sooner, cleanup runs at idle. The station stays at zero while
-a retained temporary plan awaits verified removal. The status field `temporary_schedule` reports progress.
-Unconfirmed removal is retried with a bounded delay and surfaces through the existing health alert.
-Process replacement reconciles an interrupted installation from native readback.
+The proxy supports the charger's original daily schedules and managed Start, Pause, Return and current
+selection. One-off temporary schedules have been retired. An unfinished old one-off record blocks startup
+before the journal is changed; recover it with the original implementation first. Completed schedule history
+stays in the journal, and its plan identifiers remain reserved against late reports.
+
+An expired manual Start retains its own reporting obligation while daily charging can continue. Fresh native
+evidence must identify the exact recurring plan and transaction, including when it shares the manual Start's
+tag. A newer explicit Pause takes priority. Zero verification preserves cloud acknowledgements already in flight.
 
 After a proxy process replacement, `{"command":"native-bounded-resume"}` explicitly acknowledges restricted recovery.
 Fresh verified native-ceiling evidence (6 A legacy, 32 A explicitly commissioned), a closed session, all-phase zero,

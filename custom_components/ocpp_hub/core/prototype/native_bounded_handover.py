@@ -7,7 +7,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
@@ -18,20 +18,8 @@ from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
 from .managed_current import current_session_decision, managed_current_ceiling, record_current_source
 from .managed_native_repair import NativeRepairAudits
-from .managed_occurrences import KEY
 from .managed_recovery import local_recovery_binding
-from .managed_schedule import (
-    TimerVehicleDisconnectedError,
-    continuing_session_decision,
-    installed_variant,
-    known_timer_closure_gap,
-    record_session_source,
-    recorded_station_profile,
-    recorded_timer_hold,
-    remember_disconnect,
-    request_timer_stop,
-    supervised_timer,
-)
+from .managed_sources import recorded_station_profile
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready, readiness_decision
 from .native_faults import MeasuredValues, NativeContentError, _NativeMeasurementError
 from .native_history import audit_history, inspect_history
@@ -47,9 +35,6 @@ from .trial_evidence import profile_projection
 from .trial_handover_evidence import HandoverEvidence, ObserveHandover
 from .trial_resources import ResourceBook
 from .trial_rollback import lifecycle_decision, require_lifecycle_idle
-
-if TYPE_CHECKING:
-    from .managed_fault_timer import FaultTimerRemoval
 
 NativePatch = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -81,7 +66,6 @@ class NativeBoundedHandover:
         self.gateway, self.book, self.observe, self.spec, self.choice = gateway, book, observe, spec, choice
         self.command_source_observer: Callable[[HandoverEvidence], None] | None = None
         self.ordinary_source_observer: Callable[[HandoverEvidence], None] | None = None
-        self.schedule_changed: Callable[[], None] | None = None
         self.allow_unplugged = allow_unplugged
         self.repair_audits: NativeRepairAudits | None = None
         self.lock = asyncio.Lock()
@@ -156,7 +140,6 @@ class NativeBoundedHandover:
                 "grant": journal.get("vendor_start_grant"),
                 "state": journal.get("native_bounded_handover"),
                 "current_capability": journal.get("managed_current_capability"),
-                "temporary_schedule": journal.get("managed_temporary_schedule"),
                 "ordinary_recovery": journal.get("managed_ordinary_recovery"),
                 "resources": [tuple(row) for row in journal.db.execute("SELECT * FROM trial_resources ORDER BY key")],
             }
@@ -170,9 +153,8 @@ class NativeBoundedHandover:
         *,
         owned: bool = False,
         initial: bool = False,
-        timer_removal: FaultTimerRemoval | None = None,
     ) -> HandoverEvidence:
-        result = await self._read(route, closed, owned=owned, initial=initial, timer_removal=timer_removal)
+        result = await self._read(route, closed, owned=owned, initial=initial)
         if isinstance(result, Pending):
             raise AssertionError("legacy native read returned a managed prerequisite")
         return result
@@ -189,7 +171,6 @@ class NativeBoundedHandover:
         *,
         owned: bool = False,
         initial: bool = False,
-        timer_removal: FaultTimerRemoval | None = None,
         as_result: bool = False,
     ) -> HandoverEvidence | Pending:
         self.read_sequence += 1
@@ -233,11 +214,8 @@ class NativeBoundedHandover:
                 verify_initial_history(
                     gateway.journal, native.physical.history, gateway.journal.identity, self.spec.hardware_identity
                 )
-            if attempt is not None:
-                if timer_removal is not None:
-                    timer_removal.require_validation_call()
-                elif gateway.controls._operations or gateway.charger._pending:
-                    raise RecoveryRequiredError("native repair awaits settled resource operations")
+            if attempt is not None and (gateway.controls._operations or gateway.charger._pending):
+                raise RecoveryRequiredError("native repair awaits settled resource operations")
             resource_error = self.book.native_conflict(native.physical, owned=owned or attempt is not None)
             strict_complete = True
             self.book.check_originals(native.physical)
@@ -246,22 +224,14 @@ class NativeBoundedHandover:
             if resource_error is not None:
                 raise resource_error
             audit_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
-            previous_timer = self.gateway.journal.get(KEY, {})
-            try:
-                if native.physical.connection == "Unplug":
-                    remember_disconnect(self.gateway.journal)
-                if self.command_source_observer is not None:
-                    self.command_source_observer(native)
-                record_session_source(self.gateway.journal, native, self.gateway.boot_observation)
-                record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
-            finally:
-                if self.schedule_changed is not None and self.gateway.journal.get(KEY, {}) != previous_timer:
-                    self.schedule_changed()
+            if self.command_source_observer is not None:
+                self.command_source_observer(native)
+            record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
             if self.ordinary_source_observer is not None:
                 self.ordinary_source_observer(native)
             if measured.exceeded:
                 raise _NativeMeasurementError(native, measured, self.authority(), sequence)
-            _require_ready(native, False, self.allow_unplugged, self._closing_local(native))
+            _require_ready(native, False, self.allow_unplugged, None)
         except NativeContentError as error:
             invalidate()
             # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
@@ -286,11 +256,6 @@ class NativeBoundedHandover:
                 raise AuditSupersededError("native availability result was superseded") from error
             if as_result:
                 return Pending(Prerequisite.NATIVE, "recovery awaits fresh complete native evidence", error)
-            timer = self.gateway.journal.get("managed_temporary_schedule", {})
-            if supervised_timer(timer) and (
-                "hold_since" in timer or self.gateway.journal.get("managed_control_intent", {}).get("mode") == "paused"
-            ):
-                raise UnavailableError("timer hold awaits fresh native evidence") from error
             if self.gateway.journal.get("managed_current_change", {}).get("state") == "recovering":
                 raise UnavailableError("current selection hold awaits fresh native evidence") from error
             ordinary = self.gateway.journal.get("managed_ordinary_recovery", {})
@@ -328,25 +293,12 @@ class NativeBoundedHandover:
         if closed:
             if as_result:
                 self._inspect(native, route=route).require()
-                decision = readiness_decision(native, True, self.allow_unplugged, self._closing_local(native))
+                decision = readiness_decision(native, True, self.allow_unplugged, None)
                 if isinstance(decision, Pending):
                     return decision
             else:
                 self.require(native, route=route, closed=True)
         return native
-
-    # The exact known closure exception never adopts a new native transaction.
-    def _closing_local(self, native: HandoverEvidence) -> int | None:
-        j = self.gateway.journal
-        lease = j.get("managed_temporary_schedule", {})
-        closing = j.active() if supervised_timer(lease) else None
-        if (
-            closing is None
-            and native.physical.transaction_open
-            and (known_timer_closure_gap(j, native) or recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest))
-        ):
-            closing = native.physical.native_transaction_id
-        return closing
 
     # Compose immutable checks before a private measured verdict; it is never usable positive authority.
     def _inspect(self, native: HandoverEvidence, *, route: str = "trial") -> MeasuredValues:
@@ -360,17 +312,13 @@ class NativeBoundedHandover:
                 native,
                 j.identity,
                 allow_unplugged=self.allow_unplugged,
-                closing_local=self._closing_local(native),
-                temporary_schedule_digest=installed_variant(
-                    j, self.spec.saved_schedule_digest, native.saved_schedule_digest
-                ),
             )
         return self.spec._inspect(native, j.identity, route, allow_unplugged=self.allow_unplugged)
 
     # Every public native validator still enforces all bounds and its original closed-zero readiness.
     def require(self, native: HandoverEvidence, *, route: str = "trial", closed: bool = False) -> None:
         self._inspect(native, route=route).require()
-        _require_ready(native, closed, self.allow_unplugged, self._closing_local(native))
+        _require_ready(native, closed, self.allow_unplugged, None)
 
     # A private verdict retains selected-meter facts while the controller completes nonmeasurement checks.
     def _selected_measurements(self, native: HandoverEvidence, measured: MeasuredValues) -> MeasuredValues:
@@ -515,61 +463,21 @@ class NativeBoundedHandover:
             verified_revision = gateway.controls._revision
             journal.put("trial_starting", False)
             if binding is not None and native.physical.transaction_open:
-                lease = journal.get("managed_temporary_schedule", {})
                 if journal.get("managed_current_change", {}).get("state") == "recovering":
                     pass  # This operation owns only zero; fresh supervision must identify the independent session.
-                elif not supervised_timer(lease):
-                    if (
-                        journal.get("managed_mode")
-                        and journal.get("managed_control_intent", {}).get("mode") == "app"
-                        or self.recovery_zero_only is not None
-                        and self.recovery_zero_only()
-                    ):
-                        try:
-                            await gateway.controls.ensure_ceiling()
-                        except UnavailableError, TimeoutError:
-                            # The completed audit hands only zero retries to the runtime after final authority checks.
-                            pass
-                        else:
-                            if lease and journal.active() is not None:
-                                journal.put(
-                                    "managed_temporary_schedule",
-                                    {
-                                        **lease,
-                                        "recovery_session": True,
-                                        "unidentified_local": journal.active(),
-                                        "hold_since": time.time(),
-                                    },
-                                )
-                    elif journal.active() is not None:
-                        await gateway.stop()
                 elif (
-                    lease.get("native_plan_confirmed")
-                    and native.physical.native_transaction_id == journal.active() == lease.get("bound_local")
-                    and native.session_plan_id == lease["body"]["planId"]
+                    journal.get("managed_mode")
+                    and journal.get("managed_control_intent", {}).get("mode") == "app"
+                    or self.recovery_zero_only is not None
+                    and self.recovery_zero_only()
                 ):
-                    # Introduction remains verified if this restrictive RPC fails. Its durable hold supervises retries.
-                    def same_boot() -> bool:
-                        return (
-                            gateway.current_boot_seen(epoch)
-                            and verified_revision == gateway.controls._revision
-                            and fingerprint(journal.get("boot")) == self.spec.boot_digest
-                        )
-
                     try:
-                        await request_timer_stop(gateway, lease, same_boot)
-                    except UnavailableError, RecoveryRequiredError, DeniedError:
+                        await gateway.controls.ensure_ceiling()
+                    except UnavailableError, TimeoutError:
+                        # The completed audit hands only zero retries to the runtime after final authority checks.
                         pass
                 elif journal.active() is not None:
-                    # Preserve any other open transaction under the recovery zero until its provenance is verified.
-                    journal.put(
-                        "managed_temporary_schedule",
-                        {
-                            **lease,
-                            "unidentified_local": journal.active(),
-                            "hold_since": lease.get("hold_since", time.time()),
-                        },
-                    )
+                    await gateway.stop()
             gateway._require_epoch("charger", epoch)
             if verified_revision != gateway.controls._revision:
                 raise UnavailableError("the verified charger introduction was superseded")
@@ -657,11 +565,7 @@ class NativeBoundedHandover:
                 )
             ):
                 return  # The verified zero listener can receive the real lifecycle without adopting this native ID.
-            if j.get("managed_temporary_schedule", {}).get("unreported_native"):
-                if recorded_timer_hold(j, self.spec.digest, self.spec.boot_digest):
-                    return  # Only the restricted listener/Boot can proceed. No local transaction is adopted.
-            if not known_timer_closure_gap(j, native):
-                self.require_known_session(native)
+            self.require_known_session(native)
         elif native.physical.native_transaction_id is not None:
             raise RecoveryRequiredError("restricted recovery cannot adopt contradictory native session evidence")
 
@@ -712,7 +616,9 @@ class NativeBoundedHandover:
                 return native
             if continuing_local is not None:
                 if self.continuation_guard is None:
-                    decision = continuing_session_decision(journal, native, continuing_local)
+                    decision: GateDecision = Pending(
+                        Prerequisite.SOURCE, "continuation requires a managed source guard"
+                    )
                 else:
                     decision = self.continuation_guard(native, continuing_local)
                 if isinstance(decision, Pending):
@@ -782,34 +688,18 @@ class NativeBoundedHandover:
         zero = action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0
         if zero:
             return None  # Existing ledger guards still forbid recreating a station profile after verified absence.
-        removal = self.book.fault_timer_removal
-        if removal is not None and action == "DataTransfer" and payload is removal.payload:
-            removal.require_payload(action, payload)
-            removal.authority.guard_timer_removal(removal)
-            native = await self.read(closed=True, timer_removal=removal)
-            removal.authority.guard_timer_removal(removal)
-            removal.require_payload(action, payload)
-            self.require_selected(native)
-            removal.authority.require_timer_zero(native, removal)
-            removal.verified_native_digest = native.digest
-            return None
         selecting = self.gateway.journal.get("managed_current_change", {}).get("state") == "pending"
-        timer = (
-            action == "DataTransfer"
-            and payload.get("vendorId") == "IoCharger"
-            and payload.get("messageId") in ("setPlan", "clearPlans")
-        )
         # Managed release uses the common typed prerequisite path, irrespective of its source or call location.
         if self.book.before_positive_release is not None:
             observed = await self.read_result(
-                closed=timer or action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
+                closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
             )
             if isinstance(observed, Pending):
                 return observed
             native = observed
         else:
             native = await self.read(
-                closed=timer or action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
+                closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
             )
         self.require_selected(native)
         change = self.gateway.journal.get("managed_current_change", {})
@@ -825,38 +715,6 @@ class NativeBoundedHandover:
             decision = self.positive_guard(native)
             if isinstance(decision, Pending):
                 return decision
-        lease = self.gateway.journal.get("managed_temporary_schedule", {})
-        continuing = lease.get("unidentified_local")
-        if action == "SetChargingProfile" and supervised_timer(lease) and continuing is not None:
-            decision = continuing_session_decision(self.gateway.journal, native, continuing)
-            if isinstance(decision, Pending):
-                return decision
-        if timer:
-            if payload["messageId"] == "setPlan" and native.physical.connection != "Plug":
-                raise TimerVehicleDisconnectedError("temporary timer installation requires the connected vehicle")
-            lease = self.gateway.journal.get("managed_temporary_schedule", {})
-            expected = (
-                lease.get("original_digest") if payload["messageId"] == "setPlan" else lease.get("augmented_digest")
-            )
-            if native.saved_schedule_digest != expected:
-                raise SecurityError("temporary timer write requires its exact native preimage")
-            present = self.book.owned_present(native.physical)
-            if payload["messageId"] == "clearPlans" and self.gateway.journal.get("trial_phase") == "recovering":
-                g = self.gateway
-                self.require_known_session(native)
-                if (
-                    not recorded_timer_hold(g.journal, self.spec.digest, self.spec.boot_digest)
-                    or "hold_since" not in lease
-                    or not g.current_boot_seen(g._charger_epoch)
-                    or self.introduced_epoch != g._charger_epoch
-                    or self.introduced_revision != g.controls._revision
-                    or not g.controls.ready
-                    or g.controls.desired() != 0
-                    or any(v != 0 for v in native.currents_a + native.powers_w)
-                    or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
-                ):
-                    raise RecoveryRequiredError("timer removal during recovery awaits a verified physical hold")
-                return None
         if action == "ClearChargingProfile":
             require_lifecycle_idle(self.gateway)
             present = self.book.owned_present(native.physical)

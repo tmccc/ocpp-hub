@@ -61,6 +61,11 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert status["healthy"] and status["api_version"] == 1
                     assert (await call(socket, "history"))["result"] == {"sessions": []}
                     assert rig.bench.received_limits == before
+                    retired = await call(socket, "temporary_schedule", revision=0, start_epoch=1794384000)
+                    assert retired["ok"] is False and retired["error"] == "invalid_request"
+                    assert controller.requests.intent().revision == 0
+                    assert session.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 0
+                    assert rig.bench.received_limits == before
                     request = uuid.uuid4().hex
                     first = await call(socket, "pause", id=request, revision=0)
                     second = await call(socket, "pause", id=request, revision=0)

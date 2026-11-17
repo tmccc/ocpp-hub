@@ -1,24 +1,13 @@
 """Small real-journal contracts complement the complete charger/cloud recovery regressions."""
 
-import copy
 from types import SimpleNamespace
 
 import pytest
 from ocpp_hub_core.prototype import auth_info
-from ocpp_hub_core.prototype.managed_occurrences import (
-    ARCHIVE,
-    HEAD,
-    IDENTITY,
-    KEY,
-    installed_digest,
-    remember,
-    restore_head,
-)
 from ocpp_hub_core.prototype.managed_view import health_snapshot
-from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.store import Journal
 
 from tests.test_managed_service_cli import healthy_status
-from tests.test_prototype import START
 
 
 # Allocate an ordinary file-backed journal, leaving each production helper responsible for its own transitions.
@@ -33,7 +22,6 @@ def journal(tmp_path):
 
 # Intent: every physical-zero predicate matters for both deliberate Pause and an idle timer hold.
 # Why: fresh timestamps and connected cloud cannot turn a contradictory hold into healthy authority.
-@pytest.mark.parametrize("idle", [False, True])
 @pytest.mark.parametrize(
     "change",
     [
@@ -45,9 +33,9 @@ def journal(tmp_path):
         {"charging_session_open": True},
     ],
 )
-def test_zero_health_requires_each_physical_predicate(idle, change):
+def test_zero_health_requires_each_physical_predicate(change):
     value = healthy_status(10000) | {
-        "desired_control": "app" if idle else "paused",
+        "desired_control": "paused",
         "local_hold_verified": True,
         "station_ceiling_a": 0,
         "current_a": 0,
@@ -55,100 +43,9 @@ def test_zero_health_requires_each_physical_predicate(idle, change):
         "charging_session_open": False,
         "owner_control_enabled": False,
     }
-    if idle:
-        value["temporary_schedule"] = {"idle_cutoff_hold": True}
     result = health_snapshot(value | (change or {}), 10000)
     assert result["healthy"] is (change is None)
     assert result["local_healthy"] is (change is None)
-
-
-# Supply one complete immutable occurrence, independent of the helper's archive logic.
-def occurrence(identifier="one"):
-    return {
-        "id": identifier,
-        "revision": 1,
-        "accepted_epoch": 100,
-        "start_epoch": 200,
-        "end_epoch": 300,
-        "floor": 1,
-        "body": {"planId": 10001},
-        "install": {"digest": "installed"},
-        "original_digest": "original",
-        "augmented_digest": "augmented",
-        "state": "armed",
-    }
-
-
-# Intent: identical repeats preserve receipts, while changing any same-occurrence immutable field is rejected.
-# Why: archive selection must never replace the meaning of an already receipted window or installed payload.
-@pytest.mark.parametrize("field", [None, *[key for key in IDENTITY if key != "id"]])
-def test_occurrence_identity_is_immutable(journal, field):
-    original = occurrence()
-    journal.put(KEY, original)
-    remember(journal)
-    archive, head = journal.get(ARCHIVE), journal.get(HEAD)
-    repeated = copy.deepcopy(original)
-    if field is not None:
-        repeated[field] = {"changed": True} if isinstance(repeated[field], dict) else "changed"
-    journal.put(KEY, repeated)
-    if field is None:
-        remember(journal)
-    else:
-        with pytest.raises(RecoveryRequiredError, match="identity changed"):
-            remember(journal)
-    assert journal.get(ARCHIVE) == archive and journal.get(HEAD) == head
-
-
-# Intent: inherited temporary hold fields are retired only when every independent closure guard permits it.
-# Why: restoring a working receipt cannot discard a hold that still owns an active or reported session.
-@pytest.mark.parametrize(
-    "blocker", [None, "inherited_hold", "active", "bound_local", "temporary_start_reported", "retire_reason"]
-)
-def test_restore_head_preserves_each_inherited_hold_blocker(journal, blocker):
-    old, head = occurrence("older"), occurrence("newer")
-    head |= {
-        "inherited_hold": True,
-        "hold_since": 100,
-        "next_cap": 0,
-        "next_stop": 7,
-        "unidentified_local": 7,
-        "provisional_boot": "boot",
-    }
-    if blocker == "active":
-        journal.start("active-boundary", START)
-    elif blocker is not None:
-        head[blocker] = False if blocker == "inherited_hold" else 7 if blocker == "bound_local" else True
-    journal.put(ARCHIVE, {old["id"]: old, head["id"]: head})
-    journal.put(HEAD, head["id"])
-    journal.put(KEY, old)
-    restore_head(journal)
-    actual = journal.get(KEY)
-    if blocker is None:
-        assert actual == {
-            key: value
-            for key, value in head.items()
-            if key
-            not in ("inherited_hold", "hold_since", "next_cap", "next_stop", "unidentified_local", "provisional_boot")
-        }
-    else:
-        assert actual == head
-    assert journal.get(HEAD) == head["id"]
-
-
-# Intent: installed inventory is recognized only for the matching original, augmented body and live lease state.
-# Why: any independently changed component removes authority to treat another inventory as owned.
-@pytest.mark.parametrize(
-    "state,original,actual,expected",
-    [
-        ("armed", "original", "augmented", "augmented"),
-        ("complete", "original", "augmented", "original"),
-        ("armed", "other", "augmented", "other"),
-        ("armed", "original", "other", "original"),
-    ],
-)
-def test_installed_digest_requires_all_bindings(journal, state, original, actual, expected):
-    journal.put(KEY, occurrence() | {"state": state})
-    assert installed_digest(journal, original, actual) == expected
 
 
 # Populate the genuine metadata book at an independently selected cloud observation time.

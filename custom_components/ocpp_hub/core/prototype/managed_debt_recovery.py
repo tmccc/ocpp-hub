@@ -12,11 +12,9 @@ from typing import TYPE_CHECKING, Any
 from .local_control import local_start_receipt
 from .managed_combined_start_recovery import KIND as COMBINED_KIND
 from .managed_combined_start_recovery import combined_candidate, combined_resolution
-from .managed_cutoffs import supervised_timer
 from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
 from .managed_denial_faults import current_operator_proof, proof_headers_match
-from .managed_occurrences import occurrences
 from .managed_recovery_zero import require_original_zero
 from .managed_start_delivery import KIND as START_KIND
 from .managed_start_delivery import RETRIES, start_resolution
@@ -71,7 +69,7 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
     }
 
 
-# Current/timer work, other owner requests and original-session uncertainty cannot be waived by another debt's proof.
+# Current work, other owner requests and original-session uncertainty cannot be waived by another debt's proof.
 def require_common_debt_idle(j: Journal, kind: str) -> None:
     if (
         any(entry.get("completed") is None and not entry.get("superseded") for entry in j.get(KEY, {}).values())
@@ -81,7 +79,6 @@ def require_common_debt_idle(j: Journal, kind: str) -> None:
         and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
         or j.get("managed_current_change", {}).get("state") not in (None, "completed", "cancelled")
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
-        or any(supervised_timer(lease) or lease.get("state") == "requested" for lease in occurrences(j).values())
         or kind != "local-start"
         and j.get("control", {}).get("start_pending")
         or kind != "local-start"

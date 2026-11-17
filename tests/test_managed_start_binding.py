@@ -10,8 +10,8 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import ZONE, timer_bench
 from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
-from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
@@ -93,35 +93,29 @@ async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, be
             assert (await healthy(b.c))["power_w"] == 0
 
 
-# Intent: retain an older accepted owner command when a distinct native timer reports on the same tag.
-# Why: the candidate explicitly supports older acknowledgements while the one-off copies the admitted native tag.
+# Intent: retain an older accepted owner command when a distinct native daily plan reports on the same tag.
+# Why: the candidate explicitly supports older acknowledgements while a daily plan can share its native tag.
 @pytest.mark.parametrize("same_tag", [False, True])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("first", ["native", "ledger"])
 async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatch, same_tag, restart, demand, first):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
-        g, j = b.session.gateway, b.session.journal
-        tag = b.device.plans[b.timer]["idTag"] if same_tag else "CLOUD_OWNER"
-        prior_guard = g.remote_start_guard
-        g.remote_start_guard = None  # Same pre-upgrade-ACK setup as supplied TimerBench helper.
-        try:
-            accepted = await b.rig.bench.cloud_call(
-                "older-cloud", "RemoteStartTransaction", {"connectorId": 1, "idTag": tag}
-            )
-            assert accepted[0] == 3 and accepted[2]["status"] == "Accepted"
-        finally:
-            g.remote_start_guard = prior_guard
+        j = b.session.journal
+        tag = b.device.plans[9]["idTag"] if same_tag else "CLOUD_OWNER"
+        accepted = await b.rig.bench.cloud_call(
+            "older-cloud", "RemoteStartTransaction", {"connectorId": 1, "idTag": tag}
+        )
+        assert accepted[0] == 3 and accepted[2]["status"] == "Accepted"
         grant = dict(j.get("vendor_start_grant"))
         b.clock.now = b.start
-        temporary = await b.fire(b.timer, demand=demand)
+        daily = await b.start_plan(9, demand=demand)
         await pending_cloud_offer(b.c, 6)
         assert j.get("vendor_start_grant") == grant
         end = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
         b.clock.now = end
         await b.c.tick()
-        assert b.stops() == [temporary] and b.device.effective_limit() == 0
+        assert not b.stops() and b.device.effective_limit() == 6
         pause = uuid.uuid4().hex
         b.c.command(pause, "pause", b.c.requests.intent().revision)
         await b.c.pause_task
@@ -131,14 +125,14 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
             b.rig.peer.permission_enabled = False
             b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
         else:
-            await b.close_transaction(temporary)
-            b.device.active = temporary
+            await b.close_transaction(daily)
+            b.device.active = daily
         for _ in range(2):
             await b.c.tick()
         assert b.c.requests.receipt(pause)["state"] != "completed"
         assert b.device.effective_limit() == 0
         if first == "native":
-            await b.close_transaction(temporary)
+            await b.close_transaction(daily)
         else:
             b.device.active = None
         for _ in range(4):

@@ -13,8 +13,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import ZONE, timer_bench
 from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
-from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
 
@@ -26,7 +26,6 @@ from tests.test_prototype_tls import tls as tls
 @pytest.mark.parametrize("keep_old_native", [False, True])
 async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand, keep_old_native):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
         await b.acknowledge_older_owner_start()
         if restart:
             await crash(b.session)
@@ -42,7 +41,7 @@ async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypat
             b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
             for _ in range(5):
                 await b.c.tick()
-            assert b.device.effective_limit() == 0 and set(b.device.plans) == {9}
+            assert set(b.device.plans) == {9}
             tag = b.device.plans[9]["idTag"]
             for day in (12, 13):
                 b.clock.now = int(datetime(2026, 11, day, tzinfo=ZONE).timestamp())
@@ -109,34 +108,20 @@ async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypat
 
 # Intent: a held lifecycle on the original plan must retain a distinct previously acknowledged local owner's Start.
 # Why: both a successful Start report and the positive profile restoration used to clear the one shared pending flag.
-@pytest.mark.parametrize("pre_cutoff_timer", [False, True])
-async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp_port, monkeypatch, pre_cutoff_timer):
+async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
         g, j = b.session.gateway, b.session.journal
         g.policy = replace(g.policy, allowed_tags=frozenset({"APP_OWNER", *g.policy.allowed_tags}))
         g.controls.policy = g.policy
-        guard = g.remote_start_guard
-        g.remote_start_guard = None
-        try:
-            b.c.command("e1dec715d70a414d82a57fec3bd160bb", "start", b.c.requests.intent().revision)
-            await b.c.charging.settle()
-        finally:
-            g.remote_start_guard = guard
+        b.c.command("e1dec715d70a414d82a57fec3bd160bb", "start", b.c.requests.intent().revision)
+        await b.c.charging.settle()
         owner_tag = starts(b.rig)[0][3]["idTag"]
         assert owner_tag.casefold() != b.device.plans[9]["idTag"].casefold()
         assert j.get("control")["start_pending"] and b.c.charging.state()["start_rpc_accepted"]
-        if pre_cutoff_timer:
-            b.clock.now = b.start
-            temporary = await b.fire(b.timer)
-            assert j.get("control")["start_pending"] and b.c.charging.state().get("local_transaction") is None
-            await b.c.native.read()
-            b.clock.now += 60
-            await b.close_transaction(temporary)
         b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
         for _ in range(4):
             await b.c.tick()
-        assert b.device.effective_limit() == 0 and set(b.device.plans) == {9}
+        assert set(b.device.plans) == {9}
         b.clock.now = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
         b.device.active = 123456
         b.rig.peer.plan_session = (123456, 9)
@@ -159,7 +144,6 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
         assert b.device.effective_limit() == 6 and not b.stops()
         await b.close_transaction(owner_local)
         await healthy(b.c)
-        assert not b.c.schedule.awaiting_start()
         await b.c.charging.close()
 
 
@@ -168,7 +152,6 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
 @pytest.mark.parametrize("changed", ["mutation", "digest"])
 async def test_unproven_pending_grant_blocks_separate_daily(tmp_path, tls, unused_tcp_port, monkeypatch, changed):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
         await b.acknowledge_older_owner_start()
         j = b.session.journal
         original = j.get("vendor_start_grant")

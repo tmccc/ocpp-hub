@@ -322,14 +322,12 @@ class NativeBoundedSpec:
         *,
         closed: bool = False,
         allow_unplugged: bool = False,
-        temporary_schedule_digest: str | None = None,
         closing_local: int | None = None,
     ) -> None:
         measured = self._inspect_managed(
             native,
             identity,
             allow_unplugged=allow_unplugged,
-            temporary_schedule_digest=temporary_schedule_digest,
             closing_local=closing_local,
         )
         measured.require()
@@ -342,7 +340,6 @@ class NativeBoundedSpec:
         identity: str,
         *,
         allow_unplugged: bool = False,
-        temporary_schedule_digest: str | None = None,
         closing_local: int | None = None,
     ) -> MeasuredValues:
         expected = self.original_configuration | self.trial_route | {"AmpLmt": "32"}
@@ -358,9 +355,7 @@ class NativeBoundedSpec:
             allow_full_current=True,
             closing_local=closing_local,
         )
-        if native.configuration != expected or native.saved_schedule_digest != (
-            temporary_schedule_digest or self.saved_schedule_digest
-        ):
+        if native.configuration != expected or native.saved_schedule_digest != (self.saved_schedule_digest):
             raise NativeContentError("configuration", "managed full configuration or saved schedule changed")
         return measured
 

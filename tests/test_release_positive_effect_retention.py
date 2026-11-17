@@ -7,14 +7,11 @@ from contextlib import AsyncExitStack
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
-from ocpp_hub_core.prototype.managed_cutoffs import idle_cutoff_pending, supervised_timer
-from ocpp_hub_core.prototype.managed_occurrences import KEY
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, WireReply
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import timer_bench
 from tests.test_managed_proxy import introduced, managed_session, starts
-from tests.test_managed_schedule_cutoff import timer_bench
-from tests.test_managed_schedule_idle_cutoff import END, early_cleanup
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
 
@@ -28,16 +25,8 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
         timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b,
         AsyncExitStack() as replacements,
     ):
-        await b.arm()
-        identifier = b.session.journal.get(KEY)["id"]
-        await early_cleanup(b)
-        lease = copy.deepcopy(b.session.journal.get(KEY))
-        assert lease["state"] == "complete" and lease["result"] == "no_scheduled_session"
-        assert idle_cutoff_pending(lease) and supervised_timer(lease)
-        assert b.session.journal.active() is None
         plan, configuration = copy.deepcopy(b.device.plans[9]), copy.deepcopy(b.rig.peer.configuration)
         # A real new introduction before the remaining cutoff reaches the ordinary automatic idle restoration.
-        b.clock.now = END - 1
         await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
@@ -50,8 +39,6 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
         epoch, boot, revision = g._charger_epoch, g.boot_observation, g.controls._revision
         assert intent.mode == "app" and boot is not None and c.released_epoch != epoch
         assert g.controls.ready and g.controls.desired() == b.device.effective_limit() == 0
-        assert j.get(KEY)["id"] == identifier and idle_cutoff_pending(j.get(KEY))
-        assert not j.get(KEY).get("idle_cutoff_hold") and not j.get("managed_control_fault")
         wire = len(b.rig.bench.device_calls)
         original_sender, original_hook = g.charger.sender, b.rig.bench.before_reply
         assert original_sender is not None
@@ -73,7 +60,6 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
             ):
                 assert not attempt.finished and not attempt.cancelled and not attempt.positive_confirmed
                 assert attempt.intent == intent and not attempt.known_unsent()
-                assert j.get(KEY)["id"] == identifier and j.get(KEY)["result"] == "no_scheduled_session"
                 assert c.requests.intent() == intent and c.requests.pending_return() is None
                 assert j.active() is None and not c.ordinary.active()
                 assert g._charger_epoch == epoch and g.boot_observation == boot

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from .gateway import Gateway
-from .managed_schedule import awaiting_owner_start
+from .managed_sources import awaiting_owner_start
 from .managed_start_debt import preserved_start_debt
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .store import RecoveryRequiredError

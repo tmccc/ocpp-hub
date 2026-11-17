@@ -131,10 +131,6 @@ def require_settled_debt(c: ManagedController) -> None:
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
     ):
         raise RecoveryRequiredError("terminal settlement awaits actual Start and lifecycle reconciliation")
-    from .managed_occurrences import occurrences
-
-    if any(v.get("temporary_attempts") for v in occurrences(j).values()):
-        raise RecoveryRequiredError("terminal settlement awaits genuine temporary Start attempts")
 
 
 # Record an internal restrictive winner in the same transaction as its intent and control claim.

@@ -10,7 +10,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -70,11 +70,17 @@ class Journal:
                 fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RecoveryRequiredError("journal already has an active owner") from None
-            self.db = sqlite3.connect(path, isolation_level=None)
-            cleanup.callback(self.db.close)
             from .control_state import ControlAuthority
+            from .retired_schedules import schedule_history
             from .start_lifecycle import StartLifecycle
 
+            self.retired_plan_ids: frozenset[int] = frozenset()
+            if path.exists():
+                # Inspect under the same exclusive lock before opening a writable connection or normalizing rows.
+                with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as existing:
+                    self.retired_plan_ids = schedule_history(existing)
+            self.db = sqlite3.connect(path, isolation_level=None)
+            cleanup.callback(self.db.close)
             self.control = ControlAuthority(self)
             self.starts = StartLifecycle(self)
             self._initialize(path, identity)

@@ -27,7 +27,6 @@ class Observation:
 
     native: HandoverEvidence
     verified_pause: bool
-    verified_idle_hold: bool
 
 
 @dataclass(frozen=True)
@@ -36,14 +35,13 @@ class ControlFacts:
 
     control: ControlState
     verified_pause: bool
-    verified_idle_hold: bool
     delivery_uncertain: bool
     vendor_uncertain: bool
 
-    # Independent Pause or idle-cutoff proof can establish authority without shared app ownership.
+    # Independent Pause proof can establish authority without shared app ownership.
     @property
     def has_authority(self) -> bool:
-        return self.control.shared or self.verified_pause or self.verified_idle_hold
+        return self.control.shared or self.verified_pause
 
     # Faults and retirement revoke labels without discarding the recorded physical observations.
     def authority_valid(self, faulted: bool, stopping: bool) -> bool:
@@ -89,7 +87,7 @@ def assess(
 ) -> HealthVerdict:
     valid = facts.authority_valid(faulted, stopping)
     shared = facts.control.shared and valid
-    hold = (facts.verified_pause or facts.verified_idle_hold) and valid
+    hold = facts.verified_pause and valid
     local = (
         facts.locally_ready(faulted=faulted, stopping=stopping, active=active, delivery_blocked=delivery_blocked)
         and not cloud_pending

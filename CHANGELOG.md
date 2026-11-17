@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Retire proxy one-off temporary schedules, their deadline task and timer-specific recovery. Keep native daily
+  schedules and managed Start, Pause, Return and current selection. Refuse unfinished old one-off journals before
+  modifying their evidence; retain completed history and reserved plan identifiers.
+
 - Give physical control authority one journal owner, replacing 27 direct writes across 11 modules. Name shared
   authority and restrictive holds explicitly, retaining legacy and strict Boolean evidence rules. Structure live
   polling as owned-work settlement, supervision, assessment and status publication; share the health decision and

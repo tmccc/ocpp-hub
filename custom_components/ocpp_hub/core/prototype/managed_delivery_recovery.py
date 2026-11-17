@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any
 from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
-from .managed_cutoffs import supervised_timer
-from .managed_occurrences import occurrences
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .security import SecurityError
@@ -144,7 +142,6 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
         or j.get("managed_test_charge", {}).get("state") not in (None, "completed")
         and not closed_normal_delivery(j)
-        or any(supervised_timer(lease) or lease.get("state") == "requested" for lease in occurrences(j).values())
     ):
         raise RecoveryRequiredError("delivery reconciliation requires the existing paused, closed, original zero hold")
     audit_history(j, spec.digest, list(n.history), False)

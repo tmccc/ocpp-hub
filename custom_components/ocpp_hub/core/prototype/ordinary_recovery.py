@@ -10,9 +10,7 @@ from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
-from .managed_cutoffs import supervised_timer
-from .managed_occurrences import occurrences
-from .managed_schedule import recorded_station_profile
+from .managed_sources import recorded_station_profile
 from .managed_start_binding import known_plan_source
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
@@ -72,16 +70,13 @@ class OrdinaryRecovery:
         c, j = self.c, self.c.session.journal
         return (
             not c.stopping
-            and not j.get("managed_control_fault")
-            and j.get("trial_phase") in ("active", "recovering")
-            and c.requests.intent().mode == "app"
-            and not any(
-                supervised_timer(lease) or lease.get("state") == "requested" for lease in occurrences(j).values()
-            )
-            and not c.current.pending()
-            and c.charging.lease is None
+            and (not j.get("managed_control_fault"))
+            and (j.get("trial_phase") in ("active", "recovering"))
+            and (c.requests.intent().mode == "app")
+            and (not c.current.pending())
+            and (c.charging.lease is None)
             and (c.charging.state().get("state") in (None, "completed") or self.verified_normal())
-            and j.get("managed_current_change", {}).get("state") not in ("interrupted", "uncertain")
+            and (j.get("managed_current_change", {}).get("state") not in ("interrupted", "uncertain"))
         )
 
     # A newer explicit Pause or control revision immediately invalidates the saved positive recovery authority.

@@ -6,7 +6,6 @@ import json
 from typing import TYPE_CHECKING
 
 from .local_control import local_start_receipt
-from .managed_occurrences import occurrences
 from .store import Journal, fingerprint
 
 if TYPE_CHECKING:
@@ -19,7 +18,7 @@ def known_plan_source(journal: Journal, native: HandoverEvidence) -> bool:
     marker = native.session_plan_id
     return marker is not None and (
         any(plan.get("planId") == marker for plan in (native.saved_schedule or {}).get("planList", []))
-        or any(lease["body"]["planId"] == marker for lease in occurrences(journal).values())
+        or marker in journal.retired_plan_ids
     )
 
 
@@ -66,16 +65,10 @@ class ManagedStartBinding:
         if n.saved_schedule is None:
             return
         plans = n.saved_schedule["planList"]
-        timers = occurrences(j)
-        originals = plans
         digest = n.saved_schedule_digest
-        for lease in timers.values():
-            if digest != self.original and digest == lease.get("augmented_digest"):
-                originals = [plan for plan in plans if plan != lease.get("body")]
-                digest = fingerprint(n.saved_schedule | {"planList": originals})
         if digest == self.original:
             catalogue: dict[str, list[int]] = {}
-            for plan in originals:
+            for plan in plans:
                 tag, identifier = plan.get("idTag"), plan.get("planId")
                 if isinstance(tag, str) and type(identifier) is int:
                     catalogue.setdefault(fingerprint(tag.casefold()), []).append(identifier)

@@ -11,8 +11,8 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_rollback import require_lifecycle_idle
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import ZONE, timer_bench
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_managed_start_overlap import close_in_order, delayed_owner, expire, owner_tag
 from tests.test_prototype_tls import tls as tls
 

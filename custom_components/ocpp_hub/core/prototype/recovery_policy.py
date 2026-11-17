@@ -8,7 +8,6 @@ from typing import Literal
 
 from .recovery_contracts import (
     AuthorityStamp,
-    FailureKind,
     OwnedReleaseResult,
     Pending,
     Prerequisite,
@@ -30,7 +29,6 @@ def preflight_disposition(purpose: Literal["automatic", "explicit"], pending: Pe
     if purpose == "automatic" or pending.reason in (
         Prerequisite.SOURCE,
         Prerequisite.CLOUD_ACK,
-        Prerequisite.TIMER_CLEANUP,
         Prerequisite.OWNER_RETURN,
     ):
         return PreflightDisposition.WAIT
@@ -43,7 +41,6 @@ class ReleaseDisposition(Enum):
     SHARED = "shared"
     WAIT = "wait"
     FAULT = "fault"
-    YIELD = "yield"
     STALE = "stale"
 
 
@@ -55,7 +52,6 @@ def release_disposition(
     *,
     zero_ready: bool,
     faulted: bool,
-    timer_superseded: bool,
     publication_allowed: bool = True,
 ) -> ReleaseDisposition:
     effects = result.effects
@@ -94,17 +90,6 @@ def release_disposition(
             else ReleaseDisposition.STALE
         )
     if (
-        timer_superseded
-        and purpose == "automatic"
-        and not effects.positive_dispatched
-        and not effects.positive_verified
-        and not result.cancelled
-        and not faulted
-        and result.initial_failure_kind is FailureKind.SUPERSEDED
-        and result.failure_kind is FailureKind.SUPERSEDED
-    ):
-        return ReleaseDisposition.YIELD
-    if (
         purpose == "automatic"
         and result.claimed
         and result.pending is not None
@@ -128,7 +113,6 @@ class RecoveryWork(Enum):
 
     CURRENT = "current"
     EXPIRED_START = "expired_start"
-    TIMER_DEADLINE = "timer_deadline"
     RETURN = "return"
     PAUSE = "pause"
     ORDINARY = "ordinary"
@@ -171,8 +155,6 @@ def next_recovery_work(facts: RecoveryFacts, visited: frozenset[RecoveryWork]) -
 def restore_progress(disposition: ReleaseDisposition, result: OwnedReleaseResult) -> RestoreProgress:
     if disposition is ReleaseDisposition.STALE:
         pending = Pending(Prerequisite.SUPERSEDED, "a subsequent owner event retired completed release authority")
-    elif disposition is ReleaseDisposition.YIELD:
-        pending = Pending(Prerequisite.RESTRICTIVE_OPERATION, "release yielded to its exact timer zero operation")
     elif disposition is ReleaseDisposition.WAIT:
         return RestoreProgress(RestoreState.WAITING, result.pending, result)
     elif disposition is ReleaseDisposition.SHARED:

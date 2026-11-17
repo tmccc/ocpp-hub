@@ -13,14 +13,14 @@ from ocpp_hub_core.prototype.trial_session import save_private
 
 from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_debt_reconciliation import strategy_file
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_stop_reply_recovery import pause, running
 from tests.test_managed_test_charge import ChargeRig
 from tests_model.catalog import input_digest
 from tests_model.control_cases import vendor_candidates
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 from tests_model.test_start_recovery_sequences import observe
 from tests_model.test_stop_sequences import stop_suffix
 from tools import reconcile_managed_debt as operator

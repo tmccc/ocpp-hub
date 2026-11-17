@@ -11,6 +11,8 @@ import pytest
 from tests import test_managed_proxy as managed_bench_module
 from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench
+from tests.model_tls_support import model_tls as model_tls
+from tests.model_tls_support import tls_for_case
 from tests.process_helpers import process_rig
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import starts
@@ -18,8 +20,6 @@ from tests.test_prototype import START
 from tests_model.catalog import input_digest
 from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
 from tests_model.test_current_sequences import BoundaryPeer
-from tests_model.test_schedule_sequences import model_tls as model_tls
-from tests_model.test_schedule_sequences import tls_for_case
 
 
 # Intent: automatic recovery after real process death retires its exact abandoned choice before later selections.

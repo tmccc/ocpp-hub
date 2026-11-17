@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from .connection_scope import current_scope
 from .managed_current import current_source_decision
 from .managed_intent import ControlIntent
-from .managed_schedule import KEY, current_source, supervised_timer, temporary_continuation
 from .policy import DeniedError
 from .recovery_contracts import (
     ALLOW,
@@ -68,15 +67,13 @@ class RecoveryCoordinator:
     def obligations(self) -> RecoveryFacts:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         intent = c.requests.intent()
-        change, start, timer = j.get("managed_current_change", {}), c.charging.state(), j.get(KEY, {})
+        change, start = j.get("managed_current_change", {}), c.charging.state()
         pending_return = c.requests.pending_return()
         obligations = []
         if change.get("state") == "recovering":
             obligations.append(RecoveryObligation(RecoveryWork.CURRENT, str(change.get("id"))))
         if c.charging.scoped_normal_stop():
             obligations.append(RecoveryObligation(RecoveryWork.EXPIRED_START, str(start.get("id"))))
-        if supervised_timer(timer):
-            obligations.append(RecoveryObligation(RecoveryWork.TIMER_DEADLINE, str(timer.get("id"))))
         if intent.mode == "paused":
             if pending_return is not None:
                 obligations.append(RecoveryObligation(RecoveryWork.RETURN, pending_return[0]))
@@ -87,9 +84,9 @@ class RecoveryCoordinator:
             obligations.append(RecoveryObligation(RecoveryWork.CONNECTION, str(g._charger_epoch)))
         return RecoveryFacts(tuple(obligations), intent.mode == "paused")
 
-    # Run one bounded recovery pass; rebuild facts after each await and leave urgent deadline zero independent.
+    # Run one bounded recovery pass and rebuild obligations after every await.
     async def advance(self) -> Pending | None:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
+        c, g = self.c, self.c.session.gateway
         visited: frozenset[RecoveryWork] = frozenset()
         while (work := next_recovery_work(self.obligations(), visited)) is not None:
             visited = visited | {work}
@@ -100,9 +97,7 @@ class RecoveryCoordinator:
             elif work is RecoveryWork.EXPIRED_START:
                 if await c.charging.reconcile_expired() and c.requests.intent().mode == "app":
                     return Pending(Prerequisite.LIFECYCLE, "expired Start recovery remains pending")
-            elif work is RecoveryWork.TIMER_DEADLINE:
-                await c.schedule.protect_deadline(j.get(KEY, {}))
-            elif work is RecoveryWork.RETURN:
+            if work is RecoveryWork.RETURN:
                 request = c.requests.pending_return()
                 if request is not None and c.requests.intent().mode == "paused":
                     await c.return_requested(*request)
@@ -121,43 +116,12 @@ class RecoveryCoordinator:
                     return pending
         return None
 
-    # Connection restoration retains timer-specific physical duties before using the same common restore service.
+    # Restore the current connection only after its cloud acknowledgement and the common recovery checks.
     async def connection(self) -> Pending | None:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        timer = j.get(KEY, {})
-        pending_timer = supervised_timer(timer)
-        cutoff_hold = pending_timer and "hold_since" in timer
-        if cutoff_hold:
-            pending = await c.schedule.hold_until_closed()
-            if pending is not None:
-                return pending
-            if c.schedule.awaiting_start() and j.active() is None:
-                native = await c.native.read_result(closed=True)
-                if isinstance(native, Pending):
-                    return native
-                c.require_paused(native, timer_cleanup=True)
-                await c.schedule.observe(native)
-        elif pending_timer and j.active() is not None and c.native.introduced_epoch == g._charger_epoch:
-            native = await c.native.read_result()
-            if isinstance(native, Pending):
-                return native
-            await c.schedule.observe(native)
+        c, g = self.c, self.c.session.gateway
         if not c.session.runtime.status.vendor_connected or g.vendor_registration != "Accepted":
-            if cutoff_hold and j.get("trial_phase") == "active":
-                native = await c.native.read_result(closed=True)
-                if isinstance(native, Pending):
-                    return native
-                c.require_paused(native)
-                decision = await c.schedule.before_release_result(native)
-                if isinstance(decision, Pending):
-                    return decision
             return Pending(Prerequisite.CLOUD, "connection restoration awaits the current cloud acknowledgement")
-        if j.get(KEY, {}).get("idle_cutoff_hold"):
-            if j.get("trial_phase") == "recovering":
-                resumed = await c.native.resume_result()
-                if isinstance(resumed, Pending):
-                    return resumed
-        elif c.released_epoch != g._charger_epoch:
+        if c.released_epoch != g._charger_epoch:
             progress = await self.restore()
             if not progress.shared:
                 return progress.pending
@@ -248,7 +212,6 @@ class RecoveryCoordinator:
         def guard() -> GateDecision:
             if not c.requests.return_current(return_request, expected_intent):
                 return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
-            timer = j.get(KEY, {})
             if c.ordinary.active():
                 decision = c.ordinary.authority_decision(continuing_local)
                 if isinstance(decision, Pending):
@@ -258,24 +221,6 @@ class RecoveryCoordinator:
                 decision = current_source_decision(g, continuing_local)
                 if isinstance(decision, Pending):
                     return decision
-            if (
-                continuing_local is not None
-                and not current_recovery
-                and not c.ordinary.active()
-                and not (c.charging.scoped_normal_stop() and c.charging.current_daily(continuing_local))
-                and (
-                    not current_source(g, timer)
-                    or c.schedule.needs_source(timer)
-                    or j.active() != continuing_local
-                    or timer.get("other_local") != continuing_local
-                    and (
-                        timer.get("unidentified_local") != continuing_local
-                        or not temporary_continuation(j, timer, continuing_local)
-                    )
-                    or timer.get("unreported_native")
-                )
-            ):
-                return Pending(Prerequisite.SOURCE, "source-specific continuation was superseded")
             if c.stopping or c.requests.intent() != expected_intent:
                 return Pending(Prerequisite.SUPERSEDED, "a newer requested hold superseded managed release")
             return ALLOW
@@ -287,7 +232,7 @@ class RecoveryCoordinator:
         native = await c.native.read_result()
         if isinstance(native, Pending):
             return RestoreProgress(RestoreState.WAITING, native)
-        decision = await c.schedule.closure_decision(native)
+        decision = ALLOW
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
         decision = c.native.session_decision(native)
@@ -313,20 +258,6 @@ class RecoveryCoordinator:
         decision = c.zero_decision(native, continuing_local=continuing_local)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
-        if continuing_local is None and j.get("managed_temporary_schedule", {}).get("state") in (
-            "installing",
-            "armed",
-            "clearing",
-        ):
-            decision = await c.schedule.before_release_result(native)
-            if isinstance(decision, Pending):
-                return RestoreProgress(RestoreState.WAITING, decision)
-            native = await c.native.read_result(closed=continuing_local is None)
-            if isinstance(native, Pending):
-                return RestoreProgress(RestoreState.WAITING, native)
-            decision = c.zero_decision(native, continuing_local=continuing_local)
-            if isinstance(decision, Pending):
-                return RestoreProgress(RestoreState.WAITING, decision)
         if (
             c.stopping
             or epoch != g._charger_epoch
@@ -336,7 +267,7 @@ class RecoveryCoordinator:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
-        release_guard = c.schedule.release_decision if continuing_local is None and not c.ordinary.active() else guard
+        release_guard = guard
         decision = release_guard()
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
@@ -374,31 +305,6 @@ class RecoveryCoordinator:
             if isinstance(decision, Pending):
                 return decision
             j.put("managed_owner_epoch", epoch)
-            timer = j.get(KEY, {})
-            if timer.get("state") == "complete" and not timer.get("idle_cutoff_hold") and j.active() is None:
-                # Inventory cleanup can release this verified idle profile while its separate cutoff remains pending.
-                j.put(
-                    KEY,
-                    {
-                        k: v
-                        for k, v in timer.items()
-                        if k not in ("hold_since", "next_cap", "next_stop", "unidentified_local")
-                    },
-                )
-            if continuing_local is not None:
-                c.schedule.clear_idle_cutoff("verified_session")
-            elif expected_intent.mode == "paused" and c.schedule.owner_returning():
-                c.schedule.clear_idle_cutoff("owner_return")
-            timer = j.get(KEY, {})
-            if (
-                timer.get("state") == "requested"
-                and timer.get("idle_cutoff_replacement")
-                and timer["revision"] == expected_intent.revision
-                and timer["epoch"] == epoch
-            ):
-                # This newly authorized one-off was accepted under zero; bind its installation to this verified release.
-                j.put(KEY, {**timer, "ticket": j.get("control", {}).get("ticket"), "idle_cutoff_replacement": False})
-
             if return_request is not None:
                 c.requests.returned(return_request, expected_intent, c.current.returned_to_previous)
             published = self.authority()
@@ -424,7 +330,6 @@ class RecoveryCoordinator:
             self.authority(),
             zero_ready=g.controls.ready and g.controls.desired() == 0,
             faulted=bool(j.get("managed_control_fault")),
-            timer_superseded=c.schedule.release_superseded(attempt),
             publication_allowed=not isinstance(decision, Pending),
         )
         if disposition is ReleaseDisposition.WAIT and result.claimed:

@@ -15,31 +15,29 @@ from tests.test_prototype_tls import tls as tls
 # Intent: a complete observation has one explicit verdict for app control, intentional holds and lost authority.
 # Why: health labels must never be used to infer a Start, manufacture closure or waive uncertain cloud delivery.
 @pytest.mark.parametrize(
-    ("owner", "pause", "idle", "uncertain", "delivery_uncertain", "vendor_uncertain", "latch"),
+    ("owner", "pause", "uncertain", "delivery_uncertain", "vendor_uncertain", "latch"),
     [
-        ("shared", False, False, False, False, False, False),
-        ("local", True, False, False, False, False, False),
-        ("local", False, True, False, False, False, False),
-        ("local", False, False, False, False, False, True),
-        ("shared", False, False, True, False, False, True),
-        ("shared", False, False, False, True, False, True),
-        ("shared", False, False, False, False, True, True),
-        ("local", True, False, False, True, False, True),
-        ("local", False, True, False, False, True, True),
+        ("shared", False, False, False, False, False),
+        ("local", True, False, False, False, False),
+        ("local", False, False, False, False, True),
+        ("shared", False, True, False, False, True),
+        ("shared", False, False, True, False, True),
+        ("shared", False, False, False, True, True),
+        ("local", True, False, True, False, True),
     ],
 )
 def test_observation_authority_and_delivery_are_independent(
-    owner, pause, idle, uncertain, delivery_uncertain, vendor_uncertain, latch
+    owner, pause, uncertain, delivery_uncertain, vendor_uncertain, latch
 ):
     state = ControlState({"owner": owner, "inhibit": owner == "local", "uncertain": uncertain})
-    facts = ControlFacts(state, pause, idle, delivery_uncertain, vendor_uncertain)
+    facts = ControlFacts(state, pause, delivery_uncertain, vendor_uncertain)
     assert facts.requires_fault is latch
     result = assess(
         facts, faulted=latch, stopping=False, active=True, delivery_blocked=False, cloud_pending=False, cloud_ready=True
     )
     assert result.healthy is (not latch)
     assert result.shared is (owner == "shared" and not latch)
-    assert result.hold_verified is ((pause or idle) and not latch)
+    assert result.hold_verified is (pause and not latch)
     assert result.state == ("degraded" if latch else "healthy")
 
 
@@ -50,7 +48,6 @@ def test_health_product_preserves_independent_constraints():
         facts = ControlFacts(
             ControlState({"owner": "shared" if shared else "local", "inhibit": not shared, "uncertain": uncertain}),
             hold,
-            False,
             False,
             False,
         )
@@ -130,7 +127,7 @@ async def test_real_poll_shapes_and_post_fault_read_order(tmp_path, tls, unused_
             session.journal.control.hold(session.journal.control.read().values)
             session.journal.db.execute("INSERT INTO meta VALUES(?,'{')", (corrupt,))
             try:
-                result = c._assess_observation(Observation(native, False, False))
+                result = c._assess_observation(Observation(native, False))
                 assert not isinstance(result, PollStatus)
                 assert result.state == "degraded" and not result.shared and not result.local_healthy
                 assert (

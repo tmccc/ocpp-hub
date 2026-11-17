@@ -92,7 +92,6 @@ def disposition(result, purpose="automatic", **changes):
     inputs = {
         "zero_ready": True,
         "faulted": False,
-        "timer_superseded": False,
         "publication_allowed": True,
     }
     current = changes.pop("current", result.published_authority if result.published else result.authority)
@@ -112,7 +111,6 @@ def disposition(result, purpose="automatic", **changes):
         Prerequisite.CLOUD_ACK,
         Prerequisite.ZERO_PROOF,
         Prerequisite.RECONCILIATION,
-        Prerequisite.TIMER_CLEANUP,
         Prerequisite.OWNER_RETURN,
         Prerequisite.SUPERSEDED,
         Prerequisite.RESTRICTIVE_OPERATION,
@@ -260,39 +258,6 @@ def test_failure_kinds_do_not_create_business_waits(kind):
 
 # Intent: only exact verified timer supersession may yield even when the old rollback lost its own claim.
 # Why: a pending newer zero is not the old attempt's zero proof, and strict/storage failures still dominate it.
-@pytest.mark.parametrize(
-    "initial,final,proof,expected",
-    [
-        (FailureKind.SUPERSEDED, FailureKind.SUPERSEDED, True, ReleaseDisposition.YIELD),
-        (FailureKind.SUPERSEDED, FailureKind.SUPERSEDED, False, ReleaseDisposition.FAULT),
-        (FailureKind.STRICT, FailureKind.SUPERSEDED, True, ReleaseDisposition.FAULT),
-        (FailureKind.SUPERSEDED, FailureKind.STRICT, True, ReleaseDisposition.FAULT),
-        (FailureKind.STORAGE, FailureKind.SUPERSEDED, True, ReleaseDisposition.FAULT),
-        (FailureKind.SUPERSEDED, FailureKind.STORAGE, True, ReleaseDisposition.FAULT),
-        (FailureKind.TRANSPORT, FailureKind.SUPERSEDED, True, ReleaseDisposition.FAULT),
-        (FailureKind.SUPERSEDED, FailureKind.CONTROL, True, ReleaseDisposition.FAULT),
-        (FailureKind.UNKNOWN, FailureKind.SUPERSEDED, True, ReleaseDisposition.FAULT),
-    ],
-)
-def test_timer_yield_requires_both_typed_supersession_verdicts(initial, final, proof, expected):
-    # The boolean stands for the separately verified provider; this unit test cannot prove that provider's identity.
-    result = owned(
-        effects=effects(zero_dispatched=False, zero_verified=False),
-        pending=Pending(Prerequisite.RESTRICTIVE_OPERATION, "actual newer timer claim"),
-        failure=RuntimeError("identical technical diagnostic for every row"),
-        initial_failure_kind=initial,
-        failure_kind=final,
-        cleanup_failed=True,
-    )
-    current = authority(ticket="actual-new-timer-claim")
-    assert disposition(result, current=current, zero_ready=False, timer_superseded=proof) is expected
-    if expected is ReleaseDisposition.YIELD:
-        assert not result.effects.zero_verified
-        assert disposition(result, "explicit", current=current, timer_superseded=True) is ReleaseDisposition.FAULT
-        assert disposition(replace(result, cancelled=True), timer_superseded=True) is ReleaseDisposition.FAULT
-        assert disposition(result, faulted=True, timer_superseded=True) is ReleaseDisposition.FAULT
-        positive = replace(result, effects=replace(result.effects, positive_dispatched=True))
-        assert disposition(positive, timer_superseded=True) is ReleaseDisposition.FAULT
 
 
 # Intent: published effect snapshots cannot be changed, and a new operation does not inherit an old failure.
@@ -333,7 +298,6 @@ def test_restore_progress_has_an_explicit_publication_fact(state, expected):
             [
                 RecoveryWork.CURRENT,
                 RecoveryWork.EXPIRED_START,
-                RecoveryWork.TIMER_DEADLINE,
                 RecoveryWork.RETURN,
                 RecoveryWork.ORDINARY,
             ],
@@ -343,7 +307,6 @@ def test_restore_progress_has_an_explicit_publication_fact(state, expected):
             [
                 RecoveryWork.CURRENT,
                 RecoveryWork.EXPIRED_START,
-                RecoveryWork.TIMER_DEADLINE,
                 RecoveryWork.RETURN,
                 RecoveryWork.PAUSE,
             ],
@@ -353,13 +316,11 @@ def test_restore_progress_has_an_explicit_publication_fact(state, expected):
 def test_simultaneous_work_precedence_is_explicit_and_non_destructive(paused, expected):
     obligations = (
         RecoveryObligation(RecoveryWork.CONNECTION, "connection-B"),
-        RecoveryObligation(RecoveryWork.TIMER_DEADLINE, "timer-older"),
         RecoveryObligation(RecoveryWork.PAUSE, "pause-C"),
         RecoveryObligation(RecoveryWork.CURRENT, "current-A"),
         RecoveryObligation(RecoveryWork.RETURN, "return-D"),
         RecoveryObligation(RecoveryWork.ORDINARY, "daily-E"),
         RecoveryObligation(RecoveryWork.EXPIRED_START, "start-F"),
-        RecoveryObligation(RecoveryWork.TIMER_DEADLINE, "timer-newer"),
     )
     facts = RecoveryFacts(obligations=obligations, paused=paused)
     visited = frozenset()
@@ -367,7 +328,7 @@ def test_simultaneous_work_precedence_is_explicit_and_non_destructive(paused, ex
         assert next_recovery_work(facts, visited) is work
         visited = visited | {work}
     assert next_recovery_work(facts, visited) is None
-    assert facts.obligations == obligations and len(facts.obligations) == 8
+    assert facts.obligations == obligations and len(facts.obligations) == 6
 
 
 # Intent: a completed awaited duty requires a new projection before choosing new Pause or connection work.
@@ -613,7 +574,6 @@ def test_legacy_frame_adapter_unwraps_only_the_typed_pending_edge():
         ("explicit", Prerequisite.NATIVE, PreflightDisposition.REQUEST_UNCONFIRMED),
         ("explicit", Prerequisite.SOURCE, PreflightDisposition.WAIT),
         ("explicit", Prerequisite.CLOUD_ACK, PreflightDisposition.WAIT),
-        ("explicit", Prerequisite.TIMER_CLEANUP, PreflightDisposition.WAIT),
         ("explicit", Prerequisite.OWNER_RETURN, PreflightDisposition.WAIT),
         ("explicit", Prerequisite.CLOUD, PreflightDisposition.REQUEST_UNCONFIRMED),
         ("explicit", Prerequisite.ZERO_PROOF, PreflightDisposition.REQUEST_UNCONFIRMED),
@@ -638,12 +598,6 @@ def test_preflight_native_failure_does_not_grant_explicit_return_replay(purpose,
             RestoreState.YIELDED,
             Prerequisite.SUPERSEDED,
             "a subsequent owner event retired completed release authority",
-        ),
-        (
-            ReleaseDisposition.YIELD,
-            RestoreState.YIELDED,
-            Prerequisite.RESTRICTIVE_OPERATION,
-            "release yielded to its exact timer zero operation",
         ),
         (ReleaseDisposition.WAIT, RestoreState.WAITING, Prerequisite.NATIVE, "unit prerequisite"),
         (ReleaseDisposition.SHARED, RestoreState.SHARED, None, None),

@@ -3,39 +3,18 @@
 from __future__ import annotations
 
 import uuid
-from contextlib import nullcontext
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from typing import Any
 
-import pytest
-from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.native_start_attempts import matching_unassigned_start, start_millisecond_range
 
-from tests.handover_helpers import crash
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_schedule_cutoff import ZONE, TimerBench, timer_bench
+from tests.native_schedule_support import ZONE, TimerBench, timer_bench
+from tests.test_managed_proxy import healthy, introduced, starts
 from tests.test_native_history_archive import unassigned
 from tests.test_prototype import START
+from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
-
-
-# Keep the original plan and the unremovable expired one-off side by side under the verified zero profile.
-async def retain_timer(b: TimerBench) -> Any:
-    await b.arm()
-    answer = b.device.answer
-
-    # Keep physical readbacks truthful and refuse only the outstanding one-off removal.
-    def refuse_clear(action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if action == "DataTransfer" and payload.get("messageId") == "clearPlans":
-            return {"status": "Rejected", "data": ""}
-        return answer(action, payload)
-
-    b.device.answer = refuse_clear
-    b.clock.now = b.start + 601
-    for _ in range(4):
-        await b.c.tick()
-    assert b.device.effective_limit() == 0 and b.timer in b.device.plans
-    return answer
 
 
 # Populate a new native start-only record while SESSION still exposes no assigned OCPP transaction number.
@@ -54,92 +33,21 @@ def unnumbered(b: TimerBench, instant: int, name: str) -> tuple[dict[str, Any], 
     return body, attempt
 
 
-# Intent: an original daily Start can obtain its first OCPP number while a failed temporary cleanup holds zero.
-# Why: the matching lifecycle must progress across a process restart and a full battery or persistent vehicle demand.
-@pytest.mark.parametrize("restart", [False, True])
-@pytest.mark.parametrize("demand", [False, True])
-async def test_unnumbered_daily_while_temporary_clear_fails(
-    tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand
-):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        answer = await retain_timer(b)
-        if restart:
-            await crash(b.session)
-            b.session = managed_session(b.rig)
-            await b.session.start()
-            b.c = ManagedController(b.session)
-        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
-            if restart:
-                await introduced(b.rig, b.session, b.sock, "restart-unnumbered")
-            midnight = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
-            identifiers: set[int] = set()
-            for index, instant in enumerate((midnight, midnight + 600, midnight + 86400)):
-                body, _ = unnumbered(b, instant, f"daily-{index}.json")
-                b.rig.peer.permission_enabled = demand
-                if not demand:
-                    b.device.requested_current = 0
-                for _ in range(3):
-                    await b.c.tick()
-                native = await b.c.native.read()
-                assert native.physical.native_transaction_id is None and native.session_plan_id == 9
-                assert b.device.effective_limit() == 0
-                if index == 1:
-                    body["timestamp"] = body["timestamp"].replace("+00:00", ".731000Z")
-                    b.clock.now += 1
-                reply = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
-                assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
-                local = reply[2]["transactionId"]
-                assert local not in identifiers
-                identifiers.add(local)
-                assert b.session.journal.active() == local and b.device.effective_limit() == 0
-                # An allocated ledger number alone still cannot identify the physical source.
-                b.device.active = None
-                for _ in range(2):
-                    await b.c.tick()
-                assert b.device.effective_limit() == 0 and not b.stops()
-                b.device.active = local
-                b.rig.peer.plan_session = (local, 9)
-                b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-                for _ in range(4):
-                    await b.c.tick()
-                assert b.session.journal.active() == local and b.device.effective_limit() == 6
-                assert b.device.current == (6 if demand else 0) and not b.stops()
-                b.clock.now += 60
-                await b.close_transaction(local)
-                for _ in range(4):
-                    await b.c.tick()
-                assert b.session.journal.active() is None and b.device.effective_limit() == 0
-                b.rig.peer.plan_session = (None, 9)
-                for precision in ("", ".7", ".73", ".731", ".731900"):
-                    replay = body | {
-                        "timestamp": datetime.fromtimestamp(instant, UTC).strftime("%Y-%m-%dT%H:%M:%S")
-                        + precision
-                        + "Z"
-                    }
-                    if replay == body:
-                        continue
-                    repeated = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", replay)
-                    assert repeated[0] == 4 or repeated[2]["transactionId"] == local
-                    assert b.session.journal.active() is None and not b.stops()
-            b.device.answer = answer
-            b.clock.now += 301
-            await healthy(b.c)
-            assert set(b.device.plans) == {9} and b.device.effective_limit() == 6
-            b.clock.now = int(datetime(2026, 11, 14, tzinfo=ZONE).timestamp())
-            following = await b.fire(9, demand=demand)
-            assert following not in identifiers and (await healthy(b.c))["station_ceiling_a"] == 6
-            assert b.device.current == (6 if demand else 0) and not b.stops() and not starts(b.rig)
-
-
 # Intent: only the commissioned original plan and its own unique, matching zero-draw attempt may report without an ID.
 # Why: an unassigned history filename can outlive its vehicle and the two plans can share an identification tag.
 async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        answer = await retain_timer(b)
+    async with (
+        timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b,
+        AsyncExitStack() as connections,
+    ):
+        await b.sock.close()
+        await until(lambda: not b.session.runtime.status.charger_connected)
+        b.sock = await connections.enter_async_context(b.rig.charger(b.session))
+        await introduced(b.rig, b.session, b.sock, "unnumbered-daily-reconnect")
+        assert b.device.effective_limit() == 0 and b.c.ordinary.active()
         midnight = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
         body, attempt = unnumbered(b, midnight, "current.json")
         for source, payload in (
-            (b.timer, body),
             (987655, body),
             (9, body | {"meterStart": body["meterStart"] + 1}),
             (9, body | {"timestamp": datetime.fromtimestamp(midnight + 1, UTC).isoformat()}),
@@ -149,7 +57,6 @@ async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, t
             b.rig.peer.plan_session = (None, source)
             refused = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", payload)
             assert refused[0] == 4 and b.session.journal.active() is None and b.device.effective_limit() == 0
-        # Two plausible files also leave provenance unresolved.
         b.rig.bench.history.append(attempt | {"filename": "same-second.json", "startMs": 175})
         refused = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
         assert refused[0] == 4 and b.session.journal.active() is None and not b.stops()
@@ -162,7 +69,6 @@ async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, t
         for _ in range(4):
             await b.c.tick()
         assert b.session.journal.active() == local and b.device.effective_limit() == 6 and not b.stops()
-        b.device.answer = answer
         await b.close_transaction(local)
         b.clock.now += 301
         await healthy(b.c)
@@ -196,204 +102,3 @@ def test_match_unnumbered_history_start_precision():
         assert matching_unassigned_start((reserved,), report | {"reservationId": 42}, instant) == (
             actual if alone else None
         )
-
-
-# Intent: a distinct pending owner command can coexist with an unnumbered daily Start after the one-off is removed.
-# Why: neither the original schedule nor its independently matched lifecycle may spend the earlier command's grant.
-@pytest.mark.parametrize("demand", [False, True])
-async def test_unnumbered_daily_with_earlier_grant_after_restart(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
-        await b.acknowledge_older_owner_start()
-        daily_plan = b.device.plans[9].copy()
-        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-        for _ in range(5):
-            await b.c.tick()
-        grant = b.session.journal.get("vendor_start_grant") | {"expires": 0}
-        b.session.journal.put("vendor_start_grant", grant)
-        assert b.device.effective_limit() == 0 and b.device.plans == {9: daily_plan}
-        await crash(b.session)
-        b.session = managed_session(b.rig)
-        await b.session.start()
-        b.c = ManagedController(b.session)
-        async with b.rig.charger(b.session) as b.sock:
-            await introduced(b.rig, b.session, b.sock, "earlier-grant-unnumbered")
-            midnight = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
-            body, _ = unnumbered(b, midnight, "daily-and-owner.json")
-            b.rig.peer.permission_enabled = demand
-            if not demand:
-                b.device.requested_current = 0
-            for _ in range(4):
-                await b.c.tick()
-            assert b.device.effective_limit() == 0 and b.session.journal.active() is None
-            response = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
-            assert response[0] == 3 and response[2]["idTagInfo"]["status"] == "Accepted"
-            local = response[2]["transactionId"]
-            assert b.session.journal.active() == local and b.device.effective_limit() == 0
-            assert b.session.journal.get("vendor_start_grant") == grant
-            b.rig.peer.plan_session = (local, 9)
-            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-            for _ in range(4):
-                await b.c.tick()
-            assert b.device.effective_limit() == 6 and b.device.current == (6 if demand else 0)
-            assert b.session.journal.get("vendor_start_grant") == grant and not b.stops()
-            b.clock.now += 60
-            await b.close_transaction(local)
-            for _ in range(4):
-                await b.c.tick()
-            assert b.session.journal.active() is None and b.device.effective_limit() == 0
-            assert b.device.plans == {9: daily_plan} and b.session.journal.get("vendor_start_grant") == grant
-            assert not b.stops()
-
-
-# Intent: the actual late temporary Start remains subject to its cutoff even if native timer removal finishes first.
-# Why: the station's zero-draw unassigned record can precede its real OCPP transaction by an entire process lifetime.
-@pytest.mark.parametrize("restart", [False, True])
-@pytest.mark.parametrize("demand", [False, True])
-async def test_late_temporary_report_after_plan_removal(tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
-        body, _ = unnumbered(b, b.start, "temporary-awaiting-number.json")
-        b.rig.peer.plan_session = (None, b.timer)
-        b.device.requested_current = 0
-        await b.c.native.read()
-        b.clock.now = b.start + 601
-        for _ in range(4):
-            await b.c.tick()
-        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-        for _ in range(5):
-            await b.c.tick()
-        assert set(b.device.plans) == {9} and b.device.effective_limit() == 0 and not b.stops()
-        if restart:
-            await crash(b.session)
-            b.session = managed_session(b.rig)
-            await b.session.start()
-            b.c = ManagedController(b.session)
-        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
-            if restart:
-                await introduced(b.rig, b.session, b.sock, "late-temp-boot")
-            result = await b.rig.bench.call(b.sock, "delayed-temp", "StartTransaction", body)
-            assert result[0] == 3
-            local = result[2]["transactionId"]
-            assert b.device.effective_limit() == 0 and not b.stops()
-            b.rig.peer.plan_session = (local, b.timer)
-            b.rig.peer.permission_enabled = demand
-            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-            b.device.requested_current = 32 if demand else 0
-            for _ in range(4):
-                await b.c.tick()
-            assert b.device.effective_limit() == b.device.current == 0 and b.stops() == [local]
-            await b.close_transaction(local)
-            assert (await healthy(b.c))["station_ceiling_a"] == 6
-            daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
-            assert daily != local and (await healthy(b.c))["power_w"] > 0 and b.stops() == [local]
-
-
-# Intent: a temporary attempt that never reports must leave later, identified daily sessions available.
-# Why: firmware may keep the old start-only file through several independently numbered midnight sessions.
-@pytest.mark.parametrize("demand", [False, True])
-async def test_unreported_temporary_allows_later_daily_windows(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
-        old, _ = unnumbered(b, b.start, "unreported-temporary.json")
-        b.rig.peer.plan_session = (None, b.timer)
-        b.device.requested_current = 0
-        await b.c.native.read()
-        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-        for _ in range(4):
-            await b.c.tick()
-        assert set(b.device.plans) == {9} and b.device.effective_limit() == 0
-        for day in (12, 13):
-            midnight = int(datetime(2026, 11, day, tzinfo=ZONE).timestamp())
-            body, _ = unnumbered(b, midnight, f"later-daily-{day}.json")
-            reply = await b.rig.bench.call(b.sock, f"later-daily-{day}", "StartTransaction", body)
-            assert reply[0] == 3 and b.device.effective_limit() == 0
-            local = reply[2]["transactionId"]
-            b.rig.peer.plan_session = (local, 9)
-            b.rig.peer.permission_enabled = demand
-            b.device.requested_current = 32 if demand else 0
-            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-            for _ in range(4):
-                await b.c.tick()
-            assert b.device.current == (6 if demand else 0) and b.device.effective_limit() == 6
-            b.clock.now += 60
-            await b.close_transaction(local)
-            for _ in range(4):
-                await b.c.tick()
-            assert b.device.effective_limit() == 0 and not b.stops()
-        b.rig.peer.plan_session = (None, b.timer)
-        reply = await b.rig.bench.call(b.sock, "old-temporary-report", "StartTransaction", old)
-        assert reply[0] == 3 and b.device.effective_limit() == 0 and not b.stops()
-        delayed = reply[2]["transactionId"]
-        b.rig.peer.plan_session = (delayed, b.timer)
-        for _ in range(4):
-            await b.c.tick()
-        assert b.device.effective_limit() == 0 and b.stops() == [delayed]
-        await b.close_transaction(delayed)
-        assert (await healthy(b.c))["station_ceiling_a"] == 6 and set(b.device.plans) == {9}
-
-
-# Intent: retain a real pending temporary occurrence on both sides of the ten-minute idle cleanup boundary.
-# Why: the charger can deliver its original Start before 06:00 after its first zero-draw history file appeared.
-@pytest.mark.parametrize("lag", [599, 600, 601])
-@pytest.mark.parametrize("demand", [False, True])
-async def test_unassigned_report_around_idle_cleanup(tmp_path, tls, unused_tcp_port, monkeypatch, lag, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=32)
-        await b.c.current.settle()
-        assert (await healthy(b.c))["station_ceiling_a"] == 32
-        await b.arm()
-        body, _ = unnumbered(b, b.start, "pending-native-start.json")
-        b.rig.peer.plan_session = (None, b.timer)
-        b.device.requested_current = 0
-        await b.c.native.read()
-        b.clock.now = b.start + lag
-        await b.c.tick()
-        response = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
-        assert response[0] == 3 and response[2]["idTagInfo"]["status"] == "Accepted"
-        local = response[2]["transactionId"]
-        b.rig.peer.plan_session = (local, b.timer)
-        b.rig.peer.permission_enabled = demand
-        b.device.requested_current = 32 if demand else 0
-        b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-        assert (await healthy(b.c))["current_a"] == (32 if demand else 0)
-        assert b.device.effective_limit() == 32 and not b.stops()
-        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-        await b.c.tick()
-        assert b.device.effective_limit() == b.device.current == 0 and b.stops() == [local]
-        await b.close_transaction(local)
-        assert (await healthy(b.c))["station_ceiling_a"] == 32 and set(b.device.plans) == {9}
-
-
-# Intent: cap and stop an expired temporary session first disclosed after verified idle cleanup.
-# Why: the firmware may publish both independent reports only after the supervisor has removed the one-off.
-@pytest.mark.parametrize("demand", [False, True])
-async def test_first_temporary_evidence_after_idle_cleanup(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
-        await b.arm()
-        body, row = unnumbered(b, b.start, "old.json")
-        # Firmware has not published this occurrence through either interface while cleanup takes place.
-        b.rig.bench.history.remove(row)
-        b.device.requested_current = 0
-        b.rig.peer.plan_session = None
-        b.clock.now = b.start + 601
-        for _ in range(5):
-            await b.c.tick()
-        assert set(b.device.plans) == {9}
-        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp()) + 1
-        b.rig.bench.history.append(row)
-        b.rig.peer.plan_session = (None, b.timer)
-        reply = await b.rig.bench.call(b.sock, "late-first-witness", "StartTransaction", body)
-        assert reply[0] == 3
-        local = reply[2]["transactionId"]
-        b.rig.peer.plan_session = (local, b.timer)
-        b.rig.peer.permission_enabled = demand
-        b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-        b.device.requested_current = 32 if demand else 0
-        for _ in range(4):
-            await b.c.tick()
-        assert b.device.effective_limit() == 0 and b.stops() == [local]
-        await b.close_transaction(local)
-        assert (await healthy(b.c))["station_ceiling_a"] == 6
-        daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
-        assert daily not in (None, local) and (await healthy(b.c))["current_a"] == 6 and b.stops() == [local]

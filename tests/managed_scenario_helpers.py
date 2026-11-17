@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import uuid
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import ZONE
 from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_schedule_cutoff import ZONE
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 
@@ -28,21 +27,10 @@ async def select_current(b, current):
 
 
 # Run the independently owned deadline task while a trace also drives ordinary service ticks.
-@asynccontextmanager
-async def deadline_task(b):
-    task = asyncio.create_task(b.c.schedule.watch_deadline())
-    try:
-        yield
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        if not task.cancelled():
-            task.result()
 
 
 # Yield after clock changes so both the foreground and independent supervisor can act.
 async def settle(b, count=4):
-    b.c.schedule.changed.set()
     for _ in range(count):
         await b.c.tick()
         await asyncio.sleep(0)

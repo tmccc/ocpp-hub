@@ -10,10 +10,10 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import timer_bench
 from tests.test_managed_current import adjustable, select
 from tests.test_managed_current_overlap import interrupted_increase
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_prototype_tls import tls as tls
 
 

@@ -12,6 +12,8 @@ from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.handover_helpers import crash
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.recovery_barriers import require_zero_held
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_start_refusal_native32 import commissioned
@@ -21,8 +23,6 @@ from tests.test_prototype import BOOT, START
 from tests.test_prototype_runtime import until
 from tests_model.catalog import input_digest
 from tests_model.review_cases import cloud_start_candidates
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # Intent: explicit cloud refusal or denied authorization recovers through every closure/Pause/replacement order.

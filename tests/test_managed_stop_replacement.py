@@ -10,12 +10,12 @@ from ocpp_hub_core.frames import build_call_error
 from ocpp_hub_core.prototype.gateway import decode
 
 from tests import test_managed_proxy as mp
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_stop_reply_recovery import ReplyBench, pause, reconcile, return_after_ack, running
 from tests.test_managed_test_charge import ChargeRig, positive_flow
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # Intent: a crash before the first fault-publishing tick must not remove the exact retained Stop's recovery route.

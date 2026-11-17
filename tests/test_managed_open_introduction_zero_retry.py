@@ -8,8 +8,8 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.native_schedule_support import timer_bench
 from tests.test_managed_proxy import healthy, managed_session, starts
-from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_managed_start_overlap import expire, owner_tag
 from tests.test_prototype import BOOT
 from tests.test_prototype_runtime import until

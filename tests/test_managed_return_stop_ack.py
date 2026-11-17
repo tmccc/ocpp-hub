@@ -9,8 +9,8 @@ from datetime import UTC, datetime
 import pytest
 from ocpp_hub_core.frames import build_call_error
 
+from tests.native_schedule_support import timer_bench
 from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_schedule_cutoff import timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls

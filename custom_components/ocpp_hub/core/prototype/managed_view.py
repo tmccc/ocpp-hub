@@ -34,8 +34,6 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
     native_age = current - native if native is not None else math.inf
     remaining = finite_number(value.get("certificate_remaining_seconds"))
     paused = value.get("desired_control") == "paused"
-    timer = value.get("temporary_schedule")
-    idle_hold = isinstance(timer, dict) and timer.get("idle_cutoff_hold") is True
     selected = finite_number(value.get("requested_current_a", 6))
     native_ceiling = 32 if value.get("current_capability") is True else 6
     authority = (
@@ -44,7 +42,7 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
         and value.get("current_a") == 0
         and value.get("power_w") == 0
         and value.get("charging_session_open") is False
-        if paused or idle_hold
+        if paused
         else value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == selected
     )
     local_okay = (
@@ -266,6 +264,5 @@ def observed_status(
         else None,
         "charger_sessions": history.sessions,
         "charger_history_complete": history.complete,
-        "temporary_schedule": c.schedule.summary(),
         "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
     }

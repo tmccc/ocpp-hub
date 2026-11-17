@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .managed_cutoffs import supervised_timer
 from .managed_intent import ControlIntent, write_intent
 from .policy import READS
 from .store import Journal
@@ -32,13 +31,8 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
         local_start = journal.get("local_start_receipt", {})
         charge = journal.get("managed_test_charge", {})
         current = journal.get("managed_current_change", {})
-        timer = journal.get("managed_temporary_schedule", {})
-        timers = journal.get("managed_temporary_occurrences", {})
         if (
-            not all(
-                isinstance(value, dict)
-                for value in (control, intent, mode, local_start, charge, current, timer, timers)
-            )
+            not all(isinstance(value, dict) for value in (control, intent, mode, local_start, charge, current))
             or mode.get("mode") != "app_schedule"
             or mode.get("local_start") is not False
             or set(intent) != {"mode", "revision"}
@@ -62,12 +56,6 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
             and charge.get("local_transaction") is None
             or charge.get("state") in ("armed", "starting", "awaiting_power", "charging", "running", "stopping")
             or current.get("state") not in (None, "completed", "cancelled")
-            or timer.get("state") == "requested"
-            or supervised_timer(timer)
-            or any(
-                not isinstance(value, dict) or value.get("state") == "requested" or supervised_timer(value)
-                for value in timers.values()
-            )
             or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
             or journal.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
             or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()

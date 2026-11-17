@@ -98,7 +98,6 @@ def step(state: SliceState, event: SliceEvent) -> SliceTransition:
             state.authority,
             zero_ready=event.zero_ready,
             faulted=event.faulted,
-            timer_superseded=event.timer_superseded,
             publication_allowed=event.publication_allowed and not state.closing,
         )
         returned = ReturnRecord(event.request_id, event.result, disposition)

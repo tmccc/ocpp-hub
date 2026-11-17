@@ -145,13 +145,6 @@ RISKS = (
         "Eleven raw shapes, selected numeric fields; arbitrary input combinations remain outside scope.",
     ),
     Risk(
-        "TIMER-ORDER",
-        "Cutoff/cancel keeps zero and preserves original daily plans.",
-        "Cleanup and a later genuine daily occurrence recover without replayed Start.",
-        ("tests/test_managed_schedule_model_recovery.py",),
-        "Finite two-receipt grammar; not arbitrary repeated timers.",
-    ),
-    Risk(
         "SOURCE-OWNERSHIP",
         "A matching tag alone cannot bind a local request or grant Stop authority.",
         "Actual immutable lifecycle and fresh native source evidence establish the exact owner.",

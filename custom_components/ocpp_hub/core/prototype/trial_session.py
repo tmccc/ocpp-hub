@@ -17,15 +17,13 @@ from .gateway import Gateway
 from .local_control import join_retirement, recover_unreported_local_start
 from .managed_current import managed_current_ceiling
 from .managed_faults import ManagedRefusal, latch_managed_fault
-from .managed_schedule import recorded_timer_hold
 from .native_bounded import NativeBoundedSpec
 from .native_bounded_handover import NativeBoundedHandover
 from .native_faults import diagnostic_type
-from .native_http import NativeTransportUnavailableError
 from .policy import Policy
 from .rpc import IntroductionDeferredError, UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
-from .security import SecurityError, StaleEvidenceError
+from .security import SecurityError
 from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
@@ -215,12 +213,6 @@ class TrialSession:
 
     # Never classify native profile bytes while their actual outgoing Set/Clear response is still unresolved.
     def _resource_mutation_inflight(self) -> bool:
-        if (
-            self.gateway.charger._pending
-            and self.gateway.charger.diagnostics.action == "DataTransfer"
-            and self.journal.get("managed_temporary_schedule", {}).get("state") in ("installing", "clearing")
-        ):
-            return True
         return bool(self.gateway.charger._pending) and self.gateway.charger.diagnostics.action in (
             "SetChargingProfile",
             "ClearChargingProfile",
@@ -284,19 +276,12 @@ class TrialSession:
         if phase == "prepared":
             await self.native_bounded.admit()
         elif phase in ("active", "recovering", "blocked"):
-            try:
-                native = await self.native_bounded.read()
-            except NativeTransportUnavailableError, StaleEvidenceError, UnavailableError, TimeoutError:
-                spec = self.native_bounded.spec
-                if not recorded_timer_hold(self.journal, spec.digest, spec.boot_digest):
-                    raise
-                # The listener starts inhibited. Fresh Boot and independent telemetry still gate a positive release.
+            native = await self.native_bounded.read()
+            if self.journal.get("trial_binding") is None:
+                self.native_bounded.require_known_session(native)
             else:
-                if self.journal.get("trial_binding") is None:
-                    self.native_bounded.require_known_session(native)
-                else:
-                    self.native_bounded.require_recovery_session(native)
-                self.book.owned_present(native.physical)
+                self.native_bounded.require_recovery_session(native)
+            self.book.owned_present(native.physical)
             control = self.journal.get("control", {})
             self.journal.control.hold(control)
             if self.journal.get("trial_binding") is None:

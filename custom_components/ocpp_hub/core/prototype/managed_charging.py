@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from .connection_scope import CloudAttemptScope, current_scope
 from .control_state import ControlState
+from .gateway import NativeStartReport
 from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_intent import ControlIntent, write_intent
-from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
+from .managed_sources import confirmed_vendor_start, recorded_station_profile
 from .managed_start_binding import known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
@@ -95,10 +96,9 @@ class ManagedCharging:
         controller.session.gateway.start_observer = self.started
         controller.native.observation_listener = self.record_source
         controller.native.positive_guard = self.positive_decision
-        self.prepare_report_hold = controller.session.gateway.prepare_report_hold
-        self.held_start_report = controller.session.gateway.held_start_report
         controller.session.gateway.prepare_report_hold = self.prepare_owner_report
         controller.session.gateway.held_start_report = self.can_record_owner
+        controller.session.gateway.native_start_report = self.prepare_native_report
 
     # Keep one journal owner and the same durable management receipt table as Pause/Return.
     @property
@@ -200,7 +200,6 @@ class ManagedCharging:
         return bool(
             not c.stopping
             and (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused")
-            and not (c.requests.intent().mode == "paused" and j.get(KEY, {}).get("state") in OBSERVABLE)
             and not j.get("managed_control_fault")
             and j.get("trial_phase") == "active"
             and g.controls.ready
@@ -208,7 +207,6 @@ class ManagedCharging:
             and (normal or c.current.selected() == 6)
             and not c.current.pending()
             and not g.policy.allow_local_start
-            and (g.remote_start_guard is None or g.remote_start_guard())
             and (not local or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags))
             and not j.get("control", {}).get("uncertain")
             and not j.get("control", {}).get("start_pending")
@@ -509,14 +507,12 @@ class ManagedCharging:
         if row is None:
             return False
         tag = json.loads(row["start"])["idTag"].casefold()
-        timer = j.get(KEY, {})
         return bool(
             any(
                 plan["planId"] == native.session_plan_id
                 and isinstance(plan.get("idTag"), str)
                 and plan["idTag"].casefold() == tag
                 and plan.get("kindType") == "Recurring"
-                and plan["planId"] != timer.get("body", {}).get("planId")
                 for plan in native.saved_schedule["planList"]
             )
         )
@@ -621,35 +617,73 @@ class ManagedCharging:
         # Confirm only the station zero. The separate Start receipt and real lifecycle remain outstanding.
         g.controls._complete(ticket, uncertain=False)
 
-    # Admit the genuine delayed owner report only after zero, even while unrelated daily authority remains enabled.
-    async def prepare_owner_report(self, payload: dict[str, Any]) -> None:
-        tag = payload.get("idTag")
-        if (
-            self.scoped_normal_stop()
-            and self.controller.requests.intent().mode == "app"
-            and isinstance(tag, str)
-            and self.controller.schedule.matches_pending_start(tag)
-            and self.journal.active() is None
-        ):
-            await self.hold_expired()
-        if self.prepare_report_hold is not None:
-            await self.prepare_report_hold(payload)
+    # Each ordinary recovery owner validates its own delayed original-plan report under its existing zero.
+    async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
+        c = self.controller
+        if self.journal.get("managed_current_change", {}).get("state") == "recovering":
+            return await c.current.prepare_native_report(payload)
+        if c.ordinary.active():
+            return await c.ordinary.prepare_native_report(payload)
+        return None
 
-    # The held listener consumes only the pending owner receipt and cannot authorize a new Start or guess an ID.
+    # Match an already issued owner command without replaying its Start or guessing a lifecycle number.
+    def matches_pending_start(self, tag: str) -> bool:
+        j = self.journal
+        digest = fingerprint(tag.casefold())
+        prior = local_start_receipt(j)
+        return bool(
+            j.get("control", {}).get("start_pending")
+            and prior.get("local") is None
+            and prior.get("stage") in ("issued", "accepted")
+            and prior.get("digest") == digest
+            or confirmed_vendor_start(j, digest, None)
+        )
+
+    # A held owner report must use this authenticated current introduction.
+    def report_hold_authorized(self) -> bool:
+        c, j = self.controller, self.journal
+        g = c.session.gateway
+        return bool(
+            not c.stopping
+            and g.current_boot_seen(g._charger_epoch)
+            and fingerprint(j.get("boot")) == c.native.spec.boot_digest
+            and c.native.introduced_epoch == g._charger_epoch
+            and c.native.introduced_revision == g.controls._revision
+        )
+
+    # Join the real owner Pause zero before admitting the delayed report of its already issued Start.
+    async def prepare_owner_report(self, payload: dict[str, Any], *, _reclassified: bool = False) -> None:
+        c, j = self.controller, self.journal
+        g, tag = c.session.gateway, payload.get("idTag")
+        if j.active() is not None or not isinstance(tag, str) or not self.matches_pending_start(tag):
+            return
+        if self.scoped_normal_stop() and c.requests.intent().mode == "app":
+            await self.hold_expired()
+        if c.requests.intent().mode == "paused" and (not g.controls.ready or g.controls.desired() != 0):
+            operations = set(g.controls._operations)
+            if c.pause_task is not None and not c.pause_task.done():
+                operations.add(c.pause_task)
+            if operations:
+                await asyncio.wait(operations, timeout=min(1.0, g.charger.timeout))
+            if c.requests.intent().mode == "app":
+                if _reclassified:
+                    raise UnavailableError("Start report authority changed again during its control handoff")
+                return await self.prepare_owner_report(payload, _reclassified=True)
+            if not self.can_record_owner(tag):
+                raise UnavailableError("the acknowledged owner report awaits verified Pause zero")
+
+    # The held listener consumes an existing receipt under verified zero and cannot authorize another Start.
     def can_record_owner(self, tag: str) -> bool:
         c, g = self.controller, self.controller.session.gateway
         return bool(
-            self.scoped_normal_stop()
-            and c.requests.intent().mode == "app"
-            and c.schedule.matches_pending_start(tag)
+            (c.requests.intent().mode == "paused" or self.scoped_normal_stop() and c.requests.intent().mode == "app")
+            and self.matches_pending_start(tag)
             and self.journal.active() is None
             and not c.stopping
             and not self.journal.get("managed_control_fault")
             and g.controls.ready
             and g.controls.desired() == 0
-            and c.schedule.hold_authorized()
-            or self.held_start_report is not None
-            and self.held_start_report(tag)
+            and self.report_hold_authorized()
         )
 
     # Reconcile expired authority independently of the short lease and retain the original Start reporting debt.

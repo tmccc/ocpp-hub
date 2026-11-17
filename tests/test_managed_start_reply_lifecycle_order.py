@@ -9,7 +9,7 @@ import uuid
 from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.local_control import LocalControl
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
-from ocpp_hub_core.prototype.managed_schedule import ManagedSchedule
+from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 from websockets.asyncio.client import connect
 
 from tests.native_fault_support import coroutine_locals
@@ -60,8 +60,8 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
             try:
                 if (
                     event == "call"
-                    and frame.f_code is ManagedSchedule.prepare_report_hold.__code__
-                    and frame.f_locals.get("self") is c.schedule
+                    and frame.f_code is ManagedCharging.prepare_owner_report.__code__
+                    and frame.f_locals.get("self") is c.charging
                     and burst
                     and frame.f_locals.get("payload") == burst["payload"]
                     and not entries

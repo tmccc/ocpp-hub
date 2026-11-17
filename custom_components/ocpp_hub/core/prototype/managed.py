@@ -23,13 +23,6 @@ from .managed_intent import ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
 from .managed_release_wait import awaiting_known_stops
-from .managed_schedule import (
-    KEY,
-    ManagedSchedule,
-    continuing_session_decision,
-    recorded_station_profile,
-    supervised_timer,
-)
 from .managed_settlement import (
     charge_test_candidate,
     complete_record,
@@ -37,6 +30,7 @@ from .managed_settlement import (
     internal_pause_matches,
     require_settled_debt,
 )
+from .managed_sources import awaiting_owner_start, recorded_station_profile
 from .managed_start_binding import ManagedStartBinding
 from .managed_view import observed_status, poll_base, poll_status
 from .native_bounded import readiness_decision
@@ -50,7 +44,7 @@ from .native_faults import (
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
@@ -98,8 +92,7 @@ class ManagedController:
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
-        self.schedule = ManagedSchedule(self)
-        self.native.schedule_changed = self.schedule.changed.set
+
         self.current = ManagedCurrentLimits(self)
         self.charging = ManagedCharging(self)
         self.ordinary = OrdinaryRecovery(self)
@@ -340,7 +333,7 @@ class ManagedController:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
-    def require_paused(self, native: HandoverEvidence, *, timer_cleanup: bool = False) -> None:
+    def require_paused(self, native: HandoverEvidence) -> None:
         g, j = self.session.gateway, self.session.journal
         self.native.require(native, closed=True)
         self.native.require_known_session(native)
@@ -352,8 +345,7 @@ class ManagedController:
             or not g.controls.ready
             or g.controls.desired() != 0
             or not ControlState(j.get("control", {})).local_hold
-            or not timer_cleanup
-            and j.get("control", {}).get("start_pending")
+            or j.get("control", {}).get("start_pending")
             or j.get("uncertain_vendor_command")
             or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
             or g.charger._pending
@@ -366,7 +358,6 @@ class ManagedController:
         if self.pause_task is not None and not self.pause_task.done():
             await asyncio.shield(self.pause_task)
         native = await self.native.read()
-        require_allowed(await self.schedule.closure_decision(native))
         self.native.require_known_session(native)
         if (
             native.physical.transaction_open
@@ -379,9 +370,6 @@ class ManagedController:
         g = self.session.gateway
         if (self.native.introduced_epoch, self.native.introduced_revision) != (g._charger_epoch, g.controls._revision):
             self.native.confirm_paused_introduction(native)
-        if self.schedule.awaiting_start() and self.schedule.revoked(self.session.journal.get(KEY, {})):
-            self.require_paused(native, timer_cleanup=True)
-            await self.schedule.observe(native)
         self.require_paused(native)
         g, j = self.session.gateway, self.session.journal
         records = [record for record in (current_candidate(self), charge_test_candidate(self)) if record is not None]
@@ -412,9 +400,7 @@ class ManagedController:
                 await self.native.resume(local_only=True)
             elif not j.next_delivery():
                 await self.native.resume()
-        if j.get("managed_temporary_schedule", {}).get("state") in ("installing", "armed", "clearing"):
-            require_allowed(await self.schedule.before_release_result(native))
-        if self.schedule.awaiting_start():
+        if awaiting_owner_start(j):
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         control = j.get("control", {})
         receipt = local_start_receipt(j)
@@ -466,7 +452,7 @@ class ManagedController:
         latch_managed_fault(self.session.gateway, reason, diagnostic=diagnostic)
 
     # Reuse only the existing owned zero profile; a fault never creates Stop, cleanup or positive authority.
-    async def hold_fault(self, *, occurrence: str | None = None) -> None:
+    async def hold_fault(self) -> None:
         g, j = self.session.gateway, self.session.journal
         fault, control = j.get("managed_control_fault"), j.get("control", {})
         epoch, boot, revision = g._charger_epoch, g.boot_observation, g.controls._revision
@@ -492,7 +478,6 @@ class ManagedController:
             row = j.db.execute(
                 "SELECT * FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
             ).fetchone()
-            timer = j.get(KEY, {})
             if (
                 self.stopping
                 or not fault
@@ -518,8 +503,6 @@ class ManagedController:
                 or row is None
                 or row["state"] == "absent_verified"
                 or tuple(row) not in allowed
-                or occurrence is not None
-                and (timer.get("id") != occurrence or not supervised_timer(timer))
             ):
                 raise RecoveryRequiredError("fault zero hold awaits the same admitted owner and current Boot")
 
@@ -545,7 +528,7 @@ class ManagedController:
         elif self.ordinary.active():
             return self.ordinary.session_decision(native, local)
         elif not (self.charging.scoped_normal_stop() and self.charging.independent_daily(native, local)):
-            return continuing_session_decision(j, native, local)
+            return Pending(Prerequisite.SOURCE, "continuation requires an identified daily or owner session")
         return ALLOW
 
     # Source and Start obligations remain ordinary Pending data; strict introduction refusals remain failures.
@@ -691,7 +674,6 @@ class ManagedController:
         async with asyncio.timeout(15):
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
-            require_allowed(await self.schedule.closure_decision(native))
             if authority != self.native.authority() or sequence != self.native.last_resolved_read:
                 raise AuditSupersededError("settled native evidence crossed a newer authority or observation")
             if self.ordinary.closure_gap(native):
@@ -701,10 +683,6 @@ class ManagedController:
                 native.physical.transaction_open
                 and native.physical.native_transaction_id != self.session.journal.active()
             ):
-                lease = self.session.journal.get(KEY, {})
-                if supervised_timer(lease) and lease.get("unreported_native"):
-                    await self.schedule.protect_station(lease)
-                    raise RecoveryRequiredError("timer holds zero awaiting the genuine transaction or native closure")
                 raise SecurityError("managed native transaction has no exact accepted local counterpart")
             self.native.require_known_session(native)
             present = self.session.book.owned_present(native.physical)
@@ -729,9 +707,6 @@ class ManagedController:
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
     async def tick(self) -> dict[str, Any]:
         status = await self._tick()
-        problem = self.schedule.problem()
-        if problem and status["state"] not in ("attention", "stopping"):
-            status.update(state="degraded", fault=problem, temporary_schedule=self.schedule.summary())
         return status
 
     # A poll first joins owned work, then supervises, assesses current authority and publishes one view.
@@ -797,9 +772,6 @@ class ManagedController:
     # Native observation, recovery and diagnostic escalation retain their original await and effect order.
     async def _supervise(self, base: dict[str, Any]) -> Observation | PollStatus:
         g, j = self.session.gateway, self.session.journal
-        timer = self.schedule.arm_idle_cutoff()
-        pending_timer = supervised_timer(timer)
-        cutoff_hold = pending_timer and "hold_since" in timer
         if not base["charger_connected"] or not base["boot_verified"]:
             return PollStatus("starting")
         if self.requests.intent().mode == "paused" and (self.pause_task is None or self.pause_task.done()):
@@ -807,20 +779,12 @@ class ManagedController:
         current_hold = j.get("managed_current_change", {}).get("state") == "recovering"
         if (
             not g.controls.ready
-            and self.released_epoch != g._charger_epoch
-            and not cutoff_hold
+            and (self.released_epoch != g._charger_epoch)
             and not current_hold
-            and not self.ordinary.needed()
-            and not (pending_timer and j.active() is not None)
+            and (not self.ordinary.needed())
         ):
-            if pending_timer:
-                try:
-                    await self.schedule.retry_recovery_zero()
-                except DeniedError, UnavailableError, RecoveryRequiredError:
-                    pass
             return PollStatus("starting")
         verified_pause = False
-        verified_idle_hold = False
         try:
             self.prepare_offline_pause()
             recovery_pending = await self.recovery.advance()
@@ -831,21 +795,8 @@ class ManagedController:
                     "waiting_for_cloud" if recovery_pending.reason is Prerequisite.CLOUD else "reconciling"
                 )
             native = await self.settled_native()
-            await self.schedule.observe(native)
-            if j.get(KEY, {}).get("idle_cutoff_hold"):
-                self.require_paused(native, timer_cleanup=True)
-                timer = j.get(KEY, {})
-                verified_idle_hold = timer.get("state") == "complete" or (
-                    timer.get("state") == "armed"
-                    and timer.get("idle_cutoff_replacement") is True
-                    and not self.schedule.revoked(timer)
-                )
-            if (
-                self.requests.intent().mode == "app"
-                and self.released_epoch != g._charger_epoch
-                and not verified_idle_hold
-            ):
-                raise RecoveryRequiredError("timer retirement awaits fresh app-control restoration")
+            if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
+                raise RecoveryRequiredError("managed release awaits fresh app-control restoration")
             if self.requests.intent().mode == "paused":
                 self.require_paused(native)
                 verified_pause = True
@@ -866,13 +817,7 @@ class ManagedController:
                 },
             )
             if self.native_unavailable >= 3:
-                lease = j.get(KEY, {})
-                if supervised_timer(lease):
-                    if not lease.get("retire_reason"):
-                        lease = {**lease, "retire_reason": "native_observation_unavailable"}
-                        j.put(KEY, lease)
-                    await self.schedule.protect_station(lease)
-                elif self.ordinary.ordinary():
+                if self.ordinary.ordinary():
                     try:
                         await self.ordinary.hold("native_observation_unavailable")
                     except SecurityError as failure:
@@ -922,7 +867,7 @@ class ManagedController:
         self.latest_native = native
         if intent_changed:
             return PollStatus("pausing", intent=observed_intent)
-        return Observation(native, verified_pause, verified_idle_hold)
+        return Observation(native, verified_pause)
 
     # The pure verdict requests a latch; the controller still owns its actual write and Return completion.
     def _assess_observation(self, observed: Observation) -> HealthVerdict | PollStatus:
@@ -945,7 +890,6 @@ class ManagedController:
         facts = ControlFacts(
             ControlState(control),
             observed.verified_pause,
-            observed.verified_idle_hold,
             s.runtime.status.delivery_blocked
             and (s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain),
             False,

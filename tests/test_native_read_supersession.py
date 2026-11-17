@@ -8,15 +8,14 @@ import uuid
 from datetime import datetime
 
 import pytest
-from ocpp_hub_core.prototype import managed_schedule
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
+from ocpp_hub_core.prototype.ordinary_recovery import SOURCE
 
-from tests import test_managed_schedule_cutoff as schedule_bench
+from tests import native_schedule_support as schedule_bench
+from tests.native_schedule_support import ZONE, SchedulePeer, timer_bench
 from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_schedule import SchedulePeer
-from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype_tls import tls as tls
 
 
@@ -137,14 +136,13 @@ async def test_native_read_outcome_belongs_to_its_sequence(
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
             await b.c.current.settle()
             await healthy(b.c)
-        await b.arm()
         b.clock.now = b.start
         local = await b.start_plan(9, demand=True)
         await healthy(b.c)
         c, peer, j = b.c, b.rig.peer, b.session.journal
         intent = c.requests.intent()
-        source = j.get(managed_schedule.KEY)
-        assert source.get("other_local") == local and source.get("bound_local") is None
+        source = j.get(SOURCE)
+        assert source.get("local") == local and source.get("source", {}).get("plan") == 9
         assert c.native.last_verified_at > 0 and b.device.current == selected
         peer.mode = mode
         if mode == "valid-other-source":
@@ -157,10 +155,10 @@ async def test_native_read_outcome_belongs_to_its_sequence(
             if newer_read:
                 peer.plan_session = (local, 9)
                 newest = await c.native.read()
-                newest_source = copy.deepcopy(j.get(managed_schedule.KEY))
+                newest_source = copy.deepcopy(j.get(SOURCE))
                 verified_at, resolved = c.native.last_verified_at, c.native.last_resolved_read
                 assert resolved > sequence and verified_at == newest.physical.observed_at > 0
-                assert newest_source.get("other_local") == local and newest_source.get("bound_local") is None
+                assert newest_source.get("local") == local and newest_source.get("source", {}).get("plan") == 9
             if mode == "cancelled":
                 task.cancel()
             peer.release.set()
@@ -174,7 +172,7 @@ async def test_native_read_outcome_belongs_to_its_sequence(
                 "last_resolved_read": c.native.last_resolved_read,
                 "last_verified_at": c.native.last_verified_at,
                 "result_type": type(result).__name__,
-                "current_source": j.get(managed_schedule.KEY),
+                "current_source": j.get(SOURCE),
                 "physical_limit_a": b.device.effective_limit(),
                 "physical_current_a": b.device.current,
                 "remote_stops": b.stops(),
@@ -186,18 +184,18 @@ async def test_native_read_outcome_belongs_to_its_sequence(
                 assert c.native.last_verified_at == verified_at, (
                     "obsolete read erased the newer verified native timestamp"
                 )
-                assert c.native.last_resolved_read == resolved and j.get(managed_schedule.KEY) == newest_source
-                assert not c.schedule.needs_source(j.get(managed_schedule.KEY))
+                assert c.native.last_resolved_read == resolved and j.get(SOURCE) == newest_source
+                assert j.get(SOURCE).get("source")
             elif mode == "valid-other-source":
                 assert result.session_plan_id == 987654 and c.native.last_verified_at > 0
-                assert j.get(managed_schedule.KEY).get("other_local") is None
+                assert j.get(SOURCE).get("source") is None
             else:
                 assert c.native.last_verified_at == 0, "a genuine current failure must invalidate earlier freshness"
-                assert c.schedule.needs_source(j.get(managed_schedule.KEY))
             assert c.requests.intent() == intent and j.active() == local and not b.stops()
+            await c.ordinary.hold("native_observation_unavailable")
             peer.unavailable = not newer_read
             b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-            await c.schedule.protect_deadline(j.get(managed_schedule.KEY))
+            await c.tick()
             assert not b.stops() and b.device.effective_limit() == (selected if newer_read else 0)
             await later_daily(b, local, selected)
         finally:
@@ -218,13 +216,12 @@ async def test_current_native_authority_sql_refusal_removes_freshness(
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
             await b.c.current.settle()
             await healthy(b.c)
-        await b.arm()
         b.clock.now = b.start
         local = await b.start_plan(9, demand=True)
         await healthy(b.c)
         c, peer, j = b.c, b.rig.peer, b.session.journal
-        source, intent = copy.deepcopy(j.get(managed_schedule.KEY)), c.requests.intent()
-        assert source.get("other_local") == local and c.native.last_verified_at > 0
+        source, intent = copy.deepcopy(j.get(SOURCE)), c.requests.intent()
+        assert source.get("local") == local and c.native.last_verified_at > 0
         attempts = []
 
         # Deny only the first actual authority SELECT after the already-started full native HTTP observation.
@@ -246,12 +243,13 @@ async def test_current_native_authority_sql_refusal_removes_freshness(
             finally:
                 j.db.set_authorizer(None)
             assert attempts and not j.db.in_transaction
-            assert c.native.last_verified_at == 0 and c.schedule.needs_source(j.get(managed_schedule.KEY))
-            assert j.get(managed_schedule.KEY) == source and c.requests.intent() == intent
+            assert c.native.last_verified_at == 0
+            assert j.get(SOURCE) == source and c.requests.intent() == intent
             assert j.active() == local and not b.stops()
+            await c.ordinary.hold("native_observation_unavailable")
             peer.unavailable = True
             b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-            await c.schedule.protect_deadline(j.get(managed_schedule.KEY))
+            await c.tick()
             assert b.device.effective_limit() == 0 and not b.stops()
             await later_daily(b, local, selected)
         finally:

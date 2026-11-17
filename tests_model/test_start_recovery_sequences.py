@@ -14,6 +14,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from tests import conftest as _engine  # noqa: F401 - initialize the HA-free package before importing it.
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.recovery_barriers import returned_to_app, witnessed_native_loss
 from tests.test_managed_proxy import healthy, managed_session, starts
 from tests.test_managed_start_cap_failure import BeforeCapFailurePeer
@@ -23,8 +25,6 @@ from tests.test_prototype import BOOT, START
 from tests.test_prototype_runtime import until
 from tests_model.catalog import input_digest
 from tests_model.recovery_cases import start_cases
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # Select one ordering per physical/fault seed solely for explicit development checks.

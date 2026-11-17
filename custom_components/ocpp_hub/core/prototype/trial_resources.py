@@ -8,12 +8,11 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .ics import is_safe_transaction_query
-from .managed_occurrences import occurrences
 from .native_faults import NativeContentError
 from .policy import DeniedError
 from .recovery_contracts import GateDecision, Guard, Pending
@@ -22,9 +21,6 @@ from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_bootstrap import initialize_trial_baseline
 from .trial_evidence import Evidence, Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
-
-if TYPE_CHECKING:
-    from .managed_fault_timer import FaultTimerRemoval
 
 
 @dataclass(frozen=True, repr=False)
@@ -101,8 +97,6 @@ class ResourceBook:
     def __init__(self, journal: Journal, baseline: Baseline) -> None:
         self.journal, self.baseline = journal, baseline
         self.before_positive_release: Guard | None = None
-        self.temporary_plan_write: dict[str, Any] | None = None
-        self.fault_timer_removal: FaultTimerRemoval | None = None
         if baseline.identity_digest != fingerprint(journal.identity):
             raise SecurityError("baseline belongs to another charger")
         for r in baseline.resources:
@@ -255,14 +249,6 @@ class ResourceBook:
                 action == "ClearChargingProfile" or action == "SetChargingProfile" and not safety
             ):
                 raise DeniedError("original profiles prevent new profile writes and automatic clears")
-        removal = self.fault_timer_removal
-        if removal is not None and action == "DataTransfer" and payload is removal.payload:
-            removal.require_payload(action, payload)
-            removal.authority.guard_timer_removal(removal)
-            if payload is not self.temporary_plan_write or removal.verified_native_digest is None:
-                raise DeniedError("fault timer removal lacks this call's native zero proof")
-            self.temporary_plan_write = None
-            return None
         if phase != "active" and not reading:
             key = "profile:" + str(payload.get("id"))
             if (
@@ -275,14 +261,6 @@ class ResourceBook:
                 projected = profile_projection(payload)
                 if projected["id"] == HUB_PROFILE_ID and projected["limit"] == 0 and safety:
                     phase = "active"  # Only this recorded zero-current intent proceeds through normal ownership checks.
-            if (
-                phase == "recovering"
-                and action == "DataTransfer"
-                and payload is self.temporary_plan_write
-                and payload.get("messageId") == "clearPlans"
-            ):
-                self.temporary_plan_write = None
-                return None  # The bounded native gate verified the exact preimage, closed session and owned zero.
             if phase == "rollback" and action == "ClearChargingProfile" and set(payload) == {"id"}:
                 receipt = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
                 if receipt is not None and receipt["state"] != "absent_verified":
@@ -339,9 +317,6 @@ class ResourceBook:
             if set(payload) != {"id"} or receipt is None or receipt["state"] == "absent_verified":
                 raise DeniedError("trial clear does not name an owned resource")
         elif action == "DataTransfer":
-            if payload is self.temporary_plan_write:
-                self.temporary_plan_write = None
-                return None
             if payload.get("vendorId") != "IoCharger" or payload.get("messageId") not in (
                 "getTransaction",
                 "setTransaction",
@@ -376,14 +351,7 @@ class ResourceBook:
     # Inspect every owned-resource contradiction before publishing unrelated absence/confirmation observations.
     def _owned_conflict(self, current: dict[str, Resource], rows: list[Any]) -> tuple[str, str | None] | None:
         originals = {r.key for r in self.baseline.resources}
-        temporary: set[str] = set()
-        for lease in occurrences(self.journal).values():
-            if lease.get("state") in ("installing", "armed", "clearing"):
-                expected = lease["body"]
-                key = "plan:" + str(expected["planId"])
-                if key in current and current[key].digest == fingerprint(expected) and key not in originals:
-                    temporary.add(key)
-        if set(current) - originals - {row["key"] for row in rows} - temporary:
+        if set(current) - originals - {row["key"] for row in rows}:
             return "unexpected_resources", None
         for row in rows:
             resource = current.get(row["key"])

@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
-from ocpp_hub_core.prototype import managed_schedule
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
 
@@ -119,26 +118,9 @@ class TimerBench:
         self.c = ManagedController(session)
         self.start = int(clock.now) + 180
         self.device = rig.bench.firmware
-        self.timer = 0
 
-    # Register the owner's future timer through the same durable admission path used by management.
-    def request(self, identifier: str | None = None) -> None:
-        self.c.schedule.accept(identifier or uuid.uuid4().hex, self.c.requests.intent().revision, self.start)
-        self.timer = self.session.journal.get(managed_schedule.KEY)["body"]["planId"]
 
-    # Wait for independent physical visibility after sending the installation once.
-    async def arm(self, identifier: str | None = None) -> None:
-        self.request(identifier)
-        for _ in range(2):
-            await healthy(self.c)
-        assert self.c.schedule.summary()["state"] == "armed"
 
-    # Wait for earlier connector events to reach the cloud before requesting a new timer.
-    async def wait_for_admission(self) -> None:
-        async with asyncio.timeout(5):
-            while not self.c.schedule.can_install(self.c.latest_native):
-                await self.c.tick()
-                await asyncio.sleep(0.01)
 
     # Drive a new transaction only when the wire plan is scheduled on this exact local minute.
     async def fire(self, plan_id: int, *, demand: bool = True) -> int:
@@ -164,19 +146,12 @@ class TimerBench:
             self.device.requested_current = 0
         return response[2]["transactionId"]
 
-    # Reproduce an independent command acknowledged before an upgrade began reserving new Starts for the timer.
+    # Acknowledge a distinct owner command before its delayed lifecycle arrives.
     async def acknowledge_older_owner_start(self) -> None:
-        gateway = self.session.gateway
-        guard = gateway.remote_start_guard
-        # Model a distinct Start already acknowledged by a previous release.
-        gateway.remote_start_guard = None
-        try:
-            accepted = await self.rig.bench.cloud_call(
-                "older-owner-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
-            )
-            assert accepted[0] == 3 and accepted[2]["status"] == "Accepted"
-        finally:
-            gateway.remote_start_guard = guard
+        accepted = await self.rig.bench.cloud_call(
+            "older-owner-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+        )
+        assert accepted[0] == 3 and accepted[2]["status"] == "Accepted"
 
     # Deliver the real lifecycle separately from the older Start acknowledgement.
     async def older_owner_session(self, plan_id: int) -> int:
@@ -256,8 +231,6 @@ async def timer_bench(
     selected_peer = SchedulePeer if peer_type is None else peer_type
     monkeypatch.setattr(native_bench, "NativeVehiclePeer", selected_peer)
     monkeypatch.setitem(native_bench.ORIGINAL, "timeZone", ZONE.key)
-    monkeypatch.setattr(managed_schedule, "time", SimpleNamespace(time=lambda: clock.now))
-    monkeypatch.setattr(managed_schedule, "monotonic", lambda: clock.elapsed)
     async with managed_bench(tmp_path, tls, port, monkeypatch) as rig:
         session = managed_session(rig)
         await session.start()
@@ -273,3 +246,43 @@ async def timer_bench(
             session.gateway.controls.policy = session.gateway.policy
             await healthy(b.c)
             yield b
+
+
+class SelectiveConfigPeer(SchedulePeer):
+    """The independent HTTP station can fail one chosen configuration request before sending its body."""
+
+    # Count real received configuration requests without asking the engine to select its own failure boundary.
+    def __init__(self, bench):
+        super().__init__(bench)
+        self.config_requests = 0
+        self.fail_at = None
+        self.failed_at = None
+        self.gate_at = None
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+
+    # Replay ordinary complete HTTP requests after deciding this independent peer's one-shot availability.
+    async def handle(self, reader, writer):
+        header = await reader.readuntil(b"\r\n\r\n")
+        fields = {
+            line.split(b":", 1)[0].lower(): line.split(b":", 1)[1].strip()
+            for line in header.split(b"\r\n")[1:]
+            if b":" in line
+        }
+        body = await reader.readexactly(int(fields[b"content-length"]))
+        request = json.loads(body)
+        if request["action"] == "getConfig":
+            self.config_requests += 1
+            if self.config_requests == self.gate_at:
+                self.entered.set()
+                await self.release.wait()
+            if self.config_requests == self.fail_at:
+                self.failed_at = self.config_requests
+                writer.write(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+        replay = asyncio.StreamReader()
+        replay.feed_data(header + body)
+        replay.feed_eof()
+        await super().handle(replay, writer)

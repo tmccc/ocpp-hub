@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .managed_schedule import awaiting_owner_start
+from .managed_sources import awaiting_owner_start
 from .store import Journal
 
 

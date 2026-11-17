@@ -176,7 +176,6 @@ class ReturnCompleted:
     result: OwnedReleaseResult
     zero_ready: bool
     faulted: bool
-    timer_superseded: bool = False
     publication_allowed: bool = True
 
 

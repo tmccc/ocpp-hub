@@ -13,9 +13,9 @@ import pytest
 
 from custom_components.ics_proxy.api import ProxyClient
 from tests import conftest as _engine  # noqa: F401 - register the standalone engine package.
+from tests.native_schedule_support import ZONE, timer_bench
 from tests.test_managed_api import TOKEN, ManagementServer, ManagementSettings
 from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_schedule_cutoff import ZONE, timer_bench
 from tests.test_prototype import START
 from tests.test_prototype_tls import tls as tls
 
@@ -42,7 +42,7 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             )
             gateway.controls.policy = gateway.policy
             b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
-            await b.c.tests.settle()
+            await b.c.charging.settle()
             assert starts(b.rig)[0][3]["idTag"] == delayed_owner
             unrelated = await b.start_plan(9, demand=False)
             await healthy(b.c)
@@ -50,14 +50,14 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             b.clock.now += 60
             published = await b.c.tick()
         else:
-            await b.arm()
+            published = await healthy(b.c)
         if delayed_owner == "CLOUD_OWNER":
             await b.acknowledge_older_owner_start()
             b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
             published = await b.c.tick()
         elif delayed_owner is None:
             b.clock.now = b.start
-            local = await b.fire(b.timer)
+            local = await b.start_plan(9)
             assert (await healthy(b.c))["power_w"] > 0
             b.rig.peer.permission_enabled = False
             b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
@@ -107,8 +107,7 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                     if delayed_owner:
                         async with asyncio.timeout(4):
                             while (
-                                b.timer in b.device.plans
-                                or b.c.requests.intent().mode != "paused"
+                                b.c.requests.intent().mode != "paused"
                                 or b.device.effective_limit() != 0
                                 or not early
                                 and not b.session.gateway.controls.ready
@@ -130,7 +129,7 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                         while not b.stops():
                             await asyncio.sleep(0.01)
                     assert b.stops() == [local] and not pause.done()
-                    assert (b.timer in b.device.plans) == (not delayed_owner) and b.session.journal.active() == local
+                    assert set(b.device.plans) == {9} and b.session.journal.active() == local
                     await b.close_transaction(local)
                     await pause
                 finally:
@@ -163,53 +162,3 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
 
 # Intent: the HA client can observe a scheduled full car reach the cutoff and recover its normal daily window.
 # Why: zero watts and an accepted Stop do not complete the schedule receipt or establish closure.
-async def test_full_vehicle_unattended_deadline(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
-        published = await healthy(b.c)
-        port = unused_tcp_port_factory()
-        server = ManagementServer(
-            ManagementSettings(port, tmp_path / "unused", TOKEN),
-            b.c,
-            lambda: dict(published, running=True, certificate_remaining_seconds=86400),
-        )
-        await server.start()
-        try:
-            async with aiohttp.ClientSession() as session:
-                client = ProxyClient(session, port, TOKEN)
-                initial = await client.request("status")
-                receipt = await client.request(
-                    "temporary_schedule", revision=initial["control_revision"], start_epoch=b.start
-                )
-                b.timer = b.session.journal.get("managed_temporary_schedule")["body"]["planId"]
-                for _ in range(2):
-                    published = await healthy(b.c)
-                assert (await client.request("status"))["temporary_schedule"]["state"] == "armed"
-                local = await b.advance_idle_to(b.start)
-                assert local is not None
-                b.device.requested_current = 0
-                b.rig.peer.permission_enabled = False
-                b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
-                published = await healthy(b.c)
-                assert (await client.request("status"))["power_w"] == 0
-                b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-                published = await b.c.tick()
-                assert b.stops() == [local] and b.device.effective_limit() == 0
-                b.clock.now += 61
-                published = await b.c.tick()
-                alarm = await client.request("status")
-                assert alarm["fault"] == "temporary_schedule_stop_unconfirmed" and not alarm["healthy"]
-                assert (await client.request("receipt", request_id=receipt["id"]))["state"] == "accepted"
-                await b.close_transaction(local)
-                published = await healthy(b.c)
-                restored = await client.request("status")
-                assert restored["healthy"] and restored["desired_control"] == "app"
-                assert restored["station_ceiling_a"] == 6 and restored["temporary_schedule"]["state"] == "complete"
-                assert (await client.request("receipt", request_id=receipt["id"]))["state"] == "completed"
-                assert set(b.device.plans) == {9} and not starts(b.rig)
-                daily = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
-                published = await healthy(b.c)
-                assert daily is not None and daily != local and (await client.request("status"))["power_w"] > 0
-                await b.advance_running_plan(9, daily, b.clock.now + 21600)
-                assert (await healthy(b.c))["power_w"] == 0 and daily not in b.stops()
-        finally:
-            await server.close()

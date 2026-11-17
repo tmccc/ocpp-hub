@@ -7,14 +7,14 @@ from contextlib import AsyncExitStack
 import pytest
 
 from tests import test_native_bounded_session as native_bench
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy, introduced, starts
 from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_managed_test_charge import ChargeRig, owner_start, positive_flow
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 from tests_model.test_start_recovery_sequences import close_daily, observe
 
 

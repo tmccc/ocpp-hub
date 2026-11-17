@@ -12,6 +12,8 @@ from ocpp_hub_core.prototype.gateway import decode
 
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
 from tests import test_native_bounded_session as native_bench
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.recovery_barriers import require_zero_held
 from tests.test_managed_current_tick_race import waiting_locals
 from tests.test_managed_introduction_retry import InterruptedNativePeer
@@ -21,8 +23,6 @@ from tests.test_prototype import BOOT
 from tests_model.catalog import input_digest
 from tests_model.control_cases import current_candidates
 from tests_model.control_helpers import ordinary_recovery, station_limit
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 class BoundaryPeer(InterruptedNativePeer):

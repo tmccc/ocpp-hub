@@ -14,8 +14,8 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from tests import test_managed_proxy as mp
 from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.native_schedule_support import SelectiveConfigPeer
 from tests.test_managed_current import adjustable
-from tests.test_managed_fault_timer import SelectiveConfigPeer
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_test_charge import ChargeRig, owner_start, positive_flow, ready

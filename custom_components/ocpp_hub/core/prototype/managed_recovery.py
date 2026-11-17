@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .managed_schedule import KEY, OBSERVABLE
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -15,8 +14,6 @@ if TYPE_CHECKING:
 def local_recovery_binding(gateway: Gateway, spec_digest: str) -> str:
     journal = gateway.journal
     intent = journal.get("managed_control_intent", {})
-    timer = journal.get(KEY, {})
-    timer_id = timer.get("id") if timer.get("state") in OBSERVABLE else None
     if (
         gateway.policy.allow_local_start
         or journal.get("managed_mode") != {"mode": "app_schedule", "spec_digest": spec_digest, "local_start": False}
@@ -32,9 +29,7 @@ def local_recovery_binding(gateway: Gateway, spec_digest: str) -> str:
         or journal.get("managed_test_charge", {}).get("state")
         in ("armed", "starting", "awaiting_power", "charging", "running", "stopping")
         or journal.db.execute(
-            "SELECT 1 FROM managed_requests WHERE state IN ('accepted','running') AND action!='pause' "
-            "AND NOT (action='temporary_schedule' AND id IS ? AND revision IS ? AND state='accepted') LIMIT 1",
-            (timer_id, timer.get("revision")),
+            "SELECT 1 FROM managed_requests WHERE state IN ('accepted','running') AND action!='pause' LIMIT 1"
         ).fetchone()
         or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
         or journal.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
@@ -51,6 +46,6 @@ def local_recovery_binding(gateway: Gateway, spec_digest: str) -> str:
             "current_capability": journal.get("managed_current_capability"),
             "current_change": journal.get("managed_current_change"),
             "test": journal.get("managed_test_charge"),
-            "temporary_schedule": timer,
+            "temporary_schedule": {},
         }
     )

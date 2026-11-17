@@ -10,6 +10,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import crash
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_proxy import healthy, introduced, managed_session
 from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_managed_test_charge import ChargeRig
@@ -17,8 +19,6 @@ from tests_model.catalog import input_digest
 from tests_model.control_cases import current_replacement_candidates
 from tests_model.control_helpers import ordinary_recovery
 from tests_model.test_current_sequences import BoundaryPeer
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 
 # An explicit smoke subset preserves every physical boundary and directed current pair during development.

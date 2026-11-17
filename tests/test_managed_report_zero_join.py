@@ -7,17 +7,10 @@ from datetime import UTC, datetime
 from ocpp_hub_core.prototype.gateway import decode
 
 import tests.test_managed_proxy as managed_helpers
-from tests.managed_scenario_helpers import (
-    END,
-    close_in_order,
-    deadline_task,
-    next_daily,
-    originals,
-    select_current,
-    settle,
-)
-from tests.test_managed_proxy import healthy
-from tests.test_managed_schedule_cutoff import timer_bench
+from tests.managed_scenario_helpers import close_in_order, next_daily, originals, select_current, settle
+from tests.native_schedule_support import timer_bench
+from tests.test_managed_proxy import healthy, starts
+from tests.test_managed_start_overlap import owner_tag
 from tests.test_prototype import START
 from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
@@ -96,40 +89,43 @@ async def test_delayed_report_retries_after_zero_join_timeout(tmp_path, tls, unu
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await select_current(b, 32)
         saved = originals(b)
-        await b.arm()
-        reported = b.start
-        b.clock.now = b.start + 601
-        await settle(b, 6)
+        owner_tag(b)
+        b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+        await b.c.charging.settle()
+        tag = starts(b.rig)[0][3]["idTag"]
+        reported = b.clock.now
         g, peer = b.session.gateway, b.rig.bench
         # Give the actual RPC longer than the report's one-second join, so missing proof remains genuinely pending.
         g.charger.timeout = 3
         peer.hold_zero = True
-        b.clock.now = END
+        b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
         try:
-            async with deadline_task(b):
-                await asyncio.wait_for(peer.entered.wait(), 2)
-                assert b.device.effective_limit() == 0 and not g.controls.ready
-                before = len(peer.device_calls)
-                token = uuid.uuid4().hex
-                payload = START | {
-                    "idTag": "NATIVE_TIMER",
-                    "timestamp": datetime.fromtimestamp(reported, UTC).isoformat(),
-                }
-                refused = await peer.call(b.sock, token, "StartTransaction", payload)
-                assert refused[0] == 4 and refused[2] == "InternalError"
-                assert b.session.journal.active() is None and b.device.active is None
-                assert not g.controls.ready and not b.stops() and b.device.effective_limit() == 0
-                assert peer.device_calls[before:] == []
-                peer.release.set()
-                await until(lambda: g.controls.ready and g.controls.desired() == 0)
-                accepted = await peer.call(b.sock, token, "StartTransaction", payload)
-                assert accepted[0] == 3 and accepted[2]["idTagInfo"]["status"] == "Accepted"
-                local = accepted[2]["transactionId"]
-                assert b.session.journal.active() == local and b.device.effective_limit() == 0 and not b.stops()
-                b.rig.peer.plan_session = (local, 9)
-                await settle(b)
-                await close_in_order(b, local, "native", ())
-                await healthy(b.c)
-                await next_daily(b, 32, saved)
+            await asyncio.wait_for(peer.entered.wait(), 2)
+            assert b.device.effective_limit() == 0 and not g.controls.ready
+            before = len(peer.device_calls)
+            token = uuid.uuid4().hex
+            payload = START | {
+                "idTag": tag,
+                "timestamp": datetime.fromtimestamp(reported, UTC).isoformat(),
+            }
+            refused = await peer.call(b.sock, token, "StartTransaction", payload)
+            assert refused[0] == 4 and refused[2] == "InternalError"
+            assert b.session.journal.active() is None and b.device.active is None
+            assert not g.controls.ready and not b.stops() and b.device.effective_limit() == 0
+            assert peer.device_calls[before:] == []
+            peer.release.set()
+            await until(lambda: g.controls.ready and g.controls.desired() == 0)
+            accepted = await peer.call(b.sock, token, "StartTransaction", payload)
+            assert accepted[0] == 3 and accepted[2]["idTagInfo"]["status"] == "Accepted"
+            local = accepted[2]["transactionId"]
+            assert b.session.journal.active() == local and b.device.effective_limit() == 0 and not b.stops()
+            b.rig.peer.plan_session = (local, 9)
+            await settle(b)
+            assert local in b.stops()
+            await close_in_order(b, local, "native", (local,))
+            await healthy(b.c)
+            b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+            await healthy(b.c)
+            await next_daily(b, 32, saved, (local,), starts_count=1)
         finally:
             peer.release.set()

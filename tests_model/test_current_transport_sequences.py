@@ -9,6 +9,8 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from websockets.asyncio.client import connect
 
 from tests import test_native_bounded_session as native_bench
+from tests.model_tls_support import listener_port, tls_for_case
+from tests.model_tls_support import model_tls as model_tls
 from tests.test_managed_api import TOKEN, call
 from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_proxy import healthy, starts
@@ -16,8 +18,6 @@ from tests.test_managed_start_refusal_native32 import commissioned
 from tests_model.catalog import input_digest
 from tests_model.current_obligations import require_completed_current, require_transport_summary
 from tests_model.deep_cases import current_transport_candidates
-from tests_model.test_schedule_sequences import listener_port, tls_for_case
-from tests_model.test_schedule_sequences import model_tls as model_tls
 
 EVIDENCE = (
     "reset_verified",

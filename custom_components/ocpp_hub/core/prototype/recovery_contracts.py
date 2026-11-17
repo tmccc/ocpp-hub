@@ -23,7 +23,6 @@ class Prerequisite(Enum):
     CLOUD_ACK = "cloud_ack"
     ZERO_PROOF = "zero_proof"
     RECONCILIATION = "reconciliation"
-    TIMER_CLEANUP = "timer_cleanup"
     OWNER_RETURN = "owner_return"
     SUPERSEDED = "superseded"
     RESTRICTIVE_OPERATION = "restrictive_operation"

@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Literal
 
-from ..frames import Frame
 from .connection_scope import CloudAttemptScope
 from .managed_intent import ControlIntent
 from .recovery_contracts import (
@@ -18,21 +16,6 @@ from .recovery_contracts import (
     ReleaseEffects,
     WireReply,
 )
-
-
-@dataclass(frozen=True)
-class TimerRestriction:
-    """An actual owned timer zero claimed this exact newer ticket; physical confirmation remains separate."""
-
-    scope: CloudAttemptScope
-    control_revision: int
-    intent: ControlIntent
-    old_ticket: str
-    new_ticket: str
-    occurrence: str
-    identity_digest: str
-    allowed_local: tuple[int | None, ...]
-    operation: asyncio.Task[Frame]
 
 
 @dataclass
@@ -53,7 +36,6 @@ class ReleaseAttempt:
     cancelled: bool = False
     failure: BaseException | None = None
     positive_failure: BaseException | None = None
-    restriction: TimerRestriction | None = None
     pending: Pending | None = None
     positive_reply: WireReply = WireReply.MISSING
     cleanup_failed: bool = False

@@ -42,7 +42,6 @@ async def test_failed_idle_hold_binds_request_cause_boot_and_existing_control(
                 "local_start_receipt",
                 "managed_control_fault",
                 "managed_test_charge",
-                "managed_temporary_schedule",
             )
         }
         result = c.requests.receipt(identifier)
@@ -77,7 +76,6 @@ async def test_failed_idle_hold_binds_request_cause_boot_and_existing_control(
             ("control", {"start_pending": True}),
             ("managed_control_fault", {"classification": "retained_fault"}),
             ("managed_test_charge", {"state": "starting"}),
-            ("managed_temporary_schedule", {"state": "armed"}),
             ("local_start_receipt", {"stage": "prepared"}),
             ("local_start_receipt", {"stage": "issued"}),
             ("local_start_receipt", {"stage": "accepted", "local": None}),
