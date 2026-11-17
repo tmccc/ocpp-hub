@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
-from .recovery_contracts import AuthorityStamp, FailureKind, OwnedReleaseResult
-from .recovery_policy import ReleaseDisposition
+from ocpp_hub_core.prototype.recovery_contracts import AuthorityStamp, FailureKind, OwnedReleaseResult
+from ocpp_hub_core.prototype.recovery_policy import ReleaseDisposition
 
 
 class StartOutcome(Enum):

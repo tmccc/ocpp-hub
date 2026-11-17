@@ -177,37 +177,7 @@ def complete_record(c: ManagedController, record: TerminalRecord) -> None:
         j.put(record.key, {**state, "state": "cancelled", "recovery_reason": "previous_selection_at_verified_zero"})
         return
     local = record.transaction[0] if record.transaction is not None else None
-    unissued = local is None and state["source"] == "local"
-    result: dict[str, Any]
-    outcome = "completed"
-    if unissued:
-        outcome = "failed"
-        result = {"classification": "start_not_accepted_at_verified_zero"}
-    elif state["kind"] == "normal":
-        result = {"local_session_verified": True, "charging": False, "timed": False}
-    elif state["source"] == "cloud":
-        result = {"armed": True, "charging_started": False}
-    else:
-        # Closed lifecycle settles a timed test, but cannot manufacture its missing positive-power confirmation.
-        outcome = "failed"
-        result = {"classification": "test_interrupted_at_verified_zero"}
-    j.db.execute(
-        "UPDATE managed_requests SET state=?,result=? WHERE id=? AND action=? AND revision=? "
-        "AND state IN ('accepted','running','uncertain')",
-        (outcome, encoded(result), *record.request[:3]),
-    )
-    j.put(
-        record.key,
-        {
-            **state,
-            "state": "completed",
-            "charging": False,
-            "local_transaction": local,
-            "recovery_reason": "start_not_accepted_at_verified_zero"
-            if unissued
-            else "owned_operation_settled_at_verified_zero",
-        },
-    )
+    j.starts.settled_at_zero(state, record.request, local)
 
 
 # Only closed ordinary charging debt permits automatic metadata retirement or internal Pause completion.

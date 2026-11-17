@@ -7,8 +7,16 @@ import uuid
 
 import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
-from ocpp_hub_core.prototype.control_slice import step
-from ocpp_hub_core.prototype.control_slice_state import (
+from ocpp_hub_core.prototype.recovery_contracts import AuthorityStamp
+
+from tests.recovery_barriers import completed_control
+from tests.test_managed_normal_start import owner_rig
+from tests.test_managed_proxy import healthy, starts
+from tests.test_managed_test_charge import actual_stop, positive_flow
+from tests.test_prototype_runtime import until
+from tests.test_prototype_tls import tls as tls
+from tests_model.control_slice import step
+from tests_model.control_slice_state import (
     AuthorityChanged,
     CloudSettled,
     LifecycleBound,
@@ -23,14 +31,6 @@ from ocpp_hub_core.prototype.control_slice_state import (
     StartOutcome,
     StartPrepared,
 )
-from ocpp_hub_core.prototype.recovery_contracts import AuthorityStamp
-
-from tests.recovery_barriers import completed_control
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
 
 
 # Observe exact live scope and ownership; the shadow never supplies these facts back to the engine.

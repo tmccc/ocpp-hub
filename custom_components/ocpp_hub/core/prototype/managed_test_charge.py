@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 from .connection_scope import CloudAttemptScope, current_scope
 from .local_control import local_start_receipt, retire_unsent_local_start
-from .managed_intent import ControlIntent
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
 from .managed_start_binding import known_plan_source
@@ -24,10 +23,8 @@ from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
 from .start_settlement import (
     StartFailureAction,
-    StartFailureDecision,
     StartFailureFacts,
     StartReceiptFacts,
-    StartSettlementTrace,
     settle_start,
 )
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -71,11 +68,9 @@ class ManagedChargeTests:
     # Construction may retire an interrupted permission, but never sends a Start or renews a persisted deadline.
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
-        self.lease: TestLease | None = None
+        self.journal.starts.set_lease(None)
         self.worker: asyncio.Task[None] | None = None
         self._closing = False
-        self.start_trace: StartSettlementTrace | None = None
-        self.last_start_settlement: StartFailureDecision | None = None
         self.timer: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
         self.source: tuple[HandoverEvidence, str | None, int] | None = None
@@ -93,15 +88,7 @@ class ManagedChargeTests:
                 if not preserve:
                     self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
                 claim_internal_pause(controller, "test", saved["id"])
-                self.journal.put(
-                    "managed_test_charge",
-                    {
-                        **saved,
-                        "state": "expired" if preserve else "interrupted",
-                        "expired_normal": bool(preserve),
-                        "charging": False,
-                    },
-                )
+                self.journal.starts.interrupted(saved, preserve)
         self.retire_refused_unsent()
         controller.session.gateway.start_observer = self.started
         controller.native.observation_listener = self.record_source
@@ -115,6 +102,16 @@ class ManagedChargeTests:
     @property
     def journal(self) -> Journal:
         return self.controller.session.journal
+
+    # The shared lifecycle owner holds the only active lease slot; callers retain their exact object identity.
+    @property
+    def lease(self) -> TestLease | None:
+        return self.journal.starts.lease
+
+    # Compatibility callers publish or retire memory only after their owning transaction commits.
+    @lease.setter
+    def lease(self, value: TestLease | None) -> None:
+        self.journal.starts.set_lease(value)
 
     # Private provenance includes identifiers; the public summary below exposes only source, state and timing.
     def state(self) -> dict[str, Any]:
@@ -149,10 +146,7 @@ class ManagedChargeTests:
             or j.get("uncertain_vendor_command")
         ):
             return
-        j.put(
-            "managed_test_charge",
-            {**state, "state": "completed", "charging": False, "recovery_reason": "preflight_refused_unsent"},
-        )
+        j.starts.complete_metadata(state, reason="preflight_refused_unsent")
 
     # Only explicit request-specific provenance can retire a failure before entering the Start command path.
     def unissued_at_zero(self, native: HandoverEvidence) -> bool:
@@ -191,96 +185,21 @@ class ManagedChargeTests:
     def retire_unissued_at_zero(self, native: HandoverEvidence) -> None:
         if not self.unissued_at_zero(native):
             return
-        state, j = self.state(), self.journal
-        with j.atomic():
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND revision=? "
-                "AND action=? AND state='uncertain'",
-                (
-                    json.dumps({"classification": "start_not_accepted_at_verified_zero"}),
-                    state["id"],
-                    state["revision"],
-                    "start" if state["kind"] == "normal" else "start_test",
-                ),
-            )
-            j.put(
-                "managed_test_charge",
-                {
-                    **state,
-                    "state": "completed",
-                    "charging": False,
-                    "recovery_reason": "start_not_accepted_at_verified_zero",
-                },
-            )
+        self.journal.starts.unissued_at_zero(self.state())
 
     # Exact local closure can finish its request at verified Pause zero while separate cloud delivery stays retained.
     def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
-        state, j = self.state(), self.journal
-        local, receipt = state.get("local_transaction"), local_start_receipt(j)
-        # A real Accepted reply can commit before publication; a later exact lifecycle binds its durable receipt.
-        if local is None and receipt.get("request_id") == state.get("id"):
-            local = receipt.get("local")
-        if (
-            self.lease is not None
-            and (not self.lease.normal or self.lease.source != "local" or self.lease.identifier != state.get("id"))
-            or state.get("kind") != "normal"
-            or state.get("source") != "local"
-            or type(local) is not int
-            or not (state.get("start_rpc_accepted") is True or receipt.get("request_id") == state.get("id"))
-            or receipt.get("local") != local
-            or receipt.get("stage") not in ("issued", "accepted")
-            or receipt.get("stage") == "issued"
-            and (
-                state.get("start_rpc_accepted") is not False
-                or receipt.get("request_id") != state.get("id")
-                or state.get("start_attempted") is not True
-            )
-            or receipt.get("digest") != state.get("tag_digest")
-            or j.get("control", {}).get("start_pending")
-        ):
-            return
-        row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (local,)).fetchone()
-        if row is None or row["stop"] is None:
-            return
-        if fingerprint(json.loads(row["start"])["idTag"].casefold()) != state.get("tag_digest"):
-            return
-        request = j.db.execute(
-            "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
-        ).fetchone()
-        if (
-            request is None
-            or request["action"] != "start"
-            or request["revision"] + int(state.get("start_rpc_accepted") is True) != state.get("revision")
-            or request["state"] not in ("accepted", "running", "uncertain", "completed", "failed")
-            or receipt.get("request_id") not in (None, state.get("id"))
-        ):
+        j = self.journal
+        record = j.starts.close_candidate()
+        if record is None:
             return
         try:
             self.controller.require_paused(native)
         except SecurityError, DeniedError, RecoveryRequiredError:
             return
         with j.atomic():
-            j.db.execute(
-                "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action='start' AND revision=? "
-                "AND state IN ('accepted','running','uncertain')",
-                (
-                    json.dumps({"local_session_verified": True, "charging": False, "timed": False}, sort_keys=True),
-                    state["id"],
-                    request["revision"],
-                ),
-            )
-            j.put(
-                "managed_test_charge",
-                {
-                    **state,
-                    "state": "completed",
-                    "charging": False,
-                    "local_transaction": local,
-                    "recovery_reason": "owned_session_closed_at_verified_zero",
-                },
-            )
-        # Local command completion is separate from unresolved cloud delivery; its fault and FIFO remain intact.
-        self.lease = None
+            j.starts.complete_closed_zero(record)
+        j.starts.set_lease(None)
         self.changed.set()
 
     # Fault supervision still settles exact local closure; cloud delivery retains its independent recovery gate.
@@ -380,28 +299,7 @@ class ManagedChargeTests:
             normal=action == "start",
             current_a=c.current.selected(),
         )
-        with j.atomic():
-            j.put(
-                "managed_test_charge",
-                {
-                    "id": identifier,
-                    "source": source,
-                    "kind": "normal" if lease.normal else "test",
-                    "revision": revision,
-                    "state": "starting" if source == "local" else "armed",
-                    "accepted_at": time.time(),
-                    "hard_deadline_epoch": time.time() + STARTUP_BUDGET + (0 if lease.normal else DURATION),
-                    "duration_seconds": None if lease.normal else DURATION,
-                    "start_rpc_accepted": False,
-                    "start_attempted": False,
-                    "current_a": lease.current_a,
-                },
-            )
-            j.db.execute(
-                "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
-                (identifier, action, revision, json.dumps({"accepted_at": time.time()})),
-            )
-        self.lease = lease
+        j.starts.admit(lease, action, STARTUP_BUDGET, DURATION)
         self.timer = asyncio.create_task(self._deadline(lease))
         if source == "local":
             self.worker = asyncio.create_task(self._start(lease))
@@ -448,9 +346,6 @@ class ManagedChargeTests:
     async def _start(self, lease: TestLease) -> None:
         c, j = self.controller, self.journal
         previous_current = current_candidate(c) if lease.normal else None
-        trace = StartSettlementTrace(ControlIntent(lease.mode, lease.revision)) if lease.normal else None
-        self.start_trace = trace
-        self.last_start_settlement = None
         effects = False
         try:
             self.guard(lease)
@@ -502,26 +397,15 @@ class ManagedChargeTests:
             # Commit the attempt marker with LocalControl's receipt, never before its owned task first executes.
             def prepared() -> None:
                 self.guard(lease)
-                j.put(
-                    "managed_test_charge",
-                    {**self.state(), "tag_digest": fingerprint(tag.casefold()), "start_attempted": True},
-                )
+                j.starts.prepared_metadata(lease, fingerprint(tag.casefold()))
                 lease.start_scope = current_scope(c.session.gateway)
 
             # This synchronous writer joins the child's transaction; it never opens a nested atomic block.
             def publish(context: StartHandoffContext) -> StartPublication:
                 self.guard(lease)
-                receipt = local_start_receipt(j)
                 if (
-                    not j.db.in_transaction
-                    or context.request_id != lease.identifier
-                    or context.scope != current_scope(c.session.gateway)
+                    context.scope != current_scope(c.session.gateway)
                     or context.control_revision != c.session.gateway.controls._revision
-                    or j.get("control", {}).get("ticket") != context.ticket
-                    or receipt.get("ticket") != context.ticket
-                    or receipt.get("digest") != context.tag_digest
-                    or receipt.get("request_id") != lease.identifier
-                    or receipt.get("stage") != "accepted"
                 ):
                     raise RecoveryRequiredError("owned Start publication was superseded")
                 if lease.normal:
@@ -535,24 +419,13 @@ class ManagedChargeTests:
                             pass  # A newer current request retains its own independently owned outcome.
                         else:
                             complete_record(c, previous_current)
-                intent = c.requests.intent()
-                j.put(
-                    "managed_test_charge",
-                    {
-                        **self.state(),
-                        "state": "awaiting_power",
-                        "start_rpc_accepted": True,
-                        "revision": intent.revision,
-                    },
-                )
-                return StartPublication(lease.identifier, intent, lease.epoch)
+                return j.starts.published(lease, context, c.requests.intent())
 
             # Only successful COMMIT can change these in-memory authorities; no await separates publication.
             def committed(publication: StartPublication) -> None:
                 if lease.normal:
                     c.released_epoch = publication.epoch
-                    lease.revision = publication.intent.revision
-                    lease.mode = publication.intent.mode
+                j.starts.committed(lease, publication)
                 self.changed.set()
 
             result = await c.session.gateway.start_managed_result(
@@ -560,14 +433,13 @@ class ManagedChargeTests:
                 lambda: self.guard(lease),
                 request_id=lease.identifier,
                 on_prepared=prepared,
-                handoff=StartHandoff(publish, committed, trace.observe if trace is not None else None),
+                handoff=StartHandoff(publish, committed),
             )
             if result.failure is not None:
                 raise result.failure
             if result.publication is None:
                 raise RecoveryRequiredError("managed Start authority publication was not confirmed")
             self.guard(lease)
-            self.observe_start_owner(trace)
         except (
             DeniedError,
             SecurityError,
@@ -576,20 +448,10 @@ class ManagedChargeTests:
             TimeoutError,
             sqlite3.Error,
         ) as error:
-            await self._failed_start(lease, error, effects, trace)
-
-    # Optional observation never adds a critical storage prerequisite or changes an already selected settlement.
-    def observe_start_owner(self, trace: StartSettlementTrace | None) -> None:
-        if trace is not None:
-            try:
-                trace.owner_observed(self.controller.recovery.authority())
-            except sqlite3.Error:
-                pass  # Critical publication/settlement already has its own owned retry; this observation is optional.
+            await self._failed_start(lease, error, effects)
 
     # Settle the exact failed operation before optional diagnostics; a newer restrictive winner remains intact.
-    async def _failed_start(
-        self, lease: TestLease, error: Exception, effects: bool, trace: StartSettlementTrace | None = None
-    ) -> None:
+    async def _failed_start(self, lease: TestLease, error: Exception, effects: bool) -> None:
         c, j = self.controller, self.journal
         while not self._closing and not c.stopping:
             try:
@@ -610,7 +472,6 @@ class ManagedChargeTests:
                     state.get("tag_digest"),
                 )
                 decision = settle_start(facts)
-                self.last_start_settlement = decision
                 if decision.action is StartFailureAction.UNRELATED:
                     return
                 cause = {
@@ -627,24 +488,18 @@ class ManagedChargeTests:
                     receipt.get("request_id"), receipt.get("digest"), receipt.get("stage"), receipt.get("local")
                 )
                 decision = settle_start(facts, receipt_facts)
-                self.last_start_settlement = decision
                 if decision.retire_prepared:
                     retire_unsent_local_start(j, receipt.get("ticket"))
                 if decision.action is StartFailureAction.DIAGNOSTIC_ONLY:
                     self.record_failure_diagnostic(cause)
-                    self.observe_start_owner(trace)
                     return  # A deadline or later proof already owns the state and immutable terminal receipt.
                 if decision.action is StartFailureAction.FAIL_PREFLIGHT:
-                    with j.atomic():
-                        c.requests.finish(lease.identifier, "failed", {"classification": "preflight_refused_unsent"})
-                        j.put("managed_test_charge", {**self.state(), "state": "failed", "failure": cause})
-                    self.lease = None
+                    j.starts.fail_preflight(lease.identifier, cause)
                     self.changed.set()
                     self.retire_refused_unsent()
                 else:
                     self.stop(lease, "start_not_confirmed", failure=cause)
                 self.record_failure_diagnostic(cause)
-                self.observe_start_owner(trace)
                 return
             except sqlite3.Error:
                 # Genuine critical storage failure retains the separate deadline's existing zero/Stop authority.
@@ -664,38 +519,19 @@ class ManagedChargeTests:
 
     # Bind an actual accepted Start inside its ledger transaction, including sessions ending between native polls.
     def started(self, local: int, payload: dict[str, Any]) -> None:
-        lease, state = self.lease, self.state()
-        if lease is None or not lease.normal or state.get("kind") != "normal":
-            return
-        if state.get("local_transaction") is not None or local_start_receipt(self.journal).get("local") != local:
-            return
-        tag = payload.get("idTag")
-        if not isinstance(tag, str) or state.get("tag_digest") != fingerprint(tag.casefold()):
-            return
-        try:
-            self.guard(lease)
-        except DeniedError:
-            return
-        self.journal.put("managed_test_charge", {**state, "local_transaction": local, "actual_start_at": time.time()})
+        lease = self.lease
+        if lease is not None:
+            try:
+                self.journal.starts.managed_bound(lease, local, payload.get("idTag"), lambda: self.guard(lease))
+            except DeniedError:
+                return
 
     # A real bound Start/Stop pair completes without changing current authority or stopping a later app session.
     def finish_closed_normal(self, lease: TestLease) -> bool:
-        state = self.state()
-        if self.lease is not lease or not lease.normal or not state.get("start_rpc_accepted"):
-            return False
-        local = state.get("local_transaction")
-        row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
-        if row is None or row["stop"] is None:
-            return False
-        self.journal.put(
-            "managed_test_charge", {**state, "state": "completed", "charging": False, "stopped_at": time.time()}
-        )
-        self.controller.requests.finish(
-            lease.identifier, "completed", {"local_session_verified": True, "charging": False, "timed": False}
-        )
-        self.lease = None
-        self.changed.set()
-        return True
+        finished = self.journal.starts.finish_closed(lease)
+        if finished:
+            self.changed.set()
+        return finished
 
     # Keep verified source evidence on its actual Boot; an ACK never identifies an unrelated native transaction.
     def record_source(self, native: HandoverEvidence) -> None:
@@ -703,7 +539,7 @@ class ManagedChargeTests:
         self.source = (native, g.boot_observation, g.controls._revision)
         local, state = self.journal.active(), self.state()
         if local is not None and self.independent_daily(native, local) and not state.get("independent_seen"):
-            self.journal.put("managed_test_charge", {**state, "independent_seen": True})
+            self.journal.starts.independent_seen(state)
 
     # The verified original plan and matching ledger identify the daily even when the owner uses its tag.
     def independent_daily(self, native: HandoverEvidence, local: int) -> bool:
@@ -913,7 +749,7 @@ class ManagedChargeTests:
                     progress = await c.recovery.restore(expected)
                     if not progress.shared:
                         return True
-                j.put("managed_test_charge", {**self.state(), "state": "completed", "charging": False})
+                j.starts.complete_metadata(self.state())
                 return False
             if expected.mode == "app" and local is None and not native.physical.transaction_open:
                 if (
@@ -989,17 +825,8 @@ class ManagedChargeTests:
         self.retire_closed_at_zero(native)
         lease, c = self.lease, self.controller
         state = self.state()
-        if lease is not None and self.finish_closed_normal(lease):
-            return
-        if state.get("kind") == "normal" and state.get("state") == "running":
-            local = state.get("local_transaction")
-            row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
-            if row is not None and row["stop"] is not None:
-                self.journal.put(
-                    "managed_test_charge", {**state, "state": "completed", "charging": False, "stopped_at": time.time()}
-                )
-            elif native.physical.native_transaction_id == local and self.journal.active() == local:
-                self.journal.put("managed_test_charge", {**state, "charging": native.physical.power_w > 10})
+        if self.journal.starts.observe_normal(native):
+            self.changed.set()
             return
         if lease is None:
             owner = local_start_receipt(self.journal)
@@ -1020,7 +847,7 @@ class ManagedChargeTests:
                 )
             ):
                 # An explicit Pause can finish this expired debt too, without reviving it on the next Return.
-                self.journal.put("managed_test_charge", {**state, "state": "completed", "charging": False})
+                self.journal.starts.complete_metadata(state)
             return
         if state.get("state") == "stopping":
             if (
@@ -1029,8 +856,8 @@ class ManagedChargeTests:
                 and not native.physical.transaction_open
             ):
                 c.require_paused(native)
-                self.journal.put("managed_test_charge", {**state, "state": "completed", "stopped_at": time.time()})
-                self.lease = None
+                self.journal.starts.complete_metadata(state, stopped_at=time.time())
+                self.journal.starts.set_lease(None)
                 self.changed.set()
             return
         if state.get("state") == "charging" and not native.physical.transaction_open and native.physical.power_w == 0:
@@ -1042,47 +869,10 @@ class ManagedChargeTests:
             self.stop(lease, "superseded")
             return
         if lease.normal and state.get("start_rpc_accepted"):
-            local = state.get("local_transaction")
-            row = self.journal.db.execute("SELECT start,stop FROM transactions WHERE local=?", (local,)).fetchone()
-            closed = row is not None and row["stop"] is not None
-            opened = (
-                local is not None
-                and native.physical.transaction_open
-                and native.physical.native_transaction_id == local
+            self.journal.starts.observe_normal(
+                native, allow_open=True, known_source=known_plan_source(self.journal, native)
             )
-            if opened or closed:
-                self.journal.put(
-                    "managed_test_charge",
-                    {
-                        **state,
-                        "state": "completed" if closed else "running",
-                        "local_transaction": local,
-                        "session_started_at": time.time(),
-                        "charging": opened and native.physical.power_w > 10,
-                        **(
-                            {
-                                "native_source": {
-                                    "marker": native.session_plan_id,
-                                    "start": fingerprint(json.loads(row["start"])),
-                                    "schedule": native.saved_schedule_digest,
-                                }
-                            }
-                            if opened and not known_plan_source(self.journal, native)
-                            else {}
-                        ),
-                    },
-                )
-                c.requests.finish(
-                    lease.identifier,
-                    "completed",
-                    {
-                        "local_session_verified": True,
-                        "charging": opened and native.physical.power_w > 10,
-                        "timed": False,
-                    },
-                )
-                self.lease = None
-                self.changed.set()
+            self.changed.set()
             return
         if state.get("state") != "charging" and native.physical.power_w > 10:
             if self.journal.active() is None or native.physical.native_transaction_id != self.journal.active():
@@ -1106,8 +896,7 @@ class ManagedChargeTests:
             lease.deadline = min(
                 lease.hard_deadline, time.monotonic() + DURATION + (15 if lease.source == "cloud" else 0)
             )
-            self.journal.put(
-                "managed_test_charge",
+            self.journal.starts.project_test(
                 {
                     **state,
                     "state": "charging",
@@ -1183,19 +972,9 @@ class ManagedChargeTests:
                 )
             elif self.failed_start_zero_needed(lease, reason, failure):
                 c.session.gateway.controls._claim(True)
-            j.put(
-                "managed_test_charge",
-                {
-                    **self.state(),
-                    "state": "expired" if preserve else "stopping",
-                    "stop_reason": reason,
-                    "expired_normal": lease.normal,
-                    **({"failure": failure} if failure is not None else {}),
-                },
-            )
-            c.requests.finish(lease.identifier, "uncertain", {"classification": reason})
+            j.starts.expire(lease, reason, preserve, failure)
         if lease.normal:
-            self.lease = None
+            self.journal.starts.set_lease(None)
         if c.pause_task is None or c.pause_task.done():
             c.pause_task = asyncio.create_task(c._stop_requested())
         self.changed.set()
@@ -1252,7 +1031,7 @@ class ManagedChargeTests:
     # Shutdown retires timers and awaits owned workers before their journal can be closed.
     async def close(self) -> None:
         self._closing = True
-        self.lease = None
+        self.journal.starts.set_lease(None)
         self.changed.set()
         if self.timer is not None:
             self.timer.cancel()

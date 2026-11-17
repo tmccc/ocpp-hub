@@ -7,7 +7,6 @@ import math
 import time
 from typing import TYPE_CHECKING, Any
 
-from .local_control import local_start_receipt
 from .managed_denial_faults import (
     current_operator_proof,
     denial_source_fault,
@@ -78,44 +77,7 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
 
 # Only the exact bound ordinary owner request may settle metadata alongside its denied closed lifecycle.
 def denied_normal_identity(j: Journal, local: int) -> dict[str, Any] | None:
-    state, owner = j.get("managed_test_charge", {}), local_start_receipt(j)
-    published = state.get("start_rpc_accepted") is True
-    unpublished = (
-        state.get("start_rpc_accepted") is False
-        and state.get("start_attempted") is True
-        and owner.get("request_id") == state.get("id")
-        and owner.get("stage") in ("issued", "accepted")
-    )
-    request = j.db.execute(
-        "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
-    ).fetchone()
-    transaction = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
-    if (
-        state.get("kind") != "normal"
-        or state.get("source") != "local"
-        or state.get("local_transaction") not in (None, local)
-        or state.get("local_transaction") is None
-        and owner.get("request_id") != state.get("id")
-        or not (published or unpublished)
-        or owner.get("local") != local
-        or published
-        and owner.get("stage") != "accepted"
-        or owner.get("digest") != state.get("tag_digest")
-        or transaction is None
-        or fingerprint(json.loads(transaction["start"])["idTag"].casefold()) != state.get("tag_digest")
-        or owner.get("request_id") not in (None, state.get("id"))
-        or request is None
-        or request["action"] != "start"
-        or request["state"] not in ("accepted", "running", "uncertain", "completed", "failed")
-        or request["state"] in ("accepted", "running", "uncertain")
-        and owner.get("request_id") != state.get("id")
-        or request["revision"] + int(published) != state.get("revision")
-    ):
-        return None
-    return {key: state[key] for key in ("id", "revision", "tag_digest")} | {
-        "local_transaction": local,
-        "request_revision": request["revision"],
-    }
+    return j.starts.identity(local, strict_request=True, strict_unpublished=True)
 
 
 # A persisted retry deadline avoids a tight loop and survives process replacement without resetting its budget.
@@ -294,24 +256,12 @@ def complete_one_denial(j: Journal, proof: dict[str, Any], pause: str) -> None:
     if proof.get("normal") is not None:
         if denied_normal_identity(j, proof["denial"]["local"]) != proof["normal"]:
             raise RecoveryRequiredError("denied owner metadata no longer identifies the closed lifecycle")
-        j.put(
-            "managed_test_charge",
-            {
-                **j.get("managed_test_charge"),
-                "state": "completed",
-                "charging": False,
-                "local_transaction": proof["denial"]["local"],
-                "recovery_reason": "denied_owned_session_closed_at_verified_zero",
-            },
-        )
-        j.db.execute(
-            "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action='start' "
-            "AND revision=? AND state IN ('accepted','running','uncertain')",
-            (
-                json.dumps({"local_session_verified": True, "charging": False, "timed": False}, sort_keys=True),
-                proof["normal"]["id"],
-                proof["normal"]["request_revision"],
-            ),
+        j.starts.complete_normal(
+            j.get("managed_test_charge"),
+            proof["denial"]["local"],
+            reason="denied_owned_session_closed_at_verified_zero",
+            allow_uncertain=True,
+            request_revision=proof["normal"]["request_revision"],
         )
     j.put(DENIALS, {**records, key: {**records[key], "completed": {"pause": pause, "at_epoch": time.time()}}})
 

@@ -3,8 +3,13 @@
 from dataclasses import replace
 
 import pytest
-from ocpp_hub_core.prototype.control_slice import step
-from ocpp_hub_core.prototype.control_slice_state import (
+from ocpp_hub_core.prototype.managed_intent import ControlIntent
+from ocpp_hub_core.prototype.recovery_contracts import FailureKind, OwnedReleaseResult, ReleaseEffects, WireReply
+from ocpp_hub_core.prototype.recovery_policy import ReleaseDisposition
+
+from tests.test_control_slice import accepted, authority, dispatched, prepared
+from tests_model.control_slice import step
+from tests_model.control_slice_state import (
     AuthorityChanged,
     CloseStarted,
     CloudSettled,
@@ -23,11 +28,6 @@ from ocpp_hub_core.prototype.control_slice_state import (
     StartOutcome,
     StartPrepared,
 )
-from ocpp_hub_core.prototype.managed_intent import ControlIntent
-from ocpp_hub_core.prototype.recovery_contracts import FailureKind, OwnedReleaseResult, ReleaseEffects, WireReply
-from ocpp_hub_core.prototype.recovery_policy import ReleaseDisposition
-
-from tests.test_control_slice import accepted, authority, dispatched, prepared
 
 
 # Supply a completely observed closed lifecycle, without using the reducer as an expected-result oracle.

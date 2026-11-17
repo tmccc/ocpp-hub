@@ -24,7 +24,7 @@ from .managed_stop_delivery import KINDS as STOP_KINDS
 from .managed_stop_delivery import NO_REPLY, REJECTION, WIRE_ACK, stop_identity, stop_resolution
 from .managed_storage_recovery import storage_candidate, storage_resolution
 from .native_bounded import NativeBoundedSpec
-from .store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
 
@@ -548,35 +548,11 @@ def reconcile_debt(
             )
             j.db.execute("UPDATE outbox SET state='queued' WHERE token=?", (e["delivery_token"],))
             if closed_start:
-                j.put(
-                    "managed_test_charge",
-                    {
-                        **snapshot["test"],
-                        "state": "completed",
-                        "charging": False,
-                        "recovery_reason": "operator_verified_closed_start_delivery",
-                    },
-                )
+                j.starts.complete_metadata(snapshot["test"], reason="operator_verified_closed_start_delivery")
         elif kind == "local-start":
-            j.put("local_start_receipt", {**snapshot["receipt"], "stage": "reconciled", "proof": identifier})
-            j.put(
-                "managed_test_charge",
-                {
-                    **snapshot["test"],
-                    "state": "completed",
-                    "charging": False,
-                    "recovery_reason": "operator_verified_no_pending_start",
-                },
-            )
+            j.starts.operator_no_pending(snapshot["receipt"], snapshot["test"], identifier, e["request_id"])
             if snapshot["deferred"]:
                 j.put("managed_deferred_start", {})
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? WHERE id=?",
-                (
-                    encoded({"classification": "operator_reconciled_at_zero", "charging_started": False}),
-                    e["request_id"],
-                ),
-            )
         elif kind != "storage-fault":
             assert head is not None
             j.db.execute(
@@ -585,7 +561,7 @@ def reconcile_debt(
             )
             j.db.execute("DELETE FROM outbox WHERE token=?", (head.token,))
         control = j.get("control")
-        j.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True, "start_pending": False})
+        j.starts.operator_control(control)
         j.put("managed_control_fault", fault)
         proof["resolved"] = resolved_debt(j, kind, proof)
         j.put(KEY, {**records, identifier: {"proof": proof, "completed": None}})

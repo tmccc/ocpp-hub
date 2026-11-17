@@ -22,16 +22,18 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   with fresh collection and the independent evidence audit passed. Documentation-only follow-ups do not change
   that tested implementation.
 
-## Offline architectural pilot — 17 November 2026
+## Offline architectural work — 17 November 2026
 
-- [~] A bounded, effect-free Start/Pause/Return transition core retains historical physical evidence separately
-  from newer owner authority, with exact outcome COMMIT identity and distinct local/cloud Start/cloud Stop debts.
-  It is exercised by pure contract rows and an independent real-peer late-Accepted-after-new-Pause witness.
-  The normal Start child now feeds its real synchronous boundaries into that observation, and the runtime uses
-  one pure failure-settlement selector in place of the async predicates. A 30-case isolated shadow batch agreed
-  with all 17 observed legacy selections; the same 30 cases passed after replacement. The fast pure selector and
-  boundary tests take well under a second. Existing effect authority, persistence and test families remain in place.
-  Wider state ownership, net code reduction, full qualification and deployment of this change remain open.
+- [x] Extract the pure Start failure selector, then consolidate the normal Start lifecycle under `Journal.starts`
+  using existing persisted formats. Receipt, pending-bit, managed-charge metadata and lease-slot writes now have
+  one owner, with checked typed correlation for local closure and recovery. Shared timed/cloud projections pass
+  through that owner; generic process-replaced request normalization remains separate.
+- [x] Remove temporary runtime observer plumbing and move the pilot grammar to test references while preserving
+  its original assertions. Add fast stored-state and atomic-failure checks; retain real peer, same-tag, cancellation,
+  expiry, operator and actual process-death coverage for the coherent lifecycle milestone.
+- [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
+  admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
+  separate duties. Full four-suite qualification and deployment of this local candidate remain open.
 
 ## iCS implementation history — 15 November 2026
 

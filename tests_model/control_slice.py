@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from ocpp_hub_core.prototype.recovery_policy import release_disposition
+
 from .control_slice_state import (
     AuthorityChanged,
     CloseStarted,
@@ -29,7 +31,6 @@ from .control_slice_state import (
     StartPrepared,
     StartRecord,
 )
-from .recovery_policy import release_disposition
 
 
 # Replacing one immutable attempt cannot discard independently retained historical attempts.

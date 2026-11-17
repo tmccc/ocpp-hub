@@ -143,41 +143,39 @@ four-suite twenty-worker qualification.
 
 ## Control transitions and Start settlement
 
-`core/prototype/start_settlement.py` owns the pure production Start failure selector. It returns unrelated work,
-diagnostic-only completion, preflight failure or required existing Stop settlement, with an independent prepared
-receipt-retirement flag. The async owner rebuilds facts on every storage retry and executes the selected action
-without an intervening await. Prepared retirement still precedes a diagnostic-only exit. Initial zero work counts
-as effects; an unsent RemoteStart alone is not proof of a preflight-only refusal. The original native/resource
-guards, SQL transactions, restrictive execution and cancellation retirement remain responsible for physical work.
+`Journal.starts` (`core/prototype/start_lifecycle.py`) owns Start receipt, pending-bit and shared managed-charge
+metadata writes, local Start outcomes and the sole process-local lease slot. `NormalStart` loads the current
+request, wire receipt, metadata projections and actual ledger. An older receipt remains historical until the new
+request prepares. Receipt tag/local identity is usable only with matching projections and current-request or
+explicit published legacy provenance; contradictory stored copies never become corrected permission.
 
-`control_slice.py` and `control_slice_state.py` retain bounded Start/Pause/Return observations.
-One immutable aggregate retains exact per-attempt identities, observed replies, committed outcome evidence,
-historical publication, local closure, separate cloud Start/Stop acknowledgement duties and Start-port retirement.
-Return interpretation reuses the production `release_disposition` policy. `step(state, event)` accepts boundary
-facts and returns an immutable state plus persistence, publication or recovery candidates. No candidate grants
-wire permission. The normal Start child feeds actual prepared, dispatch, reply, evidence COMMIT, publication
-COMMIT and retirement observations through its existing `StartHandoff`. There are no new tasks or journal writes.
-Current ownership is sampled at settlement; this is not a reconstruction of every earlier owner event's timing.
-Timed Start shares the production failure selector, while this boundary observation covers normal Start only.
+Wire Accepted does not mean managed publication succeeded. `start_rpc_accepted` retains its existing publication
+meaning, and `control.start_pending` remains stored evidence. In particular, a Rejected reply after a newer ticket
+preserves the existing sticky pending state. No journal key, field, schema or replay mechanism is added. Startup
+request normalization remains in `ManagedRequests`; a lease is never restored from disk.
 
-Run `tests/test_control_slice.py` and `tests/test_control_slice_inputs.py` for pure contract and causal-input rows.
-`tests/test_start_settlement.py` checks the production selector and commit-boundary observation without sockets.
-`tests/test_control_slice_peer.py` holds a genuine TLS
-Start reply, commits a newer owner Pause, releases the original Accepted bytes, then proves exact later lifecycle,
-Stop and Return using the existing engine and independent physical/SQL assertions. It also feeds those observed
-facts into the effect-free core; the core does not calculate the expected physical result.
+The owner joins the existing preparation and authority-publication transactions. Live scope, native/resource
+checks, current intent, restrictive execution, timer and task retirement stay with their existing callers.
+Closed-zero, denial, operator and ordinary local completion share identity and write ownership while retaining
+their different proof rules, exact reason strings and original terminal request bytes. Local closure leaves
+cloud Start/Stop acknowledgement duties intact. A memory-releasing entry point requires its own transaction;
+callers that supply an outer transaction release memory only after its successful COMMIT. No await belongs inside
+a journal transaction.
 
-The observation does not implement native admission, final dispatch/resource checks, restrictive permits, queue or
-storage scheduling, a complete port owner, restart/replay, journal migration, timers, current changes or debt
-attestation. `ports_retired` concerns only the Start ports represented in this experiment. Outcome storage and
-publication events report successful COMMIT, not attempted SQL. Original native/resource/live guards, SQL handoffs,
-deadline tasks and all existing boundary suites remain necessary. No test family is retired, and no code-size or
-full-suite speed improvement is established by this bounded extraction. The broader state-owner and persistence
-migration remain future work; only the failure-settlement selection now replaces its former async predicates.
+`start_settlement.settle_start` remains the pure production failure selector. Initial zero counts as effects even
+before RemoteStart dispatch; prepared receipt retirement precedes a diagnostic-only exit. The async caller
+rebuilds facts on storage retries and executes the selected settlement without an intervening await.
 
-`StartPrepared` reports an already admitted boundary; it does not admit a management request. The experiment's
-debt set does not replace `control.start_pending`, uncertainty, faults or operator-debt records. In particular,
-local request completion at exact closed-zero proof remains distinct from cloud Start and Stop delivery settlement.
+The pilot `control_slice.py`, `control_slice_state.py` and `start_reference.py` live under `tests_model/`. Their
+original assertions are preserved as reference checks. The temporary runtime observer/callback plumbing is gone;
+production imports none of these modules. Run `tests/test_start_lifecycle.py` for fast stored-state, stale-preimage
+and COMMIT-failure checks, and `tests/test_start_settlement.py` for the pure selector and preserved reference.
+The real late-Accepted-after-new-Pause witness remains in `tests/test_control_slice_peer.py`.
+
+Use a coherent milestone selection covering the moved writers: native/peer handoffs, same-tag attribution,
+expiry and later sessions, cancellation/SQL failures, operator/denial proofs, and actual process death around
+preparation, dispatch and publication. Keep fast inner checks separate from those longer boundary tests. These
+focused checks are development evidence; release still requires exact-clean-source four-suite qualification.
 
 ## Reference implementation
 

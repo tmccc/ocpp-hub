@@ -4,13 +4,10 @@ from dataclasses import replace
 
 import pytest
 from ocpp_hub_core.prototype.connection_scope import CloudAttemptScope
-from ocpp_hub_core.prototype.control_slice_state import StartOutcome
 from ocpp_hub_core.prototype.managed_intent import ControlIntent
 from ocpp_hub_core.prototype.recovery_contracts import AuthorityStamp, FailureKind, WireReply
 from ocpp_hub_core.prototype.start_handoff import (
     OwnedStartResult,
-    StartBoundary,
-    StartBoundaryObservation,
     StartHandoffContext,
     StartPublication,
 )
@@ -19,9 +16,11 @@ from ocpp_hub_core.prototype.start_settlement import (
     StartFailureDecision,
     StartFailureFacts,
     StartReceiptFacts,
-    StartSettlementTrace,
     settle_start,
 )
+
+from tests_model.control_slice_state import StartOutcome
+from tests_model.start_reference import StartBoundary, StartBoundaryObservation, StartSettlementTrace
 
 
 # Name input facts without deriving expected actions from the production decision.

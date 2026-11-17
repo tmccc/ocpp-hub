@@ -4,8 +4,18 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 from ocpp_hub_core.prototype.connection_scope import CloudAttemptScope
-from ocpp_hub_core.prototype.control_slice import step
-from ocpp_hub_core.prototype.control_slice_state import (
+from ocpp_hub_core.prototype.managed_intent import ControlIntent
+from ocpp_hub_core.prototype.recovery_contracts import (
+    AuthorityStamp,
+    FailureKind,
+    OwnedReleaseResult,
+    ReleaseEffects,
+    WireReply,
+)
+from ocpp_hub_core.prototype.recovery_policy import ReleaseDisposition
+
+from tests_model.control_slice import step
+from tests_model.control_slice_state import (
     AuthorityChanged,
     CloseStarted,
     CloudSettled,
@@ -27,15 +37,6 @@ from ocpp_hub_core.prototype.control_slice_state import (
     StartOutcome,
     StartPrepared,
 )
-from ocpp_hub_core.prototype.managed_intent import ControlIntent
-from ocpp_hub_core.prototype.recovery_contracts import (
-    AuthorityStamp,
-    FailureKind,
-    OwnedReleaseResult,
-    ReleaseEffects,
-    WireReply,
-)
-from ocpp_hub_core.prototype.recovery_policy import ReleaseDisposition
 
 
 # Use synthetic independent identities; these records are never installed in an engine journal.

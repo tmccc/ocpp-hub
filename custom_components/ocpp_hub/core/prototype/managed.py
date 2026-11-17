@@ -406,7 +406,7 @@ class ManagedController:
                     if internal:
                         g.controls._complete(j.get("control")["ticket"], uncertain=False)
                 if any(record.key == "managed_test_charge" for record in records):
-                    self.tests.lease = None
+                    j.starts.set_lease(None)
                     self.tests.changed.set()
         if self.current.failed_idle_hold():
             # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
@@ -440,7 +440,7 @@ class ManagedController:
             g.controls._complete(control["ticket"], uncertain=False)
         pause_revision = self.requests.intent().revision
         if receipt.get("pause_revision") == pause_revision and receipt.get("verified_pause_revision") != pause_revision:
-            j.put("local_start_receipt", {**receipt, "verified_pause_revision": pause_revision})
+            j.starts.pause_verified(receipt, pause_revision)
         self.requests.confirm_pauses()
         return native
 

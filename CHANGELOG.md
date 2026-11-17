@@ -2,13 +2,13 @@
 
 ## Unreleased
 
-- Select Start failure settlement through one pure production policy, replacing the request, lease, phase and
-  receipt-retirement predicates in the async owner. Keep initial-zero effects distinct from RemoteStart dispatch.
-- Observe the normal Start child's real preparation, dispatch, reply, evidence/publication COMMIT and retirement
-  boundaries through immutable transitions. Keep physical outcomes and newer authority separate; observations have
-  no effect ports, new tasks or journal writes. Existing physical guards and publication owners remain in charge.
-- Add an independent real-peer witness for a genuine Start Accepted reply arriving after a newer Pause commits,
-  followed by the exact delayed lifecycle, Stop and Return without repeating Start.
+- Consolidate Start receipt, pending state, managed-charge projections and the active lease under one journal
+  lifecycle owner. Share typed local-session identity across completion and recovery, preserving publication lag,
+  legacy journals, newer Pause authority and independent cloud delivery debt.
+- Remove temporary runtime control observations; keep the pilot grammar and its original checks as test references.
+  Add fast SQLite identity, stale-state and COMMIT-failure regressions.
+- Select Start failure settlement through one pure production policy. Keep initial-zero effects distinct from
+  RemoteStart dispatch, and retain the real-peer late-Accepted-after-new-Pause lifecycle witness.
 
 ## 0.2.3 — iCS recovery and control handoffs
 

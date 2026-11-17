@@ -305,6 +305,6 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
     c.released_epoch = None
     if terminal_test is not None:
-        c.tests.lease = None
+        c.session.journal.starts.set_lease(None)
         c.tests.changed.set()
     return True

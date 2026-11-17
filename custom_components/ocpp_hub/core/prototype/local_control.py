@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import sys
 import uuid
@@ -41,8 +40,6 @@ from .security import SecurityError
 from .start_handoff import (
     OwnedStartResult,
     StartAttempt,
-    StartBoundary,
-    StartBoundaryObservation,
     StartHandoff,
     StartHandoffContext,
 )
@@ -50,12 +47,6 @@ from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
-
-
-# An optional synchronous observation stays inside the owned child's lifetime and grants no effect permission.
-def observe_start(handoff: StartHandoff | None, observation: StartBoundaryObservation) -> None:
-    if handoff is not None and handoff.observed is not None:
-        handoff.observed(observation)
 
 
 class ControlSupersededError(DeniedError):
@@ -111,68 +102,19 @@ class StopAcknowledgement:
     generation: int
 
 
-# Older managed normal Starts saved their tag with the owner's request before dispatching the physical command.
+# Read compatibility evidence through the journal's sole Start lifecycle owner.
 def local_start_receipt(j: Journal) -> dict[str, Any]:
-    receipt = j.get("local_start_receipt", {})
-    if receipt:
-        return dict(receipt)
-    old = j.get("managed_test_charge", {})
-    if old.get("tag_digest") and old.get("source") == "local":
-        return {
-            "digest": old["tag_digest"],
-            "stage": "accepted" if old.get("start_rpc_accepted") else "prepared",
-            "local": old.get("local_transaction"),
-        }
-    return {}
+    return j.starts.receipt()
 
 
-# A crash or revoked validation before final dispatch cannot leave a real transaction for this command to report.
+# Retire only the exact prepared receipt while preserving later owner claims.
 def retire_unsent_local_start(j: Journal, ticket: str | None) -> None:
-    receipt = j.get("local_start_receipt", {})
-    if not ticket or receipt.get("ticket") != ticket or receipt.get("stage") != "prepared":
-        return
-    control = j.get("control", {})
-    with j.atomic():
-        intent = j.get("managed_control_intent", {})
-        j.put(
-            "local_start_receipt",
-            {
-                **receipt,
-                "stage": "unsent",
-                "settled_ticket": control.get("ticket"),
-                "pause_revision": intent.get("revision") if intent.get("mode") == "paused" else None,
-            },
-        )
-        j.put("control", {**control, "start_pending": False})
+    j.starts.retire_prepared(ticket)
 
 
-# A pre-upgrade ordinary Start can lose its pending flag when a different tag is accepted first.
+# Normalize old unbound evidence without replaying the Start command.
 def recover_unreported_local_start(j: Journal) -> None:
-    existing = j.get("local_start_receipt", {})
-    if existing:
-        retire_unsent_local_start(j, existing.get("ticket"))
-        return
-    owner = j.get("managed_test_charge", {})
-    if (
-        owner.get("source") != "local"
-        or owner.get("kind") != "normal"
-        or owner.get("start_rpc_accepted") is not True
-        or owner.get("local_transaction") is not None
-        or owner.get("state") not in ("awaiting_power", "stopping", "interrupted")
-        or not isinstance(owner.get("tag_digest"), str)
-        or len(owner["tag_digest"]) != 64
-    ):
-        return
-    control = j.get("control", {})
-    # The old ledger never recorded a Start-command floor. A matching historical tag alone has no ordering proof.
-    if not control.get("start_pending") and any(
-        fingerprint(json.loads(row["start"])["idTag"].casefold()) == owner["tag_digest"]
-        for row in j.db.execute("SELECT start FROM transactions")
-    ):
-        return
-    with j.atomic():
-        j.put("local_start_receipt", {"digest": owner["tag_digest"], "stage": "accepted", "local": None})
-        j.put("control", {**control, "start_pending": True})
+    j.starts.recover_legacy()
 
 
 class LocalControl:
@@ -307,28 +249,9 @@ class LocalControl:
         if state.get("ticket") == ticket:
             self.journal.put("control", {**state, **changes})
 
-    # Bind only the issued local command with this tag, inside the actual transaction's durable commit.
+    # The journal's Start owner binds evidence inside the actual lifecycle transaction.
     def bind_start(self, tag: str, local: int) -> None:
-        control = self.journal.get("control", {})
-        if not control.get("start_pending"):
-            return
-        receipt = local_start_receipt(self.journal)
-        if (
-            receipt.get("local") is None
-            and receipt.get("digest") == fingerprint(tag.casefold())
-            and receipt.get("stage") in ("issued", "accepted")
-        ):
-            intent = self.journal.get("managed_control_intent", {})
-            self.journal.put(
-                "local_start_receipt",
-                {
-                    **receipt,
-                    "local": local,
-                    "bound_ticket": control.get("ticket"),
-                    "pause_revision": intent.get("revision") if intent.get("mode") == "paused" else None,
-                },
-            )
-            self.journal.put("control", {**control, "start_pending": False})
+        self.journal.starts.bind(tag, local)
 
     # Install the reserved station profile; Accepted confirms receipt, not yet real-device execution or persistence.
     async def _cap(self, call: Call, limit: float, epoch: int, *, guard: Callable[[], None] | None = None) -> Frame:
@@ -676,12 +599,6 @@ class LocalControl:
         finally:
             attempt.failure = sys.exception()
             attempt.finished = True
-            observe_start(
-                handoff,
-                StartBoundaryObservation(
-                    StartBoundary.RETIRED, result=attempt.result(), failure_kind=failure_kind(attempt.failure)
-                ),
-            )
 
     # A claimed start either completes its bounded sequence or reasserts the physical hold on failure.
     async def _start(
@@ -715,27 +632,9 @@ class LocalControl:
             raise DeniedError("tag is not allowed or a transaction is unresolved")
         with self.journal.atomic():
             epoch, ticket = self._claim(previous.get("inhibit", False))
-            self.journal.put(
-                "local_start_receipt",
-                {
-                    "ticket": ticket,
-                    "digest": fingerprint(tag.casefold()),
-                    "stage": "prepared",
-                    "local": None,
-                    "request_id": request_id,
-                },
-            )
+            self.journal.starts.prepare(ticket, fingerprint(tag.casefold()), request_id)
             if on_prepared is not None:
                 on_prepared()
-
-        if scope is not None:
-            observe_start(
-                handoff,
-                StartBoundaryObservation(
-                    StartBoundary.PREPARED,
-                    context=StartHandoffContext(request_id, ticket, scope, self._revision, fingerprint(tag.casefold())),
-                ),
-            )
 
         restoring_zero = False
 
@@ -749,25 +648,7 @@ class LocalControl:
 
         # Write dispatch and ACK independently of the control ticket a later Pause can supersede.
         def record_stage(stage: str) -> None:
-            receipt = self.journal.get("local_start_receipt", {})
-            if receipt.get("ticket") == ticket:
-                with self.journal.atomic():
-                    control = self.journal.get("control", {})
-                    settled = stage == "rejected" and receipt.get("local") is None and control.get("ticket") == ticket
-                    self.journal.put(
-                        "local_start_receipt",
-                        {**receipt, "stage": stage, **({"settled_ticket": ticket} if settled else {})},
-                    )
-                    if settled:
-                        self.journal.put("control", {**control, "start_pending": False})
-                if stage in ("accepted", "rejected"):
-                    observe_start(
-                        handoff,
-                        StartBoundaryObservation(
-                            StartBoundary.EVIDENCE_COMMITTED,
-                            reply=WireReply.ACCEPTED if stage == "accepted" else WireReply.REJECTED,
-                        ),
-                    )
+            self.journal.starts.record(ticket, stage)
 
         # The native and resource gates both run before the transport can send this command.
         def dispatch(action: str) -> None:
@@ -777,20 +658,11 @@ class LocalControl:
                 record_stage("issued")
                 if attempt is not None:
                     attempt.remote_start_dispatched = True
-                observe_start(handoff, StartBoundaryObservation(StartBoundary.DISPATCHED))
 
         # Receipt recording precedes fallible resource/result publication and never claims observed charging.
         def received(action: str, frame: Frame) -> None:
             if attempt is not None and action == "RemoteStartTransaction":
                 attempt.answer = frame
-                reply = (
-                    WireReply.ACCEPTED
-                    if frame[0] == 3 and frame[2].get("status") == "Accepted"
-                    else WireReply.REJECTED
-                    if frame[0] == 3 and frame[2].get("status") == "Rejected"
-                    else WireReply.ERROR
-                )
-                observe_start(handoff, StartBoundaryObservation(StartBoundary.REPLIED, reply=reply))
 
         async with self.peer.sequence(1, check, on_dispatch=dispatch, on_reply=received) as call:
             try:
@@ -799,7 +671,7 @@ class LocalControl:
                 if self.authorize is not None and not self.authorize(tag):
                     raise DeniedError("authorization changed before forwarding a local start")
                 with self.journal.atomic():
-                    self._complete(ticket, inhibit=False, start_pending=True)
+                    self.journal.starts.armed(ticket)
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
                 if attempt is not None:
                     attempt.answer = answer
@@ -824,9 +696,6 @@ class LocalControl:
                     handoff.committed(publication)
                     if attempt is not None:
                         attempt.publication = publication
-                    observe_start(
-                        handoff, StartBoundaryObservation(StartBoundary.PUBLICATION_COMMITTED, publication=publication)
-                    )
             except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError, sqlite3.Error:
                 retire_unsent_local_start(self.journal, ticket)
                 self._complete(ticket, inhibit=True)

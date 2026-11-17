@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
-from .store import Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import Journal, encoded, fingerprint
 
 if TYPE_CHECKING:
     from .managed_test_charge import ManagedChargeTests, TestLease
@@ -143,32 +142,12 @@ def retire_cancelled_start(owner: ManagedChargeTests, lease: TestLease) -> Cance
             or g.charger._pending
         ):
             return CancellationRetirement.PENDING
-        changed = j.db.execute(
-            "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND action=? AND revision=? "
-            "AND state IN ('accepted','running')",
-            (
-                encoded({"classification": "cancelled_before_start_dispatch"}),
-                candidate.identifier,
-                candidate.action,
-                candidate.revision,
-            ),
-        ).rowcount
-        if changed != 1:
-            raise RecoveryRequiredError("cancelled Start request changed before retirement")
-        j.put(
-            "managed_test_charge",
-            {
-                **json.loads(candidate.metadata),
-                "state": "completed",
-                "charging": False,
-                "recovery_reason": "cancelled_before_start_dispatch",
-            },
-        )
+        j.starts.cancelled(candidate.identifier, candidate.action, candidate.revision, candidate.metadata)
         recover = initial_zero_recovery(owner, lease)
         if recover:
             j.put("trial_phase", "recovering")
     if recover:
         owner.controller.released_epoch = None
-    owner.lease = None
+    j.starts.set_lease(None)
     owner.changed.set()
     return CancellationRetirement.RETIRED

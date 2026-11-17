@@ -72,6 +72,9 @@ class Journal:
                 raise RecoveryRequiredError("journal already has an active owner") from None
             self.db = sqlite3.connect(path, isolation_level=None)
             cleanup.callback(self.db.close)
+            from .start_lifecycle import StartLifecycle
+
+            self.starts = StartLifecycle(self)
             self._initialize(path, identity)
             cleanup.pop_all()
 

@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
-from .local_control import local_start_receipt
 from .managed_current import managed_current_ceiling
 from .managed_cutoffs import supervised_timer
 from .managed_occurrences import occurrences
@@ -30,28 +29,19 @@ FAULT = "owner_control_or_delivery_uncertain"
 
 # A completed local Start may retain running metadata when its delivery fault bypasses ordinary closure publication.
 def closed_normal_delivery(j: Journal) -> bool:
-    state = j.get("managed_test_charge", {})
-    local, owner, head = state.get("local_transaction"), local_start_receipt(j), j.next_delivery()
-    row = j.db.execute("SELECT start,stop FROM transactions WHERE local=?", (local,)).fetchone()
-    request = j.db.execute("SELECT action,state FROM managed_requests WHERE id=?", (state.get("id"),)).fetchone()
+    record, head = j.starts.closed(), j.next_delivery()
     return bool(
-        state.get("kind") == "normal"
-        and state.get("source") == "local"
-        and state.get("state") in ("running", "interrupted")
-        and state.get("start_rpc_accepted") is True
-        and type(local) is int
-        and owner.get("local") == local
-        and owner.get("stage") == "accepted"
-        and owner.get("digest") == state.get("tag_digest")
-        and row is not None
-        and row["stop"] is not None
-        and fingerprint(json.loads(row["start"])["idTag"].casefold()) == state.get("tag_digest")
-        and request is not None
-        and tuple(request) == ("start", "completed")
+        record is not None
+        and record.phase in ("running", "interrupted")
+        and record.published is True
+        and record.reported_local == record.local
+        and record.receipt.stage == "accepted"
+        and record.request is not None
+        and record.request.state == "completed"
         and head is not None
         and head.action == "StartTransaction"
         and head.state in ("ambiguous", "rejected")
-        and head.transaction == local
+        and head.transaction == record.local
     )
 
 
@@ -268,15 +258,12 @@ def reconcile_delivery_start(
         if normal is not None:
             if j.get("managed_test_charge") != normal:
                 raise RecoveryRequiredError("closed normal Start metadata changed")
-            j.put(
-                "managed_test_charge",
-                {
-                    **normal,
-                    "state": "completed",
-                    "charging": False,
-                    "stopped_at": time.time(),
-                    "recovery_reason": "operator_delivery_verified_closed_zero",
-                },
+            j.starts.complete_normal(
+                normal,
+                None,
+                finish_request=False,
+                stopped_at=time.time(),
+                reason="operator_delivery_verified_closed_zero",
             )
         j.put(KEY, {**records, str(evidence.local): {"proof": proof, "completed": None}})
 
