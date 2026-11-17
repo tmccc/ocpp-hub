@@ -892,7 +892,6 @@ class ManagedController:
             self.prepare_offline_pause()
             recovery_pending = await self.recovery.advance()
             if recovery_pending is not None:
-                state = "waiting_for_cloud" if recovery_pending.reason is Prerequisite.CLOUD else "reconciling"
                 if recovery_pending.reason is Prerequisite.NATIVE:
                     return {
                         **base,
@@ -900,7 +899,11 @@ class ManagedController:
                         "fault": "native_observation_unavailable",
                         "owner_control_enabled": False,
                     }
-                return {**base, "state": state, "owner_control_enabled": False}
+                return {
+                    **base,
+                    "state": "waiting_for_cloud" if recovery_pending.reason is Prerequisite.CLOUD else "reconciling",
+                    "owner_control_enabled": False,
+                }
             native = await self.settled_native()
             await self.schedule.observe(native)
             if j.get(KEY, {}).get("idle_cutoff_hold"):
