@@ -151,8 +151,11 @@ async def test_real_ha_diagnostic_download_is_passive_redacted_and_truthful(
     peer["state"]["private"] = PRIVATE
     peer["state"]["software"] = {"proxy_python": "3.14.4", "proxy_source_sha256": "c" * 64, "token": TOKEN}
     entry = await setup(actual_hass, peer)
+    from homeassistant.loader import async_get_integration
+
     from custom_components.ics_proxy.diagnostics import async_get_config_entry_diagnostics
 
+    integration = await async_get_integration(actual_hass, "ics_proxy")
     coordinator = entry.runtime_data
     if stale:
         coordinator.received_at -= 30
@@ -167,7 +170,7 @@ async def test_real_ha_diagnostic_download_is_passive_redacted_and_truthful(
     monkeypatch.setattr(coordinator.client, "request", deny)
     report = await async_get_config_entry_diagnostics(actual_hass, entry)
     assert report["snapshot_fresh"] is (not stale and not failed)
-    assert report["software"]["client_version"] == "0.2.2"
+    assert report["software"]["client_version"] == str(integration.version)
     assert len(report["software"]["client_source_sha256"]) == 64
     assert report["software"]["proxy_source_sha256"] == "c" * 64
     assert report["diagnostics"]["pending_commands"][0]["confirmation"] == "unknown"
