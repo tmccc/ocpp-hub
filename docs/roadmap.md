@@ -35,6 +35,11 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   policy and owner execution path. Preserve different legacy and proof contracts; add fast pure and SQLite checks.
   This consolidation increases physical runtime lines; the net-reduction target is still open and is not claimed
   achieved by moving the record types within the runtime.
+- [x] Consolidate durable control intent and Pause/Return request transitions in `ManagedRequests`. Start and
+  Return share the current-intent transaction check; one completion owns Return disposition, including prelaunch
+  queue refusal. Retain the legacy status completion and distinct physical/claim proofs. Remove unused adapters
+  and duplicate reads/disposition. Runtime is four physical lines smaller than the preceding milestone; most of
+  that milestone's increase remains, so the broader code-size reduction goal is still open.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties. Full four-suite qualification and deployment of this local candidate remain open.

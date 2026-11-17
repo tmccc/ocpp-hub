@@ -549,15 +549,7 @@ class ManagedSchedule:
     # Return remains explicit owner authority while its receipt moves from accepted to running.
     def owner_returning(self) -> bool:
         intent = self.c.requests.intent()
-        return (
-            intent.mode == "paused"
-            and self.j.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action='app_control' AND revision=? "
-                "AND state IN ('accepted','running') LIMIT 1",
-                (intent.revision,),
-            ).fetchone()
-            is not None
-        )
+        return intent.mode == "paused" and self.c.requests.return_in_progress(intent.revision)
 
     # Keep a connector-1 Available transition even when the next status or native poll sees its replacement.
     def observe_status(self, token: str, payload: dict[str, Any]) -> None:

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .connection_scope import CloudAttemptScope, current_scope
 from .local_control import local_start_receipt, retire_unsent_local_start
+from .managed_intent import ControlIntent, write_intent
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
 from .managed_start_binding import known_plan_source
@@ -86,7 +87,7 @@ class ManagedChargeTests:
                     and local_start_receipt(self.journal).get("stage") in ("issued", "accepted")
                 )
                 if not preserve:
-                    self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                    write_intent(self.journal, intent, "paused")
                 claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.retire_refused_unsent()
@@ -245,8 +246,6 @@ class ManagedChargeTests:
             or not self.available(native, local=action in ("start", "start_test"), normal=action == "start")
         ):
             raise RecoveryRequiredError("test requires current shared six-ampere authority and no pending work")
-        if not c.requests.has_capacity():
-            raise RecoveryRequiredError("management receipt capacity requires maintenance")
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"
         lease = TestLease(
@@ -375,9 +374,7 @@ class ManagedChargeTests:
                 ):
                     raise RecoveryRequiredError("owned Start publication was superseded")
                 if lease.normal:
-                    j.put("managed_control_intent", {"mode": "app", "revision": lease.revision + 1})
-                    j.put("managed_owner_epoch", lease.epoch)
-                    c.requests.supersede_pauses(lease.identifier)
+                    c.requests.start_published(lease.identifier, ControlIntent(lease.mode, lease.revision), lease.epoch)
                     if previous_current is not None:
                         try:
                             require_record(c, previous_current)
@@ -888,13 +885,9 @@ class ManagedChargeTests:
                 and self.state().get("independent_seen") is True
             )
             if intent.mode != "paused" and not preserve:
-                j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                write_intent(j, intent, "paused")
                 claim_internal_pause(c, "test", lease.identifier)
-                j.db.execute(
-                    "UPDATE managed_requests SET state='failed',result=? WHERE action='app_control' "
-                    "AND state IN ('accepted','running')",
-                    (json.dumps({"classification": "superseded_by_test_stop"}),),
-                )
+                c.requests.test_stopped()
             elif self.failed_start_zero_needed(lease, reason, failure):
                 c.session.gateway.controls._claim(True)
             j.starts.expire(lease, reason, preserve, failure)

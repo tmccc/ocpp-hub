@@ -10,6 +10,7 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_cutoffs import idle_cutoff_pending
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, reconcile_owner_release
 from ocpp_hub_core.prototype.managed_schedule import KEY
+from ocpp_hub_core.prototype.recovery_contracts import require_allowed
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, ReleaseDeferredError
 
@@ -194,7 +195,8 @@ async def test_automatic_timer_restoration_retries_predispatch_http_failure(
             b.rig.peer.fail_at = b.rig.peer.config_requests + 7
             mark = len(b.rig.bench.received_limits)
             with pytest.raises(ReleaseDeferredError):
-                await b.c.restore_owner_control()
+                progress = await b.c.recovery.restore()
+                require_allowed(progress.pending)
             assert b.rig.peer.failed_at == b.rig.peer.fail_at
             assert not b.session.journal.get("managed_control_fault")
             assert b.session.journal.get("control")["uncertain"] is False

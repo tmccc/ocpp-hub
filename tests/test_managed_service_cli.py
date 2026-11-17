@@ -277,7 +277,7 @@ async def test_stop_request_fences_inflight_release_before_positive_send(
                 return native
 
             session.native_bounded.observe = delay_positive_read
-            pending = asyncio.create_task(controller.restore_owner_control())
+            pending = asyncio.create_task(controller.recovery.restore())
             try:
                 await asyncio.wait_for(observed.wait(), 5)
                 controller.request_stop()

@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from .managed_cutoffs import supervised_timer
+from .managed_intent import ControlIntent, write_intent
 from .policy import READS
 from .store import Journal
 
@@ -88,10 +89,7 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
         journal.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
         if fault is not None and fault.get("classification") == "owner_control_or_delivery_uncertain":
             journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
-        journal.put(
-            "managed_control_intent",
-            {"mode": "paused", "revision": intent["revision"] + int(intent["mode"] != "paused")},
-        )
+        write_intent(journal, ControlIntent(intent["mode"], intent["revision"]), "paused", coalesce=True)
         journal.put("control", {**control, "owner": "local", "inhibit": True, "uncertain": True})
         journal.put("trial_phase", "recovering")
         return True

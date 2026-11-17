@@ -20,6 +20,20 @@ class ControlIntent:
     mode: str
     revision: int
 
+    # Both owner Pause and its later Stop retain this exact persisted ticket/revision identity.
+    def pause_claim(self, ticket: str | None) -> dict[str, str | int | None]:
+        return {"ticket": ticket, "revision": self.revision}
+
+    # Domain changes advance revision; legacy read recovery may retain a mode it already requested.
+    def next(self, mode: str, *, coalesce: bool = False) -> ControlIntent:
+        return ControlIntent(mode, self.revision + int(not coalesce or self.mode != mode))
+
+
+# Apply the shared revision transition inside the caller's original transaction, without creating request work.
+def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesce: bool = False) -> None:
+    intent = current.next(mode, coalesce=coalesce)
+    journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
+
 
 class ManagedRequests:
     """A paused intent is recorded before its effect; a return remains paused until physically confirmed."""
@@ -96,12 +110,7 @@ class ManagedRequests:
         current = self.intent()
         if action != "pause" and not self.has_capacity():
             raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
-        if action == "app_control" and (
-            current.revision != revision
-            or self.journal.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action='app_control' AND state IN ('accepted','running')"
-            ).fetchone()
-        ):
+        if action == "app_control" and (current.revision != revision or self.return_in_progress()):
             raise RecoveryRequiredError("return requires the current revision and no pending return")
         with self.journal.atomic():
             if action == "pause":
@@ -111,7 +120,7 @@ class ManagedRequests:
                     "WHERE action='pause' AND state IN ('accepted','running','uncertain')",
                     (json.dumps({"classification": "superseded_by_pause", "superseded_by": identifier}),),
                 )
-                self.journal.put("managed_control_intent", {"mode": "paused", "revision": current.revision + 1})
+                write_intent(self.journal, current, "paused")
                 if on_pause is not None:
                     on_pause()
                 # A new restrictive intent revokes an old Return, including one whose reply was lost at replacement.
@@ -155,21 +164,74 @@ class ManagedRequests:
         )
 
     # Admission remains exclusive after the selected Return starts awaiting real charger evidence.
-    def return_in_progress(self) -> bool:
+    def return_in_progress(self, revision: int | None = None) -> bool:
+        query = "SELECT 1 FROM managed_requests WHERE action='app_control' AND state IN ('accepted','running')"
+        if revision is not None:
+            query += " AND revision=?"
         return (
-            self.journal.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action='app_control' AND state IN ('accepted','running') LIMIT 1"
-            ).fetchone()
-            is not None
+            self.journal.db.execute(query + " LIMIT 1", () if revision is None else (revision,)).fetchone() is not None
         )
 
-    # A separately authorized normal Start retires earlier Pause requests without replaying their physical effect.
-    def supersede_pauses(self, identifier: str) -> None:
+    # The accepted Start joins app intent and old Pause supersession to its wire child's publication transaction.
+    def start_published(self, identifier: str, expected: ControlIntent, epoch: int) -> None:
+        self._publish_app(expected)
+        self.journal.put("managed_owner_epoch", epoch)
         self.journal.db.execute(
             "UPDATE managed_requests SET state='failed',result=? "
             "WHERE action='pause' AND state IN ('accepted','uncertain')",
             (json.dumps({"classification": "superseded_by_start", "superseded_by": identifier}),),
         )
+
+    # Test-stop revocation follows its caller's induced Pause and claim, without consuming replacement uncertainty.
+    def test_stopped(self) -> None:
+        self.journal.db.execute(
+            "UPDATE managed_requests SET state='failed',result=? WHERE action='app_control' "
+            "AND state IN ('accepted','running')",
+            (json.dumps({"classification": "superseded_by_test_stop"}),),
+        )
+
+    # A paused release belongs to its exact current Return; automatic app release has no Return request.
+    def return_current(self, identifier: str | None, expected: ControlIntent) -> bool:
+        if expected.mode != "paused":
+            return identifier is None
+        row = self.journal.db.execute(
+            "SELECT action,revision,state FROM managed_requests WHERE id=?", (identifier,)
+        ).fetchone()
+        return row is not None and tuple(row) in (
+            ("app_control", expected.revision, "accepted"),
+            ("app_control", expected.revision, "running"),
+        )
+
+    # The owner claims Return immediately before launch; busy or stopping polls leave it accepted.
+    def return_started(self, identifier: str) -> None:
+        self.journal.db.execute(
+            "UPDATE managed_requests SET state='running' WHERE id=? AND state='accepted'", (identifier,)
+        )
+
+    # Waiting never replays a claimed positive attempt or changes a newer superseding receipt.
+    def return_waiting(self, identifier: str, expected: ControlIntent, *, unconfirmed: bool = False) -> None:
+        if unconfirmed:
+            self.finish(identifier, "uncertain", {"classification": "return_not_confirmed"})
+        elif self.intent() == expected:
+            self.journal.db.execute(
+                "UPDATE managed_requests SET state='accepted' WHERE id=? AND state='running'", (identifier,)
+            )
+
+    # Actual release publishes app intent in its child transaction; legacy healthy completion changes no intent.
+    def returned(
+        self, identifier: str, expected: ControlIntent | None = None, before_finish: Callable[[], None] | None = None
+    ) -> None:
+        if expected is not None:
+            self._publish_app(expected)
+        if before_finish is not None:
+            before_finish()
+        self.finish(identifier, "completed", {"app_control_enabled": True, "charging_started": False})
+
+    # Positive intent publication joins the exact current owner's transaction and grants nothing across an await.
+    def _publish_app(self, expected: ControlIntent) -> None:
+        if not self.journal.db.in_transaction or self.intent() != expected:
+            raise RecoveryRequiredError("control intent publication requires its current owning transaction")
+        write_intent(self.journal, expected, "app")
 
     # Make a single operation's final outcome durable without overwriting a newer superseding receipt.
     def finish(self, identifier: str, state: str, result: dict[str, Any]) -> None:

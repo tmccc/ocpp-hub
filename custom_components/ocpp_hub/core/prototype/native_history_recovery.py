@@ -9,6 +9,7 @@ from typing import Any
 
 from ..control import HUB_PROFILE_ID
 from .managed_current import managed_current_ceiling
+from .managed_intent import ControlIntent, write_intent
 from .native_bounded import NativeBoundedSpec
 from .native_history import NativeHistoryArchive, audit_history, history_policy
 from .native_start_attempts import split_attempts
@@ -168,7 +169,7 @@ def _reconcile(
             journal.require_allocation()
             audit_history(journal, spec.digest, list(native.history), False)
             summary = {"unassigned_attempts": len(unassigned)}
-            journal.put("managed_control_intent", {"mode": "paused", "revision": intent["revision"] + 1})
+            write_intent(journal, ControlIntent(intent["mode"], intent["revision"]), "paused")
             journal.put(
                 "native_start_attempt_recovery",
                 {

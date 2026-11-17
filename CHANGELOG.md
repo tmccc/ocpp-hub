@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Centralize control-intent writes and Pause/Return request transitions in the existing request owner. Share the
+  transaction check for Start and Return app-intent publication; preserve publication order and legacy completion.
+  Claim Return after busy/stopping waits, retain queue-refusal uncertainty, and remove duplicate disposition and
+  unused exception adapters. Add fast stored-state/COMMIT checks and actual-peer scheduling/status witnesses.
+
 - Share pure Start retirement decisions and rule-specific snapshots across refusal, cancellation, verified-zero
   completion and generic test settlement. Preserve distinct legacy evidence, result bytes, terminal history and
   caller-owned physical proof; use one request-outcome writer with each original filter and transaction contract.

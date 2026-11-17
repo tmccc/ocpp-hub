@@ -17,7 +17,7 @@ from .managed_current import (
 )
 from .managed_current_recovery import capture_interrupted_collision
 from .managed_faults import latch_managed_fault
-from .managed_intent import ControlIntent, ManagedRequests
+from .managed_intent import ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
 from .managed_release_wait import awaiting_known_stops
@@ -49,7 +49,7 @@ from .native_faults import (
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
@@ -142,9 +142,7 @@ class ManagedController:
         # This claim shares the intent transaction, so no accepted Pause can leave old shared authority committed.
         def claim() -> None:
             _, ticket = self.session.gateway.controls._claim(True, stopping=True)
-            self.session.journal.put(
-                "managed_owner_pause", {"ticket": ticket, "revision": self.requests.intent().revision}
-            )
+            self.session.journal.put("managed_owner_pause", self.requests.intent().pause_claim(ticket))
             record_release_pause(self, identifier)
 
         receipt = self.requests.accept(identifier, action, revision, claim)
@@ -316,7 +314,7 @@ class ManagedController:
                 if stop_ticket is None:
                     stop_ticket = control["ticket"]
                     # Preserve the original Pause identity used by Return and historical Start recovery.
-                    j.put("managed_owner_stop", {"ticket": stop_ticket, "revision": intent.revision})
+                    j.put("managed_owner_stop", intent.pause_claim(stop_ticket))
 
             try:
                 native = await self.native.read()
@@ -425,10 +423,8 @@ class ManagedController:
         control = j.get("control", {})
         receipt = local_start_receipt(j)
         if control.get("uncertain") and (
-            j.get("managed_owner_pause")
-            == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
-            or j.get("managed_owner_stop")
-            == {"ticket": control.get("ticket"), "revision": self.requests.intent().revision}
+            j.get("managed_owner_pause") == self.requests.intent().pause_claim(control.get("ticket"))
+            or j.get("managed_owner_stop") == self.requests.intent().pause_claim(control.get("ticket"))
             or receipt.get("stage") in ("unsent", "rejected")
             and receipt.get("settled_ticket") == control.get("ticket")
             or receipt.get("bound_ticket") == control.get("ticket")
@@ -459,7 +455,7 @@ class ManagedController:
             and intent.mode == "app"
         ):
             with j.atomic():
-                j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                write_intent(j, intent, "paused")
                 g.controls._claim(True, stopping=True)
 
     # A newer stop ticket invalidates an awaited release before it can send a positive ceiling.
@@ -546,10 +542,6 @@ class ManagedController:
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             return  # The fault/debts remain latched; a safety ACK alone is never reported as measured physical zero.
 
-    # Require the actual source under whichever operation is currently holding this particular open transaction.
-    def require_continuation(self, native: HandoverEvidence, local: int) -> None:
-        require_allowed(self.continuation_decision(native, local))
-
     # Choose the domain's current source proof once, identically at preflight and the final native send gate.
     def continuation_decision(self, native: HandoverEvidence, local: int) -> GateDecision:
         j = self.session.journal
@@ -560,10 +552,6 @@ class ManagedController:
         elif not (self.tests.scoped_normal_stop() and self.tests.independent_daily(native, local)):
             return continuing_session_decision(j, native, local)
         return ALLOW
-
-    # Preserve scoped test restrictions and recheck ordinary source immediately before any positive physical write.
-    def require_positive(self, native: HandoverEvidence) -> None:
-        require_allowed(self.positive_decision(native))
 
     # Source and Start obligations remain ordinary Pending data; strict introduction refusals remain failures.
     def positive_decision(self, native: HandoverEvidence) -> GateDecision:
@@ -582,12 +570,6 @@ class ManagedController:
             elif native.physical.transaction_open:
                 return Pending(Prerequisite.LIFECYCLE, "ordinary idle recovery cannot adopt another native session")
         return ALLOW
-
-    # The present owned zero, live introduction and actual reconciled events are prerequisites to any release.
-    def require_zero(
-        self, native: HandoverEvidence, *, allow_offline: bool = False, continuing_local: int | None = None
-    ) -> None:
-        require_allowed(self.zero_decision(native, allow_offline=allow_offline, continuing_local=continuing_local))
 
     # Verified zero and cloud/lifecycle prerequisites are independent from source and physical release effects.
     def zero_decision(
@@ -653,14 +635,6 @@ class ManagedController:
             return Pending(Prerequisite.CLOUD_ACK, "shared control awaits the current cloud acknowledgement")
         return ALLOW
 
-    # Verify again after recovery acknowledgement; release raises only the ceiling and never sends RemoteStart.
-    async def restore_owner_control(
-        self, expected_intent: ControlIntent | None = None, *, continuing_local: int | None = None
-    ) -> None:
-        progress = await self.recovery.restore(expected_intent, continuing_local=continuing_local)
-        if not progress.shared:
-            require_allowed(progress.pending)
-
     # One accepted return receives one guarded attempt; uncertainty never changes persisted paused intent to app.
     async def return_requested(self, identifier: str, revision: int) -> None:
         expected = self.requests.intent()
@@ -671,10 +645,7 @@ class ManagedController:
             return  # An already accepted Return survives until observation completes the timed test under Pause.
         j = self.session.journal
         control = j.get("control", {})
-        if control.get("uncertain") and j.get("managed_owner_stop") == {
-            "ticket": control.get("ticket"),
-            "revision": expected.revision,
-        }:
+        if control.get("uncertain") and j.get("managed_owner_stop") == expected.pause_claim(control.get("ticket")):
             # Verify this exact protective Stop before treating Return as a positive release attempt.
             try:
                 await self.maintain_pause()
@@ -696,23 +667,16 @@ class ManagedController:
             )
             or receipt.get("pause_revision") == expected.revision
             and receipt.get("verified_pause_revision") != expected.revision
-            or j.get("managed_owner_pause") == {"ticket": control.get("ticket"), "revision": expected.revision}
+            or j.get("managed_owner_pause") == expected.pause_claim(control.get("ticket"))
             and j.db.execute(
                 "SELECT 1 FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') LIMIT 1"
             ).fetchone()
         ):
             return  # The same Return survives the real Start and both closure reports under its Pause.
-        j.db.execute("UPDATE managed_requests SET state='running' WHERE id=? AND state='accepted'", (identifier,))
         try:
-            progress = await self.recovery.restore(expected, return_request=identifier)
+            await self.recovery.restore(expected, return_request=identifier)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
-            self.requests.finish(identifier, "uncertain", {"classification": "return_not_confirmed"})
-            return
-        if not progress.shared:
-            self.session.journal.db.execute(
-                "UPDATE managed_requests SET state='accepted' WHERE id=? AND state='running'", (identifier,)
-            )
-            return
+            return  # The owned completion retains the exact request disposition when its caller disappears.
 
     # Resource settling, a complete native audit and closure agreement each have their own bounded wait.
     async def settled_native(self) -> HandoverEvidence:
@@ -1061,9 +1025,7 @@ class ManagedController:
         if healthy and not paused:
             pending_return = self.requests.pending_return()
             if pending_return is not None:
-                self.requests.finish(
-                    pending_return[0], "completed", {"app_control_enabled": True, "charging_started": False}
-                )
+                self.requests.returned(pending_return[0])
         history = summarize_charger_history(native.history)
         return {
             **base,

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from ..control import HUB_PROFILE_ID
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
+from .managed_intent import write_intent
 from .managed_schedule import KEY, OBSERVABLE, recorded_station_profile
 from .managed_settlement import claim_internal_pause
 from .native_bounded import NativeBoundedSpec
@@ -191,7 +192,7 @@ class ManagedCurrentLimits:
                 return
             with self.journal.atomic():
                 intent = controller.requests.intent()
-                self.journal.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                write_intent(self.journal, intent, "paused")
                 claim_internal_pause(controller, "current", change["id"])
                 control = self.journal.get("control")
                 self.journal.put("control", {**control, "resume_limit": previous})
@@ -433,7 +434,7 @@ class ManagedCurrentLimits:
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
         previous_value = self.selected()
         with j.atomic():
-            j.put("managed_control_intent", {"mode": intent.mode, "revision": revision + 1})
+            write_intent(j, intent, intent.mode)
             timer = j.get(KEY, {})
             if (
                 timer.get("state") == "armed"
@@ -571,7 +572,7 @@ class ManagedCurrentLimits:
                     return
                 with j.atomic():
                     if not superseded:
-                        j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                        write_intent(j, intent, "paused")
                         claim_internal_pause(c, "current", identifier)
                     control = j.get("control", {})
                     if control.get("inhibit") is True and j.get("managed_current_change", {}).get("id") == identifier:
@@ -693,7 +694,7 @@ class ManagedCurrentLimits:
             # Preserve the existing fail-closed policy when replacement confirms there was no overlapping session.
             with j.atomic():
                 intent = c.requests.intent()
-                j.put("managed_control_intent", {"mode": "paused", "revision": intent.revision + 1})
+                write_intent(j, intent, "paused")
                 claim_internal_pause(c, "current", change["id"])
                 j.put("control", {**j.get("control"), "resume_limit": change["previous_a"]})
                 j.put("managed_current_change", {**j.get("managed_current_change"), "state": "interrupted"})

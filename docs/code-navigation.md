@@ -89,6 +89,16 @@ selected session and exact lease identity; cancellation uses raw receipt bytes; 
 native proof, task/cancellation ownership, restrictive execution and post-COMMIT memory changes. Local completion
 never consumes independent cloud delivery debt.
 
+`managed_intent.py` owns control-intent serialization and Pause/Return request transitions. All domain intent
+writes use `write_intent`, including admission-time recovery on a bare journal; that function performs no request
+startup sweep. Its pure `ControlIntent.next` advances revisions or explicitly coalesces legacy read recovery.
+`ManagedRequests` shares the transaction/current-intent check for Start and Return app publication,
+while their separate request outcomes and original callback order remain. Return claims after busy/stopping waits
+and before completion launch; queue refusal records uncertainty, and the owned completion settles later waits or
+failures. Controller/native/send guards, owner Pause/Stop markers, independent cloud debt and task lifetime remain
+separate responsibilities. `test_control_lifecycle.py` covers stored transitions and real SQL/COMMIT rollback;
+`test_control_lifecycle_peer.py` covers actual scheduling, capacity and the retained legacy healthy-status path.
+
 The former control grammar and boundary observer are test references under `tests_model/control_slice.py`,
 `control_slice_state.py` and `start_reference.py`. Production has no observer callback or dependency on those
 modules. Their original tests remain, alongside real peer and process-death checks of the production owner.

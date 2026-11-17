@@ -180,9 +180,16 @@ class RecoveryCoordinator:
                 Pending(Prerequisite.OWNED_OPERATION, "the current owned recovery completion remains pending"),
             )
         expected = expected_intent or self.c.requests.intent()
-        self._task = self.c.session.gateway.controls.launch_completion(
-            self._restore_owned(expected, continuing_local=continuing_local, return_request=return_request)
-        )
+        if return_request is not None:
+            self.c.requests.return_started(return_request)
+        try:
+            self._task = self.c.session.gateway.controls.launch_completion(
+                self._restore_owned(expected, continuing_local=continuing_local, return_request=return_request)
+            )
+        except DeniedError:
+            if return_request is not None:
+                self.c.requests.return_waiting(return_request, expected, unconfirmed=True)
+            raise
         progress = await asyncio.shield(self._task)
         if progress.shared:
             operation = progress.operation
@@ -204,7 +211,7 @@ class RecoveryCoordinator:
     async def _restore_owned(
         self, expected_intent: ControlIntent, *, continuing_local: int | None, return_request: str | None
     ) -> RestoreProgress:
-        c, j = self.c, self.c.session.journal
+        c = self.c
         try:
             progress = await self._restore_impl(
                 expected_intent, continuing_local=continuing_local, return_request=return_request
@@ -214,17 +221,13 @@ class RecoveryCoordinator:
                 if (operation is None or not operation.claimed) and progress.pending is not None:
                     disposition = preflight_disposition("explicit", progress.pending)
                     if disposition is PreflightDisposition.REQUEST_UNCONFIRMED:
-                        c.requests.finish(return_request, "uncertain", {"classification": "return_not_confirmed"})
+                        c.requests.return_waiting(return_request, expected_intent, unconfirmed=True)
                         return RestoreProgress(RestoreState.REQUEST_UNCONFIRMED, progress.pending, operation)
-                if c.requests.intent() == expected_intent:
-                    j.db.execute(
-                        "UPDATE managed_requests SET state='accepted' WHERE id=? AND state='running'",
-                        (return_request,),
-                    )
+                c.requests.return_waiting(return_request, expected_intent)
             return progress
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             if return_request is not None:
-                c.requests.finish(return_request, "uncertain", {"classification": "return_not_confirmed"})
+                c.requests.return_waiting(return_request, expected_intent, unconfirmed=True)
             raise
 
     # All restoration callers consume this same prerequisite, operation-result and publication contract.
@@ -239,23 +242,9 @@ class RecoveryCoordinator:
         g, j = c.session.gateway, c.session.journal
         expected_intent = expected_intent or c.requests.intent()
 
-        # A paused positive release belongs to one actual accepted/running Return UUID and revision.
-        def return_current() -> bool:
-            if expected_intent.mode != "paused":
-                return return_request is None
-            row = j.db.execute(
-                "SELECT action,revision,state FROM managed_requests WHERE id=?", (return_request,)
-            ).fetchone()
-            return bool(
-                row is not None
-                and row["action"] == "app_control"
-                and row["revision"] == expected_intent.revision
-                and row["state"] in ("accepted", "running")
-            )
-
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> GateDecision:
-            if not return_current():
+            if not c.requests.return_current(return_request, expected_intent):
                 return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
             timer = j.get(KEY, {})
             if c.ordinary.active():
@@ -412,9 +401,7 @@ class RecoveryCoordinator:
                 j.put(KEY, {**timer, "ticket": j.get("control", {}).get("ticket"), "idle_cutoff_replacement": False})
 
             if return_request is not None:
-                j.put("managed_control_intent", {"mode": "app", "revision": expected_intent.revision + 1})
-                c.current.returned_to_previous()
-                c.requests.finish(return_request, "completed", {"app_control_enabled": True, "charging_started": False})
+                c.requests.returned(return_request, expected_intent, c.current.returned_to_previous)
             published = self.authority()
             if published is None:
                 raise RecoveryRequiredError("release publication lost its exact Boot")

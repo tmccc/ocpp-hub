@@ -143,6 +143,24 @@ four-suite twenty-worker qualification.
 
 ## Control transitions and Start settlement
 
+`ManagedRequests` owns durable control-intent serialization and Pause/Return request transitions. Domain recovery
+uses `write_intent(journal, current, mode)` with its original captured intent and transaction; constructing a
+request owner during native admission would prematurely normalize requests. `ControlIntent.next` owns revision
+advancement; legacy read recovery explicitly coalesces an already-paused mode. The writer creates no permission,
+schema, request row or replay task. Start and explicit Return app publication share `_publish_app`, which requires
+the current expected intent inside the existing wire-child transaction. Start keeps its distinct Pause supersession
+and metadata publication. Return preserves intent, previous-current settlement and request completion in that order.
+Its post-COMMIT memory notification stays with the existing handoff.
+
+Return's running claim follows the recovery owner's busy/stopping exits and precedes completion launch. Queue
+refusal retains `return_not_confirmed`; once launched, the owned completion alone requeues or records uncertainty.
+Stale revision, domain admission, physical Pause/native proof and each send/publication recheck remain distinct
+moments. `return_in_progress` can restrict its existing accepted/running lookup to a particular revision for timers.
+The legacy healthy/app status path still completes only its selected accepted Return without changing intent.
+`test_control_lifecycle.py` checks state filters, opaque historical results, startup and real SQL/COMMIT rollback.
+`test_control_lifecycle_peer.py` drives the real engine through healthy status, busy/stopping and queue-full entry.
+The unused controller exception wrappers are removed; callers use typed decisions and `RecoveryCoordinator.restore`.
+
 `Journal.starts` (`core/prototype/start_lifecycle.py`) owns Start receipt, pending-bit and shared managed-charge
 metadata writes, local Start outcomes and the sole process-local lease slot. `ChargeStart` loads the current
 request, wire receipt, metadata projections and actual ledger. An older receipt remains historical until the new
