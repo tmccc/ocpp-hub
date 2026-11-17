@@ -152,14 +152,7 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
     row = j.db.execute(
         "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
     ).fetchone()
-    if (
-        len(station) != 1
-        or station[0].canonical.get("limit") != 0
-        or row is None
-        or row["state"] != "confirmed"
-        or row["confirmed"] is None
-        or json.loads(row["confirmed"]) != station[0].canonical
-    ):
+    if not book.confirmed_station_zero(station, row):
         raise RecoveryRequiredError("delivery reconciliation requires independently confirmed owned station zero")
 
 

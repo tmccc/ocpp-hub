@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 from ..control import HUB_PROFILE_ID
 from .managed_current import managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
@@ -53,12 +51,5 @@ def require_original_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
     row = j.db.execute(
         "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
     ).fetchone()
-    if (
-        len(station) != 1
-        or station[0].canonical.get("limit") != 0
-        or row is None
-        or row["state"] != "confirmed"
-        or row["confirmed"] is None
-        or json.loads(row["confirmed"]) != station[0].canonical
-    ):
+    if not book.confirmed_station_zero(station, row):
         raise RecoveryRequiredError("operator reconciliation requires independently confirmed owned station zero")

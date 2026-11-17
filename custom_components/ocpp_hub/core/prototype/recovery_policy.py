@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
-from .recovery_contracts import AuthorityStamp, FailureKind, OwnedReleaseResult, Pending, Prerequisite, WireReply
+from .recovery_contracts import (
+    AuthorityStamp,
+    FailureKind,
+    OwnedReleaseResult,
+    Pending,
+    Prerequisite,
+    RestoreProgress,
+    RestoreState,
+    WireReply,
+)
 
 
 class PreflightDisposition(Enum):
@@ -156,3 +165,18 @@ def next_recovery_work(facts: RecoveryFacts, visited: frozenset[RecoveryWork]) -
             continue
         return work
     return None
+
+
+# Map the existing owned-result policy to progress; SQL acknowledgement and fault effects stay with the driver.
+def restore_progress(disposition: ReleaseDisposition, result: OwnedReleaseResult) -> RestoreProgress:
+    if disposition is ReleaseDisposition.STALE:
+        pending = Pending(Prerequisite.SUPERSEDED, "a subsequent owner event retired completed release authority")
+    elif disposition is ReleaseDisposition.YIELD:
+        pending = Pending(Prerequisite.RESTRICTIVE_OPERATION, "release yielded to its exact timer zero operation")
+    elif disposition is ReleaseDisposition.WAIT:
+        return RestoreProgress(RestoreState.WAITING, result.pending, result)
+    elif disposition is ReleaseDisposition.SHARED:
+        return RestoreProgress(RestoreState.SHARED, operation=result)
+    else:
+        raise ValueError("a failed release requires its fault effect")
+    return RestoreProgress(RestoreState.YIELDED, pending, result)

@@ -1,12 +1,11 @@
-"""Private connected-handover evidence; historical capability is never current vehicle permission."""
+"""Complete private native evidence for bounded commissioning and managed control."""
 
 from __future__ import annotations
 
-import math
 import re
-import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from .native_faults import NativeContentError
 from .policy import integer, number
@@ -19,130 +18,6 @@ from .trial_evidence import Evidence, native_evidence
 def require_digest(value: str) -> None:
     if not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{64}", value) is None:
         raise SecurityError("handover requires a complete identity or evidence digest")
-
-
-@dataclass(frozen=True, repr=False)
-class PauseRequest:
-    """A one-use read request binds the provider to this exact trial, native view and local authority."""
-
-    binding: str
-    nonce: str
-    stage: str
-    identity_digest: str
-    hardware_digest: str
-    vehicle_digest: str
-    baseline_digest: str
-    native_digest: str
-    boot_digest: str
-    epoch: int
-
-
-@dataclass(frozen=True, repr=False)
-class PauseCapability:
-    """The observed reboot/positive-offer test establishes capability, alongside a separate fresh pause readback."""
-
-    digest: str
-    identity_digest: str
-    hardware_digest: str
-    vehicle_digest: str
-    boot_digest: str
-    charging_before_a: float
-    user_limit_a: float
-    positive_offer_a: float
-    zero_offer_seconds: float
-    restart_verified: bool
-
-    # Reject a different vehicle/firmware or a zero observation without genuine offered current and prior charging.
-    def require_match(self, request: PauseRequest) -> None:
-        require_digest(self.digest)
-        if (
-            any(
-                getattr(self, key) != getattr(request, key)
-                for key in ("identity_digest", "hardware_digest", "vehicle_digest", "boot_digest")
-            )
-            or not 5.5 <= number(self.charging_before_a, 6.5) <= 6.5
-            or type(self.user_limit_a) not in (float, int)
-            or self.user_limit_a != 6
-            or type(self.positive_offer_a) not in (float, int)
-            or self.positive_offer_a != 6
-            or number(self.zero_offer_seconds, 1800) < 60
-            or self.restart_verified is not True
-        ):
-            raise SecurityError("vehicle pause has no matching restart and positive-offer capability proof")
-
-
-@dataclass(frozen=True, repr=False)
-class PauseObservation:
-    """Only a live provider may assert the current car permission and its explicit bounded validity."""
-
-    request: PauseRequest
-    provider_digest: str
-    observed_at: float
-    expires_at: float
-    pause_valid_until: float
-    release_only: bool
-    paused: bool
-    revision: str
-    permission_digest: str
-    original_revision: str
-    original_permission_digest: str
-    capability: PauseCapability
-
-    # An old pilot file, unknown expiry, optimistic command ACK or another operation cannot release a charger hold.
-    def require_current(self, request: PauseRequest, provider_digest: str) -> None:
-        for digest in (self.provider_digest, self.permission_digest, self.original_permission_digest):
-            require_digest(digest)
-        dates = (self.observed_at, self.expires_at, self.pause_valid_until)
-        now = time.time()
-        if (
-            self.request != request
-            or self.provider_digest != provider_digest
-            or self.paused is not True
-            or self.release_only is not True
-            or any(type(value) not in (int, float) or not math.isfinite(value) for value in dates)
-            or not 0 <= now - self.observed_at <= 5
-            or not now + 5 <= self.expires_at <= self.observed_at + 30
-            or not max(self.expires_at, now + 900) <= self.pause_valid_until <= now + 1800
-            or any(
-                not isinstance(value, str) or not 1 <= len(value) <= 128
-                for value in (self.revision, self.original_revision)
-            )
-        ):
-            raise SecurityError("fresh matching vehicle-pause evidence with known validity is required")
-        self.capability.require_match(request)
-
-
-@dataclass(frozen=True, repr=False)
-class PermissionObservation:
-    """An acknowledged Start is insufficient; the provider must reconcile the exact saved permission state."""
-
-    request: PauseRequest
-    provider_digest: str
-    operation: str
-    observed_at: float
-    permission_digest: str
-    previous_revision: str
-    revision: str
-
-
-class PauseProvider(Protocol):
-    """No live SEAT adapter is inferred from historical UI captures or the read-only Home Assistant integration."""
-
-    digest: str
-
-    # Obtain current vehicle state for this fresh request, independently from charger profiles and power readings.
-    async def observe(self, request: PauseRequest) -> PauseObservation: ...
-
-    # Apply an idempotent compare-and-set operation, or reconcile its previous outcome after a lost reply.
-    async def restore(
-        self, request: PauseRequest, operation: str, expected_revision: str, original_permission_digest: str
-    ) -> PermissionObservation: ...
-
-    # Read a prior operation's actual current result; retrying the request itself is never outcome reconciliation.
-    async def restoration_status(self, request: PauseRequest, operation: str) -> PermissionObservation | None: ...
-
-    # An unplugged fallback may only observe that the owner already restored the original vehicle permission.
-    async def permission_status(self, request: PauseRequest) -> PermissionObservation: ...
 
 
 @dataclass(frozen=True, repr=False)
@@ -211,6 +86,9 @@ class HandoverEvidence:
             or self.physical.power_w != 0
         ):
             raise SecurityError("connected handover requires USER guard, closed session and every phase at zero")
+
+
+ObserveHandover = Callable[[], Awaitable[HandoverEvidence]]
 
 
 # Parse the known native tenths-of-an-ampere fields without widening the existing unplugged evidence contract.

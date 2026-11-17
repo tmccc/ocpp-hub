@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -78,14 +77,7 @@ async def prepare_current_capability(
             "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
         station = [r for r in present if r.identifier == HUB_PROFILE_ID]
-        if (
-            len(station) != 1
-            or station[0].canonical.get("limit") != 0
-            or row is None
-            or row["state"] != "confirmed"
-            or row["confirmed"] is None
-            or json.loads(row["confirmed"]) != station[0].canonical
-        ):
+        if not book.confirmed_station_zero(station, row):
             raise SecurityError("current preparation requires independently verified owned station zero")
 
     native = await observe()

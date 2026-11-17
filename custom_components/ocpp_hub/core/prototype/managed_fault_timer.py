@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -143,14 +142,7 @@ class PausedReleaseAuthority:
         row = j.db.execute(
             "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
-        if (
-            len(station) != 1
-            or station[0].canonical.get("limit") != 0
-            or row is None
-            or row["state"] != "confirmed"
-            or row["confirmed"] is None
-            or json.loads(row["confirmed"]) != station[0].canonical
-        ):
+        if not c.session.book.confirmed_station_zero(station, row):
             raise RecoveryRequiredError("release reconciliation awaits independently confirmed owned station zero")
 
     # Only the exact receipted augmented digest is admissible before its restrictive removal.

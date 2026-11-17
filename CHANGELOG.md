@@ -2,10 +2,15 @@
 
 ## Unreleased
 
-- Drive owned restore prerequisites through a pure per-attempt phase core and share terminal progress mapping.
-  Preserve initial versus later native checks, capture timing, live send guards, direct/public Return contracts,
-  publication transactions and cancellation ownership. Share the existing zero-rollback sequence and remove unused
-  compatibility paths around typed operations; add fast finite transition checks and retain real boundary tests.
+- Retire the experimental vehicle-pause handover controller, SEAT pause checker and physical-pause verifier,
+  including their CLI commands and provider wiring. Refuse unfinished legacy handovers before opening a listener;
+  preserve completed history, ordinary unplugged trials and the managed native-bounded service.
+- Use direct owned restore sequencing and keep terminal progress in the existing recovery policy. Preserve the
+  native checks, capture timing, live send guards, direct/public Return contracts, publication and cancellation
+  ownership. Share the existing zero rollback and remove obsolete compatibility paths.
+- Give the resource owner one exact confirmed-station-zero check for its seven consumers. Keep their existing
+  observation/SQL order, lazy JSON evaluation, profile filters and independent authority/debt guards. Remove only
+  tests for the retired experiments and phase interpreter; retain terminal and actual boundary regressions.
 
 - Centralize control-intent writes and Pause/Return request transitions in the existing request owner. Share the
   transaction check for Start and Return app-intent publication; preserve publication order and legacy completion.

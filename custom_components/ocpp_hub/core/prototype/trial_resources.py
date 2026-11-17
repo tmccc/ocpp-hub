@@ -464,6 +464,25 @@ class ResourceBook:
             raise
         return sorted(result, key=lambda r: (r.identifier == HUB_PROFILE_ID, r.key))
 
+    # Compare the already observed station with its exact saved receipt only when the caller reaches this proof.
+    @staticmethod
+    def confirmed_station_zero(station: list[Resource], receipt: sqlite3.Row | None) -> bool:
+        return bool(
+            len(station) == 1
+            and station[0].canonical.get("limit") == 0
+            and receipt is not None
+            and receipt["state"] == "confirmed"
+            and receipt["confirmed"] is not None
+            and json.loads(receipt["confirmed"]) == station[0].canonical
+        )
+
+    # A pending earlier Release cannot change the zero station hold while cleanup waits for the RPC gate.
+    def require_zero_station(self, present: list[Resource]) -> None:
+        if present and not any(
+            resource.identifier == HUB_PROFILE_ID and resource.canonical.get("limit") == 0 for resource in present
+        ):
+            raise SecurityError("connected cleanup requires the independently observed owned zero station hold")
+
     # The owned release child retains its guard through cancellation of the caller awaiting it.
     @contextmanager
     def positive_release_guard(self, guard: Guard) -> Iterator[None]:

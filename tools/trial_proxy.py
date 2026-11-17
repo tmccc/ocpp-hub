@@ -36,7 +36,6 @@ from ocpp_hub_core.prototype.native_bounded import (  # noqa: E402
     NativeBoundedSpec,
     capture_native_bounded_baseline,
 )
-from ocpp_hub_core.prototype.seat_access import configured_verifier  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.store import fingerprint  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
@@ -95,15 +94,11 @@ async def run(
     config_path: Path,
     duration: int,
     terminal: bool,
-    car_pause_config: Path | None = None,
     native_bounded_config: Path | None = None,
 ) -> int:
     prepared = preflight(config_path)
-    verifier = configured_verifier(car_pause_config) if car_pause_config is not None else None
     bounded = native_spec(native_bounded_config, prepared) if native_bounded_config is not None else None
     options: dict[str, Any] = {}
-    if verifier is not None:
-        options["car_pause_verifier"] = verifier
     if bounded is not None:
         options["native_bounded"] = bounded
     session = TrialSession(prepared, **options)
@@ -178,15 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--interactive", action="store_true")
-    strategy = parser.add_mutually_exclusive_group()
-    strategy.add_argument("--car-pause-config", type=Path)
-    strategy.add_argument("--native-bounded-spec", type=Path)
+    parser.add_argument("--native-bounded-spec", type=Path)
     args = parser.parse_args(argv)
     if not 60 <= args.duration <= 1800:
         parser.error("duration must be 60 to 1800 seconds")
     try:
-        if args.action != "run" and args.car_pause_config is not None:
-            configured_verifier(args.car_pause_config)
         if args.action == "check":
             prepared = preflight(args.config)
             if args.native_bounded_spec is not None:
@@ -197,9 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             return capture(args.config)
         if args.action == "capture-bounded-baseline":
             return capture(args.config, bounded=True)
-        return asyncio.run(
-            run(args.config, args.duration, args.interactive, args.car_pause_config, args.native_bounded_spec)
-        )
+        return asyncio.run(run(args.config, args.duration, args.interactive, args.native_bounded_spec))
     except Exception as error:
         # This outer boundary must never turn a parser/TLS/network error into a credential-bearing traceback.
         emit({"trial_action_failed": type(error).__name__, "live_readiness_proven": False})

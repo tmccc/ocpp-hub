@@ -347,12 +347,7 @@ class OrdinaryRecovery:
             or control.get("inhibit") is not True
             or not g.controls.ready
             or g.controls.desired() != 0
-            or len(station) != 1
-            or station[0].canonical.get("limit") != 0
-            or row is None
-            or row["state"] != "confirmed"
-            or row["confirmed"] is None
-            or json.loads(row["confirmed"]) != station[0].canonical
+            or not c.session.book.confirmed_station_zero(station, row)
             or j.get("trial_binding")
             != {
                 "configuration_digest": c.native.binding_digest(native),

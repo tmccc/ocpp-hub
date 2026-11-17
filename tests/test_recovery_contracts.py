@@ -39,6 +39,7 @@ from ocpp_hub_core.prototype.recovery_policy import (
     next_recovery_work,
     preflight_disposition,
     release_disposition,
+    restore_progress,
 )
 from ocpp_hub_core.prototype.rpc import Peer
 from ocpp_hub_core.prototype.start_handoff import StartAttempt, StartPublication
@@ -625,3 +626,46 @@ def test_legacy_frame_adapter_unwraps_only_the_typed_pending_edge():
 )
 def test_preflight_native_failure_does_not_grant_explicit_return_replay(purpose, reason, expected):
     assert preflight_disposition(purpose, Pending(reason, "same diagnostic", OSError("unit cause"))) is expected
+
+
+# Intent: terminal classification retains exact pending detail and operation identity without granting effects.
+# Why: later Pause/Boot supersession is a yielded result, distinct from zero waiting and committed sharing.
+@pytest.mark.parametrize(
+    "disposition,state,reason,detail",
+    [
+        (
+            ReleaseDisposition.STALE,
+            RestoreState.YIELDED,
+            Prerequisite.SUPERSEDED,
+            "a subsequent owner event retired completed release authority",
+        ),
+        (
+            ReleaseDisposition.YIELD,
+            RestoreState.YIELDED,
+            Prerequisite.RESTRICTIVE_OPERATION,
+            "release yielded to its exact timer zero operation",
+        ),
+        (ReleaseDisposition.WAIT, RestoreState.WAITING, Prerequisite.NATIVE, "unit prerequisite"),
+        (ReleaseDisposition.SHARED, RestoreState.SHARED, None, None),
+    ],
+)
+@pytest.mark.parametrize("claimed", [False, True])
+def test_terminal_progress(disposition, state, reason, detail, claimed):
+    result = owned(claimed=claimed)
+    progress = restore_progress(disposition, result)
+    assert progress.state is state and progress.operation is result
+    assert progress.shared is (state is RestoreState.SHARED)
+    if reason is None:
+        assert progress.pending is None
+    else:
+        assert progress.pending.reason is reason and progress.pending.detail == detail
+        if disposition is ReleaseDisposition.WAIT:
+            assert progress.pending is result.pending
+
+
+# Intent: failure classification cannot become ordinary progress before the driver records its exact fault.
+# Why: a failed or possibly applied positive release still requires diagnostic/uncertainty and guarded zero handling.
+@pytest.mark.parametrize("disposition", [ReleaseDisposition.FAULT, None, "shared"])
+def test_fault_requires_its_effect(disposition):
+    with pytest.raises(ValueError, match="fault effect"):
+        restore_progress(disposition, owned())

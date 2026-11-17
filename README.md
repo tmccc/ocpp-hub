@@ -145,11 +145,9 @@ restart and a fresh iCS Start: a 6 A offer continued for 60 seconds with every c
 settings and vehicle permission were restored with the lead still attached. All ten original history bodies remained,
 alongside two genuine completed sessions totalling 129 Wh. This is capability evidence, not present permission.
 
-The standalone proxy now has a separate, offline-tested connected-handover controller. Ordinary unplugged admission
-and rollback remain unchanged. **No live vehicle-pause provider is supplied or enabled by default.** The command path
-refuses connected cleanup before any freeze or write when that provider is absent; a historical pilot JSON, a zero
-power reading, a command acceptance or an operator `allow_connected` flag cannot substitute for fresh vehicle state.
-No charger or live Home Assistant change accompanies this implementation.
+The experimental vehicle-pause handover controller and its SEAT/physical-pause tools were retired during the
+17 November 2026 simplification. Their historical trials do not grant current vehicle permission. Ordinary
+unplugged commissioning and the native-bounded strategy used by the managed service remain available.
 
 The third trial verified ordinary Stop at 0 A and Release back to 6 A with accepted 60-second composites and the same
 accepted cloud session. Exact-id removal of the owned profile succeeded from a profile-free baseline; fresh native
@@ -402,124 +400,21 @@ fresh native readings show the original configuration, original resources, no ow
 Configuration restoration alone cannot prove that reconnection has happened. History and any unsent observations remain
 in the journal; they are not erased to make rollback look successful.
 
-The separate connected path is exposed through `connected-handover-plan`, `connected-handover`,
-`confirm-connected-original-backend`, `confirm-connected-original-settings` and
-`restore-connected-vehicle-permission`. A commissioning adapter must explicitly supply a `PauseProvider`, the vehicle
-identity digest and the immutable original full configuration to `TrialSession`; the default CLI supplies none.
-The read-only SEAT checker described below is separate from that provider; there is no file-based permission import.
-Home Assistant's deliberately read-only SEAT integration is not used for vehicle writes.
+#### Retired vehicle-pause experiments
 
-#### Automatic SEAT pause check
+The experimental vehicle-pause handover, read-only SEAT pause checker and reversible physical-pause verifier are
+retired. Their operator commands and `--car-pause-config` option are no longer supported. They were separate from
+the commissioned managed controls and the native-bounded recovery described below. The ordinary unplugged trial
+mode, native-bounded cleanup and original-backend restoration remain supported.
 
-`prototype/seat_pause.py` reads the inspected SEAT charging endpoint through one TLS-verified GET. It pins the
-vehicle and host, refuses redirects and does not refresh authentication, wake the car, send charging commands or
-reuse cached success. `prototype/seat_access.py` can borrow current access and device proof from the existing private
-production SEAT store, read-only and as its owner. It never exports or redeems the refresh token. Expired access,
-rejected proof or an unresolved authentication rotation makes the check unavailable.
+An unfinished or malformed `connected_handover` record refuses session construction before any native read or
+listener starts. Recover that old operation using its original implementation; this version neither migrates nor
+settles its vehicle obligation. Completed historical records remain untouched and part of native observation identity.
 
-Use a private configuration file containing `session` (the absolute existing store path) and `vehicle_digest`
-(the store's 64-character vehicle SHA-256). `python tools/seat_pause.py check --config /private/seat-pause.json`
-validates files/access offline. The explicit `verify` action makes the read and prints only classified status.
-Exit 3 means current pause is unverified; exit 2 means private access is unavailable. No credential belongs on the
-command line. Do not copy the store or run another authentication-refresh client to make this checker work.
-
-The standalone proxy accepts `--car-pause-config /private/seat-pause.json`. Its `verify-car-pause` command runs the
-check on demand, and connected-handover planning/execution checks it automatically before any freeze or mutation.
-Default preflight remains offline. The checker does not constitute a `PauseProvider` or enable connected admission.
-
-The real endpoint has no established vehicle observation timestamp. Exact mode `stopped` is reported as
-`pause_reported_source_age_unknown`; manual/timer/off modes, a completed charge or zero power do not prove the car's
-pause permission. Missing optional power stays unknown, rather than becoming zero. Malformed or contradictory
-readings fail closed. HTTP fetch time, HTTP Date and the separate vehicle-status timestamp never establish freshness.
-Every report therefore retains `current_pause_verified=false`, `durable_pause_verified=false` and
-`handover_authority=false`. No permission revision, release-only guarantee or pause lifetime is fabricated.
-
-A read-only live check confirmed manual mode with a connected car; the genuine response omitted optional charging
-power. This verifies the reader and its conservative classification, not current pause or unattended handover.
-
-#### Fresh physical pause verification
-
-`prototype/physical_pause.py` supplies a separate current-behaviour verifier. `PhysicalPauseObserver` brackets each
-complete direct native read with the process's monotonic clock. `PhysicalPauseVerifier` requires real nominal 6 A
-charging, an explicitly recorded car Stop, at least 60 seconds of sampled zero draw under an actual positive 6 A offer,
-a car Start that returns to real charging, then another Stop and second 60-second zero window. An accepted command,
-a full car or an app status alone cannot complete this reversible challenge.
-
-Saved and runtime USER must both be 6 A, HWCFG and original hardware rating 32 A, and both `offerCur` and effective
-`outLimit` must be 6 A. Native transaction identity, full configuration, schedules, profiles and history remain pinned.
-Only live `MeterValues` on the same explicitly open native history row (`stopTime` is integer0) may grow; every other
-field and every completed history body remain pinned. This only normalises the private comparison and never changes
-a native record. Each zero window requires at least 13 distinct observations, a maximum seven-second sampling gap,
-CP B and all three current/four power channels exactly zero. The observed session label may remain `Charging`:
-it describes the open session, not power demand. Both known `Plug`/`Charging` labels are accepted alongside the
-independent open-session and positive-offer checks. The current result expires five seconds from the
-last native read's start. Reads are bounded to two seconds; owned control transitions have a 90-second deadline and
-the whole challenge a ten-minute deadline.
-
-The charger's CP and meter files may publish at different instants during an owned transition. Residual current can
-remain unverified settling data within that deadline; it cannot start/count a zero window. Nonzero readings or loss
-of the required CP/offer/session after a zero window begins reject the challenge. Source failure, a new session,
-changed limits/resources or a later
-control invalidates current evidence. Call `supersede()` before restoring car permission and on observer failure.
-Process replacement cannot initialise current evidence from historical JSON.
-
-The classified result is `current_vehicle_refusal_verified`, alongside `reversible_challenge_passed`. It proves
-sampled present behaviour while the positive offer exists. `current_pause_permission_verified`,
-`durable_pause_verified` and `handover_authority` remain false. It supplies no permission revision, compare-and-set
-restoration or guarantee that pause survives a closed session/backend switch; the stronger handover gates remain.
-
-Operational control stays outside this read-only verifier. A connected normal-backend pilot must journal restoration
-authority before lowering USER, reconcile startup history/session publication lag, and support cleanup even when no
-charge starts. Observe a car Stop actually reaching zero before a later Start: overlapping an unapplied Stop with
-Start can make an already-charging observation look like restoration. Restore accepting permission at 6 A, verify real
-charging, then use ordinary iCS Stop and retain the actual completed history before closed-zero USER32 restoration.
-Keep the saved overnight schedule and the lead attached throughout; permit cleanup even after the experiment expires.
-
-A normal-backend live run on 2026-11-09 completed both fresh pause windows: 18 distinct samples over 63.5 seconds,
-then real 6 A charging after Start, followed by 16 zero samples over 62 seconds. The current flag was superseded before
-restoring car permission. The complete original USER32 configuration and unchanged 00:00–06:00 schedule were restored;
-two independent native reads confirmed normal charging, with all 12 pre-existing history bodies preserved and the lead
-still attached. An earlier vendor disconnection at midnight correctly invalidated an incomplete run rather than
-turning an old zero reading into current authority. No live Home Assistant setup or permanent proxy service changed.
-
-The isolated owner's control test used the normal authenticated SEAT service after the Android app became
-unavailable. Current real command replies contained a string `requestId`, whereas the inspected APK model names
-`actionId` and discards its value. These private submission receipts are separate from actual physical completion;
-neither field is a permission revision, an idempotency guarantee or a durable pause lease. Home Assistant's own
-read-only endpoint allowlist and authentication-refresh ownership were unchanged.
-
-Each protected step requires a new provider response bound to the car, charger, hardware, baseline, operation nonce,
-current Boot/connection and complete native snapshot. The response must prove current pause, unchanged owner revision,
-matching restart/positive-offer capability, observation age at most five seconds and known validity. The pause must
-require explicit release, survive process loss and remain reserved for at least fifteen minutes; expiration of a
-readback must never resume the car. The original physical test alone does not establish that provider contract.
-
-Native checks require saved USER6 **and** runtime USER60/HWCFG320, all three currents and four power readings at zero,
-CP B/Plug, a closed native/local session, reconciled lifecycle/vendor writes and zero effective `outLimit`.
-Two distinct native timestamps must be at least two seconds apart. `offerCur` can retain 60 after Finished and is
-not an active-output test. Every other readable configuration field, original resource and retained history body stays
-pinned. Unknown/changed resources or revoked vehicle permission block further restoration.
-
-Cleanup freezes positive writes, retires the vendor runner, clears only exactly owned profiles and verifies actual
-absence, with station profile 7001 last. Its durable handover state is separate from ordinary recovery. The explicit
-`TrialSession.resume_connected_handover()` continuation cannot reinstall a cleared profile: verified absence needs no
-listener; remaining owned resources use a fresh proof-gated cleanup-only transport without ceiling reapplication.
-An unconfirmed Clear is reconciled through complete native inventory rather than sent again after verified absence.
-
-Connection and USER restoration remain explicit operator steps. First restore only the original connection fields
-while retaining USER6 and the car pause, then confirm the original backend. Only then restore USER32 and confirm the
-complete original configuration. Vehicle permission is restored last through a provider compare-and-set operation.
-A lost response uses a distinct outcome read and never repeats an uncertain vehicle Start. Normal manufacturer-side
-charging after that restoration is observed as actual native activity, without inventing a proxy transaction or
-claiming ownership of new manufacturer resources. Only ordinary transaction profiles tied to the genuine native
-session or a newly completed native history record are accepted as new resources; unrelated plans/station profiles
-block completion. Original history/resources must still be intact. The final handover stage and trial phase commit
-atomically, while the independently verified vehicle outcome is retained before any remaining completion check.
-
-A connected plan never disables the stronger unplugged fallback. If the lead is removed, ordinary `rollback` can
-still clear its owned resources. `confirm-original-backend` verifies the normal unplugged original configuration but
-retains any recorded vehicle-permission obligation instead of claiming completion. After the owner has restored that
-permission, `confirm-unplugged-vehicle-permission` verifies it read-only through the provider; it never sends Start.
+The normal-backend experiment on 2026-11-09 observed two positive-offer zero windows, with real charging between
+them, and restored the original USER32 configuration and schedule. That historical result established sampled
+behaviour, without a durable permission revision or vehicle-pause lease. The stored research evidence remains
+separate from the current service's authority.
 
 After process loss, a verified existing trial may now open restricted recovery while the vehicle remains connected,
 subject to the exact native session and saved binding checks above. New socket admission and changed introductions
@@ -541,7 +436,7 @@ the exact four trial connection fields, saved-plan digest and commissioned nativ
 Admission reserves fresh transaction numbers with the original route under independently read-back saved USER6,
 runtime USER60/HWCFG320, closed SESSION and all seven meter channels at zero. Actual Boot after routing repeats the
 native audit and installs a local zero hold. Reconnection retains zero; positive sends recheck native6 inside the
-outgoing RPC gate. Ordinary unplugged admission and the stronger vehicle-permission strategy are unchanged.
+outgoing RPC gate. Ordinary unplugged admission retains its separate guards.
 
 This strategy permits unexpected charging at nominal6A; it never labels zero consumption as a paused vehicle.
 `native-bounded-handover` freezes positive controls, stops only actual known transactions, drains lifecycle delivery,
@@ -571,7 +466,6 @@ The standalone CLI also accepts `--native-bounded-spec /absolute/private/native-
 validates the specification against the immutable baseline and exact listener without opening a journal or contacting
 the charger. `capture-bounded-baseline` is a separate read-only action for the original32A connected, closed station;
 `run` still requires independently verified native6 before admission and explicit external route/configuration steps.
-The native strategy and `--car-pause-config` are mutually exclusive.
 
 ## Standalone service and initial 6 A commissioning
 

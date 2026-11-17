@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator
@@ -44,8 +43,7 @@ from .station import StationChoice
 from .store import RecoveryRequiredError, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
 from .trial_evidence import profile_projection
-from .trial_handover import ObserveHandover
-from .trial_handover_evidence import HandoverEvidence
+from .trial_handover_evidence import HandoverEvidence, ObserveHandover
 from .trial_resources import ResourceBook
 from .trial_rollback import lifecycle_decision, require_lifecycle_idle
 
@@ -756,12 +754,7 @@ class NativeBoundedHandover:
                 or not control.get("inhibit")
                 or gateway.controls.desired() != 0
                 or not gateway.controls.ready
-                or receipt is None
-                or receipt["state"] != "confirmed"
-                or len(station) != 1
-                or station[0].canonical.get("limit") != 0
-                or receipt["confirmed"] is None
-                or json.loads(receipt["confirmed"]) != station[0].canonical
+                or not self.book.confirmed_station_zero(station, receipt)
                 or not local_only
                 and journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
                 or gateway.controls._operations

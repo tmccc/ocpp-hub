@@ -121,14 +121,7 @@ def _reconcile(
             "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
         station = [resource for resource in present if resource.identifier == HUB_PROFILE_ID]
-        if (
-            len(station) != 1
-            or station[0].canonical.get("limit") != 0
-            or receipt is None
-            or receipt["state"] != "confirmed"
-            or receipt["confirmed"] is None
-            or json.loads(receipt["confirmed"]) != station[0].canonical
-        ):
+        if not book.confirmed_station_zero(station, receipt):
             raise RecoveryRequiredError("history acknowledgement requires actual confirmed owned zero")
         if attempts:
             numbered, unassigned = split_attempts(list(native.history))

@@ -31,13 +31,12 @@ from .recovery_policy import (
     next_recovery_work,
     preflight_disposition,
     release_disposition,
+    restore_progress,
 )
 from .release_attempt import ReleaseAttempt
-from .restore_machine import RestoreStep, restore_progress
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import RecoveryRequiredError
-from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -284,56 +283,50 @@ class RecoveryCoordinator:
         decision = guard()
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
-        if c.stopping:
-            raise UnavailableError("managed shutdown retains its hold")
         epoch, revision = g._charger_epoch, g.controls._revision
-        native: HandoverEvidence
-        ticket: str | None = None
-        step = RestoreStep.READ_INITIAL
-        while step is not RestoreStep.RELEASE:
-            decision = ALLOW
-            if step in (RestoreStep.READ_INITIAL, RestoreStep.VERIFY, RestoreStep.RECHECK):
-                if step is RestoreStep.VERIFY:
-                    ticket = j.get("control", {}).get("ticket")
-                observed = await (
-                    c.native.read_result()
-                    if step is RestoreStep.READ_INITIAL
-                    else c.native.read_result(closed=continuing_local is None)
-                )
-                if isinstance(observed, Pending):
-                    decision = observed
-                else:
-                    native = observed
-                    if step is not RestoreStep.READ_INITIAL:
-                        decision = c.zero_decision(native, continuing_local=continuing_local)
-            elif step is RestoreStep.CHECK_INITIAL:
-                decision = await c.schedule.closure_decision(native)
-                if not isinstance(decision, Pending):
-                    decision = c.native.session_decision(native)
-                if not isinstance(decision, Pending):
-                    decision = (
-                        Pending(Prerequisite.LIFECYCLE, "owner release awaits actual transaction closure")
-                        if native.physical.transaction_open and continuing_local is None
-                        else c.zero_decision(native, continuing_local=continuing_local)
-                    )
-            elif step is RestoreStep.RESUME:
-                resumed = await c.native.resume_result(
-                    continuing_local=continuing_local, preserve_expired_start=c.tests.preserve_debt
-                )
-                decision = resumed if isinstance(resumed, Pending) else ALLOW
-            elif step is RestoreStep.CLEAN_TIMER:
-                decision = await c.schedule.before_release_result(native)
-            needed = not isinstance(decision, Pending) and (
-                step is RestoreStep.CHECK_INITIAL
-                and j.get("trial_phase") == "recovering"
-                or step is RestoreStep.VERIFY
-                and continuing_local is None
-                and j.get(KEY, {}).get("state") in ("installing", "armed", "clearing")
+        native = await c.native.read_result()
+        if isinstance(native, Pending):
+            return RestoreProgress(RestoreState.WAITING, native)
+        decision = await c.schedule.closure_decision(native)
+        if isinstance(decision, Pending):
+            return RestoreProgress(RestoreState.WAITING, decision)
+        decision = c.native.session_decision(native)
+        if isinstance(decision, Pending):
+            return RestoreProgress(RestoreState.WAITING, decision)
+        if native.physical.transaction_open and continuing_local is None:
+            return RestoreProgress(
+                RestoreState.WAITING, Pending(Prerequisite.LIFECYCLE, "owner release awaits actual transaction closure")
             )
-            next_step = step.advance(decision if isinstance(decision, Pending) else None, needed=needed)
-            if isinstance(next_step, RestoreProgress):
-                return next_step
-            step = next_step
+        decision = c.zero_decision(native, continuing_local=continuing_local)
+        if isinstance(decision, Pending):
+            return RestoreProgress(RestoreState.WAITING, decision)
+        if j.get("trial_phase") == "recovering":
+            resumed = await c.native.resume_result(
+                continuing_local=continuing_local, preserve_expired_start=c.tests.preserve_debt
+            )
+            if isinstance(resumed, Pending):
+                return RestoreProgress(RestoreState.WAITING, resumed)
+        ticket = j.get("control", {}).get("ticket")
+        native = await c.native.read_result(closed=continuing_local is None)
+        if isinstance(native, Pending):
+            return RestoreProgress(RestoreState.WAITING, native)
+        decision = c.zero_decision(native, continuing_local=continuing_local)
+        if isinstance(decision, Pending):
+            return RestoreProgress(RestoreState.WAITING, decision)
+        if continuing_local is None and j.get("managed_temporary_schedule", {}).get("state") in (
+            "installing",
+            "armed",
+            "clearing",
+        ):
+            decision = await c.schedule.before_release_result(native)
+            if isinstance(decision, Pending):
+                return RestoreProgress(RestoreState.WAITING, decision)
+            native = await c.native.read_result(closed=continuing_local is None)
+            if isinstance(native, Pending):
+                return RestoreProgress(RestoreState.WAITING, native)
+            decision = c.zero_decision(native, continuing_local=continuing_local)
+            if isinstance(decision, Pending):
+                return RestoreProgress(RestoreState.WAITING, decision)
         if (
             c.stopping
             or epoch != g._charger_epoch

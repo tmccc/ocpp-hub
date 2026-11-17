@@ -216,8 +216,7 @@ focused checks are development evidence; release still requires exact-clean-sour
 
 ## Owned restore sequencing
 
-`RecoveryCoordinator._run_restore` executes `RestoreStep` from the pure `restore_machine` module for each owned
-attempt. The initial read uses the original default closure mode, followed by closure reconciliation, session
+`RecoveryCoordinator._run_restore` directly sequences each owned attempt. The initial read uses the original default closure mode, followed by closure reconciliation, session
 agreement, the open-session check and zero proof. Optional native recovery is selected from current durable state
 after those checks. The ticket is captured only at entry to the following verified read. Timer cleanup is selected
 from fresh state after that read's zero proof and requires one further read/zero check. Later observations never
@@ -226,17 +225,28 @@ repeat the initial closure/session pipeline, recapture the ticket or loop back t
 A Pending ends the attempt with its original reason/cause and no owned release result. Existing request policy
 decides later work. The direct restore API retains its accepted-before-publication contract; the public request
 driver alone selects the running claim before task launch. Busy/stopping exits, queue refusal, shielded completion
-and post-completion supersession stay outside the phase core. No new task, lock, persisted phase or replay exists.
+and post-completion supersession stay with the existing completion owner. No phase interpreter or replay exists.
 
 The executor retains the exact native/Boot/resource/send guards, rollback permit, SQL publisher and post-COMMIT
 memory callback. `release_disposition` still classifies each real completed result once; `restore_progress` maps
-that verdict to progress. Claimed WAIT still acknowledges zero in its checked transaction; FAULT still records,
+that verdict to progress in the same policy module. Claimed WAIT still acknowledges zero in its checked transaction; FAULT still records,
 latches and raises the original failure. Pure constructors cannot perform either effect. The shared wire rollback
 coroutine executes the same zero sequence inside the original LocalControl task, peer sequence and permit.
 
-`test_restore_machine.py` provides cheap phase/terminal tables and complete optional-step sequences. Existing real
-native, timer, storage, cancellation and process-death tests remain. Preflight observers inspect the registered
+`test_recovery_contracts.py` covers terminal mapping. Existing real native, timer, storage, cancellation and
+process-death tests retain their sequencing and effect witnesses. Preflight observers inspect the registered
 `_restore_owned` frame with their original native/UUID/task conditions; no runtime observation callback is added.
+
+`ResourceBook.confirmed_station_zero` owns the seven identical profile/receipt comparisons. Native observation,
+resource publication and receipt SQL stay at each caller's original position. The pure comparison stays after
+any lifecycle Pending return and inside its original short-circuit condition; malformed JSON retains its error.
+Callers still select their original profile-kind scope. Weaker physical-presence checks remain weaker.
+`test_station_zero.py` checks canonical equality and lazy decoding without a controller or network installation.
+
+The experimental vehicle-pause handover and SEAT/physical-pause tools are retired. The session constructor rejects
+unfinished or malformed old handover records before resource setup or network work, closes its journal on refusal,
+and preserves completed historical records. `test_retired_handover.py` checks both remaining modes and every retired
+operator command. Native-bounded and ordinary unplugged commissioning retain their original entry points.
 
 ## Reference implementation
 
