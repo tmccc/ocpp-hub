@@ -79,7 +79,7 @@ collector independently repeat the checks and verify source types on their actua
 an explicit policy update, not an overlay of pinned code. Every attempt has its own directory; interrupted runs are
 retained and cannot be combined into one pass.
 Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
-must all pass the auditor. The source-pinned registry declares46,634 raw/16,402 runnable engine inputs and
+must all pass the auditor. The source-pinned registry declares33,194 raw/9,202 runnable engine inputs and
 584 raw/360 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
 source, including HA families, then verifies exact input/event/recovery evidence. See the
 [recovery coverage matrix](recovery-coverage.md) for scopes, focused-only risks and limits.

@@ -171,7 +171,8 @@ async def test_unplugged_option_requires_native_bounded_mode_and_disabled_local_
     local_start: bool,
 ) -> None:
     async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
-        with pytest.raises(SecurityError, match="disabled local Start"):
+        message = "disabled local Start" if bounded else "explicit native bounded specification"
+        with pytest.raises(SecurityError, match=message):
             TrialSession(
                 rig.prepared,
                 native_bounded=rig.spec if bounded else None,
