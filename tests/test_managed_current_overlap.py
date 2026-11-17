@@ -11,10 +11,8 @@ from datetime import UTC, datetime
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
-from ocpp_hub_core.prototype.recovery_contracts import FailureKind, GateDecision, Prerequisite
+from ocpp_hub_core.prototype.recovery_contracts import FailureKind, GateDecision, Pending, Prerequisite
 from ocpp_hub_core.prototype.rpc import UnavailableError
-from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests.handover_helpers import crash
 from tests.test_managed_proxy import healthy, introduced, managed_session, starts
@@ -250,11 +248,24 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
                 assert b.c.requests.receipt(identifier)["result"]["classification"] == "superseded_by_verified_return"
                 return
             if failure == "unknown-source":
+                intent, wire = b.c.requests.intent(), len(b.rig.bench.device_calls)
                 b.rig.peer.plan_session = (local, 987654)
-                with pytest.raises((SecurityError, RecoveryRequiredError)):
-                    await b.c.current.recover_overlap()
+                pending = await b.c.current.recover_overlap()
+                assert isinstance(pending, Pending) and pending.reason is Prerequisite.SOURCE
                 assert b.device.effective_limit() == 0 and not b.stops()
+                assert b.c.requests.intent() == intent and j.active() == local
+                assert b.session.gateway.controls.ready and b.session.gateway.controls.desired() == 0
+                assert not j.get("managed_control_fault") and not starts(b.rig)
+                limits = [
+                    period["limit"]
+                    for frame in b.rig.bench.device_calls[wire:]
+                    if frame[2] == "SetChargingProfile"
+                    for period in frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+                ]
+                assert limits and set(limits) == {0}
                 assert j.get("managed_current_change")["state"] == "recovering"
+                assert j.get("managed_current_change")["continuing_local"] is None
+                assert j.get("managed_current_change")["source_boot"] == b.session.gateway.boot_observation
                 assert b.c.requests.receipt(identifier) == before
                 b.rig.peer.plan_session = (local, 9)
             trace = len(b.rig.bench.device_calls)
