@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..frames import Frame
-from .connection_scope import CloudAttemptScope
+from .connection_scope import CloudAttemptScope, ControlScope
 from .managed_intent import ControlIntent
 
 
@@ -19,6 +19,11 @@ class StartHandoffContext:
     scope: CloudAttemptScope
     control_revision: int
     tag_digest: str
+
+    # Publication rechecks the same exact connection identity as the wire child's rollback guard.
+    @property
+    def control_scope(self) -> ControlScope:
+        return self.scope, self.control_revision
 
 
 @dataclass(frozen=True)

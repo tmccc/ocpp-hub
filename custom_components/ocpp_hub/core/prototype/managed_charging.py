@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .connection_scope import CloudAttemptScope, current_scope
+from .connection_scope import CloudAttemptScope, control_scope_matches, current_scope
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt, retire_unsent_local_start
@@ -366,10 +366,7 @@ class ManagedCharging:
             # This synchronous writer joins the child's transaction; it never opens a nested atomic block.
             def publish(context: StartHandoffContext) -> StartPublication:
                 self.guard(lease)
-                if (
-                    context.scope != current_scope(c.session.gateway)
-                    or context.control_revision != c.session.gateway.controls._revision
-                ):
+                if not control_scope_matches(c.session.gateway, context.control_scope):
                     raise RecoveryRequiredError("owned Start publication was superseded")
                 if lease.normal:
                     c.requests.start_published(lease.identifier, ControlIntent(lease.mode, lease.revision), lease.epoch)
@@ -882,8 +879,7 @@ class ManagedCharging:
             and lease.mode == intent.mode == "paused"
             and lease.revision == intent.revision
             and lease.start_scope is not None
-            and current_scope(g) == lease.start_scope
-            and g.controls._revision == lease.control_revision
+            and control_scope_matches(g, (lease.start_scope, lease.control_revision))
             and state.get("id") == lease.identifier
             and state.get("source") == "local"
             and state.get("start_attempted") is True

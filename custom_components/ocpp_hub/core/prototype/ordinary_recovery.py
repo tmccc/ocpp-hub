@@ -380,10 +380,6 @@ class OrdinaryRecovery:
         c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
         return ALLOW
 
-    # A native reread must still prove the exact known session that is about to receive its original cap.
-    def require_session(self, native: HandoverEvidence, local: int) -> None:
-        require_allowed(self.session_decision(native, local))
-
     # Native and journal source observations must still identify the same transaction at this effect boundary.
     def session_decision(self, native: HandoverEvidence, local: int) -> GateDecision:
         decision = self.authority_decision(local)

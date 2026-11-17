@@ -87,6 +87,12 @@ Boolean proof. Admission replaces the record; claim, hold, current selection and
 the caller's existing preimage. Exact-ticket completion cannot publish a late result over a newer Pause. Callers
 keep their transactions and fresh physical checks; the owner adds no cache, migration, socket or transaction.
 
+`current_control_scope()` in `connection_scope.py` captures the exact authenticated Boot and control revision;
+`control_scope_matches()` reconstructs that identity at every dispatch or publication check. Missing observations
+never match. `ManagedController.authority()` adds the existing intent and ticket for full result/publication
+identity. These values are observations, not reusable permission. Narrower Stop, fault-zero and current-worker
+guards keep their existing epoch/Boot rules, since adding a metadata fence could prevent a legitimate restriction.
+
 The main poll reads top to bottom: settle owned work, maintain faults, supervise recovery/native evidence, assess
 authority, publish a view. `_supervise()` keeps native and recovery effects explicit. `ControlFacts` and `assess()`
 in `supervision.py` make the health decision pure; the controller still performs the fault latch and Return

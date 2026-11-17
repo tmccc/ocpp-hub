@@ -68,6 +68,11 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   Retire only the two one-off model families; preserve all 97 process and 72 current-replacement cases. Focused
   checks on both HA client runtimes retain daily control and reconnect behaviour. Full qualification and deployment
   remain separate.
+- [x] Share exact Boot/control identity checks at seven live boundaries and rebuild complete ownership through
+  `ManagedController.authority()`. Keep narrower Stop/fault/current guards, receipt reads and claim/publication
+  ordering. Remove three unused exception adapters; retain all charging features and persisted formats. The gain is
+  consistent authority vocabulary rather than another large line-count reduction. Release qualification and
+  deployment remain separate.
 
 ## iCS implementation history — 15 November 2026
 

@@ -7,7 +7,7 @@ import sqlite3
 import time
 from typing import TYPE_CHECKING
 
-from .connection_scope import current_scope
+from .connection_scope import control_scope_matches, current_scope
 from .managed_current import current_source_decision
 from .managed_intent import ControlIntent
 from .policy import DeniedError
@@ -52,16 +52,6 @@ class RecoveryCoordinator:
     # Concurrent polls observe the existing owned completion instead of preparing or settling the same work twice.
     def pending(self) -> bool:
         return self._task is not None and not self._task.done()
-
-    # Rebuild the current exact identity at each send/publication boundary; an earlier snapshot is not permission.
-    def authority(self) -> AuthorityStamp | None:
-        c, g = self.c, self.c.session.gateway
-        scope = current_scope(g)
-        if scope is None:
-            return None
-        return AuthorityStamp(
-            c.requests.intent(), scope, g.controls._revision, c.session.journal.get("control", {}).get("ticket")
-        )
 
     # Project simultaneous domain duties without replacing their authoritative durable records with one phase.
     def obligations(self) -> RecoveryFacts:
@@ -162,7 +152,7 @@ class RecoveryCoordinator:
             operation = progress.operation
             if (
                 operation is None
-                or operation.published_authority != self.authority()
+                or operation.published_authority != self.c.authority()
                 or self.c.stopping
                 or self.c.session.journal.get("managed_control_fault")
             ):
@@ -295,12 +285,12 @@ class RecoveryCoordinator:
 
         # Restrictive rollback keeps its exact Boot proof even when the positive release permission is revoked.
         def rollback_guard() -> None:
-            if current_scope(g) != scope or g.controls._revision != revision:
+            if not control_scope_matches(g, (scope, revision)):
                 raise UnavailableError("release rollback belongs to a superseded Boot observation")
 
         # Final SQL joins the wire child's transaction; this callback grants no permission across an await.
         def publish(authority: AuthorityStamp) -> AuthorityStamp | Pending:
-            if not j.db.in_transaction or self.authority() != authority:
+            if not j.db.in_transaction or c.authority() != authority:
                 return Pending(Prerequisite.SUPERSEDED, "release publication was superseded")
             decision = guard()
             if isinstance(decision, Pending):
@@ -311,7 +301,7 @@ class RecoveryCoordinator:
             j.put("managed_owner_epoch", epoch)
             if return_request is not None:
                 c.requests.returned(return_request, expected_intent, c.current.returned_to_previous)
-            published = self.authority()
+            published = c.authority()
             if published is None:
                 raise RecoveryRequiredError("release publication lost its exact Boot")
             return published
@@ -331,14 +321,14 @@ class RecoveryCoordinator:
         disposition = release_disposition(
             attempt.purpose,
             result,
-            self.authority(),
+            c.authority(),
             zero_ready=g.controls.ready and g.controls.desired() == 0,
             faulted=bool(j.get("managed_control_fault")),
             publication_allowed=not isinstance(decision, Pending),
         )
         if disposition is ReleaseDisposition.WAIT and result.claimed:
             with j.atomic():
-                if self.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
+                if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
                     raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
                 assert attempt.ticket is not None
                 g.controls._complete(attempt.ticket, uncertain=False)

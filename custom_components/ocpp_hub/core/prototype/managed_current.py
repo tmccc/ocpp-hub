@@ -18,7 +18,7 @@ from .managed_settlement import claim_internal_pause
 from .managed_sources import recorded_station_profile
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError, integer
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -85,11 +85,6 @@ def record_current_source(j: Journal, n: HandoverEvidence, boot: str | None) -> 
     )
 
 
-# Current recovery has no Stop authority and can continue only its freshly identified independent original session.
-def require_current_source(g: Gateway, local: int | None) -> None:
-    require_allowed(current_source_decision(g, local))
-
-
 # Current source prerequisites are ordinary data at both preflight and the final transport boundary.
 def current_source_decision(g: Gateway, local: int | None) -> GateDecision:
     j = g.journal
@@ -107,11 +102,6 @@ def current_source_decision(g: Gateway, local: int | None) -> GateDecision:
     ):
         return Pending(Prerequisite.SOURCE, "current recovery awaits the independent original session on this Boot")
     return ALLOW
-
-
-# Every recovery read must still describe the same open original transaction before its positive ceiling is sent.
-def require_current_session(g: Gateway, n: HandoverEvidence, local: int) -> None:
-    require_allowed(current_session_decision(g, n, local))
 
 
 # Actual native and journal identities must agree before continuing this current operation's original session.

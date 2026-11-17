@@ -11,7 +11,7 @@ from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
-from .connection_scope import ConnectionLineage, current_scope
+from .connection_scope import ConnectionLineage, control_scope_matches, current_scope
 from .control_state import ControlState
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
@@ -652,8 +652,7 @@ class NativeBoundedHandover:
             if (
                 journal.get("trial_phase") != "recovering"
                 or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
-                or revision != gateway.controls._revision
-                or current_scope(gateway) != scope
+                or not control_scope_matches(gateway, (scope, revision))
                 or ticket != control.get("ticket")
                 or not gateway.current_boot_seen(epoch)
                 or not control.get("inhibit")

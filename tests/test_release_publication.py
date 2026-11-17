@@ -612,7 +612,7 @@ async def test_new_pause_after_owned_completion_retires_restore_consumer(tmp_pat
                     observed = {
                         "owned_progress": progress,
                         "consumer_done": consumer.done(),
-                        "before_authority": c.recovery.authority(),
+                        "before_authority": c.authority(),
                         "return_receipt": copy.deepcopy(c.requests.receipt(returning)),
                         "physical": b.rig.bench.firmware.effective_limit(),
                     }
@@ -623,7 +623,7 @@ async def test_new_pause_after_owned_completion_retires_restore_consumer(tmp_pat
                     assert observed["return_receipt"]["state"] == "completed"
                     accepted = c.command(pause, "pause", observed["before_authority"].intent.revision)
                     assert accepted["state"] == "accepted"
-                    observed["after_authority"] = c.recovery.authority()
+                    observed["after_authority"] = c.authority()
                     observed["new_ticket"] = j.get("control")["ticket"]
                     assert observed["after_authority"] != operation.published_authority
                     event.set_result(observed)

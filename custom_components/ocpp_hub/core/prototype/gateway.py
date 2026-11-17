@@ -18,7 +18,7 @@ from typing import Any
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
 from .auth_info import InfoBook, validate_info
 from .authorisation import VendorAuthorisation
-from .connection_scope import current_scope
+from .connection_scope import control_scope_matches, current_control_scope
 from .delivery_reply import DeliveryReply
 from .events import validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
@@ -1009,11 +1009,11 @@ class Gateway:
         on_prepared: Callable[[], None] | None = None,
         handoff: StartHandoff | None = None,
     ) -> OwnedStartResult:
-        scope, revision = current_scope(self), self.controls._revision
+        connection = current_control_scope(self)
 
         # Restrictive rollback retains the exact source even after the positive management grant is revoked.
         def source() -> None:
-            if scope is None or current_scope(self) != scope or self.controls._revision != revision:
+            if not control_scope_matches(self, connection):
                 raise UnavailableError("managed Start belongs to a superseded Boot observation")
 
         # Revocation or a newer Pause can invalidate authorization while native evidence is awaited.
@@ -1024,7 +1024,13 @@ class Gateway:
 
         check()
         return await self.controls.start_managed_result(
-            tag, check, request_id=request_id, on_prepared=on_prepared, scope_guard=source, scope=scope, handoff=handoff
+            tag,
+            check,
+            request_id=request_id,
+            on_prepared=on_prepared,
+            scope_guard=source,
+            scope=connection[0] if connection is not None else None,
+            handoff=handoff,
         )
 
     # A local stop installs a durable zero-current hold even when there is no known transaction to stop.

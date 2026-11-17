@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
-from .connection_scope import current_scope
+from .connection_scope import control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
 from .local_control import local_start_receipt
 from .managed_charging import ManagedCharging
@@ -44,7 +44,7 @@ from .native_faults import (
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
+from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
@@ -108,6 +108,14 @@ class ManagedController:
             session.journal, lambda fault: release_evidence(self, fault) is not None
         )
 
+    # Rebuild full ownership for result/publication checks without caching permission across an await.
+    def authority(self) -> AuthorityStamp | None:
+        g, j = self.session.gateway, self.session.journal
+        scope = current_scope(g)
+        if scope is None:
+            return None
+        return AuthorityStamp(self.requests.intent(), scope, g.controls._revision, j.get("control", {}).get("ticket"))
+
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
         if self.stopping:
@@ -167,12 +175,12 @@ class ManagedController:
         ):
             return
         receipt, control, owner_pause = local_start_receipt(j), j.get("control", {}), j.get("managed_owner_pause", {})
-        scope, revision = current_scope(g), g.controls._revision
+        connection = current_control_scope(g)
         row = j.db.execute(
             "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
         ).fetchone()
         if (
-            scope is None
+            connection is None
             or row is None
             or tuple(row) != ("start", intent.revision, "uncertain")
             or receipt.get("request_id") != state.get("id")
@@ -194,8 +202,7 @@ class ManagedController:
                 and not g.controls._operations
                 and not g.charger._pending
                 and self.requests.intent() == intent
-                and current_scope(g) == scope
-                and g.controls._revision == revision
+                and control_scope_matches(g, connection)
                 and j.get("trial_phase") == "active"
                 and self.charging.state() == state
                 and local_start_receipt(j) == receipt
@@ -222,7 +229,7 @@ class ManagedController:
             return
         self.reclaim_failed_start_pause()
         epoch, ticket = g._charger_epoch, j.get("control", {}).get("ticket")
-        scope, revision = current_scope(g), g.controls._revision
+        connection = current_control_scope(g)
 
         # Recheck the owner's claim and authenticated device immediately before each wire operation.
         def guard() -> None:
@@ -234,10 +241,7 @@ class ManagedController:
                 or control.get("ticket") != ticket
                 or not ControlState(control).explicit_local_hold
                 or g._charger_epoch != epoch
-                or scope is None
-                or current_scope(g) != scope
-                or g.controls._revision != revision
-                or not g.current_boot_seen(epoch)
+                or not control_scope_matches(g, connection)
                 or fingerprint(j.get("boot")) != self.native.spec.boot_digest
                 or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
             ):

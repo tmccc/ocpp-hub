@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Share exact Boot/control-generation checks across Start, Pause, rollback and publication. Put complete authority
+  reconstruction on the controller and remove three unused check adapters. Preserve narrower Stop/fault/current
+  guards, pending outcomes, journal formats and all charging features.
+
 - Retire proxy one-off temporary schedules, their deadline task and timer-specific recovery. Keep native daily
   schedules and managed Start, Pause, Return and current selection. Refuse unfinished old one-off journals before
   modifying their evidence; retain completed history and reserved plan identifiers.
