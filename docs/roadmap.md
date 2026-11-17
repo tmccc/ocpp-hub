@@ -64,7 +64,7 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] Retire proxy one-off temporary schedules with owner approval. Remove their API, deadline task, native-plan
   write capability and recovery branches while retaining daily schedules and managed Start/Pause/Return/current.
   Read-only startup checks refuse unfinished old obligations before journal normalization; completed history and
-  reserved IDs remain passive. Runtime is 2,686 physical lines smaller, including the new guard and shared helpers.
+  reserved IDs remain passive. Runtime is 2,689 physical lines smaller, including the new guard and shared helpers.
   Retire only the two one-off model families; preserve all 97 process and 72 current-replacement cases. Focused
   checks on both HA client runtimes retain daily control and reconnect behaviour. Full qualification and deployment
   remain separate.

@@ -221,6 +221,13 @@ class RecoveryCoordinator:
                 decision = current_source_decision(g, continuing_local)
                 if isinstance(decision, Pending):
                     return decision
+            if (
+                continuing_local is not None
+                and not current_recovery
+                and not c.ordinary.active()
+                and not (c.charging.scoped_normal_stop() and c.charging.current_daily(continuing_local))
+            ):
+                return Pending(Prerequisite.SOURCE, "source-specific continuation was superseded")
             if c.stopping or c.requests.intent() != expected_intent:
                 return Pending(Prerequisite.SUPERSEDED, "a newer requested hold superseded managed release")
             return ALLOW
@@ -232,9 +239,6 @@ class RecoveryCoordinator:
         native = await c.native.read_result()
         if isinstance(native, Pending):
             return RestoreProgress(RestoreState.WAITING, native)
-        decision = ALLOW
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
         decision = c.native.session_decision(native)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)

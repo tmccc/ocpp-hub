@@ -157,7 +157,7 @@ async def test_release_reconciliation_requires_pause_then_return(
                 await recover_then_return(replacement_bench)
 
 
-# Intent: recovering one release fault cannot acknowledge a different fault, vendor write, Start, queue or timer duty.
+# Intent: recovering one release fault cannot acknowledge a different fault, vendor write, Start or queue duty.
 # Why: independent zero alone cannot erase unrelated command/lifecycle uncertainty or an archived cutoff obligation.
 @pytest.mark.parametrize(
     "blocker",
@@ -168,7 +168,6 @@ async def test_release_reconciliation_requires_pause_then_return(
         "uncertain-vendor",
         "pending-start",
         "changed-config",
-        "archived-cutoff",
         "positive-native-profile",
     ],
 )
@@ -189,19 +188,6 @@ async def test_release_reconciliation_preserves_unrelated_uncertainty(
             j.put("vendor_start_grant", {"digest": "a" * 64, "token": "b" * 32})
         elif blocker == "changed-config":
             b.rig.peer.configuration["untouched"] = "external-change"
-        elif blocker == "archived-cutoff":
-            j.put(
-                "managed_temporary_occurrences",
-                {
-                    "old": {
-                        "id": "old",
-                        "state": "complete",
-                        "result": "no_scheduled_session",
-                        "idle_cutoff_hold": True,
-                        "start_epoch": 1,
-                    }
-                },
-            )
         else:
             b.rig.bench.firmware.profiles[7001]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] = 6
         before = copy.deepcopy(j.get("managed_control_fault"))

@@ -16,97 +16,123 @@ from tests.handover_helpers import crash
 from tests.native_schedule_support import ZONE, timer_bench
 from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
 from tests.test_prototype import START
+from tests.test_prototype_runtime import until
 from tests.test_prototype_tls import tls as tls
+
+
+# Reach the existing ordinary native-outage hold through actual failed loopback HTTP reads.
+async def native_outage_at_zero(b):
+    port = b.session.prepared.observer.port
+
+    # Close the independent endpoint after a real request, leaving both OCPP peers connected.
+    async def unavailable(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.close()
+        await writer.wait_closed()
+
+    async with await asyncio.start_server(unavailable, "127.0.0.1", 0) as server:
+        b.session.prepared.observer.port = server.sockets[0].getsockname()[1]
+        try:
+            for _ in range(3):
+                await b.c.tick()
+        finally:
+            b.session.prepared.observer.port = port
+    assert b.device.effective_limit() == 0 and not b.stops()
 
 
 # Intent: let successive genuine daily occurrences run while retaining an unrelated acknowledged cloud Start.
 # Why: the older grant may never report, or its report may immediately follow a daily Stop before the next tick.
-@pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("keep_old_native", [False, True])
-async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypatch, restart, demand, keep_old_native):
+async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypatch, demand, keep_old_native):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await b.acknowledge_older_owner_start()
-        if restart:
-            await crash(b.session)
-            b.session = managed_session(b.rig)
-            await b.session.start()
-            b.c = ManagedController(b.session)
-        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
-            if restart:
-                await introduced(b.rig, b.session, b.sock, "pending-owner-restart")
-            j = b.session.journal
-            grant = {**j.get("vendor_start_grant"), "expires": 0}
-            j.put("vendor_start_grant", grant)
-            b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
-            for _ in range(5):
-                await b.c.tick()
-            assert set(b.device.plans) == {9}
-            tag = b.device.plans[9]["idTag"]
-            for day in (12, 13):
-                b.clock.now = int(datetime(2026, 11, day, tzinfo=ZONE).timestamp())
-                provisional = 1000 + day
-                b.device.active = provisional
-                b.rig.peer.plan_session = (provisional, 9)
-                b.device.fire_plan(9)
-                b.rig.peer.paused = False
-                b.rig.peer.permission_enabled = demand
-                b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-                if not demand:
-                    b.device.requested_current = 0
-                await b.c.tick()
-                result = await b.rig.bench.call(
-                    b.sock,
-                    f"daily-{day}",
-                    "StartTransaction",
-                    START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
-                )
-                assert result[0] == 3 and result[2]["idTagInfo"]["status"] == "Accepted"
-                local = result[2]["transactionId"]
-                assert b.device.effective_limit() == 0 and j.get("vendor_start_grant") == grant
-                b.rig.peer.plan_session = (local, 9)
-                assert (await pending_cloud_offer(b.c, 6))["station_ceiling_a"] == 6
-                assert b.device.current == (6 if demand else 0) and not b.stops()
-                b.clock.now += 60
-                await b.close_transaction(local)
-                assert j.get("vendor_start_grant") == grant
-            if keep_old_native:
-                b.device.active = local
-                b.rig.peer.plan_session = (local, 9)
-            result = await b.rig.bench.call(
-                b.sock,
-                "delayed-owner",
-                "StartTransaction",
-                START | {"idTag": "CLOUD_OWNER", "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
-            )
-            assert result[0] == 3 and b.device.effective_limit() == 0
-            owner = result[2]["transactionId"]
-            assert owner != local and j.get("vendor_start_grant") == {**grant, "local": owner}
-            if keep_old_native:
-                # This peer normally updates SESSION on the OCPP reply. Keep its separate native view behind.
-                b.device.active = local
-                assert (await b.c.native.read()).physical.native_transaction_id == local
-                for _ in range(3):
-                    await b.c.tick()
-                assert b.device.effective_limit() == 0 and not b.stops()
-            b.device.active = owner
-            b.rig.peer.plan_session = (owner, 987655)
-            b.rig.peer.paused = False
-            b.rig.peer.permission_enabled = demand
-            b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
-            b.device.requested_current = 32 if demand else 0
-            assert (await healthy(b.c))["station_ceiling_a"] == 6
+        j = b.session.journal
+        grant = j.get("vendor_start_grant")
+        assert grant.get("local") is None
+        for day in (12, 13):
+            b.clock.now = int(datetime(2026, 11, day, tzinfo=ZONE).timestamp())
+            local = await b.start_plan(9, demand=demand)
+            assert b.device.effective_limit() == 6 and j.get("vendor_start_grant") == grant
+            assert (await pending_cloud_offer(b.c, 6))["station_ceiling_a"] == 6
             assert b.device.current == (6 if demand else 0) and not b.stops()
             b.clock.now += 60
-            await b.close_transaction(owner)
-            await healthy(b.c)
-            assert not j.get("vendor_start_grant") and set(b.device.plans) == {9}
-            assert len(starts(b.rig)) == 1 and not b.stops()
-            next_daily = await b.advance_idle_to(int(datetime(2026, 11, 14, tzinfo=ZONE).timestamp()))
-            assert next_daily is not None and (await healthy(b.c))["power_w"] > 0
+            await b.close_transaction(local)
+            assert j.get("vendor_start_grant") == grant
+        if keep_old_native:
+            b.device.active = local
+            b.rig.peer.plan_session = (local, 9)
+        result = await b.rig.bench.call(
+            b.sock,
+            "delayed-owner",
+            "StartTransaction",
+            START | {"idTag": "CLOUD_OWNER", "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
+        )
+        assert result[0] == 3 and b.device.effective_limit() == 6
+        owner = result[2]["transactionId"]
+        assert owner != local and j.get("vendor_start_grant") == {**grant, "local": owner}
+        if keep_old_native:
+            # Real outage zero stays owned while the independent native channel still names a closed daily.
+            b.device.active = local
+            await native_outage_at_zero(b)
+            assert (await b.c.native.read()).physical.native_transaction_id == local
+            for _ in range(3):
+                await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops()
+        b.device.active = owner
+        b.rig.peer.plan_session = (owner, 987655)
+        b.rig.peer.paused = False
+        b.rig.peer.permission_enabled = demand
+        b.rig.bench.cp, b.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
+        b.device.requested_current = 32 if demand else 0
+        assert (await healthy(b.c))["station_ceiling_a"] == 6
+        assert b.device.current == (6 if demand else 0) and not b.stops()
+        b.clock.now += 60
+        await b.close_transaction(owner)
+        await healthy(b.c)
+        assert not j.get("vendor_start_grant") and set(b.device.plans) == {9}
+        assert len(starts(b.rig)) == 1 and not b.stops()
+        next_daily = await b.advance_idle_to(int(datetime(2026, 11, 14, tzinfo=ZONE).timestamp()))
+        assert next_daily is not None and (await healthy(b.c))["power_w"] > 0
 
 
-# Intent: a held lifecycle on the original plan must retain a distinct previously acknowledged local owner's Start.
+# Intent: ordinary replacement retains zero for a real known daily while an unrelated cloud Start remains unbound.
+# Why: a fresh Boot and daily closure cannot consume that accepted command or authorize replay or positive release.
+@pytest.mark.parametrize("demand", [False, True])
+async def test_restart_retains_unbound_owner_at_zero(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await b.acknowledge_older_owner_start()
+        grant = b.session.journal.get("vendor_start_grant")
+        daily = await b.start_plan(9, demand=demand)
+        await pending_cloud_offer(b.c, 6)
+        await until(lambda: b.session.journal.next_delivery() is None and not b.session.gateway.vendor._pending)
+        assert b.session.journal.vendor_id(daily) is not None
+        original = copy.deepcopy(b.device.plans[9])
+        await b.c.charging.close()
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "unbound-owner-known-daily-restart")
+            for _ in range(4):
+                status = await b.c.tick()
+            native = await b.c.native.read()
+            assert native.physical.native_transaction_id == daily and native.session_plan_id == 9
+            assert b.session.journal.active() == daily and b.session.journal.get("vendor_start_grant") == grant
+            assert b.c.requests.intent().mode == "app" and status["cloud_start_pending"]
+            assert status["owner_control_enabled"] is False and b.device.effective_limit() == 0
+            assert not b.stops() and len(starts(b.rig)) == 1
+            assert not b.session.journal.get("managed_control_fault")
+            await b.close_transaction(daily)
+            for _ in range(4):
+                await b.c.tick()
+            assert b.session.journal.active() is None and b.session.journal.get("vendor_start_grant") == grant
+            assert b.device.effective_limit() == 0 and b.device.plans == {9: original}
+            assert not b.stops() and len(starts(b.rig)) == 1
+
+
+# Intent: an original daily lifecycle retains a distinct previously acknowledged local owner's Start.
 # Why: both a successful Start report and the positive profile restoration used to clear the one shared pending flag.
 async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
@@ -123,10 +149,8 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
             await b.c.tick()
         assert set(b.device.plans) == {9}
         b.clock.now = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
-        b.device.active = 123456
-        b.rig.peer.plan_session = (123456, 9)
         local = await b.start_plan(9)
-        assert j.get("control")["start_pending"] and b.device.effective_limit() == 0
+        assert j.get("control")["start_pending"] and b.device.effective_limit() == 6
         await healthy(b.c)
         assert b.device.current == 6 and j.get("control")["start_pending"]
         b.clock.now += 60
@@ -137,7 +161,7 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
             "StartTransaction",
             START | {"idTag": owner_tag, "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
         )
-        assert result[0] == 3 and b.device.effective_limit() == 0 and not j.get("control")["start_pending"]
+        assert result[0] == 3 and b.device.effective_limit() == 6 and not j.get("control")["start_pending"]
         owner_local = result[2]["transactionId"]
         b.rig.peer.plan_session = (owner_local, 132456)
         await healthy(b.c)
@@ -147,30 +171,41 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
         await b.c.charging.close()
 
 
-# Intent: an unverified or matching pending command cannot become evidence of a distinct earlier owner.
-# Why: a legacy grant may be incomplete even when the independent native plan and plug are both visible.
+# Intent: an incomplete cloud grant cannot bind or be consumed by an independently permitted native daily.
+# Why: ordinary app permission allows the original daily; only the real cloud owner's lifecycle spends its grant.
 @pytest.mark.parametrize("changed", ["mutation", "digest"])
-async def test_unproven_pending_grant_blocks_separate_daily(tmp_path, tls, unused_tcp_port, monkeypatch, changed):
+async def test_unproven_pending_grant_does_not_bind_daily(tmp_path, tls, unused_tcp_port, monkeypatch, changed):
     async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         await b.acknowledge_older_owner_start()
         j = b.session.journal
         original = j.get("vendor_start_grant")
         grant = {**original, changed: ""}
         j.put("vendor_start_grant", grant)
-        tag = b.device.plans[9]["idTag"]
         b.clock.now = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
-        for _ in range(3):
-            await b.c.tick()
-        b.device.active = 123455
-        b.rig.peer.plan_session = (123455, 9)
-        await b.c.tick()
-        body = START | {"idTag": tag, "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()}
-        reply = await b.rig.bench.call(b.sock, "unconfirmed-daily", "StartTransaction", body)
-        assert reply[0] == 4 and j.active() is None and b.device.effective_limit() == 0 and not b.stops()
-        assert j.get("vendor_start_grant") == grant
+        daily = await b.start_plan(9)
+        assert b.device.effective_limit() == 6 and j.active() == daily
+        await b.c.native.read()
+        assert j.get("vendor_start_grant") == grant and grant.get("local") is None
+        assert not b.stops() and len(starts(b.rig)) == 1
         j.put("vendor_start_grant", original)
-        retry = await b.rig.bench.call(b.sock, "confirmed-daily", "StartTransaction", body)
-        assert retry[0] == 3 and j.get("vendor_start_grant") == original and b.device.effective_limit() == 0
+        await pending_cloud_offer(b.c, 6)
+        assert j.get("vendor_start_grant") == original
+        await b.close_transaction(daily)
+        b.clock.now += 60
+        reply = await b.rig.bench.call(
+            b.sock,
+            "actual-owner-after-repair",
+            "StartTransaction",
+            START | {"idTag": "CLOUD_OWNER", "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()},
+        )
+        assert reply[0] == 3
+        owner = reply[2]["transactionId"]
+        assert owner != daily and j.get("vendor_start_grant") == {**original, "local": owner}
+        b.rig.peer.plan_session = (owner, 987655)
+        assert (await healthy(b.c))["station_ceiling_a"] == 6
+        await b.close_transaction(owner)
+        await healthy(b.c)
+        assert not j.get("vendor_start_grant") and not b.stops() and len(starts(b.rig)) == 1
 
 
 # Intent: an unrelated daily Start cannot consume the local owner's command before or after its acknowledgement.

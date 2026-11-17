@@ -33,8 +33,8 @@ def unnumbered(b: TimerBench, instant: int, name: str) -> tuple[dict[str, Any], 
     return body, attempt
 
 
-# Intent: only the commissioned original plan and its own unique, matching zero-draw attempt may report without an ID.
-# Why: an unassigned history filename can outlive its vehicle and the two plans can share an identification tag.
+# Intent: matching identifies native attempts, while an ordinary original-plan report obtains its real OCPP number.
+# Why: allocation under zero grants no current until native and local source identifiers actually converge.
 async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with (
         timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b,
@@ -44,27 +44,38 @@ async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, t
         await until(lambda: not b.session.runtime.status.charger_connected)
         b.sock = await connections.enter_async_context(b.rig.charger(b.session))
         await introduced(b.rig, b.session, b.sock, "unnumbered-daily-reconnect")
+        await b.c.ordinary.hold("restricted_introduction")
         assert b.device.effective_limit() == 0 and b.c.ordinary.active()
         midnight = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
         body, attempt = unnumbered(b, midnight, "current.json")
-        for source, payload in (
-            (987655, body),
-            (9, body | {"meterStart": body["meterStart"] + 1}),
-            (9, body | {"timestamp": datetime.fromtimestamp(midnight + 1, UTC).isoformat()}),
-            (9, body | {"idTag": "CLOUD_OWNER"}),
+        b.clock.now = midnight + 2
+        for payload in (
+            body | {"meterStart": body["meterStart"] + 1},
+            body | {"timestamp": datetime.fromtimestamp(midnight + 1, UTC).isoformat()},
+            body | {"idTag": "CLOUD_OWNER"},
         ):
-            b.clock.now = midnight + 2
-            b.rig.peer.plan_session = (None, source)
-            refused = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", payload)
-            assert refused[0] == 4 and b.session.journal.active() is None and b.device.effective_limit() == 0
-        b.rig.bench.history.append(attempt | {"filename": "same-second.json", "startMs": 175})
-        refused = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
-        assert refused[0] == 4 and b.session.journal.active() is None and not b.stops()
-        b.rig.bench.history.pop()
+            assert matching_unassigned_start((attempt,), payload, datetime.fromisoformat(payload["timestamp"])) is None
+        competing = attempt | {"filename": "same-second.json", "startMs": 175}
+        assert matching_unassigned_start((attempt, competing), body, datetime.fromisoformat(body["timestamp"])) is None
+        assert matching_unassigned_start((attempt,), body, datetime.fromisoformat(body["timestamp"])) is not None
+        refused = await b.rig.bench.call(
+            b.sock, uuid.uuid4().hex, "StartTransaction", body | {"idTag": "CLOUD_OWNER"}
+        )
+        assert refused[0] == 4 and b.session.journal.active() is None and b.device.effective_limit() == 0
         accepted = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
         assert accepted[0] == 3
         local = accepted[2]["transactionId"]
         assert b.device.effective_limit() == 0
+        # Native absence after allocation still cannot identify the original open daily source.
+        b.device.active = None
+        for _ in range(2):
+            await b.c.tick()
+        assert b.device.effective_limit() == 0 and not b.stops()
+        b.device.active = local
+        b.rig.peer.plan_session = (local, 987655)
+        for _ in range(2):
+            await b.c.tick()
+        assert b.device.effective_limit() == 0 and not b.stops()
         b.rig.peer.plan_session = (local, 9)
         for _ in range(4):
             await b.c.tick()

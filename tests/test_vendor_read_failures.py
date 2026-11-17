@@ -237,7 +237,6 @@ def legacy(journal):
         "queued-event",
         "active-session",
         "current-recovery",
-        "archived-cutoff",
         "uncertain-request",
         "other-fault",
         "preservation-fault",
@@ -281,8 +280,6 @@ def test_legacy_read_repair_preserves_genuine_debt(tmp_path, blocker):
             journal.db.execute("INSERT INTO transactions(local,connector,start,vendor) VALUES(1001,1,'{}',9001)")
         elif blocker == "current-recovery":
             journal.put("managed_current_change", {"state": "recovering"})
-        elif blocker == "archived-cutoff":
-            journal.put("managed_temporary_occurrences", {"old": {"state": "complete", "closure_gap": True}})
         elif blocker == "uncertain-request":
             journal.db.execute("CREATE TABLE managed_requests(id TEXT,action TEXT,state TEXT)")
             journal.db.execute("INSERT INTO managed_requests VALUES('old','start','uncertain')")

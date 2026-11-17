@@ -26,7 +26,7 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
         AsyncExitStack() as replacements,
     ):
         plan, configuration = copy.deepcopy(b.device.plans[9]), copy.deepcopy(b.rig.peer.configuration)
-        # A real new introduction before the remaining cutoff reaches the ordinary automatic idle restoration.
+        # A replacement introduction starts ordinary automatic idle restoration under its verified zero.
         await b.c.charging.close()
         await crash(b.session)
         b.session = managed_session(b.rig)
@@ -61,7 +61,7 @@ async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_pa
                 assert not attempt.finished and not attempt.cancelled and not attempt.positive_confirmed
                 assert attempt.intent == intent and not attempt.known_unsent()
                 assert c.requests.intent() == intent and c.requests.pending_return() is None
-                assert j.active() is None and not c.ordinary.active()
+                assert j.active() is None and c.ordinary.active()
                 assert g._charger_epoch == epoch and g.boot_observation == boot
                 assert g.controls._revision == revision and b.session.book.before_positive_release is not None
                 positives = [
