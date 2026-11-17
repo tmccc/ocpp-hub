@@ -35,13 +35,38 @@ def literal_branches(value):
     raise AssertionError("review dynamic diagnostic producer: " + ast.unparse(value))
 
 
-# Select only controller status methods and the actual service's top-level status publications.
+# A named verdict must come from one unconditional assignment; another branch needs explicit contract review.
+def produced_state(value, producer):
+    if isinstance(value, ast.Name):
+        assignments = []
+        for statement in ast.walk(producer):
+            if isinstance(statement, ast.Assign):
+                pairs = [pair for target in statement.targets for pair in assignment_pairs(target, statement.value)]
+            elif isinstance(statement, ast.AnnAssign):
+                pairs = [(statement.target, statement.value)]
+            else:
+                continue
+            for target, assigned in pairs:
+                if isinstance(target, ast.Name) and target.id == value.id:
+                    assignments.append((statement, assigned))
+        assert len(assignments) == 1 and assignments[0][0] in producer.body, "review ambiguous health verdict producer"
+        value = assignments[0][1]
+    return literal_branches(value)
+
+
+# Follow actual controller outcomes, the pure verdict and the service's top-level status publications.
 def emitted_states():
     methods = [
         node
         for node in ast.walk(producer_tree(CORE / "managed.py"))
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in ("tick", "_tick")
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name in ("tick", "_tick", "_poll_gate", "_supervise", "_assess_observation")
     ]
+    methods.extend(
+        node
+        for node in ast.walk(producer_tree(CORE / "supervision.py"))
+        if isinstance(node, ast.FunctionDef) and node.name == "assess"
+    )
     methods.append(producer_tree(ROOT / "tools/managed_proxy.py"))
     values = set()
     for method in methods:
@@ -54,6 +79,11 @@ def emitted_states():
                 for keyword in node.keywords:
                     if keyword.arg == "state":
                         values |= literal_branches(keyword.value)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "PollStatus":
+                    values |= produced_state(node.args[0], method)
+                elif node.func.id == "HealthVerdict":
+                    values |= produced_state(node.args[0], method)
     assert {"healthy", "stopped", "waiting_for_cloud"} <= values
     return sorted(values)
 
@@ -87,6 +117,21 @@ def assignment_pairs(target, value):
             yield from assignment_pairs(child, assigned)
     else:
         yield target, value
+
+
+# Intent: typed state discovery cannot miss a second assignment or silently accept an unreviewed dynamic label.
+# Why: moving the producer out of a dictionary must retain the independent consumer-vocabulary check.
+@pytest.mark.parametrize(
+    "source",
+    [
+        "state = 'healthy'\nif condition: state = next_state()",
+        "if condition: state = 'healthy'",
+        "state = next_state()",
+    ],
+)
+def test_typed_verdict_requires_one_reviewed_literal_assignment(source):
+    with pytest.raises(AssertionError, match="review .*producer"):
+        produced_state(ast.Name(id="state"), ast.parse(source))
 
 
 # Intent: unrelated dynamic tuple unpacking cannot prevent collection of the actual diagnostic producer contract.

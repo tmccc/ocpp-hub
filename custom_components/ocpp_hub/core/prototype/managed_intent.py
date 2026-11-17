@@ -183,7 +183,7 @@ class ManagedRequests:
         )
 
     # Test-stop revocation follows its caller's induced Pause and claim, without consuming replacement uncertainty.
-    def test_stopped(self) -> None:
+    def charge_stopped(self) -> None:
         self.journal.db.execute(
             "UPDATE managed_requests SET state='failed',result=? WHERE action='app_control' "
             "AND state IN ('accepted','running')",

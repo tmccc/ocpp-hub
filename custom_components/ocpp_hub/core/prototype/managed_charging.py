@@ -883,7 +883,7 @@ class ManagedCharging:
             if intent.mode != "paused" and not preserve:
                 write_intent(j, intent, "paused")
                 claim_internal_pause(c, "test", lease.identifier)
-                c.requests.test_stopped()
+                c.requests.charge_stopped()
             elif self.failed_start_zero_needed(lease, reason, failure):
                 c.session.gateway.controls._claim(True)
             j.starts.expire(lease, reason, preserve, failure)

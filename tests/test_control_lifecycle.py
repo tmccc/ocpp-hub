@@ -179,7 +179,7 @@ def test_legacy_return_completion_changes_no_authority(owner, state):
 @pytest.mark.parametrize("action", ["app_control", "start", "pause"])
 def test_test_stop_retains_original_request_filter(owner, state, action):
     identifier = seed(owner, action=action, state=state)
-    owner.test_stopped()
+    owner.charge_stopped()
     expected = (
         ("failed", '{"classification": "superseded_by_test_stop"}')
         if (action == "app_control" and state in ("accepted", "running"))
