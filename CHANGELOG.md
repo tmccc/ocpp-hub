@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add an effect-free architectural experiment for Start/Pause/Return evidence and authority transitions.
+  Keep per-attempt physical outcomes, committed evidence, publication and lifecycle/cloud debts separate.
+  The standalone service does not load the experiment; existing runtime control and persistence remain authoritative.
+- Add an independent real-peer witness for a genuine Start Accepted reply arriving after a newer Pause commits,
+  followed by the exact delayed lifecycle, Stop and Return without repeating Start.
+
 ## 0.2.3 — iCS recovery and control handoffs
 
 - Share typed recovery prerequisites and whole-operation results across current,

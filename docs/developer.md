@@ -141,6 +141,33 @@ four-suite twenty-worker qualification.
   boundaries.
 - Never write to a charger from tests against a real device. The engine is tested with a fake charger over a real websocket.
 
+## Offline control experiment
+
+`core/prototype/control_slice.py` and `control_slice_state.py` contain a bounded Start/Pause/Return experiment.
+One immutable aggregate retains exact per-attempt identities, observed replies, committed outcome evidence,
+historical publication, local closure, separate cloud Start/Stop acknowledgement duties and Start-port retirement.
+Return interpretation reuses the production `release_disposition` policy. `step(state, event)` accepts boundary
+facts and returns an immutable state plus persistence, publication or recovery candidates. No candidate grants
+wire permission. The standalone service does not import these modules, and runtime authority has not moved.
+
+Run `tests/test_control_slice.py` and `tests/test_control_slice_inputs.py` for pure contract and causal-input rows.
+`tests/test_control_slice_peer.py` holds a genuine TLS
+Start reply, commits a newer owner Pause, releases the original Accepted bytes, then proves exact later lifecycle,
+Stop and Return using the existing engine and independent physical/SQL assertions. It also feeds those observed
+facts into the effect-free core; the core does not calculate the expected physical result.
+
+This pilot does not implement native admission, final dispatch/resource checks, restrictive permits, queue or
+storage scheduling, a complete port owner, restart/replay, journal migration, timers, current changes or debt
+attestation. `ports_retired` concerns only the Start ports represented in this experiment. Outcome storage and
+publication events report successful COMMIT, not attempted SQL. Original native/resource/live guards, SQL handoffs,
+deadline tasks and all existing boundary suites remain necessary. No test family is retired, and no code-size or
+full-suite speed improvement is established by the experiment. A production adapter requires its own concrete
+ownership, event-order and persistence proof before it can replace existing decisions.
+
+`StartPrepared` reports an already admitted boundary; it does not admit a management request. The experiment's
+debt set does not replace `control.start_pending`, uncertainty, faults or operator-debt records. In particular,
+local request completion at exact closed-zero proof remains distinct from cloud Start and Stop delivery settlement.
+
 ## Reference implementation
 
 When you build or change how the hub handles a charger, read how [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) (MIT) does it first and reuse what it proved on real chargers; `.agents/skills/ocpp-expert/SKILL.md` lists the files and functions to read. Compare the result with what the Raedian NEO really does, and credit adapted code in `NOTICE`.

@@ -22,6 +22,14 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   with fresh collection and the independent evidence audit passed. Documentation-only follow-ups do not change
   that tested implementation.
 
+## Offline architectural pilot — 17 November 2026
+
+- [~] A bounded, effect-free Start/Pause/Return transition core retains historical physical evidence separately
+  from newer owner authority, with exact outcome COMMIT identity and distinct local/cloud Start/cloud Stop debts.
+  It is exercised by pure contract rows and an independent real-peer late-Accepted-after-new-Pause witness.
+  The service does not import it. Existing runtime authority, persistence and test families remain in place;
+  production integration, measured simplification and qualification of a replacement remain open.
+
 ## iCS implementation history — 15 November 2026
 
 - [~] Introduction readiness and RPC deadline corrections distinguish retryable closed-zero/lifecycle waits from

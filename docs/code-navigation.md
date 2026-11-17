@@ -60,6 +60,7 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
 | Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
+| Offline control experiment | [`control_slice.py`](../custom_components/ocpp_hub/core/prototype/control_slice.py), pure boundary transitions; `control_slice_state.py`, immutable attempt/authority/debt records. The service does not import these modules. | `test_control_slice.py`, `test_control_slice_inputs.py`, `test_control_slice_peer.py` |
 | Start and cancellation | [`managed_test_charge.py`](../custom_components/ocpp_hub/core/prototype/managed_test_charge.py), `ManagedChargeTests`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
 | Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
 | Native evidence and resources | [`native_bounded_handover.py`](../custom_components/ocpp_hub/core/prototype/native_bounded_handover.py), `NativeBoundedHandover`; `trial_evidence.py`, `NativeObserver`; `native_http.py`; `native_history.py`; `trial_resources.py`, `ResourceBook` | `test_native_read_supersession.py`, `test_native_optional_storage.py`, `test_native_repair_strict_conflict.py` |
@@ -71,6 +72,11 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 
 Read recovery siblings alongside their callers. The small modules divide proof and settlement across files; a
 function that returns successfully may only advance one boundary, leaving an actual command or receipt pending.
+
+The offline control experiment retains historical Start evidence independently of current authority, including
+separate cloud Start and Stop acknowledgement debts. Its effects are candidates for the existing owner, with no
+wire ports or zero/Stop permission. It is not an alternative runtime controller or a persistence migration.
+See the [developer guide](developer.md#offline-control-experiment) for its exact limits.
 
 `managed_settlement.py` binds exact terminal current/test records and internal Pause claims to caller-owned zero
 proofs. `managed_fault_timer.py` carries the acknowledged Pause authority across the schedule, native and resource
