@@ -214,6 +214,30 @@ expiry and later sessions, cancellation/SQL failures, operator/denial proofs, an
 preparation, dispatch and publication. Keep fast inner checks separate from those longer boundary tests. These
 focused checks are development evidence; release still requires exact-clean-source four-suite qualification.
 
+## Owned restore sequencing
+
+`RecoveryCoordinator._run_restore` executes `RestoreStep` from the pure `restore_machine` module for each owned
+attempt. The initial read uses the original default closure mode, followed by closure reconciliation, session
+agreement, the open-session check and zero proof. Optional native recovery is selected from current durable state
+after those checks. The ticket is captured only at entry to the following verified read. Timer cleanup is selected
+from fresh state after that read's zero proof and requires one further read/zero check. Later observations never
+repeat the initial closure/session pipeline, recapture the ticket or loop back to recovery/cleanup.
+
+A Pending ends the attempt with its original reason/cause and no owned release result. Existing request policy
+decides later work. The direct restore API retains its accepted-before-publication contract; the public request
+driver alone selects the running claim before task launch. Busy/stopping exits, queue refusal, shielded completion
+and post-completion supersession stay outside the phase core. No new task, lock, persisted phase or replay exists.
+
+The executor retains the exact native/Boot/resource/send guards, rollback permit, SQL publisher and post-COMMIT
+memory callback. `release_disposition` still classifies each real completed result once; `restore_progress` maps
+that verdict to progress. Claimed WAIT still acknowledges zero in its checked transaction; FAULT still records,
+latches and raises the original failure. Pure constructors cannot perform either effect. The shared wire rollback
+coroutine executes the same zero sequence inside the original LocalControl task, peer sequence and permit.
+
+`test_restore_machine.py` provides cheap phase/terminal tables and complete optional-step sequences. Existing real
+native, timer, storage, cancellation and process-death tests remain. Preflight observers inspect the registered
+`_restore_owned` frame with their original native/UUID/task conditions; no runtime observation callback is added.
+
 ## Reference implementation
 
 When you build or change how the hub handles a charger, read how [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) (MIT) does it first and reuse what it proved on real chargers; `.agents/skills/ocpp-expert/SKILL.md` lists the files and functions to read. Compare the result with what the Raedian NEO really does, and credit adapted code in `NOTICE`.

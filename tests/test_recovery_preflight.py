@@ -97,7 +97,7 @@ async def test_explicit_return_native503_preflight_requires_a_new_request(tmp_pa
             owned = c.recovery._task
             if owned is None or owned not in g.controls._completions:
                 return None
-            restore = coroutine_locals(owned, RecoveryCoordinator._restore_impl.__code__)
+            restore = coroutine_locals(owned, RecoveryCoordinator._restore_owned.__code__)
             read = coroutine_locals(owned, NativeBoundedHandover._read.__code__)
             if (
                 restore.get("self") is not c.recovery

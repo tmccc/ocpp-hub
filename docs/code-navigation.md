@@ -59,7 +59,7 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | Process and connections | [`trial_session.py`](../custom_components/ocpp_hub/core/prototype/trial_session.py), `TrialSession`; `trial_transport.py`; `runtime.py`, `ConnectionRuntime`; `tools/managed_proxy.py` | `test_managed_service_cli.py`, `test_service_observation_recovery.py`, `test_managed_boot_supersession.py` |
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
-| Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
+| Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions; `restore_machine.py`, per-attempt sequencing/progress; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_restore_machine.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
 | Start lifecycle and settlement | [`start_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/start_lifecycle.py), `StartLifecycle`, typed persisted identity, receipt/pending/metadata writes and the lease slot; `start_settlement.py`, pure failure/retirement policy, shared evidence and scoped candidates | `test_start_lifecycle.py`, `test_start_settlement.py`, `test_control_slice_peer.py` |
 | Start and cancellation | [`managed_test_charge.py`](../custom_components/ocpp_hub/core/prototype/managed_test_charge.py), `ManagedChargeTests`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
 | Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
@@ -141,6 +141,15 @@ visiting one during a poll does not discharge another. An authority snapshot nev
 permits a later send: the executor checks current intent, Boot, revision and ticket
 at the actual effect and SQL publication boundaries. Timer deadline zero retains its
 independent watchdog and exact restrictive claim.
+
+`restore_machine.py` drives the production owned restore driver `_run_restore`; the old `_restore_impl` is gone.
+`RestoreStep` sequences the initial observation/check, optional recovery, verified observation, optional timer
+cleanup and required recheck before release. A Pending ends this attempt. The pure core also maps the existing
+release disposition to terminal progress; claimed-zero acknowledgement and fault effects stay in the driver.
+Phases are local control flow, with no persisted phase or positive permission. Initial closure/session checks,
+post-resume ticket capture, final native proof and every live send/publication guard keep their original order.
+`tests/test_restore_machine.py` covers the finite sequence/outcome contract without I/O. The real HTTP and SQLite
+witnesses in preflight, retirement and publication tests still establish their independent effect boundaries.
 
 `ReleaseHandoff` joins final release metadata, explicit Return intent/receipt and
 shared control in the wire child's transaction. `start_handoff.py` similarly joins

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Drive owned restore prerequisites through a pure per-attempt phase core and share terminal progress mapping.
+  Preserve initial versus later native checks, capture timing, live send guards, direct/public Return contracts,
+  publication transactions and cancellation ownership. Share the existing zero-rollback sequence and remove unused
+  compatibility paths around typed operations; add fast finite transition checks and retain real boundary tests.
+
 - Centralize control-intent writes and Pause/Return request transitions in the existing request owner. Share the
   transaction check for Start and Return app-intent publication; preserve publication order and legacy completion.
   Claim Return after busy/stopping waits, retain queue-refusal uncertainty, and remove duplicate disposition and

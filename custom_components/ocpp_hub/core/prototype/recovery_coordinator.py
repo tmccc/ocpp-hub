@@ -33,9 +33,11 @@ from .recovery_policy import (
     release_disposition,
 )
 from .release_attempt import ReleaseAttempt
+from .restore_machine import RestoreStep, restore_progress
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import RecoveryRequiredError
+from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -215,7 +217,7 @@ class RecoveryCoordinator:
     ) -> RestoreProgress:
         c = self.c
         try:
-            progress = await self._restore_impl(
+            progress = await self._run_restore(
                 expected_intent, continuing_local=continuing_local, return_request=return_request
             )
             if return_request is not None and not progress.shared:
@@ -233,16 +235,15 @@ class RecoveryCoordinator:
             raise
 
     # All restoration callers consume this same prerequisite, operation-result and publication contract.
-    async def _restore_impl(
+    async def _run_restore(
         self,
-        expected_intent: ControlIntent | None = None,
+        expected_intent: ControlIntent,
         *,
-        continuing_local: int | None = None,
-        return_request: str | None = None,
+        continuing_local: int | None,
+        return_request: str | None,
     ) -> RestoreProgress:
         c = self.c
         g, j = c.session.gateway, c.session.journal
-        expected_intent = expected_intent or c.requests.intent()
 
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> GateDecision:
@@ -267,11 +268,10 @@ class RecoveryCoordinator:
                     not current_source(g, timer)
                     or c.schedule.needs_source(timer)
                     or j.active() != continuing_local
-                    or timer.get("unidentified_local") != continuing_local
-                    and timer.get("other_local") != continuing_local
-                    or (
-                        timer.get("other_local") != continuing_local
-                        and not temporary_continuation(j, timer, continuing_local)
+                    or timer.get("other_local") != continuing_local
+                    and (
+                        timer.get("unidentified_local") != continuing_local
+                        or not temporary_continuation(j, timer, continuing_local)
                     )
                     or timer.get("unreported_native")
                 )
@@ -287,49 +287,53 @@ class RecoveryCoordinator:
         if c.stopping:
             raise UnavailableError("managed shutdown retains its hold")
         epoch, revision = g._charger_epoch, g.controls._revision
-        native = await c.native.read_result()
-        if isinstance(native, Pending):
-            return RestoreProgress(RestoreState.WAITING, native)
-        decision = await c.schedule.closure_decision(native)
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        decision = c.native.session_decision(native)
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        if native.physical.transaction_open and continuing_local is None:
-            return RestoreProgress(
-                RestoreState.WAITING, Pending(Prerequisite.LIFECYCLE, "owner release awaits actual transaction closure")
+        native: HandoverEvidence
+        ticket: str | None = None
+        step = RestoreStep.READ_INITIAL
+        while step is not RestoreStep.RELEASE:
+            decision = ALLOW
+            if step in (RestoreStep.READ_INITIAL, RestoreStep.VERIFY, RestoreStep.RECHECK):
+                if step is RestoreStep.VERIFY:
+                    ticket = j.get("control", {}).get("ticket")
+                observed = await (
+                    c.native.read_result()
+                    if step is RestoreStep.READ_INITIAL
+                    else c.native.read_result(closed=continuing_local is None)
+                )
+                if isinstance(observed, Pending):
+                    decision = observed
+                else:
+                    native = observed
+                    if step is not RestoreStep.READ_INITIAL:
+                        decision = c.zero_decision(native, continuing_local=continuing_local)
+            elif step is RestoreStep.CHECK_INITIAL:
+                decision = await c.schedule.closure_decision(native)
+                if not isinstance(decision, Pending):
+                    decision = c.native.session_decision(native)
+                if not isinstance(decision, Pending):
+                    decision = (
+                        Pending(Prerequisite.LIFECYCLE, "owner release awaits actual transaction closure")
+                        if native.physical.transaction_open and continuing_local is None
+                        else c.zero_decision(native, continuing_local=continuing_local)
+                    )
+            elif step is RestoreStep.RESUME:
+                resumed = await c.native.resume_result(
+                    continuing_local=continuing_local, preserve_expired_start=c.tests.preserve_debt
+                )
+                decision = resumed if isinstance(resumed, Pending) else ALLOW
+            elif step is RestoreStep.CLEAN_TIMER:
+                decision = await c.schedule.before_release_result(native)
+            needed = not isinstance(decision, Pending) and (
+                step is RestoreStep.CHECK_INITIAL
+                and j.get("trial_phase") == "recovering"
+                or step is RestoreStep.VERIFY
+                and continuing_local is None
+                and j.get(KEY, {}).get("state") in ("installing", "armed", "clearing")
             )
-        decision = c.zero_decision(native, continuing_local=continuing_local)
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        if j.get("trial_phase") == "recovering":
-            resumed = await c.native.resume_result(
-                continuing_local=continuing_local, preserve_expired_start=c.tests.preserve_debt
-            )
-            if isinstance(resumed, Pending):
-                return RestoreProgress(RestoreState.WAITING, resumed)
-        ticket = j.get("control", {}).get("ticket")
-        native = await c.native.read_result(closed=continuing_local is None)
-        if isinstance(native, Pending):
-            return RestoreProgress(RestoreState.WAITING, native)
-        decision = c.zero_decision(native, continuing_local=continuing_local)
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        if continuing_local is None and j.get("managed_temporary_schedule", {}).get("state") in (
-            "installing",
-            "armed",
-            "clearing",
-        ):
-            decision = await c.schedule.before_release_result(native)
-            if isinstance(decision, Pending):
-                return RestoreProgress(RestoreState.WAITING, decision)
-            native = await c.native.read_result(closed=continuing_local is None)
-            if isinstance(native, Pending):
-                return RestoreProgress(RestoreState.WAITING, native)
-            decision = c.zero_decision(native, continuing_local=continuing_local)
-            if isinstance(decision, Pending):
-                return RestoreProgress(RestoreState.WAITING, decision)
+            next_step = step.advance(decision if isinstance(decision, Pending) else None, needed=needed)
+            if isinstance(next_step, RestoreProgress):
+                return next_step
+            step = next_step
         if (
             c.stopping
             or epoch != g._charger_epoch
@@ -430,24 +434,12 @@ class RecoveryCoordinator:
             timer_superseded=c.schedule.release_superseded(attempt),
             publication_allowed=not isinstance(decision, Pending),
         )
-        if disposition is ReleaseDisposition.STALE:
-            return RestoreProgress(
-                RestoreState.YIELDED,
-                Pending(Prerequisite.SUPERSEDED, "a subsequent owner event retired completed release authority"),
-                result,
-            )
-        if disposition is ReleaseDisposition.YIELD:
-            pending = Pending(Prerequisite.RESTRICTIVE_OPERATION, "release yielded to its exact timer zero operation")
-            return RestoreProgress(RestoreState.YIELDED, pending, result)
-        if disposition is ReleaseDisposition.WAIT:
-            if not result.claimed:
-                return RestoreProgress(RestoreState.WAITING, result.pending, result)
+        if disposition is ReleaseDisposition.WAIT and result.claimed:
             with j.atomic():
                 if self.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
                     raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
                 assert attempt.ticket is not None
                 g.controls._complete(attempt.ticket, uncertain=False)
-            return RestoreProgress(RestoreState.WAITING, result.pending, result)
         if disposition is ReleaseDisposition.FAULT:
             if not c.stopping and c.requests.intent() == expected_intent:
                 failure = result.failure
@@ -468,4 +460,4 @@ class RecoveryCoordinator:
             if result.failure is not None:
                 raise result.failure
             raise RecoveryRequiredError("owned release did not establish shared authority")
-        return RestoreProgress(RestoreState.SHARED, operation=result)
+        return restore_progress(disposition, result)

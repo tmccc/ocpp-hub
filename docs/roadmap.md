@@ -40,6 +40,10 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   queue refusal. Retain the legacy status completion and distinct physical/claim proofs. Remove unused adapters
   and duplicate reads/disposition. Runtime is two physical lines smaller than the preceding milestone; most of
   that milestone's increase remains, so the broader code-size reduction goal is still open.
+- [x] Replace the old shared restore orchestration with production per-attempt sequencing and terminal progress
+  mapping in a pure core. Retain all live proof, publication and task boundaries; share wire zero rollback and
+  remove obsolete compatibility paths. Runtime is 24 physical lines smaller overall: core plus coordinator grows
+  47 lines, while adjacent typed-operation cleanup removes 71. No relocation credit or full-suite speedup is claimed.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties. Full four-suite qualification and deployment of this local candidate remain open.

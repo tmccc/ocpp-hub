@@ -1016,18 +1016,6 @@ class Gateway:
             raise DeniedError("current authorization does not permit a new local start")
         return await self.controls.start(tag)
 
-    # A bounded management request must keep its grant and the existing static authorization valid at every send.
-    async def start_managed(
-        self,
-        tag: str,
-        guard: Callable[[], None],
-        *,
-        request_id: str | None = None,
-        on_prepared: Callable[[], None] | None = None,
-    ) -> Frame:
-        result = await self.start_managed_result(tag, guard, request_id=request_id, on_prepared=on_prepared)
-        return result.require_reply()
-
     # One exact-scoped owned Start publishes authority in its child, while retaining truthful failed wire outcomes.
     async def start_managed_result(
         self,

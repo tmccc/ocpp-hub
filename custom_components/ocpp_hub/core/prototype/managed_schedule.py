@@ -35,7 +35,7 @@ from .managed_occurrences import (
 )
 from .native_start_attempts import matching_unassigned_start, split_attempts, start_millisecond_range
 from .policy import DeniedError, integer, number
-from .recovery_contracts import ALLOW, FailureKind, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, FailureKind, GateDecision, Pending, Prerequisite
 from .release_attempt import ReleaseAttempt, TimerRestriction
 from .rpc import UnavailableError
 from .schedule_time import cutoff_epoch, temporary_window
@@ -383,11 +383,6 @@ def temporary_continuation(j: Journal, lease: dict[str, Any], local: int) -> boo
 # Once observed, this occurrence's cutoff cannot become future authority after a calendar correction.
 def cutoff_due(lease: dict[str, Any]) -> bool:
     return bool(lease.get("cutoff_reached")) or time.time() >= lease.get("end_epoch", float("inf"))
-
-
-# A provisional hold may be lifted only for this same open transaction on a positively identified original plan.
-def require_continuing_session(j: Journal, n: HandoverEvidence, local: int) -> None:
-    require_allowed(continuing_session_decision(j, n, local))
 
 
 # Source identification is a shared prerequisite; it grants neither Stop authority nor reusable send permission.
@@ -1241,10 +1236,6 @@ class ManagedSchedule:
             or intent.mode == "paused"
         )
 
-    # A withheld positive write can be retried after a verified zero and independent native removal.
-    def check_release(self) -> None:
-        require_allowed(self.release_decision())
-
     # Timer cleanup and owner Return are distinct obligations even when they both retain station zero.
     def release_decision(self) -> GateDecision:
         lease = self.arm_idle_cutoff()
@@ -1253,10 +1244,6 @@ class ManagedSchedule:
         if self.release_needs_cleanup(lease):
             return Pending(Prerequisite.TIMER_CLEANUP, "positive release awaits verified native timer removal")
         return ALLOW
-
-    # Retire a missed or superseded timer while still under verified zero, before Return or restart raises the ceiling.
-    async def before_release(self, n: HandoverEvidence) -> None:
-        require_allowed(await self.before_release_result(n))
 
     # Cleanup owns its ledger while the common release path receives any remaining prerequisite explicitly.
     async def before_release_result(self, n: HandoverEvidence) -> GateDecision:
@@ -1637,10 +1624,6 @@ class ManagedSchedule:
             return
         self.begin_hold(lease)
         await request_timer_stop(self.c.session.gateway, j.get(KEY), self.hold_authorized)
-
-    # A known closing transaction needs zero, with no guessed Stop, until native and ledger closure agree.
-    async def await_closure_agreement(self, native: HandoverEvidence) -> None:
-        require_allowed(await self.closure_decision(native))
 
     # Both closure channels must agree; a real scoped zero protects their ordinary asynchronous arrival gap.
     async def closure_decision(self, native: HandoverEvidence) -> GateDecision:

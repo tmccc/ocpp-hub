@@ -51,7 +51,7 @@ async def test_cancelled_close_joins_held_return_before_closing_journal(tmp_path
             owned = c.recovery._task
             if owned is None or owned not in g.controls._completions:
                 return None
-            restore = coroutine_locals(owned, RecoveryCoordinator._restore_impl.__code__)
+            restore = coroutine_locals(owned, RecoveryCoordinator._restore_owned.__code__)
             read = coroutine_locals(owned, NativeBoundedHandover._read.__code__)
             if (
                 restore.get("self") is not c.recovery

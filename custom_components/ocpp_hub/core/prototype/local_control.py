@@ -317,16 +317,6 @@ class LocalControl:
         self._confirmed_epoch, self._confirmed_limit = epoch, limit
         return answer
 
-    # Retry only a small future clock offset; every extra request is read-only and shares one monotonic deadline.
-    async def _verify_ceiling(self, call: Call, limit: float, check: Callable[[], None]) -> None:
-        # Preserve the old verifier API for current/Start paths while keeping one composite verification loop.
-        async def result_call(action: str, payload: dict[str, Any]) -> Reply:
-            return Reply(await call(action, payload))
-
-        result = await self._verify_ceiling_result(result_call, limit, check)
-        if result is not None:
-            require_allowed(result)
-
     # Each composite and retry revalidates current ownership and may return an ordinary prerequisite as data.
     async def _verify_ceiling_result(self, call: ResultCall, limit: float, check: Guard) -> Pending | None:
         loop = asyncio.get_running_loop()
@@ -533,21 +523,6 @@ class LocalControl:
     async def start(self, tag: str) -> Frame:
         return await self._owned(self._start(tag))
 
-    # A managed test supplies a live per-request guard without enabling the unrestricted local Start policy.
-    async def start_managed(
-        self,
-        tag: str,
-        guard: Callable[[], None],
-        *,
-        request_id: str | None = None,
-        on_prepared: Callable[[], None] | None = None,
-        scope_guard: Callable[[], None] | None = None,
-    ) -> Frame:
-        result = await self.start_managed_result(
-            tag, guard, request_id=request_id, on_prepared=on_prepared, scope_guard=scope_guard
-        )
-        return result.require_reply()
-
     # Managed parents consume wire acceptance and publication separately after the owned child finishes.
     async def start_managed_result(
         self,
@@ -709,18 +684,8 @@ class LocalControl:
         return answer
 
     # Releasing local ownership is a physical operation, never removal of the station safety profile.
-    async def release(
-        self,
-        acknowledge_uncertainty: bool = False,
-        *,
-        guard: Callable[[], None] | None = None,
-        attempt: ReleaseAttempt | None = None,
-        context: AbstractContextManager[None] | None = None,
-        rollback_guard: Callable[[], None] | None = None,
-    ) -> None:
-        pending = await self._owned(
-            self._release_owned(acknowledge_uncertainty, guard, attempt, context, rollback_guard)
-        )
+    async def release(self, acknowledge_uncertainty: bool = False) -> None:
+        pending = await self._owned(self._release_owned(acknowledge_uncertainty, None, None, None, None))
         require_allowed(pending)
 
     # The managed coordinator consumes the completed child result, never a guessed exception-chain outcome.
@@ -827,6 +792,19 @@ class LocalControl:
                     )
 
             async with self.peer.sequence_results(1, check, on_dispatch=dispatched, on_reply=received) as call:
+                # Both failure and pending rollback retain the same ticket, Boot and observed zero sequence.
+                async def rollback_zero() -> None:
+                    nonlocal restoring_zero
+                    self._complete(ticket, inhibit=True)
+                    self._check(epoch, ticket)
+                    restoring_zero = True
+                    rollback = await self._cap_result(call, 0, epoch)
+                    if isinstance(rollback, CapPending):
+                        raise RecoveryRequiredError("owned release rollback did not reach verified zero")
+                    check()
+                    if attempt is not None:
+                        attempt.zero_confirmed = True
+
                 try:
                     result = await self._cap_result(
                         call,
@@ -866,28 +844,12 @@ class LocalControl:
                     if attempt is not None:
                         attempt.positive_failure = error
                         attempt.initial_failure_kind = failure_kind(error)
-                    self._complete(ticket, inhibit=True)
-                    self._check(epoch, ticket)
-                    restoring_zero = True
-                    rollback = await self._cap_result(call, 0, epoch)
-                    if isinstance(rollback, CapPending):
-                        raise RecoveryRequiredError("owned release rollback did not reach verified zero")
-                    check()
-                    if attempt is not None:
-                        attempt.zero_confirmed = True
+                    await rollback_zero()
                     if attempt is None and isinstance(error, ReleaseDeferredError):
                         check()
                         self._complete(ticket, uncertain=False)
                     raise
-                self._complete(ticket, inhibit=True)
-                self._check(epoch, ticket)
-                restoring_zero = True
-                rollback = await self._cap_result(call, 0, epoch)
-                if isinstance(rollback, CapPending):
-                    raise RecoveryRequiredError("owned release rollback did not reach verified zero")
-                check()
-                if attempt is not None:
-                    attempt.zero_confirmed = True
+                await rollback_zero()
                 return pending
         finally:
             if self._release_ticket == ticket:

@@ -18,7 +18,7 @@ from .managed_start_binding import known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
@@ -567,10 +567,6 @@ class ManagedChargeTests:
             and self.current_daily(continuing_local)
             and all(value == 0 for value in native.currents_a + native.powers_w)
         )
-
-    # Positive writes under expired Start authority need a verified daily or the genuine owner's closed lifecycle.
-    def check_positive(self, native: HandoverEvidence) -> None:
-        require_allowed(self.positive_decision(native))
 
     # Expired Start debt is an independent prerequisite, never permission inferred from zero or task completion.
     def positive_decision(self, native: HandoverEvidence) -> GateDecision:

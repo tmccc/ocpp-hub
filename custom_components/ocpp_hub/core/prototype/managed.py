@@ -49,7 +49,7 @@ from .native_faults import (
 from .native_http import NativeTransportUnavailableError
 from .ordinary_recovery import OrdinaryRecovery
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
@@ -369,7 +369,7 @@ class ManagedController:
         if self.pause_task is not None and not self.pause_task.done():
             await asyncio.shield(self.pause_task)
         native = await self.native.read()
-        await self.schedule.await_closure_agreement(native)
+        require_allowed(await self.schedule.closure_decision(native))
         self.native.require_known_session(native)
         if (
             native.physical.transaction_open
@@ -417,7 +417,7 @@ class ManagedController:
             elif not j.next_delivery():
                 await self.native.resume()
         if j.get("managed_temporary_schedule", {}).get("state") in ("installing", "armed", "clearing"):
-            await self.schedule.before_release(native)
+            require_allowed(await self.schedule.before_release_result(native))
         if self.schedule.awaiting_start():
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         control = j.get("control", {})
@@ -696,7 +696,7 @@ class ManagedController:
         async with asyncio.timeout(15):
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")
-            await self.schedule.await_closure_agreement(native)
+            require_allowed(await self.schedule.closure_decision(native))
             if authority != self.native.authority() or sequence != self.native.last_resolved_read:
                 raise AuditSupersededError("settled native evidence crossed a newer authority or observation")
             if self.ordinary.closure_gap(native):
