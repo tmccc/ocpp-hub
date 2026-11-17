@@ -13,16 +13,22 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] Version 0.2.3 implements shared recovery coordination, explicit permission/result/effect contracts, atomic
   Start/Return authority publication and owned shutdown. Reconnect completion remains separate from admission
   auditing and verified zero. The README, navigation guide and recovery coverage describe these boundaries and
-  their regressions. Backend and HA client implementation `8013d2f` are deployed and independently verified.
+  their regressions. Backend implementation `0020bbd`, including the simplifications below, is deployed and
+  independently verified. The unchanged HA client remains at implementation `8013d2f`; its files and running
+  process were retained without installation or restart.
   Settings, history, the dashboard, 16 entities and all 25 automation states (including five disabled) are preserved.
-  The final checks confirm unplugged, paused zero with the 32 A selection and native configuration retained.
+  The final checks confirm healthy local and cloud connections, paused zero at control revision 59, and the
+  32 A selection and native configuration retained. The session is closed; no delivery or mutation debt remains.
   Home Assistant remains on core 2026.11.1. No new live charging trial was performed.
-- [x] Implementation `8013d2f` passed all four complete suites with 20 workers each: 20,360 engine/model tests,
-  620 HA 2026.11.0 client tests, 620 HA 2026.10.4 client tests and 48 older-integration tests. The normal evidence gate
+- [x] Implementation `0020bbd` passed all four complete suites with 20 workers each: 12,866 engine/model tests,
+  613 HA 2026.11.0 client tests, 613 HA 2026.10.4 client tests and 48 older-integration tests. The normal evidence gate
   with fresh collection and the independent evidence audit passed. Documentation-only follow-ups do not change
   that tested implementation.
 
-## Offline architectural work — 17 November 2026
+## Architectural simplification — 17 November 2026
+
+The completed changes below are included in the qualified deployment above. Line counts describe individual
+changes rather than a cumulative total. Further simplification remains open.
 
 - [x] Extract the pure Start failure selector, then consolidate the normal Start lifecycle under `Journal.starts`
   using existing persisted formats. Receipt, pending-bit, managed-charge metadata and lease-slot writes now have
@@ -33,48 +39,49 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   expiry, operator and actual process-death coverage for the coherent lifecycle milestone.
 - [x] Consolidate Start retirement eligibility, outcome selection and scoped preimages into one pure production
   policy and owner execution path. Preserve different legacy and proof contracts; add fast pure and SQLite checks.
-  This consolidation increases physical runtime lines; the net-reduction target is still open and is not claimed
-  achieved by moving the record types within the runtime.
+  This consolidation adds physical runtime lines; moving record types alone does not reduce the implementation.
 - [x] Consolidate durable control intent and Pause/Return request transitions in `ManagedRequests`. Start and
   Return share the current-intent transaction check; one completion owns Return disposition, including prelaunch
   queue refusal. Retain the legacy status completion and distinct physical/claim proofs. Remove unused adapters
-  and duplicate reads/disposition. Runtime is two physical lines smaller than the preceding milestone; most of
-  that milestone's increase remains, so the broader code-size reduction goal is still open.
+  and duplicate reads/disposition. This change removes two physical runtime lines; larger reductions come from
+  the retired paths below.
 - [x] Keep shared restore sequencing directly in its owned driver and terminal mapping in the recovery policy.
   Retain live proof, publication and task boundaries, share wire zero rollback and remove obsolete adapters.
 - [x] Retire the experimental vehicle-pause handover, SEAT checker and physical-pause verifier with owner approval.
   Keep native-bounded commissioning and daily controls. Reject unfinished old handovers before
   startup, retain completed history, remove the restore phase interpreter and share seven station-zero predicates.
   Runtime is 1,558 physical lines smaller, including new guards and shared checks; test/doc deletions are excluded.
-  Fast physical/terminal checks and the exact collection difference retain the active test scope. Full release
-  qualification and deployment remain separate.
+  Fast physical/terminal checks and the exact collection difference retain the active test scope.
 - [x] Retire the remaining plain commissioning lifecycle and require the native specification for session startup.
   Preserve native commissioning Start/Release, cleanup/restoration and daily controls. Refuse unfinished plain
   journals without changing their evidence; retain shared physical/resource tests on the native path. Runtime is
   480 physical lines smaller, including new guards and a repeated-cleanup inventory correction. Fast checks and
-  independent semantic review cover the implementation; full release qualification and deployment remain open.
+  independent semantic review cover the implementation.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current-selection authority, connection and task lifetimes, cloud delivery and physical evidence remain
-  separate duties. Full four-suite qualification and deployment of this local candidate remain open.
+  separate duties.
 - [x] Centralize physical control writes in `Journal.control`, replacing 27 sites across 11 modules with named
   transitions. Share authority predicates and the pure health decision; make the live poll's stages explicit and
   name its production charging owner `ManagedCharging`. Preserve raw stored formats, public status and actual
-  effect/commit/task boundaries. The first grouped check passed 242 tests; broader verification is separate.
+  effect/commit/task boundaries. The first grouped check passed 242 tests; the full gate above provides broader
+  verification of the deployed implementation.
   This improves ownership and navigation but adds runtime lines; no physical code-size reduction is claimed.
 - [x] Retire proxy one-off temporary schedules with owner approval. Remove their API, deadline task, native-plan
   write capability and recovery branches while retaining daily schedules and managed Start/Pause/Return/current.
   Read-only startup checks refuse unfinished old obligations before journal normalization; completed history and
   reserved IDs remain passive. Runtime is 2,689 physical lines smaller, including the new guard and shared helpers.
   Retire only the two one-off model families; preserve all 97 process and 72 current-replacement cases. Focused
-  checks on both HA client runtimes retain daily control and reconnect behaviour. Full qualification and deployment
-  remain separate.
+  checks on both HA client runtimes retain daily control and reconnect behaviour.
 - [x] Share exact Boot/control identity checks at seven live boundaries and rebuild complete ownership through
   `ManagedController.authority()`. Keep narrower Stop/fault/current guards, receipt reads and claim/publication
   ordering. Remove three unused exception adapters; retain all charging features and persisted formats. The gain is
-  consistent authority vocabulary rather than another large line-count reduction. Release qualification and
-  deployment remain separate.
+  consistent authority vocabulary rather than another large line-count reduction.
 
-## iCS implementation history — 15 November 2026
+## iCS implementation history — 15–17 November 2026
+
+- [x] Previous deployment `8013d2f` passed all four complete suites with 20 workers each: 20,360 engine/model tests,
+  620 HA 2026.11.0 client tests, 620 HA 2026.10.4 client tests and 48 older-integration tests. Its deployment and
+  preservation checks passed before the simplifications above. These counts describe that historical implementation.
 
 - [~] Introduction readiness and RPC deadline corrections distinguish retryable closed-zero/lifecycle waits from
   strict content refusals, and unsent validation from dispatched uncertainty. Focused regressions and all HA suites

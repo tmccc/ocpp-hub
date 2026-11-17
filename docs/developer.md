@@ -174,7 +174,7 @@ refusal retains `return_not_confirmed`; once launched, the owned completion alon
 The management request driver selects this claim; direct restore retains its existing accepted-before-publication
 contract. Both entry points keep the same exact request guard and owned completion.
 Stale revision, domain admission, physical Pause/native proof and each send/publication recheck remain distinct
-moments. `return_in_progress` can restrict its existing accepted/running lookup to a particular revision for timers.
+moments. `return_in_progress` can restrict its existing accepted/running lookup to a particular intent revision.
 The legacy healthy/app status path still completes only its selected accepted Return without changing intent.
 `test_control_lifecycle.py` checks state filters, opaque historical results, startup and real SQL/COMMIT rollback.
 `test_control_lifecycle_peer.py` drives the real engine through healthy status, busy/stopping and queue-full entry.
@@ -236,9 +236,9 @@ focused checks are development evidence; release still requires exact-clean-sour
 
 `RecoveryCoordinator._run_restore` directly sequences each owned attempt. The initial read uses the original default closure mode, followed by closure reconciliation, session
 agreement, the open-session check and zero proof. Optional native recovery is selected from current durable state
-after those checks. The ticket is captured only at entry to the following verified read. Timer cleanup is selected
-from fresh state after that read's zero proof and requires one further read/zero check. Later observations never
-repeat the initial closure/session pipeline, recapture the ticket or loop back to recovery/cleanup.
+after those checks. The ticket is captured only at entry to the following verified read and zero proof. The release
+guard then rechecks the current source domain and owner authority before the owned release. Later observations never
+repeat the initial closure/session pipeline, recapture the ticket or loop back to recovery.
 
 A Pending ends the attempt with its original reason/cause and no owned release result. Existing request policy
 decides later work. The direct restore API retains its accepted-before-publication contract; the public request
@@ -251,7 +251,7 @@ that verdict to progress in the same policy module. Claimed WAIT still acknowled
 latches and raises the original failure. Pure constructors cannot perform either effect. The shared wire rollback
 coroutine executes the same zero sequence inside the original LocalControl task, peer sequence and permit.
 
-`test_recovery_contracts.py` covers terminal mapping. Existing real native, timer, storage, cancellation and
+`test_recovery_contracts.py` covers terminal mapping. Existing real native, daily-schedule, storage, cancellation and
 process-death tests retain their sequencing and effect witnesses. Preflight observers inspect the registered
 `_restore_owned` frame with their original native/UUID/task conditions; no runtime observation callback is added.
 

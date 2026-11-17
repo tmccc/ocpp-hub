@@ -513,7 +513,7 @@ measurements remain unknown. Missing connection facts remain unknown rather than
 Verified local app/schedule control remains labelled as available during a cloud outage, with `cloud offline`
 shown explicitly. Both native and status readings must still be fresh; an outage never extends their deadlines.
 The timeline retains cloud-wait and cleanup phases, protocol details retain Boot-probe and completed-RPC labels,
-and temporary-schedule alarms retain their specific cause. A control whose send or reply fails is reported as
+and retained historical diagnostic labels remain readable. A control whose send or reply fails is reported as
 possibly sent with an unknown outcome; the client does not retry it. Optional native observation notes can fail
 without terminating supervision. Required atomic fault proof and command settlement retain their storage checks.
 
@@ -721,15 +721,15 @@ Management status, history and receipt reads return `not_ready` when their journ
 the same connection available for recovery and return no guessed result. This read-only classification does not
 change the unknown-outcome handling of a sent control; clients still never resend mutations automatically.
 
-The deadline watchdog can also retain the existing owned zero profile while a fault remains latched, independently
-of health polling. This restrictive path grants no Start, Stop, cleanup or positive-current authority and preserves
-all pending debts; foreground and watchdog attempts share an elapsed-time retry limit.
+Fault maintenance retains the existing owned zero profile through foreground supervision without granting Start,
+Stop, cleanup or positive-current authority. Timed local/cloud tests keep their separate Stop deadline; the process
+watchdog supervises event-loop liveness.
 
 Ordinary app/daily sessions can continue after reconnect or process replacement at their previous selected ceiling.
 The proxy first verifies its owned zero, the exact accepted transaction and freshly observed original-plan or
 consumed app-command source. It sends neither a new Start nor an inferred Stop. Unknown native IDs, source
-contradictions and unresolved command debt remain restricted; temporary timers, current changes and test charges
-retain their separate recovery policies. Three unavailable native observations create a recoverable zero hold.
+contradictions and unresolved command debt remain restricted; current changes and test charges retain their
+separate recovery policies. Three unavailable native observations create a recoverable zero hold.
 Fresh native identity/configuration/history and source proof must agree before that hold can be released.
 
 The final vendor send guard rechecks both connection generations, current ownership and current tag permission after
@@ -921,7 +921,7 @@ command effects separately. Fresh native or source evidence does not itself gran
 permission: the current owner choice, Boot and control claim must still agree when
 a command is sent and its result is committed.
 
-Temporary native unavailability or a withheld source/lifecycle/timer prerequisite
+Temporary native unavailability or a withheld source/lifecycle prerequisite
 can keep an automatic operation waiting after it claims physical ownership only
 if it sent no positive profile and confirmed its own rollback zero; failed cleanup
 remains a failure. Before ownership, it may wait without borrowing physical proof. An earlier
@@ -933,7 +933,7 @@ on an unrelated new temporary hold. Explicit Return is separately accepted once.
 Unavailable native proof in Return's own release preflight makes that request
 unconfirmed, without silently replaying it; fresh proof alone does not grant
 another Return. Earlier Pause or test settlement retains its separate wait rules.
-Named source, timer-cleanup, owner-return and actual cloud-acknowledgement waits
+Named source, owner-return and actual cloud-acknowledgement waits
 can retain the same accepted Return. Connection failure, zero-proof debt and
 reconciliation blockage make it unconfirmed; a new Return is required after recovery.
 
@@ -1106,7 +1106,8 @@ management credentials do not grant transaction-mapping authority.
    a separate explicit action to resume the previous selected offer.
 
 The workflow refuses unrelated faults, ambiguous additional transactions, missing genuine closure, unresolved
-commands, active temporary timers, changed configuration/history, and unconfirmed station zero. It never guesses a
+commands, changed configuration/history, and unconfirmed station zero. Unfinished retired one-off obligations
+refuse journal startup before this workflow can run. It never guesses a
 vendor ID, replays Start, invents a Stop, clears unrelated debts or automatically raises current.
 
 `tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for nine specific debts:

@@ -103,7 +103,7 @@ These controls model task/runtime/process death, not literal hardware power fail
 | App lifetime | Public setup/retry/reload/unload/remove/disable reject obsolete callbacks | Second fault can notify at60s and dismiss on its own success | Twenty-two focused held-read/public-replacement/actual HA-stop histories per runtime; no cross-process HA restart claim. |
 | Qualification | Canonical input regeneration, complete roots, raw once-only phases and source/runtime pins | All events and full suffix in one complete attempt | Synthetic negative controls are never real execution receipts. |
 
-The machine matrix links exact tests for legacy state, source ownership, cutoff precedence and focused-only risks.
+The machine matrix links exact tests for legacy state, source ownership, owner-request precedence and focused-only risks.
 No risk is marked universally covered. Real hardware/network behavior and unbounded repeated failures remain outside
 offline qualification. This work requires neither live charging nor deployment.
 
