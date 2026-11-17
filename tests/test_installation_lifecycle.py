@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import copy
 import sqlite3
+import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from ocpp_hub_core.prototype.gateway import Gateway
 from ocpp_hub_core.prototype.installation_lifecycle import InstallationState
-from ocpp_hub_core.prototype.store import Journal
+from ocpp_hub_core.prototype.managed_faults import latch_managed_fault
+from ocpp_hub_core.prototype.native_faults import NativeContentError
+from ocpp_hub_core.prototype.store import Journal, fingerprint
+from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource
+from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
 
 
 # Intent: exercise the real durable journal while leaving phase fixtures independent of the new owner.
@@ -237,3 +244,55 @@ def test_lifecycle_reads_are_lazy_and_never_normalize(journal):
     with pytest.raises(ValueError):
         journal.phase.read()
     assert journal.db.execute("SELECT value FROM meta WHERE key='trial_phase'").fetchone()[0] == "not JSON"
+
+
+# Intent: the actual managed-fault latch holds control without changing prepared or rollback phases.
+# Why: wiring this caller to the broader resource-fault transition would alter its original scope.
+@pytest.mark.parametrize("phase", ["prepared", "rollback"])
+def test_managed_fault_caller_retains_phase_scope(journal, phase):
+    gateway = Gateway(journal)
+    control = {"owner": "shared", "inhibit": False, "ticket": "old", "start_pending": True}
+    journal.put("control", control)
+    journal.put("trial_phase", phase)
+    revision = gateway.controls._revision
+    latch_managed_fault(gateway, "native_refused", diagnostic={"kind": "strict"})
+    assert journal.get("managed_control_fault")["classification"] == "native_refused"
+    assert journal.get("managed_native_failure") == {"kind": "strict"}
+    assert journal.get("control") == {**control, "owner": "local", "inhibit": True, "uncertain": True}
+    assert journal.get("trial_phase") == phase
+    assert gateway.controls._revision == revision + 1
+
+
+# Intent: genuine missing-original evidence blocks preparation while leaving cleanup phases frozen.
+# Why: the real resource caller must not accidentally use unconditional block or the narrower managed-fault rule.
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        ("prepared", "blocked"),
+        ("rollback", "rollback"),
+        ("backend_restore_pending", "backend_restore_pending"),
+        ("complete", "complete"),
+    ],
+)
+def test_resource_fault_caller_preserves_cleanup(journal, phase, expected):
+    original = Resource("plan", 9, {"planId": 9, "limitCurrent": 32}, {"planId": 9, "limitCurrent": 32})
+    observation = Evidence(
+        fingerprint(journal.identity),
+        time.time(),
+        "A",
+        "Unplug",
+        0,
+        0,
+        False,
+        fingerprint({"configuration": "original"}),
+        (original,),
+    )
+    book = ResourceBook(journal, Baseline.capture(journal.identity, observation))
+    journal.put("trial_phase", phase)
+    control = {"owner": "local", "inhibit": True, "ticket": "cleanup", "uncertain": False}
+    journal.put("control", control)
+    with pytest.raises(NativeContentError, match="original resource preservation failed"):
+        book.check_originals(replace(observation, resources=()))
+    assert journal.get("trial_preservation_fault")["missing"] == ["plan:9"]
+    assert journal.get("trial_phase") == expected
+    assert journal.get("control") == control

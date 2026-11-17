@@ -81,8 +81,10 @@ changes rather than a cumulative total. Further simplification remains open.
 
 - [~] Give installation phase and introduction-flag writes one owner, `Journal.phase`, with named transitions
   and shared phase predicates. Preserve raw stored values, lazy reads, separate fault policies, physical-control
-  preimages and original transaction/write order. This is an ownership improvement; full qualification and
-  deployment are separate from the requested focused development checks and Claude review.
+  preimages and original transaction/write order. Focused verification passes 341 unique cases, including 80 new
+  lifecycle cases, diagnostic contracts and two actual SIGKILL boundaries. All 17 generated owner mutants are
+  caught; static checks and Claude's independent runtime review pass. Runtime grows by 115 physical lines to
+  centralise ownership. Full qualification and deployment remain separate; the deployed backend is still `0020bbd`.
 
 ## iCS implementation history — 15–17 November 2026
 
