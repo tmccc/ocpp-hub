@@ -60,7 +60,7 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
 | Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
-| Start lifecycle and settlement | [`start_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/start_lifecycle.py), `StartLifecycle`, typed persisted identity, receipt/pending/metadata writes and the lease slot; `start_settlement.py`, pure failure selector | `test_start_lifecycle.py`, `test_start_settlement.py`, `test_control_slice_peer.py` |
+| Start lifecycle and settlement | [`start_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/start_lifecycle.py), `StartLifecycle`, typed persisted identity, receipt/pending/metadata writes and the lease slot; `start_settlement.py`, pure failure/retirement policy, shared evidence and scoped candidates | `test_start_lifecycle.py`, `test_start_settlement.py`, `test_control_slice_peer.py` |
 | Start and cancellation | [`managed_test_charge.py`](../custom_components/ocpp_hub/core/prototype/managed_test_charge.py), `ManagedChargeTests`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
 | Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
 | Native evidence and resources | [`native_bounded_handover.py`](../custom_components/ocpp_hub/core/prototype/native_bounded_handover.py), `NativeBoundedHandover`; `trial_evidence.py`, `NativeObserver`; `native_http.py`; `native_history.py`; `trial_resources.py`, `ResourceBook` | `test_native_read_supersession.py`, `test_native_optional_storage.py`, `test_native_repair_strict_conflict.py` |
@@ -74,25 +74,29 @@ Read recovery siblings alongside their callers. The small modules divide proof a
 function that returns successfully may only advance one boundary, leaving an actual command or receipt pending.
 
 `Journal.starts` is the synchronous Start lifecycle owner. It reads the existing journal keys into a typed
-`NormalStart`, treats the current wire receipt as canonical, and checks metadata projections before correlating
+`ChargeStart`, treats the current wire receipt as canonical, and checks metadata projections before correlating
 local closure. Published acceptance, actual wire outcome, stored pending obligation and the current in-memory
 lease remain distinct. Normal, timed and cloud tests share the metadata key, so their writes pass through this
 owner. Generic `ManagedRequests` startup still marks unfinished request rows `process_replaced`; it restores no
 lease or positive permission.
 
-`start_settlement.settle_start` selects failure settlement from exact current request, lease, phase, receipt and
-effects-started facts. The async caller retains live admission, native proof, task/cancellation ownership and
-restrictive execution. Local completion never consumes cloud delivery debt. Callers joining an existing SQL
-transaction release the lease only after COMMIT; memory-releasing owner entry points require their own COMMIT.
+`start_settlement` holds the pure failure and caller-named retirement policies. `ChargeStart` preserves raw
+legacy markers and opaque result bytes. Preflight, unissued-at-zero, closed-at-zero, generic test settlement and
+cancelled-unprepared rules retain different evidence and update contracts; the selector does not choose a priority
+between them. `RetirementCandidate` freezes only the original rule's preimage. Generic settlement includes its
+selected session and exact lease identity; cancellation uses raw receipt bytes; closed-zero also pins pending.
+`Journal.starts.retire` applies the selected outcome through one filtered request writer. The async caller retains
+native proof, task/cancellation ownership, restrictive execution and post-COMMIT memory changes. Local completion
+never consumes independent cloud delivery debt.
 
 The former control grammar and boundary observer are test references under `tests_model/control_slice.py`,
 `control_slice_state.py` and `start_reference.py`. Production has no observer callback or dependency on those
 modules. Their original tests remain, alongside real peer and process-death checks of the production owner.
 See the [developer guide](developer.md#control-transitions-and-start-settlement) for the stored-state contract.
 
-`managed_settlement.py` binds exact terminal current/test records and internal Pause claims to caller-owned zero
-proofs. `managed_fault_timer.py` carries the acknowledged Pause authority across the schedule, native and resource
-checks for one exact timer removal. Start with `test_managed_settlement_regressions.py` and
+`managed_settlement.py` binds terminal current records, owner-held Start candidates and internal Pause claims to
+caller-owned zero proofs. `managed_fault_timer.py` carries the acknowledged Pause authority across the schedule,
+native and resource checks for one exact timer removal. Start with `test_managed_settlement_regressions.py` and
 `test_managed_fault_timer.py` for their real-peer recovery and storage-failure cases. `test_runtime_boot_retry.py`
 covers repeated read-only probes; `test_managed_cached_authorization.py` and
 `test_managed_cloud_pending_return.py` cover cloud decisions, retained permissions and timed-test Return settlement.

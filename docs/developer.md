@@ -144,7 +144,7 @@ four-suite twenty-worker qualification.
 ## Control transitions and Start settlement
 
 `Journal.starts` (`core/prototype/start_lifecycle.py`) owns Start receipt, pending-bit and shared managed-charge
-metadata writes, local Start outcomes and the sole process-local lease slot. `NormalStart` loads the current
+metadata writes, local Start outcomes and the sole process-local lease slot. `ChargeStart` loads the current
 request, wire receipt, metadata projections and actual ledger. An older receipt remains historical until the new
 request prepares. Receipt tag/local identity is usable only with matching projections and current-request or
 explicit published legacy provenance; contradictory stored copies never become corrected permission.
@@ -162,14 +162,31 @@ cloud Start/Stop acknowledgement duties intact. A memory-releasing entry point r
 callers that supply an outer transaction release memory only after its successful COMMIT. No await belongs inside
 a journal transaction.
 
-`start_settlement.settle_start` remains the pure production failure selector. Initial zero counts as effects even
-before RemoteStart dispatch; prepared receipt retirement precedes a diagnostic-only exit. The async caller
-rebuilds facts on storage retries and executes the selected settlement without an intervening await.
+`start_settlement` owns the pure caller-named retirement rules and outcomes as well as failure selection.
+The caller selects preflight refusal, unissued at zero, closed at zero, generic settlement or cancelled unprepared;
+there is no rule-priority picker. These rules deliberately differ in legacy acceptance, request-state filters,
+compact versus spaced result encoding, metadata local projection and proof strength. Missing attempted/published
+markers remain distinct from explicit False. Metadata-only expiry stays separate from request completion.
+
+`RetirementCandidate` centralizes the original snapshot contracts. Generic settlement pins only its selected
+ledger row and exact lease object; cancellation pins metadata, full request and raw receipt, including None versus
+an empty dictionary; closed-zero also pins pending and the canonical local session. Unrelated historical rows
+are not frozen. A candidate grants no physical permission. Native Pause proof, cancellation/owned-I/O checks,
+initial-zero restoration and current/Boot/resource guards stay with their callers. Unissued cleanup owns its
+transaction; generic, closed and cancellation settlement join their caller transaction; memory follows COMMIT.
+
+Failure selection consumes the same charge evidence with live worker facts. Initial zero counts as effects even
+before RemoteStart dispatch. It still selects before reading fallible wire evidence, then selects prepared
+retirement from the actual receipt; unrelated work exits before that receipt read. Stored results remain opaque
+except for preflight-refusal classification. The shared SQL writer preserves each caller's exact action,
+revision and state filters, result encoding, terminal bytes and cancellation row-count requirement.
 
 The pilot `control_slice.py`, `control_slice_state.py` and `start_reference.py` live under `tests_model/`. Their
 original assertions are preserved as reference checks. The temporary runtime observer/callback plumbing is gone;
 production imports none of these modules. Run `tests/test_start_lifecycle.py` for fast stored-state, stale-preimage
-and COMMIT-failure checks, and `tests/test_start_settlement.py` for the pure selector and preserved reference.
+and COMMIT-failure checks. `tests/test_start_retirement.py` covers the pure rules and scoped snapshots;
+`tests/test_start_retirement_sqlite.py` checks actual SQL filters/bytes and raw-shape boundaries.
+`tests/test_start_settlement.py` retains failure selection and the preserved reference.
 The real late-Accepted-after-new-Pause witness remains in `tests/test_control_slice_peer.py`.
 
 Use a coherent milestone selection covering the moved writers: native/peer handoffs, same-tag attribution,

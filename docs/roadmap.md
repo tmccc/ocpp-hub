@@ -31,6 +31,10 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] Remove temporary runtime observer plumbing and move the pilot grammar to test references while preserving
   its original assertions. Add fast stored-state and atomic-failure checks; retain real peer, same-tag, cancellation,
   expiry, operator and actual process-death coverage for the coherent lifecycle milestone.
+- [x] Consolidate Start retirement eligibility, outcome selection and scoped preimages into one pure production
+  policy and owner execution path. Preserve different legacy and proof contracts; add fast pure and SQLite checks.
+  This consolidation increases physical runtime lines; the net-reduction target is still open and is not claimed
+  achieved by moving the record types within the runtime.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current/timer authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties. Full four-suite qualification and deployment of this local candidate remain open.

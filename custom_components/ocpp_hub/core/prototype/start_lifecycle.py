@@ -6,119 +6,27 @@ import json
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .managed_intent import ControlIntent
 from .start_handoff import StartHandoffContext, StartPublication
+from .start_settlement import (
+    ChargeStart,
+    LeaseIdentity,
+    RetirementCandidate,
+    RetirementRule,
+    StartReceipt,
+    StartRequest,
+    StartSession,
+    idle_receipt_ended,
+    retire_start,
+)
 from .store import RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
     from .managed_test_charge import TestLease
     from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
-
-
-@dataclass(frozen=True)
-class StartRequest:
-    identifier: str
-    action: str
-    revision: int
-    state: str
-    result: str
-
-
-@dataclass(frozen=True)
-class StartReceipt:
-    """Receipt evidence can precede publication and may instead belong to an older settled request."""
-
-    body: str
-    request_id: str | None
-    ticket: str | None
-    digest: str | None
-    stage: str | None
-    local: int | None
-
-
-@dataclass(frozen=True)
-class StartSession:
-    """Actual transaction evidence is read-only input; cloud delivery and source permission stay separate."""
-
-    local: int
-    start: str
-    stop: str | None
-    vendor: int | None
-    digest: str
-
-
-@dataclass(frozen=True)
-class NormalStart:
-    """The existing journal keys encode this aggregate; publication is distinct from a real wire Accepted."""
-
-    body: str
-    identifier: str
-    revision: int
-    phase: str
-    attempted: bool | None
-    published: bool | None
-    projection_digest: str | None
-    reported_local: int | None
-    receipt: StartReceipt
-    request: StartRequest | None
-    pending: bool
-    session: StartSession | None
-
-    # Only this request's receipt, or its explicit pre-upgrade publication, identifies the canonical effect.
-    @property
-    def effect(self) -> StartReceipt | None:
-        return (
-            self.receipt
-            if (
-                self.receipt.request_id == self.identifier
-                or self.receipt.request_id is None
-                and self.published is True
-                and self.receipt.digest == self.projection_digest
-            )
-            else None
-        )
-
-    # The wire receipt owns tag identity; the metadata copy is only a checked compatibility projection.
-    @property
-    def digest(self) -> str | None:
-        return self.effect.digest if self.effect is not None else None
-
-    # Before preparation an older receipt stays historical, while a bound current receipt supplies late identity.
-    @property
-    def local(self) -> int | None:
-        return self.effect.local if self.effect is not None else None
-
-    # One identity predicate covers current and legacy local completion without manufacturing publication.
-    def owns(self, local: int, *, strict_unpublished: bool = False, strict_request: bool = False) -> bool:
-        receipt, request = self.receipt, self.request
-        return bool(
-            type(local) is int
-            and self.local == receipt.local == local
-            and self.reported_local in (None, local)
-            and (self.reported_local is not None or receipt.request_id == self.identifier)
-            and receipt.request_id in (None, self.identifier)
-            and receipt.digest == self.projection_digest
-            and receipt.stage in ("issued", "accepted")
-            and (self.published is True or receipt.request_id == self.identifier)
-            and (
-                receipt.stage != "issued"
-                or self.published is False
-                and self.attempted is True
-                and receipt.request_id == self.identifier
-            )
-            and (not strict_unpublished or self.published is True or self.published is False and self.attempted is True)
-            and request is not None
-            and request.action == "start"
-            and request.state in ("accepted", "running", "uncertain", "completed", "failed")
-            and request.revision + int(self.published is True) == self.revision
-            and (
-                not strict_request or request.state in ("completed", "failed") or receipt.request_id == self.identifier
-            )
-        )
 
 
 class StartLifecycle:
@@ -143,13 +51,12 @@ class StartLifecycle:
             }
         return {}
 
-    # Load the persisted aggregate once at a synchronous boundary, retaining legacy and pre-prepared identities.
-    def normal(self) -> NormalStart | None:
-        j = self.journal
-        state = j.get("managed_test_charge", {})
-        if state.get("kind") != "normal" or state.get("source") != "local" or not isinstance(state.get("id"), str):
+    # Decode shared charge bookkeeping without interpreting opaque request results or granting any permission.
+    def load(self, *, wire: bool = True, ledger: bool = True, request_id: str | None = None) -> ChargeStart | None:
+        j, state = self.journal, self.journal.get("managed_test_charge", {})
+        if not isinstance(state, dict) or not state:
             return None
-        value = self.receipt()
+        value = self.receipt() if wire else {}
         receipt = StartReceipt(
             encoded(value),
             value.get("request_id"),
@@ -158,32 +65,22 @@ class StartLifecycle:
             value.get("stage"),
             value.get("local"),
         )
-        row = j.db.execute(
-            "SELECT id,action,revision,state,result FROM managed_requests WHERE id=?", (state["id"],)
-        ).fetchone()
+        row = j.db.execute("SELECT * FROM managed_requests WHERE id=?", (request_id or state.get("id"),)).fetchone()
         request = StartRequest(*row) if row is not None else None
-        belongs = value.get("request_id") == state["id"] or (
-            value.get("request_id") is None
-            and state.get("start_rpc_accepted") is True
-            and value.get("digest") == state.get("tag_digest")
+        rows = (
+            j.db.execute(
+                "SELECT local,start,stop,vendor FROM transactions WHERE local IN (?,?) ORDER BY local",
+                tuple(
+                    value if isinstance(value, (int, float, str)) else None
+                    for value in (value.get("local"), state.get("local_transaction"))
+                ),
+            ).fetchall()
+            if wire and ledger
+            else []
         )
-        row = j.db.execute(
-            "SELECT local,start,stop,vendor FROM transactions WHERE local=?", (value.get("local") if belongs else None,)
-        ).fetchone()
-        session = (
-            StartSession(
-                row["local"],
-                row["start"],
-                row["stop"],
-                row["vendor"],
-                fingerprint(json.loads(row["start"])["idTag"].casefold()),
-            )
-            if row is not None
-            else None
-        )
-        return NormalStart(
+        return ChargeStart(
             encoded(state),
-            state["id"],
+            state.get("id"),
             state.get("revision"),
             state.get("state"),
             state.get("start_attempted"),
@@ -193,8 +90,69 @@ class StartLifecycle:
             receipt,
             request,
             bool(j.get("control", {}).get("start_pending")),
-            session,
+            state.get("kind"),
+            state.get("source"),
+            state.get("start_source_verified"),
+            encoded(j.get("local_start_receipt")) if wire else "null",
+            tuple(StartSession(row["local"], row["start"], row["stop"], row["vendor"]) for row in rows),
         )
+
+    # Normal identity continues to reject other charge kinds and sources before using the canonical effect.
+    def normal(self) -> ChargeStart | None:
+        state = self.journal.get("managed_test_charge", {})
+        if (
+            not isinstance(state, dict)
+            or state.get("kind") != "normal"
+            or state.get("source") != "local"
+            or not isinstance(state.get("id"), str)
+        ):
+            return None
+        return self.load()
+
+    # One pure rule selects current evidence; each rule reads only the independent runtime fences it needs.
+    def retirement(
+        self, rule: RetirementRule, *, worker_pending: bool = False, lease: TestLease | None = None
+    ) -> RetirementCandidate | None:
+        j = self.journal
+        if rule is RetirementRule.REFUSED and (
+            self.lease is not None or j.get("managed_test_charge", {}).get("state") != "failed"
+        ):
+            return None
+        raw = j.get("local_start_receipt") if rule in (RetirementRule.CANCELLED, RetirementRule.GENERIC) else None
+        if raw is not None and not isinstance(raw, dict):
+            return None
+        if rule is RetirementRule.CANCELLED:
+            state = j.get("managed_test_charge")
+            if lease is None or not isinstance(state, dict) or state.get("id") != lease.identifier:
+                return None
+        record = (
+            self.normal()
+            if rule is RetirementRule.CLOSED
+            else self.load(ledger=rule not in (RetirementRule.REFUSED, RetirementRule.UNISSUED))
+        )
+        if record is None:
+            return None
+        current = lease if rule is RetirementRule.CANCELLED else self.lease
+        identity = LeaseIdentity(current.identifier, current.source, current.normal) if current is not None else None
+        generic = rule is RetirementRule.GENERIC
+        decision = retire_start(
+            record,
+            rule,
+            identity,
+            worker_pending=worker_pending,
+            active=j.active() if generic else None,
+            vendor_pending=bool(j.get("vendor_start_grant")) if generic else False,
+            uncertain_vendor=bool(j.get("uncertain_vendor_command")),
+            mutation_pending=bool(j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone())
+            if generic
+            else False,
+        )
+        return RetirementCandidate.capture(record, decision, self.lease) if decision is not None else None
+
+    # Idle/expiry scope is checked by the caller; this is only the old historical receipt-ended predicate.
+    def receipt_ended(self) -> bool:
+        record = self.load()
+        return record is not None and idle_receipt_ended(record)
 
     # Compatibility callers can release or publish the sole lease slot without maintaining another copy.
     def set_lease(self, lease: TestLease | None) -> None:
@@ -279,10 +237,7 @@ class StartLifecycle:
     def fail_preflight(self, identifier: str, cause: dict[str, Any]) -> None:
         j = self.journal
         with j.atomic():
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND state IN ('accepted','running')",
-                (json.dumps({"classification": "preflight_refused_unsent"}, sort_keys=True), identifier),
-            )
+            self._finish(identifier, "failed", {"classification": "preflight_refused_unsent"})
             j.put("managed_test_charge", {**j.get("managed_test_charge", {}), "state": "failed", "failure": cause})
         self.lease = None
 
@@ -299,10 +254,7 @@ class StartLifecycle:
                 **({"failure": failure} if failure is not None else {}),
             },
         )
-        j.db.execute(
-            "UPDATE managed_requests SET state='uncertain',result=? WHERE id=? AND state IN ('accepted','running')",
-            (json.dumps({"classification": reason}, sort_keys=True), lease.identifier),
-        )
+        self._finish(lease.identifier, "uncertain", {"classification": reason})
 
     # Timed/cloud metadata shares storage but never becomes an alternate writer of a normal Start record.
     def project_test(self, state: dict[str, Any]) -> None:
@@ -347,21 +299,14 @@ class StartLifecycle:
         j.put("managed_test_charge", {**state, "local_transaction": local, "actual_start_at": time.time()})
 
     # A closed record is identified once for Pause, denial and operator consumers, independently of native proof.
-    def closed(self, *, strict_request: bool = False, strict_unpublished: bool = False) -> NormalStart | None:
+    def closed(self, *, strict_request: bool = False, strict_unpublished: bool = False) -> ChargeStart | None:
         record = self.normal()
-        if (
-            record is None
-            or type(record.local) is not int
-            or not record.owns(
-                record.local,
-                strict_request=strict_request,
-                strict_unpublished=strict_unpublished,
-            )
-        ):
-            return None
-        if record.session is None or record.session.stop is None or record.session.digest != record.digest:
-            return None
-        return record
+        return (
+            record
+            if record is not None
+            and record.correlated(closed=True, strict_request=strict_request, strict_unpublished=strict_unpublished)
+            else None
+        )
 
     # Consumers add their own native, denial or operator proof to this single exact lifecycle identity.
     def identity(
@@ -370,10 +315,9 @@ class StartLifecycle:
         record = self.normal()
         if (
             record is None
-            or not record.owns(local, strict_request=strict_request, strict_unpublished=strict_unpublished)
-            or record.session is None
-            or record.session.digest != record.digest
+            or record.local != local
             or record.request is None
+            or not record.correlated(strict_request=strict_request, strict_unpublished=strict_unpublished)
         ):
             return None
         return {
@@ -383,30 +327,6 @@ class StartLifecycle:
             "local_transaction": local,
             "request_revision": record.request.revision,
         }
-
-    # Closed-zero retirement may settle a failed publication, but never adopts another live lease's permission.
-    def close_candidate(self) -> NormalStart | None:
-        record = self.closed()
-        lease = self.lease
-        if (
-            record is None
-            or record.pending
-            or lease is not None
-            and (not lease.normal or lease.source != "local" or lease.identifier != record.identifier)
-        ):
-            return None
-        return record
-
-    # A caller supplies fresh closed-zero proof and owns this transaction; local completion leaves cloud debt intact.
-    def complete_closed_zero(self, record: NormalStart) -> None:
-        self.require(record)
-        self.complete_normal(
-            json.loads(record.body),
-            record.local,
-            reason="owned_session_closed_at_verified_zero",
-            allow_uncertain=True,
-            request_revision=record.request.revision if record.request is not None else None,
-        )
 
     # The lease's known real closure is sufficient even when native polling did not observe the open session.
     def finish_closed(self, lease: TestLease) -> bool:
@@ -425,10 +345,11 @@ class StartLifecycle:
         self.lease = None
         return True
 
-    # The owner checks snapshots at publication; old frozen evidence cannot complete a replaced request.
-    def require(self, record: NormalStart) -> None:
-        if self.normal() != record:
-            raise RecoveryRequiredError("normal Start changed before lifecycle settlement")
+    # Compare exactly the rule's original persisted scope; generic candidates also pin the actual lease object.
+    def require(self, candidate: RetirementCandidate) -> None:
+        current = self.load()
+        if current is None or RetirementCandidate.capture(current, candidate.decision, self.lease) != candidate:
+            raise RecoveryRequiredError("Start retirement changed before settlement")
 
     # All locally confirmed normal completion paths share one writer and keep actual cloud debt independent.
     def observe_normal(self, native: HandoverEvidence, *, allow_open: bool = False, known_source: bool = True) -> bool:
@@ -440,7 +361,7 @@ class StartLifecycle:
             return False
         state = json.loads(record.body)
         local, session = record.local, record.session
-        if local is not None and (not record.owns(local) or session is None or session.digest != record.digest):
+        if local is not None and not record.correlated():
             return False
         if lease is not None and self.finish_closed(lease):
             return True
@@ -480,15 +401,10 @@ class StartLifecycle:
                         ),
                     },
                 )
-                j.db.execute(
-                    "UPDATE managed_requests SET state='completed',result=? WHERE id=? "
-                    "AND state IN ('accepted','running')",
-                    (
-                        json.dumps(
-                            {"local_session_verified": True, "charging": charging, "timed": False}, sort_keys=True
-                        ),
-                        lease.identifier,
-                    ),
+                self._finish(
+                    lease.identifier,
+                    "completed",
+                    {"local_session_verified": True, "charging": charging, "timed": False},
                 )
             self.lease = None
         return True
@@ -604,20 +520,13 @@ class StartLifecycle:
             raise RecoveryRequiredError("normal Start completion requires its exact local record")
         with nullcontext() if j.db.in_transaction else j.atomic():
             if finish_request:
-                revision = " AND revision=?" if request_revision is not None else ""
-                j.db.execute(
-                    "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action='start' "
-                    + (
-                        "AND state IN ('accepted','running','uncertain')"
-                        if allow_uncertain
-                        else "AND state IN ('accepted','running')"
-                    )
-                    + revision,
-                    (
-                        json.dumps({"local_session_verified": True, "charging": False, "timed": False}, sort_keys=True),
-                        state["id"],
-                        *((request_revision,) if request_revision is not None else ()),
-                    ),
+                self._finish(
+                    state["id"],
+                    "completed",
+                    {"local_session_verified": True, "charging": False, "timed": False},
+                    action="start",
+                    revision=request_revision,
+                    states=("accepted", "running", "uncertain") if allow_uncertain else ("accepted", "running"),
                 )
             self.complete_metadata(
                 state if local is None else {**state, "local_transaction": local}, reason=reason, stopped_at=stopped_at
@@ -634,63 +543,70 @@ class StartLifecycle:
             changes["stopped_at"] = stopped_at
         self.journal.put("managed_test_charge", {**state, **changes})
 
-    # A cancelled, explicitly unprepared request needs its critical outcome before the caller releases memory.
-    def cancelled(self, identifier: str, action: str, revision: int, metadata: str) -> None:
-        j = self.journal
-        changed = j.db.execute(
-            "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND action=? AND revision=? "
-            "AND state IN ('accepted','running')",
-            (encoded({"classification": "cancelled_before_start_dispatch"}), identifier, action, revision),
-        ).rowcount
-        if changed != 1:
-            raise RecoveryRequiredError("cancelled Start request changed before retirement")
-        self.complete_metadata(json.loads(metadata), reason="cancelled_before_start_dispatch")
+    # All local management outcomes share encoding and exact optional filters, inside their existing transaction.
+    def _finish(
+        self,
+        identifier: str,
+        state: str,
+        result: dict[str, Any],
+        *,
+        action: str | None = None,
+        revision: int | None = None,
+        states: tuple[str, ...] | None = ("accepted", "running"),
+        compact: bool = False,
+    ) -> int:
+        query = "UPDATE managed_requests SET state=?,result=? WHERE id=?"
+        parameters: list[Any] = [state, encoded(result) if compact else json.dumps(result, sort_keys=True), identifier]
+        for key, value in (("action", action), ("revision", revision)):
+            if value is not None:
+                query += f" AND {key}=?"
+                parameters.append(value)
+        if states is not None:
+            query += " AND state IN (" + ",".join("?" for _ in states) + ")"
+            parameters.extend(states)
+        return self.journal.db.execute(query, parameters).rowcount
 
-    # A fresh zero caller may fail only the exact uncertain unsent request, retaining original terminal bytes.
-    def unissued_at_zero(self, state: dict[str, Any]) -> None:
-        j = self.journal
-        with j.atomic():
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND revision=? "
-                "AND action=? AND state='uncertain'",
-                (
-                    json.dumps({"classification": "start_not_accepted_at_verified_zero"}),
-                    state["id"],
-                    state["revision"],
-                    "start" if state["kind"] == "normal" else "start_test",
-                ),
+    # Execute one selected retirement; original native/cancellation proofs and caller transactions stay external.
+    def retire(self, candidate: RetirementCandidate) -> None:
+        record, decision = candidate.record, candidate.decision
+        j, rule, local = self.journal, decision.rule, decision.local
+        if rule in (RetirementRule.CLOSED, RetirementRule.GENERIC):
+            self.require(candidate)
+        # Closed/generic/cancelled callers retain their exact preimage and transaction checks. Unissued owns its COMMIT.
+        transaction = j.atomic() if rule is RetirementRule.UNISSUED else nullcontext()
+        with transaction:
+            state = json.loads(record.body)
+            update = decision.update(record)
+            if update.state is not None:
+                request = record.request
+                if request is None:
+                    raise RecoveryRequiredError("Start retirement requires its exact request")
+                changed = self._finish(
+                    request.identifier,
+                    update.state,
+                    update.result,
+                    action=request.action,
+                    revision=request.revision,
+                    states=decision.states,
+                    compact=rule in (RetirementRule.CANCELLED, RetirementRule.GENERIC),
+                )
+            else:
+                changed = 0
+            if rule is RetirementRule.CANCELLED and changed != 1:
+                raise RecoveryRequiredError("cancelled Start request changed before retirement")
+            self.complete_metadata(
+                {**state, **({"local_transaction": local} if decision.writes_local else {})}, reason=update.reason
             )
-            self.complete_metadata(state, reason="start_not_accepted_at_verified_zero")
-
-    # Generic Pause settlement supplies byte-exact preimages and cannot change an already terminal request.
-    def settled_at_zero(self, state: dict[str, Any], request: tuple[Any, ...], local: int | None) -> None:
-        unissued = local is None and state["source"] == "local"
-        outcome = "completed"
-        result: dict[str, Any]
-        if unissued:
-            outcome, result = "failed", {"classification": "start_not_accepted_at_verified_zero"}
-        elif state["kind"] == "normal":
-            result = {"local_session_verified": True, "charging": False, "timed": False}
-        elif state["source"] == "cloud":
-            result = {"armed": True, "charging_started": False}
-        else:
-            outcome, result = "failed", {"classification": "test_interrupted_at_verified_zero"}
-        self.journal.db.execute(
-            "UPDATE managed_requests SET state=?,result=? WHERE id=? AND action=? AND revision=? "
-            "AND state IN ('accepted','running','uncertain')",
-            (outcome, encoded(result), *request[:3]),
-        )
-        self.complete_metadata(
-            {**state, "local_transaction": local},
-            reason=("start_not_accepted_at_verified_zero" if unissued else "owned_operation_settled_at_verified_zero"),
-        )
 
     # Operator proof clears a proven absent local command, while its other debt and outbox facts stay independent.
     def operator_no_pending(self, receipt: dict[str, Any], state: dict[str, Any], proof: str, identifier: str) -> None:
         j = self.journal
         j.put("local_start_receipt", {**receipt, "stage": "reconciled", "proof": proof})
         self.complete_metadata(state, reason="operator_verified_no_pending_start")
-        j.db.execute(
-            "UPDATE managed_requests SET state='failed',result=? WHERE id=?",
-            (encoded({"classification": "operator_reconciled_at_zero", "charging_started": False}), identifier),
+        self._finish(
+            identifier,
+            "failed",
+            {"classification": "operator_reconciled_at_zero", "charging_started": False},
+            states=None,
+            compact=True,
         )

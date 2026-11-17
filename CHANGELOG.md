@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Share pure Start retirement decisions and rule-specific snapshots across refusal, cancellation, verified-zero
+  completion and generic test settlement. Preserve distinct legacy evidence, result bytes, terminal history and
+  caller-owned physical proof; use one request-outcome writer with each original filter and transaction contract.
+
 - Consolidate Start receipt, pending state, managed-charge projections and the active lease under one journal
   lifecycle owner. Share typed local-session identity across completion and recovery, preserving publication lag,
   legacy journals, newer Pause authority and independent cloud delivery debt.

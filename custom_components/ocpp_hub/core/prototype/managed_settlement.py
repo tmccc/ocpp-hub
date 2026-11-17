@@ -7,11 +7,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
-from .store import RecoveryRequiredError, encoded, fingerprint
+from .start_settlement import RetirementCandidate, RetirementRule
+from .store import RecoveryRequiredError, encoded
 
 if TYPE_CHECKING:
     from .managed import ManagedController
-    from .store import Journal
+    from .start_settlement import RetirementCandidate, RetirementRule
+from .store import Journal
 
 
 @dataclass(frozen=True)
@@ -21,9 +23,6 @@ class TerminalRecord:
     key: str
     body: str
     request: tuple[Any, ...]
-    receipt: str | None = None
-    transaction: tuple[Any, ...] | None = None
-    lease: object | None = None
     current_target: int | None = None
 
     # Bind the only request this candidate may exempt from the pending-request fence.
@@ -77,73 +76,18 @@ def current_candidate(c: ManagedController) -> TerminalRecord | None:
 
 
 # Closed lifecycle or exact known-unsent provenance distinguishes obsolete test metadata from unbound Start debt.
-def charge_test_candidate(c: ManagedController) -> TerminalRecord | None:
-    j, tests = c.session.journal, c.tests
-    state, lease = tests.state(), tests.lease
-    request = request_snapshot(j, state.get("id"))
-    if (
-        request is None
-        or tests.worker is not None
-        and not tests.worker.done()
-        or state.get("kind") not in ("normal", "test")
-        or state.get("source") not in ("local", "cloud")
-        or state.get("state") not in ("interrupted", "expired", "stopping", "running", "charging", "awaiting_power")
-        or lease is not None
-        and (lease.identifier != state.get("id") or lease.source != state.get("source"))
-        or j.active() is not None
-        or j.get("control", {}).get("start_pending")
-        or j.get("vendor_start_grant")
-        or j.get("uncertain_vendor_command")
-        or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-    ):
-        return None
-    local, receipt = state.get("local_transaction"), local_start_receipt(j)
-    normal, cloud = state["kind"] == "normal", state["source"] == "cloud"
-    action = "arm_cloud_test" if cloud else "start" if normal else "start_test"
-    if request[1] != action or request[2] + int(normal and state.get("start_rpc_accepted") is True) != state.get(
-        "revision"
-    ):
-        return None
-    if cloud:
-        if normal or local is None and (lease is not None or state.get("state") != "interrupted"):
-            return None
-        if local is not None and state.get("start_source_verified") is not True:
-            return None
-    else:
-        if local is None and receipt.get("request_id") == state.get("id"):
-            local = receipt.get("local")
-        if local is None:
-            if state.get("start_rpc_accepted") is not False or not (
-                state.get("start_attempted") is False
-                or receipt.get("request_id") == state.get("id")
-                and receipt.get("digest") == state.get("tag_digest")
-                and receipt.get("stage") in ("unsent", "rejected")
-            ):
-                return None
-        elif (
-            receipt.get("local") != local
-            or receipt.get("request_id") not in (None, state.get("id"))
-            or receipt.get("stage") not in ("issued", "accepted")
-            or receipt.get("digest") != state.get("tag_digest")
-            or receipt.get("stage") == "issued"
-            and (state.get("start_attempted") is not True or state.get("start_rpc_accepted") is not False)
-        ):
-            return None
-    transaction = None
-    if local is not None:
-        if type(local) is not int:
-            return None
-        row = j.db.execute("SELECT local,start,stop,vendor FROM transactions WHERE local=?", (local,)).fetchone()
-        if row is None or row["stop"] is None:
-            return None
-        if not cloud and fingerprint(json.loads(row["start"])["idTag"].casefold()) != state.get("tag_digest"):
-            return None
-        transaction = tuple(row)
-    return TerminalRecord("managed_test_charge", encoded(state), request, encoded(receipt), transaction, lease)
+def charge_test_candidate(c: ManagedController) -> RetirementCandidate | None:
+    worker = c.tests.worker
+    return c.session.journal.starts.retirement(
+        RetirementRule.GENERIC, worker_pending=worker is not None and not worker.done()
+    )
 
 
 # A candidate may never outlive replacement of its exact metadata, request, receipt, lifecycle or live lease.
-def require_record(c: ManagedController, record: TerminalRecord) -> None:
+def require_record(c: ManagedController, record: TerminalRecord | RetirementCandidate) -> None:
+    if isinstance(record, RetirementCandidate):
+        c.session.journal.starts.require(record)
+        return
     j = c.session.journal
     if encoded(j.get(record.key, {})) != record.body or request_snapshot(j, record.identifier) != record.request:
         raise RecoveryRequiredError("terminal record changed before settlement")
@@ -153,20 +97,13 @@ def require_record(c: ManagedController, record: TerminalRecord) -> None:
         ).fetchone()
         if target is None or target[0] != record.current_target:
             raise RecoveryRequiredError("terminal current target changed before settlement")
-    if record.receipt is not None and (
-        encoded(local_start_receipt(j)) != record.receipt or c.tests.lease is not record.lease
-    ):
-        raise RecoveryRequiredError("terminal Start receipt changed before settlement")
-    if record.transaction is not None:
-        row = j.db.execute(
-            "SELECT local,start,stop,vendor FROM transactions WHERE local=?", (record.transaction[0],)
-        ).fetchone()
-        if row is None or tuple(row) != record.transaction:
-            raise RecoveryRequiredError("terminal lifecycle changed before settlement")
 
 
 # The caller owns the fresh physical proof and atomic transaction; terminal receipts remain byte for byte intact.
-def complete_record(c: ManagedController, record: TerminalRecord) -> None:
+def complete_record(c: ManagedController, record: TerminalRecord | RetirementCandidate) -> None:
+    if isinstance(record, RetirementCandidate):
+        c.session.journal.starts.retire(record)
+        return
     require_record(c, record)
     j, state = c.session.journal, json.loads(record.body)
     if record.key == "managed_current_change":
@@ -176,8 +113,6 @@ def complete_record(c: ManagedController, record: TerminalRecord) -> None:
             raise RecoveryRequiredError("previous current selection changed before settlement")
         j.put(record.key, {**state, "state": "cancelled", "recovery_reason": "previous_selection_at_verified_zero"})
         return
-    local = record.transaction[0] if record.transaction is not None else None
-    j.starts.settled_at_zero(state, record.request, local)
 
 
 # Only closed ordinary charging debt permits automatic metadata retirement or internal Pause completion.

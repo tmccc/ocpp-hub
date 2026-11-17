@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from .store import Journal, encoded, fingerprint
+from .start_settlement import RetirementCandidate, RetirementRule
+from .store import Journal, fingerprint
 
 if TYPE_CHECKING:
     from .managed_test_charge import ManagedChargeTests, TestLease
@@ -21,75 +20,9 @@ class CancellationRetirement(Enum):
     RETIRED = auto()
 
 
-@dataclass(frozen=True)
-class UnpreparedStart:
-    """Immutable preimages bind only this management row and leave every earlier receipt unchanged."""
-
-    identifier: str
-    action: str
-    revision: int
-    metadata: str
-    request: str
-    receipt: str
-
-
-# A separate settled historical command cannot be confused with preparation of the current managed request.
-def previous_receipt(j: Journal, value: Any, identifier: str) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, dict):
-        return False
-    prior = value.get("request_id")
-    if (
-        not isinstance(prior, str)
-        or re.fullmatch(r"[a-f0-9]{32}", prior) is None
-        or prior == identifier
-        or not isinstance(value.get("ticket"), str)
-        or re.fullmatch(r"[a-f0-9]{32}", value["ticket"]) is None
-        or not isinstance(value.get("digest"), str)
-        or re.fullmatch(r"[a-f0-9]{64}", value["digest"]) is None
-    ):
-        return False
-    local, stage = value.get("local"), value.get("stage")
-    if local is None:
-        return stage in ("unsent", "rejected", "reconciled")
-    if type(local) is not int or local <= 0 or stage not in ("issued", "accepted", "reconciled"):
-        return False
-    row = j.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
-    return row is not None and row["stop"] is not None
-
-
-# Explicit current-version false markers prove no Start dispatch, while initial restrictive work may have occurred.
-def unprepared_start(j: Journal, lease: TestLease) -> UnpreparedStart | None:
-    state = j.get("managed_test_charge")
-    if (
-        lease.source != "local"
-        or not isinstance(state, dict)
-        or state.get("id") != lease.identifier
-        or state.get("source") != "local"
-        or state.get("kind") != ("normal" if lease.normal else "test")
-        or state.get("state") != "starting"
-        or state.get("start_attempted") is not False
-        or state.get("start_rpc_accepted") is not False
-        or state.get("local_transaction") is not None
-        or state.get("tag_digest") is not None
-        or type(state.get("revision")) is not int
-    ):
-        return None
-    row = j.db.execute("SELECT * FROM managed_requests WHERE id=?", (lease.identifier,)).fetchone()
-    if (
-        row is None
-        or row["action"] != ("start" if lease.normal else "start_test")
-        or row["revision"] != state["revision"]
-        or row["state"] not in ("accepted", "running")
-    ):
-        return None
-    receipt = j.get("local_start_receipt")
-    if not previous_receipt(j, receipt, lease.identifier):
-        return None
-    return UnpreparedStart(
-        lease.identifier, row["action"], row["revision"], encoded(state), encoded(dict(row)), encoded(receipt)
-    )
+# Cancellation selects with its explicit live lease and retains its original metadata/request/raw-receipt preimage.
+def unprepared_start(j: Journal, lease: TestLease) -> RetirementCandidate | None:
+    return j.starts.retirement(RetirementRule.CANCELLED, lease=lease)
 
 
 # Only the exact initial zero may request ordinary re-verification of the still-current original app authority.
@@ -142,7 +75,7 @@ def retire_cancelled_start(owner: ManagedChargeTests, lease: TestLease) -> Cance
             or g.charger._pending
         ):
             return CancellationRetirement.PENDING
-        j.starts.cancelled(candidate.identifier, candidate.action, candidate.revision, candidate.metadata)
+        j.starts.retire(candidate)
         recover = initial_zero_recovery(owner, lease)
         if recover:
             j.put("trial_phase", "recovering")

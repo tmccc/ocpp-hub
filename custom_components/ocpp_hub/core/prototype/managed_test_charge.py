@@ -22,9 +22,9 @@ from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
 from .start_settlement import (
+    RetirementRule,
     StartFailureAction,
     StartFailureFacts,
-    StartReceiptFacts,
     settle_start,
 )
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -127,78 +127,44 @@ class ManagedChargeTests:
 
     # A durable failed receipt proves this request had no effects; it cannot own a later ordinary session.
     def retire_refused_unsent(self) -> None:
-        state, j = self.state(), self.journal
-        if state.get("state") != "failed" or self.lease is not None:
-            return
-        row = j.db.execute("SELECT action,state,result FROM managed_requests WHERE id=?", (state.get("id"),)).fetchone()
-        result = json.loads(row["result"]) if row is not None else None
-        receipt = local_start_receipt(j)
-        if (
-            row is None
-            or row["action"] not in ("start", "start_test")
-            or row["state"] != "failed"
-            or not isinstance(result, dict)
-            or result.get("classification") != "preflight_refused_unsent"
-            or state.get("start_rpc_accepted") is not False
-            or j.get("control", {}).get("start_pending")
-            or receipt.get("local") is None
-            and receipt.get("stage") in ("prepared", "issued", "accepted")
-            or j.get("uncertain_vendor_command")
-        ):
-            return
-        j.starts.complete_metadata(state, reason="preflight_refused_unsent")
+        candidate = self.journal.starts.retirement(RetirementRule.REFUSED)
+        if candidate is not None:
+            self.journal.starts.retire(candidate)
 
-    # Only explicit request-specific provenance can retire a failure before entering the Start command path.
-    def unissued_at_zero(self, native: HandoverEvidence) -> bool:
-        state, j = self.state(), self.journal
-        receipt = local_start_receipt(j)
-        unissued = (
-            state.get("start_attempted") is False
-            or receipt.get("request_id") == state.get("id")
-            and receipt.get("digest") == state.get("tag_digest")
-            and receipt.get("local") is None
-            and receipt.get("stage") in ("unsent", "rejected")
-        )
-        row = j.db.execute(
-            "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
-        ).fetchone()
-        if (
-            self.lease is not None
-            or state.get("kind") not in ("normal", "test")
-            or state.get("source") != "local"
-            or not unissued
-            or state.get("start_rpc_accepted") is not False
-            or state.get("local_transaction") is not None
-            or row is None
-            or row["action"] != ("start" if state.get("kind") == "normal" else "start_test")
-            or row["revision"] != state.get("revision")
-            or row["state"] not in ("failed", "uncertain")
-        ):
+    # Select once, then require the caller's live Pause proof before this exact unissued retirement.
+    def retire_unissued_at_zero(self, native: HandoverEvidence) -> bool:
+        candidate = self.journal.starts.retirement(RetirementRule.UNISSUED)
+        if candidate is None:
             return False
         try:
             self.controller.require_paused(native)
         except SecurityError, DeniedError, RecoveryRequiredError:
             return False
+        self.journal.starts.retire(candidate)
         return True
 
-    # Exact not-accepted provenance and fresh physical zero settle only this request and its metadata together.
-    def retire_unissued_at_zero(self, native: HandoverEvidence) -> None:
-        if not self.unissued_at_zero(native):
-            return
-        self.journal.starts.unissued_at_zero(self.state())
+    # Idle expiry can use an ended historical receipt, or a separately verified unissued command.
+    def ended_at_idle(self, native: HandoverEvidence, *, unissued: bool = False) -> bool:
+        j = self.journal
+        return bool(
+            not j.get("control", {}).get("start_pending")
+            and j.active() is None
+            and not native.physical.transaction_open
+            and (unissued or j.starts.receipt_ended())
+        )
 
     # Exact local closure can finish its request at verified Pause zero while separate cloud delivery stays retained.
     def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
         j = self.journal
-        record = j.starts.close_candidate()
-        if record is None:
+        candidate = j.starts.retirement(RetirementRule.CLOSED)
+        if candidate is None:
             return
         try:
             self.controller.require_paused(native)
         except SecurityError, DeniedError, RecoveryRequiredError:
             return
         with j.atomic():
-            j.starts.complete_closed_zero(record)
+            j.starts.retire(candidate)
         j.starts.set_lease(None)
         self.changed.set()
 
@@ -455,41 +421,28 @@ class ManagedChargeTests:
         c, j = self.controller, self.journal
         while not self._closing and not c.stopping:
             try:
-                state = self.state()
-                row = j.db.execute(
-                    "SELECT action,revision,state FROM managed_requests WHERE id=?", (lease.identifier,)
-                ).fetchone()
+                record = j.starts.load(wire=False, request_id=lease.identifier)
                 facts = StartFailureFacts(
-                    lease.identifier,
-                    "start" if lease.normal else "start_test",
-                    state.get("id"),
-                    state.get("source"),
-                    state.get("state"),
-                    row["action"] if row is not None else None,
-                    row["state"] if row is not None else None,
-                    self.lease is lease,
-                    effects,
-                    state.get("tag_digest"),
+                    lease.identifier, "start" if lease.normal else "start_test", self.lease is lease, effects
                 )
-                decision = settle_start(facts)
+                decision = settle_start(record, facts)
                 if decision.action is StartFailureAction.UNRELATED:
                     return
+                assert record is not None and record.request is not None
                 cause = {
                     "id": lease.identifier,
-                    "action": row["action"],
-                    "revision": row["revision"],
+                    "action": record.request.action,
+                    "revision": record.request.revision,
                     "type": type(error).__name__,
                     "detail": str(error)[:1024],
                     "at_epoch": time.time(),
                     "effects_started": effects,
                 }
-                receipt = local_start_receipt(j)
-                receipt_facts = StartReceiptFacts(
-                    receipt.get("request_id"), receipt.get("digest"), receipt.get("stage"), receipt.get("local")
-                )
-                decision = settle_start(facts, receipt_facts)
+                record = j.starts.load(ledger=False)
+                decision = settle_start(record, facts)
                 if decision.retire_prepared:
-                    retire_unsent_local_start(j, receipt.get("ticket"))
+                    assert record is not None
+                    retire_unsent_local_start(j, record.receipt.ticket)
                 if decision.action is StartFailureAction.DIAGNOSTIC_ONLY:
                     self.record_failure_diagnostic(cause)
                     return  # A deadline or later proof already owns the state and immutable terminal receipt.
@@ -717,7 +670,7 @@ class ManagedChargeTests:
             if expected.mode == "paused" or active is not None and not self.current_daily(active):
                 await self.hold_expired()
             native = await c.native.read()
-            self.retire_unissued_at_zero(native)
+            unissued = self.retire_unissued_at_zero(native)
             self.retire_closed_at_zero(native)
             local, owner = j.active(), local_start_receipt(j)
             if expected.mode == "app" and local is not None and self.independent_daily(native, local):
@@ -731,19 +684,7 @@ class ManagedChargeTests:
                 # Reuse the ordinary guarded release; this raises the ceiling and never sends RemoteStart.
                 progress = await c.recovery.restore(expected, continuing_local=local)
                 return not progress.shared
-            owner_closed = (
-                not j.get("control", {}).get("start_pending")
-                and local is None
-                and not native.physical.transaction_open
-                and (
-                    self.unissued_at_zero(native)
-                    or owner.get("stage") in ("unsent", "rejected")
-                    or owner.get("local") is not None
-                    and j.db.execute(
-                        "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner["local"],)
-                    ).fetchone()
-                )
-            )
+            owner_closed = self.ended_at_idle(native, unissued=unissued)
             if owner_closed:
                 if expected.mode == "app" and (not g.controls.ready or g.controls.desired() == 0):
                     progress = await c.recovery.restore(expected)
@@ -829,23 +770,7 @@ class ManagedChargeTests:
             self.changed.set()
             return
         if lease is None:
-            owner = local_start_receipt(self.journal)
-            if (
-                state.get("state") != "completed"
-                and not native.physical.transaction_open
-                and self.journal.active() is None
-                and not self.journal.get("control", {}).get("start_pending")
-                and (
-                    self.unissued_at_zero(native)
-                    or state.get("expired_normal")
-                    and (
-                        owner.get("stage") in ("unsent", "rejected")
-                        or self.journal.db.execute(
-                            "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (owner.get("local"),)
-                        ).fetchone()
-                    )
-                )
-            ):
+            if state.get("state") != "completed" and state.get("expired_normal") and self.ended_at_idle(native):
                 # An explicit Pause can finish this expired debt too, without reviving it on the next Return.
                 self.journal.starts.complete_metadata(state)
             return

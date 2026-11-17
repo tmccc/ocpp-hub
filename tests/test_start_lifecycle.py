@@ -6,6 +6,7 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed_intent import ManagedRequests
 from ocpp_hub_core.prototype.managed_test_charge import TestLease as StartLease
+from ocpp_hub_core.prototype.start_settlement import RetirementCandidate, RetirementDecision, RetirementRule
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 
 from tests.test_prototype import START
@@ -185,6 +186,7 @@ def test_closed_candidate_requires_current_preimage(closed_owner, changed):
     j, owner, _ = closed_owner
     record = j.starts.closed()
     assert record is not None
+    candidate = RetirementCandidate.capture(record, RetirementDecision(RetirementRule.CLOSED, record.local))
     if changed == "metadata":
         j.put("managed_test_charge", {**j.get("managed_test_charge"), "charging": True})
     elif changed == "request":
@@ -198,7 +200,7 @@ def test_closed_candidate_requires_current_preimage(closed_owner, changed):
     before = j.get("managed_test_charge")
     with pytest.raises(RecoveryRequiredError, match="changed"):
         with j.atomic():
-            j.starts.complete_closed_zero(record)
+            j.starts.retire(candidate)
     assert j.get("managed_test_charge") == before and j.starts.lease is owner
 
 
