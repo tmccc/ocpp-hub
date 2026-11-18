@@ -21,7 +21,7 @@ from .managed_current_recovery import capture_interrupted_collision
 from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault
 from .managed_intent import ManagedRequests, write_intent
-from .managed_native_repair import NativeRepairAudits, RepairPublicationError
+from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
 from .managed_release_wait import awaiting_known_stops
 from .managed_settlement import (
@@ -754,7 +754,11 @@ class ManagedController:
     async def tick(self) -> dict[str, Any]:
         try:
             return await self._tick()
-        except RepairPublicationError:
+        except sqlite3.Error as error:
+            # Match the error from this attempted publication, including its original subtype and cause.
+            repair = self.native.repair_audits
+            if repair is None or repair.pending_storage_error is not error:
+                raise
             self.latest_native = None
             return poll_status(self, PollStatus("attention", "native_repair_publication_pending"), pending=True)
 

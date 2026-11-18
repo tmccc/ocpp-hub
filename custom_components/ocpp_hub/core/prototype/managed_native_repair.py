@@ -84,10 +84,6 @@ class RepairAttempt:
         }
 
 
-class RepairPublicationError(sqlite3.Error):
-    """Storage refused an exact repair outcome still owned by the live controller."""
-
-
 class NativeRepairAudits:
     """One live audit may settle its own fence; replacement cannot invent its missing outcome."""
 
@@ -96,6 +92,7 @@ class NativeRepairAudits:
         self.journal, self.eligible = journal, eligible
         self.active: RepairAttempt | None = None
         self.pending: tuple[RepairAttempt, Outcome, dict[str, Any] | None] | None = None
+        self.pending_storage_error: sqlite3.Error | None = None
 
     # Retry the frozen outcome only, never reread restored peer data to replace an observed refusal.
     def flush(self) -> None:
@@ -104,8 +101,10 @@ class NativeRepairAudits:
             try:
                 self._publish(attempt, outcome, refusal)
             except sqlite3.Error as error:
-                raise RepairPublicationError("native repair publication awaits storage") from error
+                self.pending_storage_error = error
+                raise
             self.pending = None
+            self.pending_storage_error = None
             self.active = None
 
     # A durable fence precedes the audit; a failed BEGIN or COMMIT therefore prevents the read entirely.
@@ -135,10 +134,18 @@ class NativeRepairAudits:
         return attempt
 
     # Retain a known live outcome without retrying storage while the original SQL error is propagating.
-    def defer(self, attempt: RepairAttempt | None, outcome: Outcome, error: NativeContentError | None = None) -> None:
+    def defer(
+        self,
+        attempt: RepairAttempt | None,
+        outcome: Outcome,
+        error: NativeContentError | None = None,
+        *,
+        storage_error: sqlite3.Error | None = None,
+    ) -> None:
         if attempt is not None:
             refusal = {"stage": error.stage, "detail": str(error)[:1024]} if error is not None else None
             self.pending = (attempt, outcome, refusal)
+            self.pending_storage_error = storage_error
 
     # Freeze a classified live outcome before storage so failed publication cannot downgrade strict evidence.
     def finish(self, attempt: RepairAttempt | None, outcome: Outcome, error: NativeContentError | None = None) -> None:

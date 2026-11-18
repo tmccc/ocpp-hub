@@ -17,7 +17,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
 from .managed_current import current_session_decision, managed_current_ceiling, record_current_source
-from .managed_native_repair import NativeRepairAudits, RepairPublicationError
+from .managed_native_repair import NativeRepairAudits
 from .managed_recovery import local_recovery_binding
 from .managed_sources import recorded_station_profile
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready, readiness_decision
@@ -275,9 +275,8 @@ class NativeBoundedHandover:
             if repair is not None and resource_error is not None:
                 repair.defer(attempt, "strict", resource_error)
                 raise resource_error from error
-            if repair is not None and attempt is not None and strict_complete:
-                repair.defer(attempt, "readiness")
-                raise RepairPublicationError("native repair publication awaits storage") from error
+            if repair is not None and strict_complete:
+                repair.defer(attempt, "readiness", storage_error=error)
             # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
             raise
         except asyncio.CancelledError:
