@@ -9,7 +9,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, reconcile_owner_release
 from ocpp_hub_core.prototype.managed_settlement import current_candidate, internal_pause_matches, require_record
-from ocpp_hub_core.prototype.store import RecoveryRequiredError
+from ocpp_hub_core.prototype.store import RecoveryRequiredError, encoded
 
 from tests.charge_rig import ChargeRig, owner_start, positive_flow, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
@@ -201,21 +201,15 @@ async def test_interrupted_request_retains_its_action_outcome(tmp_path, tls, unu
     ) as b:
         c, j = b.controller, b.session.journal
         identifier, local = uuid.uuid4().hex, None
+        receipt = c.command(identifier, action, c.requests.intent().revision)
         if action == "arm_cloud_test":
-            # Fail the actual arm receipt UPDATE after its independently committed permission/request metadata.
+            # Reconstruct the legacy journal from before cloud arm and its receipt shared a commit.
+            assert receipt["state"] == "completed" and c.charging.state()["state"] == "armed"
             j.db.execute(
-                "CREATE TRIGGER refuse_arm_confirmation BEFORE UPDATE ON managed_requests "
-                f"WHEN NEW.id='{identifier}' AND NEW.state='completed' "
-                "BEGIN SELECT RAISE(ABORT,'synthetic arm confirmation failure'); END"
+                "UPDATE managed_requests SET state='accepted',result=? WHERE id=?",
+                (encoded({"accepted_at": c.charging.state()["accepted_at"]}), identifier),
             )
-            try:
-                with pytest.raises(sqlite3.Error):
-                    c.command(identifier, action, c.requests.intent().revision)
-            finally:
-                j.db.execute("DROP TRIGGER refuse_arm_confirmation")
-            assert c.charging.state()["state"] == "armed"
         else:
-            c.command(identifier, action, c.requests.intent().revision)
             await c.charging.settle()
             local = await positive_flow(b)
             # The actual device has flowed, but no supervisor observation has published that proof.

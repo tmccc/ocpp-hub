@@ -81,6 +81,9 @@ routine updates do not require another dedicated charging trial when the owner h
 
 ## Older integration and HACS releases
 
+On public working forks, HACS publishing validation runs on release tags and manual workflow runs. Hassfest
+continues to validate both integrations on branch pushes.
+
 1. Work on a branch (`feature/<name>`, `fix/<name>`), commit with Conventional Commits, open a pull request. CI runs the checks, hassfest and the HACS validation.
 2. Bump the version and write the changelog entry on the release branch.
 3. Pass the full evidence gate above, then use `tools/deploy_ha.py --domain ocpp_hub` for an authorized candidate deployment.

@@ -1,11 +1,11 @@
 {
   "domain": "ics_proxy",
   "name": "iCS local proxy",
-  "version": "0.2.3",
+  "codeowners": [],
   "config_flow": true,
   "documentation": "https://github.com/MarkBovee/ocpp-hub",
-  "iot_class": "local_polling",
   "integration_type": "device",
-  "codeowners": [],
-  "requirements": []
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "0.2.3"
 }

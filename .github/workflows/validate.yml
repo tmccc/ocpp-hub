@@ -11,8 +11,11 @@ permissions: {}
 
 jobs:
   validate-hacs:
-    # The HACS action refuses private repositories; the release gate drops this check while the repository is private.
-    if: ${{ !github.event.repository.private }}
+    # Keep publishing validation for public release tags and explicit runs from working forks.
+    if: >-
+      ${{ !github.event.repository.private &&
+          (!github.event.repository.fork || startsWith(github.ref, 'refs/tags/') ||
+            github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     steps:
       - name: HACS validation
