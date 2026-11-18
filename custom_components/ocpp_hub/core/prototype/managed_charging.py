@@ -13,6 +13,7 @@ from .connection_scope import CloudAttemptScope, control_scope_matches, current_
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt, retire_unsent_local_start
+from .managed_facts import ManagedFacts
 from .managed_intent import ControlIntent, write_intent
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
 from .managed_sources import confirmed_vendor_start, recorded_station_profile
@@ -210,48 +211,68 @@ class ManagedCharging:
             )
         return "denied" if g.policy.allowed_tags else "no_approved_tag"
 
-    # Admission may offer a normal online renewal; the worker still needs actual approval and fresh physical zero.
+    # Admission may offer a normal online renewal; execution still rechecks approval and fresh physical zero.
     def available(self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False) -> bool:
+        return self.start_refusal(native, local=local, normal=normal) is None
+
+    # Report the first failed prerequisite in admission order.
+    def start_refusal(
+        self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False
+    ) -> str | None:
         c, j = self.controller, self.journal
         g = c.session.gateway
-        return bool(
-            not c.stopping
-            and (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused")
-            and not j.get("managed_control_fault")
-            and j.phase.read().active
-            and g.controls.ready
-            and g.controls.desired() == (0 if c.requests.intent().mode == "paused" else c.current.selected())
-            and (normal or c.current.selected() == 6)
-            and not c.current.pending()
-            and not g.policy.allow_local_start
-            and (
-                not local
-                or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags)
-                or normal
-                and self.authorization_status() == "renewal_required"
-            )
-            and not j.get("control", {}).get("uncertain")
-            and not j.get("control", {}).get("start_pending")
-            and j.active() is None
-            and not j.get("vendor_start_grant")
-            and not j.db.execute(
-                "SELECT 1 FROM outbox WHERE action IN ('StartTransaction','StopTransaction') LIMIT 1"
-                if normal
-                else "SELECT 1 FROM outbox LIMIT 1"
-            ).fetchone()
-            and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            and not c.requests.return_in_progress()
-            and c.requests.has_capacity()
-            and self.state().get("state") not in ACTIVE
-            and g.current_boot_seen(g._charger_epoch)
-            and (normal or c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
-            and (
-                native is None
-                or native.physical.connection == "Plug"
-                and not native.physical.transaction_open
-                and native.physical.power_w == 0
-            )
-        )
+        facts = ManagedFacts(c)
+        if c.stopping:
+            return "service_stopping"
+        if not (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused"):
+            return "intent_not_startable"
+        if facts.fault_latched():
+            return "fault_latched"
+        if not j.phase.read().active:
+            return "installation_not_active"
+        if not g.controls.ready:
+            return "station_ceiling_unconfirmed"
+        if g.controls.desired() != (0 if c.requests.intent().mode == "paused" else c.current.selected()):
+            return "station_ceiling_differs_from_selection"
+        if not normal and c.current.selected() != 6:
+            return "timed_test_requires_six_amperes"
+        if c.current.pending():
+            return "current_update_pending"
+        if g.policy.allow_local_start:
+            return "legacy_start_enabled"
+        if local and not any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
+            if not normal or self.authorization_status() != "renewal_required":
+                return "start_authorization_unavailable"
+        if j.get("control", {}).get("uncertain"):
+            return "control_uncertain"
+        if j.get("control", {}).get("start_pending"):
+            return "start_pending"
+        if j.active() is not None:
+            return "transaction_open"
+        if j.get("vendor_start_grant"):
+            return "vendor_start_pending"
+        if not facts.cloud_queue_empty(lifecycle_only=normal):
+            return "cloud_delivery_pending"
+        if not facts.mutations_confirmed():
+            return "mutation_unconfirmed"
+        if c.requests.return_in_progress():
+            return "return_pending"
+        if not c.requests.has_capacity():
+            return "request_capacity_exhausted"
+        if self.state().get("state") in ACTIVE:
+            return "managed_start_active"
+        if not facts.boot_current():
+            return "boot_unconfirmed"
+        if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
+            return "timed_test_requires_cloud"
+        if native is not None:
+            if native.physical.connection != "Plug":
+                return "vehicle_not_plugged_in"
+            if native.physical.transaction_open:
+                return "native_transaction_open"
+            if native.physical.power_w != 0:
+                return "native_power_nonzero"
+        return None
 
     # Acceptance and its one-shot deadline commit before any positive effect; duplicate identifiers return receipts.
     def accept(self, identifier: str, action: str, revision: int) -> dict[str, Any]:

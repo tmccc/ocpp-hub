@@ -278,6 +278,10 @@ async def test_unresolved_work_blocks_current_admission_without_effects(
         journal = test.session.journal
         if debt == "outbox":
             journal.enqueue("Heartbeat", {})
+            controller = test.controller
+            assert controller.charging.start_refusal(controller.latest_native, normal=True) is None
+            assert controller.charging.start_refusal(controller.latest_native) == "cloud_delivery_pending"
+            assert controller.current.current_refusal(controller.latest_native) == "cloud_delivery_pending"
         elif debt == "mutation":
             journal.mutation_intent("vendor", "DataTransfer", {"unresolved": True})
         elif debt == "cloud-start":

@@ -18,6 +18,7 @@ from .managed_current import (
     current_session_decision,
 )
 from .managed_current_recovery import capture_interrupted_collision
+from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault
 from .managed_intent import ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
@@ -50,7 +51,7 @@ from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .store import RecoveryRequiredError, encoded, fingerprint
 from .supervision import ControlFacts, HealthVerdict, Observation, PollStatus, assess
-from .trial_evidence import profile_projection
+from .trial_evidence import Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import lifecycle_decision
 from .trial_session import TrialSession
@@ -338,24 +339,40 @@ class ManagedController:
 
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
     def require_paused(self, native: HandoverEvidence) -> None:
-        g, j = self.session.gateway, self.session.journal
         self.native.require(native, closed=True)
         self.native.require_known_session(native)
         present = self.session.book.owned_present(native.physical)
-        if (
-            not g.current_boot_seen(g._charger_epoch)
-            or self.native.introduced_epoch != g._charger_epoch
-            or self.native.introduced_revision != g.controls._revision
-            or not g.controls.ready
-            or g.controls.desired() != 0
-            or not ControlState(j.get("control", {})).local_hold
-            or j.get("control", {}).get("start_pending")
-            or j.get("uncertain_vendor_command")
-            or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
-            or g.charger._pending
-            or g.controls._operations
-        ):
-            raise RecoveryRequiredError("requested pause awaits independently verified closed zero")
+        reason = self._paused_refusal(present)
+        if reason is not None:
+            error = RecoveryRequiredError("requested pause awaits independently verified closed zero")
+            error.add_note(reason)
+            raise error
+
+    # This follows the independent native/session/resource checks already performed by require_paused.
+    def _paused_refusal(self, present: list[Resource]) -> str | None:
+        g, j = self.session.gateway, self.session.journal
+        facts = ManagedFacts(self)
+        if not facts.boot_current():
+            return "boot_unconfirmed"
+        if not facts.introduction_current():
+            return "introduction_unconfirmed"
+        if not g.controls.ready:
+            return "station_ceiling_unconfirmed"
+        if g.controls.desired() != 0:
+            return "station_ceiling_nonzero"
+        if not ControlState(j.get("control", {})).local_hold:
+            return "local_hold_missing"
+        if j.get("control", {}).get("start_pending"):
+            return "start_pending"
+        if j.get("uncertain_vendor_command"):
+            return "vendor_command_uncertain"
+        if not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present):
+            return "station_zero_receipt_missing"
+        if g.charger._pending:
+            return "charger_rpc_pending"
+        if g.controls._operations:
+            return "control_operation_pending"
+        return None
 
     # Reapply only a requested Stop after replacement; this branch never returns authority to the app implicitly.
     async def maintain_pause(self) -> HandoverEvidence:
@@ -584,38 +601,60 @@ class ManagedController:
             )
             if isinstance(decision, Pending):
                 return decision
-        if (
-            not j.phase.read().operating
-            or j.get("native_bounded_handover", {}).get("stage") != "admitted"
-            or j.get("managed_control_fault")
-            or not g.current_boot_seen(g._charger_epoch)
-            or self.native.introduced_epoch != g._charger_epoch
-            or self.native.introduced_revision != g.controls._revision
-            or g.charger.sender is None
-            or not allow_offline
-            and (
-                g.vendor.sender is None or g.vendor_registration != "Accepted" or not s.runtime.status.vendor_connected
-            )
-            or not g.controls.ready
-            or g.controls.desired() != 0
-            or not j.get("control", {}).get("inhibit")
-            or row is None
-            or row["state"] != "confirmed"
-            or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
-            or not allow_offline
-            and not pending_stop
-            and j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-            or g.controls._operations
-            or g.charger._pending
-            or j.get("uncertain_vendor_command")
-        ):
-            return Pending(
-                Prerequisite.ZERO_PROOF, "shared control awaits fresh zero and actual history/cloud reconciliation"
-            )
+        refusal = self._zero_refusal(present, row, allow_offline=allow_offline, pending_stop=pending_stop)
+        if refusal is not None:
+            return Pending(Prerequisite.ZERO_PROOF, refusal)
         if pending_stop or g.vendor._pending:
             # A known closed Stop or ordinary RPC can finish before any positive release is dispatched.
             return Pending(Prerequisite.CLOUD_ACK, "shared control awaits the current cloud acknowledgement")
         return ALLOW
+
+    # Release needs an owned zero receipt and no conflicting work after the native and lifecycle checks.
+    def _zero_refusal(
+        self,
+        present: list[Resource],
+        row: sqlite3.Row | None,
+        *,
+        allow_offline: bool,
+        pending_stop: bool,
+    ) -> str | None:
+        s, g, j = self.session, self.session.gateway, self.session.journal
+        facts = ManagedFacts(self)
+        if not j.phase.read().operating:
+            return "installation is not operating"
+        if j.get("native_bounded_handover", {}).get("stage") != "admitted":
+            return "native handover is not admitted"
+        if facts.fault_latched():
+            return "managed fault is latched"
+        if not facts.boot_current():
+            return "current Boot is unconfirmed"
+        if not facts.introduction_current():
+            return "current introduction is unconfirmed"
+        if g.charger.sender is None:
+            return "charger sender is unavailable"
+        if not allow_offline and (
+            g.vendor.sender is None or g.vendor_registration != "Accepted" or not s.runtime.status.vendor_connected
+        ):
+            return "cloud registration is unavailable"
+        if not g.controls.ready:
+            return "station ceiling is unconfirmed"
+        if g.controls.desired() != 0:
+            return "station ceiling is not zero"
+        if not j.get("control", {}).get("inhibit"):
+            return "local inhibit is missing"
+        if row is None or row["state"] != "confirmed":
+            return "owned station profile is unconfirmed"
+        if not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present):
+            return "owned station zero receipt is missing"
+        if not allow_offline and not pending_stop and not facts.cloud_queue_empty():
+            return "cloud delivery is pending"
+        if g.controls._operations:
+            return "control operation is pending"
+        if g.charger._pending:
+            return "charger RPC is pending"
+        if j.get("uncertain_vendor_command"):
+            return "vendor command is uncertain"
+        return None
 
     # One accepted return receives one guarded attempt; uncertainty never changes persisted paused intent to app.
     async def return_requested(self, identifier: str, revision: int) -> None:

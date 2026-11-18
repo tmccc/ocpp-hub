@@ -13,6 +13,7 @@ from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
+from .managed_facts import ManagedFacts
 from .managed_intent import write_intent
 from .managed_settlement import claim_internal_pause
 from .managed_sources import recorded_station_profile
@@ -350,44 +351,73 @@ class ManagedCurrentLimits:
             and row["revision"] + 1 == intent.revision
         )
 
-    # The first version changes current only while closed and idle; an open car session cannot be silently resumed.
+    # Changing current requires a closed idle session; an open car session cannot be silently resumed.
     def available(self, native: HandoverEvidence | None) -> bool:
+        return self.current_refusal(native) is None
+
+    # Report the first failed prerequisite, preserving the different authority required in app and Pause modes.
+    def current_refusal(self, native: HandoverEvidence | None) -> str | None:
         c, g, j = self.controller, self.controller.session.gateway, self.journal
-        return bool(
-            managed_current_ceiling(j, c.native.spec) == 32
-            and not c.stopping
-            and not self.pending()
-            and not j.get("managed_control_fault")
-            and j.phase.read().active
-            and g.controls.ready
-            and g.current_boot_seen(g._charger_epoch)
-            and c.native.introduced_epoch == g._charger_epoch
-            and c.native.introduced_revision == g.controls._revision
-            and not j.get("control", {}).get("uncertain")
-            and not j.get("control", {}).get("start_pending")
-            and not g.controls._operations
-            and not g.charger._pending
-            and (
-                c.requests.intent().mode == "app"
-                and j.get("control", {}).get("owner") == "shared"
-                and not j.get("control", {}).get("inhibit")
-                or c.requests.intent().mode == "paused"
-                and ControlState(j.get("control", {})).explicit_local_hold
-            )
-            and not j.get("vendor_start_grant")
-            and not j.get("uncertain_vendor_command")
-            and j.active() is None
-            and not j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-            and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            and not c.requests.return_in_progress()
-            and c.charging.lease is None
-            and c.requests.has_capacity()
-            and native is not None
-            and 0 <= time.time() - native.physical.observed_at <= 15
-            and not native.physical.transaction_open
-            and native.physical.power_w == 0
-            and all(value == 0 for value in native.currents_a + native.powers_w)
+        facts = ManagedFacts(c)
+        if managed_current_ceiling(j, c.native.spec) != 32:
+            return "current_selection_not_commissioned"
+        if c.stopping:
+            return "service_stopping"
+        if self.pending():
+            return "current_update_pending"
+        if facts.fault_latched():
+            return "fault_latched"
+        if not j.phase.read().active:
+            return "installation_not_active"
+        if not g.controls.ready:
+            return "station_ceiling_unconfirmed"
+        if not facts.boot_current():
+            return "boot_unconfirmed"
+        if not facts.introduction_current():
+            return "introduction_unconfirmed"
+        if j.get("control", {}).get("uncertain"):
+            return "control_uncertain"
+        if j.get("control", {}).get("start_pending"):
+            return "start_pending"
+        if g.controls._operations:
+            return "control_operation_pending"
+        if g.charger._pending:
+            return "charger_rpc_pending"
+
+        shared = (
+            c.requests.intent().mode == "app"
+            and j.get("control", {}).get("owner") == "shared"
+            and not j.get("control", {}).get("inhibit")
         )
+        if not shared and not (
+            c.requests.intent().mode == "paused" and ControlState(j.get("control", {})).explicit_local_hold
+        ):
+            return "current_selection_authority_unconfirmed"
+        if j.get("vendor_start_grant"):
+            return "vendor_start_pending"
+        if j.get("uncertain_vendor_command"):
+            return "vendor_command_uncertain"
+        if j.active() is not None:
+            return "transaction_open"
+        if not facts.cloud_queue_empty():
+            return "cloud_delivery_pending"
+        if not facts.mutations_confirmed():
+            return "mutation_unconfirmed"
+        if c.requests.return_in_progress():
+            return "return_pending"
+        if c.charging.lease is not None:
+            return "managed_start_active"
+        if not c.requests.has_capacity():
+            return "request_capacity_exhausted"
+        if native is None or not 0 <= time.time() - native.physical.observed_at <= 15:
+            return "native_observation_stale"
+        if native.physical.transaction_open:
+            return "native_transaction_open"
+        if native.physical.power_w != 0:
+            return "native_power_nonzero"
+        if not all(value == 0 for value in native.currents_a + native.powers_w):
+            return "native_phase_nonzero"
+        return None
 
     # Idempotency binds the complete current argument as well as the request identifier, action and observed revision.
     def accept(self, identifier: str, revision: int, current_a: int) -> dict[str, Any]:

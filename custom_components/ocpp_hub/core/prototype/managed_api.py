@@ -158,21 +158,32 @@ class ManagementServer:
                 result["can_set_current"] = result["local_healthy"] and self.controller.current.available(
                     self.controller.latest_native
                 )
-                result["can_return"] = (
-                    intent.mode == "paused"
-                    and result["healthy"]
-                    and result.get("local_hold_verified") is True
-                    and not self.controller.requests.return_in_progress()
-                    and not self.controller.current.pending()
-                    and not self.controller.charging.return_blocked()
-                    and self.controller.requests.has_capacity()
-                )
+                result["can_return"] = self._return_refusal(intent.mode, result) is None
                 result["sessions"] = session_history(self.controller.session.journal)
             else:
                 raise SecurityError("management read is not supported")
         except sqlite3.Error:
             raise UnavailableError("management journal read is temporarily unavailable") from None
         return {"id": identifier, "ok": True, "result": result}
+
+    # This status hint uses published evidence. Return execution rechecks its own authority and fresh zero.
+    def _return_refusal(self, mode: str, status: dict[str, Any]) -> str | None:
+        c = self.controller
+        if mode != "paused":
+            return "pause_not_requested"
+        if not status["healthy"]:
+            return "service_unhealthy"
+        if status.get("local_hold_verified") is not True:
+            return "local_hold_unverified"
+        if c.requests.return_in_progress():
+            return "return_pending"
+        if c.current.pending():
+            return "current_update_pending"
+        if c.charging.return_blocked():
+            return "managed_start_active"
+        if not c.requests.has_capacity():
+            return "request_capacity_exhausted"
+        return None
 
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:
