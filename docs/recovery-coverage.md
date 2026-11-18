@@ -78,6 +78,12 @@ positive independent peer output until an external
 zero event. Shared manual recovery helpers require the exact completed Return receipt and at least three fresh actual
 failed getConfig reads per outage; manual ticks or an older healthy paused status cannot satisfy those obligations.
 
+The process-death matrix uses a one-second poll for most subprocess cases. The issued-Start and bound-owner
+delivery matrices also shorten the respective expiry and retry waits in their test children. Every generation
+of a case uses the same timing and observes real clocks, process death, peer traffic and durable records. The
+autonomous cross-feature cases, a Return commit witness and representative 6 A issued-Start and bound-owner
+cases exercise the production timings as well.
+
 Excluded inputs remain in the full manifest with exact reasons. The retired one-off timer/source families no longer contribute cases or exclusions.
 Start replay follows an accepted Pause; fixed timed tests require6A; `restart-ready` means successful listener startup
 and real Boot response, so native restoration precedes it. Real unavailable startup/restoration has a separate test

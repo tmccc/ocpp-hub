@@ -31,6 +31,8 @@ from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_
 from tools.managed_reporting import Reporting  # noqa: E402
 from tools.trial_proxy import native_spec  # noqa: E402
 
+_SUPERVISION_POLL_SECONDS = 5
+
 
 # The manager receives only short classified status; no protocol bodies, identities or credential paths are sent.
 def notify(value: str) -> None:
@@ -145,7 +147,7 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
             if reporting.write(published, status_path, events_path, save_private, event):
                 notify("STATUS=App/schedule control: " + str(published.get("state")))
             try:
-                await asyncio.wait_for(stopped.wait(), 5)
+                await asyncio.wait_for(stopped.wait(), _SUPERVISION_POLL_SECONDS)
             except TimeoutError:
                 pass
     finally:

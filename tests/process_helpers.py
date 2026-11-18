@@ -9,6 +9,7 @@ import sys
 import uuid
 from contextlib import asynccontextmanager, closing
 from types import SimpleNamespace
+from typing import Literal
 
 from ocpp_hub_core.prototype.trial_session import save_private
 from websockets.asyncio.client import connect
@@ -20,13 +21,16 @@ from tests.managed_rig import OwnerBench
 from tests.management_peer import TOKEN, call
 from tests.prototype_rig import BOOT, START
 
+ProcessTiming = Literal["production", "fast-poll", "fast-start-expiry", "fast-cloud-retry"]
+
 
 class ServiceProcess:
     """A child owns the real journal/controller; this parent owns only its independent peers and control transport."""
 
     # Allocate distinct management paths while preserving the same genuine journal and physical installation.
-    def __init__(self, rig, directory, port):
+    def __init__(self, rig, directory, port, timing: ProcessTiming = "production"):
         self.rig, self.directory, self.port = rig, directory, port
+        self.timing = timing
         self.process = self.socket = self.reader = self.collector = None
         self.events = asyncio.Queue()
         self.generation = 0
@@ -51,6 +55,7 @@ class ServiceProcess:
             str(self.directory / "process-strategy.json"),
             str(self.directory / "process-management.json"),
             str(self.rig.prepared.observer.port),
+            self.timing,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=log,
@@ -93,7 +98,7 @@ class ServiceProcess:
         ) as socket:
             return await call(socket, command, **fields)
 
-    # Wait for real published service evidence under its unchanged five-second supervisor cadence.
+    # Wait for an actual supervisor publication on the polling cadence selected for this case.
     async def status(self, predicate=lambda status: status.get("healthy") is True):
         async with asyncio.timeout(25):
             while True:
@@ -318,6 +323,7 @@ async def process_rig(
     *,
     native_peer: type[NativeVehiclePeer] = NativeVehiclePeer,
     bench_type: type[OwnerBench] = OwnerBench,
+    timing: ProcessTiming = "production",
 ):
     async with commissioned(
         directory, tls, listener, monkeypatch, current, cli_route=True, native_peer=native_peer, bench_type=bench_type
@@ -332,7 +338,7 @@ async def process_rig(
         save_private(directory / "process-strategy.json", json.loads(strategy.read_text()))
         await original.controller.charging.close()
         await crash(original.session)
-        child = ServiceProcess(rig, directory, management)
+        child = ServiceProcess(rig, directory, management, timing)
         try:
             yield child
         finally:

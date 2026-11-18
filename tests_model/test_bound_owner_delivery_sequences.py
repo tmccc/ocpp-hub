@@ -35,6 +35,7 @@ async def test_bound_owner_delivery_sequences(
             case.selected,
             bench_type=StartReplyBench,
             native_peer=InterruptedNativePeer,
+            timing="production" if case.selected == 6 and not case.demand else "fast-cloud-retry",
         ) as child:
             await child.start()
             state = await child.status()
@@ -73,6 +74,8 @@ async def test_bound_owner_delivery_sequences(
                         break
                     await asyncio.sleep(0.1)
             head = child.durable()["outbox"][0]
+            attempts = [frame for frame in child.rig.bench.lifecycle_wires if frame[1] == head["token"]]
+            assert len(attempts) == (1 if case.cloud == "silent" else 3)
             quarantined = child.durable()
             assert next(row for row in quarantined["requests"] if row["id"] == identifier)["state"] == "uncertain"
             assert quarantined["metadata"]["managed_test_charge"]["start_rpc_accepted"] is False
