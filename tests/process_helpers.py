@@ -199,6 +199,10 @@ class ServiceProcess:
         await self.status(
             lambda value: value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == expected
         )
+        return await self.scheduled_sessions(expected, demand, start_minute=start_minute)
+
+    # Exercise the restored native schedule without another management request.
+    async def scheduled_sessions(self, expected, demand, *, start_minute=0):
         locals_seen = []
         demands = demand if isinstance(demand, tuple) else (demand, demand)
         for epoch, demand in enumerate(demands):

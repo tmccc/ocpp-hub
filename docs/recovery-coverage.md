@@ -69,9 +69,12 @@ is tested separately from applied-but-unanswered writes. All existing HA outage/
 
 Focused autonomous checks complement the finite families. The actual child service combines a saved accepted cloud
 Start with failed acknowledgement COMMIT, repeated native503 responses, a genuine rejected zero profile and a new
-Boot. Both storage/native repair orders at6/32A retain exact receipts and two later sessions/outages in the same service
-process. HA's actual scheduler observes and recovers two successive transport/schema/cloud outages, including a
-production-five-second polling control. Pending Pause tests retain positive independent peer output until an external
+Boot. Both storage/native repair orders at 6 A and 32 A retain exact receipts. The native-first replacement cases
+also kill the service while it reports verified zero and SQLite still refuses acknowledgement. A new process
+re-establishes zero, keeps the saved reply and settles it without resending the cloud Start. Two later native
+sessions and outages follow the verified Return. HA's actual scheduler observes and recovers two successive
+transport/schema/cloud outages, including a production-five-second polling control. Pending Pause tests retain
+positive independent peer output until an external
 zero event. Shared manual recovery helpers require the exact completed Return receipt and at least three fresh actual
 failed getConfig reads per outage; manual ticks or an older healthy paused status cannot satisfy those obligations.
 

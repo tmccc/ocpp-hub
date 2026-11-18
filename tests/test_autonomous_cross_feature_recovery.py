@@ -1,4 +1,4 @@
-"""Three real failures and a new Boot compose under the unmodified standalone service poller."""
+"""Three real failures compose through Boot and process replacement under the standalone poller."""
 
 import asyncio
 import copy
@@ -78,10 +78,19 @@ async def close_after_wire_stop(child, local):
     )[0] == 3
 
 
-# Intent: real ACK COMMIT failure, native503 and rejected zero compose through both repair orders and new Boot.
+# A verified hold is physical evidence even while cloud delivery keeps readiness and Return unavailable.
+def assert_hold_waiting(status):
+    assert status["local_hold_verified"] and status["desired_control"] == "paused"
+    assert status["station_ceiling_a"] == status["current_a"] == status["power_w"] == 0
+    assert status["charging_session_open"] is False and status["pending_lifecycle_events"] > 0
+    assert not status["owner_control_enabled"] and not status["healthy"] and not status["local_healthy"]
+    assert not status["can_start"] and not status["can_return"]
+
+
+# Intent: real ACK COMMIT failure, native503 and rejected zero compose through both repair orders and replacement.
 # Why: isolated one-fault models and helper ticks cannot establish autonomous progress or honest receipt ownership.
 @pytest.mark.parametrize("selected", [6, 32])
-@pytest.mark.parametrize("repair_order", ["storage-first", "native-first"])
+@pytest.mark.parametrize("repair_order", ["storage-first", "native-first", "native-first-restart"])
 async def test_service_three_failures_pause_return_boot_and_later_sessions(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, selected, repair_order
 ):
@@ -169,6 +178,7 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
             # A genuine same-socket Boot supersedes the old introduction while both independent faults still remain.
             assert (await rig.bench.call(child.socket, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
             assert (await receipt(child, return_id))["state"] != "completed"
+            replaced_return = None
             if repair_order == "storage-first":
                 repair_ack_commit(path)
                 repaired = True
@@ -186,9 +196,32 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                         value.get("checked_at", 0) > first["checked_at"] and value.get("local_hold_verified") is True
                     )
                 )
-                assert not first["healthy"] and not later["healthy"] and has_saved_reply(path, held)
-                assert (await receipt(child, return_id))["state"] in ("accepted", "running", "uncertain")
+                assert_hold_waiting(first)
+                assert_hold_waiting(later)
+                assert has_saved_reply(path, held)
+                pending_return = await receipt(child, return_id)
+                assert pending_return["state"] in ("accepted", "running", "uncertain")
                 assert firmware.effective_limit() == 0
+                if repair_order == "native-first-restart":
+                    await child.kill()
+                    # After death the committed row can no longer change before the replacement reads it.
+                    interrupted = next(row for row in child.durable()["requests"] if row["id"] == return_id)
+                    assert interrupted["state"] in ("accepted", "running", "uncertain")
+                    await child.start()
+                    current = await child.status(lambda value: value.get("local_hold_verified") is True)
+                    assert_hold_waiting(current)
+                    assert current["pid"] == child.process.pid != original_pid
+                    assert firmware.effective_limit() == 0 and has_saved_reply(path, held)
+                    assert wire_count(rig, held.token) == 1
+                    replaced_return = await receipt(child, return_id)
+                    assert replaced_return == {
+                        "id": return_id,
+                        "action": "app_control",
+                        "state": "uncertain",
+                        "result": json.loads(interrupted["result"])
+                        if interrupted["state"] == "uncertain"
+                        else {"classification": "process_replaced"},
+                    }
                 repair_ack_commit(path)
                 repaired = True
             await child.delivered(local, closed=True)
@@ -199,6 +232,8 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
             old_return = {key: row[key] for key in ("id", "action", "state")}
             old_return["result"] = json.loads(row["result"])
             assert old_return["id"] == return_id and old_return["action"] == "app_control"
+            if replaced_return is not None:
+                assert old_return == replaced_return
             if old_return["state"] == "completed":
                 assert old_return["result"] == {"app_control_enabled": True, "charging_started": False}
                 assert before_pause["metadata"]["managed_control_intent"] == {
@@ -212,7 +247,7 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                     "mode": "paused",
                     "revision": early_return_revision,
                 }
-                if old_return["state"] == "uncertain":
+                if old_return["state"] == "uncertain" and replaced_return is None:
                     assert old_return["result"] == {"classification": "return_not_confirmed"}
             current = (await child.request("status"))["result"]
             newer_pause = await child.request("pause", revision=current["control_revision"])
@@ -245,7 +280,7 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
             assert current["control_revision"] == expected_pause_revision
             newer_return = await child.request("app_control", revision=expected_pause_revision)
             assert newer_return["ok"]
-            await child.completed_control(newer_return["result"]["id"])
+            completed_return = await child.completed_control(newer_return["result"]["id"])
             snapshot = child.durable()
             assert snapshot["metadata"]["managed_control_intent"] == {
                 "mode": "app",
@@ -258,10 +293,12 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                 lambda value: value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == selected
             )
             assert final["healthy"] and wire_count(rig, held.token) == 1
-            assert not any(frame[2] == "RemoteStartTransaction" for frame in rig.bench.device_calls)
-            await child.ordinary_recovery(selected, (True, False), start_minute=10)
+            await child.scheduled_sessions(selected, (True, False), start_minute=10)
             assert await receipt(child, return_id) == terminal_old_return
-            assert child.process.pid == original_pid and child.generation == 1 and child.process.returncode is None
+            assert await receipt(child, completed_return["id"]) == completed_return
+            assert not any(frame[2] == "RemoteStartTransaction" for frame in rig.bench.device_calls)
+            assert child.generation == (2 if repair_order == "native-first-restart" else 1)
+            assert child.process.returncode is None
             assert firmware.plans == original_plan and peer.configuration == original_config
             assert not rig.bench.backend_errors and all(row["closed"] for row in rig.bench.backend_starts)
             assert child.durable()["outbox"] == [] and child.durable()["metadata"].get("managed_control_fault") is None
@@ -271,6 +308,7 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                         "selected": selected,
                         "repair_order": repair_order,
                         "pid": original_pid,
+                        "replacement_pid": child.process.pid if child.kills else None,
                         "first_outage_actual_failed_getConfig": len(failed),
                         "actual_zero_refusals": len(zero_rejections),
                         "original_start_wire_count": wire_count(rig, held.token),

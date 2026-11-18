@@ -155,9 +155,9 @@ An operation completes only its current ticket. The owner preserves unknown fiel
 performs no I/O beyond the existing journal write and joins its caller's transaction without nesting one.
 
 `ManagedController._tick()` is the orchestration: pending work, fault maintenance, supervised observation,
-assessment and view publication. The effect-bearing methods retain their original ordering. `ControlFacts` and
-`assess()` in `supervision.py` explain when a completed observation needs a fault and how authority, local health
-and cloud health differ. A fault or shutdown removes authority labels while retaining physical evidence. Shared
+assessment and view publication. The poll and the API use `ControlProof` in `supervision.py` to keep observed
+authority scoped to the current control record. A delivery wait can block local and cloud readiness while a
+verified zero remains visible. A fault or shutdown withdraws authority labels while retaining physical evidence. Shared
 and local-hold predicates distinguish legacy falsey flags from explicit Boolean confirmations. Optional cloud
 authorization is read only after local readiness, preserving fault precedence. A snapshot never grants permission
 for a later send; exact native/Boot/ticket checks remain at the actual effect and COMMIT boundaries.

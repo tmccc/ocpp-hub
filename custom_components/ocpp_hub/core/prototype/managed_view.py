@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .store import Journal
-from .supervision import HealthVerdict, PollStatus
+from .supervision import ControlProof, HealthVerdict, PollStatus
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -29,7 +29,9 @@ def finite_number(value: object) -> float | None:
 
 
 # A fresh file or API response must still prove the applicable app or intentional zero-hold authority.
-def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+def health_snapshot(
+    value: dict[str, Any], now: float | None = None, *, delivery_blocked: bool = False
+) -> dict[str, Any]:
     current = time.time() if now is None else now
     checked, native = finite_number(value.get("checked_at")), finite_number(value.get("native_observed_at"))
     age = current - checked if checked is not None else math.inf
@@ -59,6 +61,7 @@ def health_snapshot(value: dict[str, Any], now: float | None = None) -> dict[str
         and value.get("boot_verified") is True
         and value.get("phase") == "active"
         and value.get("preservation_failed") is False
+        and not delivery_blocked
         and value.get("cloud_start_pending") is not True
         and selected is not None
         and 6 <= selected <= native_ceiling
@@ -244,10 +247,10 @@ def observed_status(
         "phase": j.phase.read().value,
         "cloud_connected": verdict.cloud_ready,
         "state": verdict.state,
-        "owner_control_enabled": verdict.shared,
+        "owner_control_enabled": verdict.proof.shared,
         "desired_control": c.requests.intent().mode,
         "control_revision": c.requests.intent().revision,
-        "local_hold_verified": verdict.hold_verified,
+        "local_hold_verified": verdict.proof.hold_verified,
         "native_observed_at": native.physical.observed_at,
         "native_limit_a": native.runtime_user_a,
         "requested_current_a": c.current.selected(),
@@ -356,30 +359,34 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         or c.status_vendor_epoch != g._vendor_epoch
     ):
         result["cloud_connected"] = False
-    if (
+    scope_current = not (
         c.stopping
         or j.fault.latched()
         or not result.get("charger_connected")
         or c.latest_native is None
         or c.status_authority is None
         or c.authority() != c.status_authority
-    ):
-        result.update(local_hold_verified=False, owner_control_enabled=False)
-    if not phase.active or not control.shared or c.released_epoch != g._charger_epoch:
-        result["owner_control_enabled"] = False
-    # Physical zero can be verified while delivery or recovery still blocks shared control.
-    if not control.local_hold:
-        result["local_hold_verified"] = False
-    if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
+    )
+    intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
+    if not intent_current:
         pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
-        result.update(
-            state="pausing" if intent.mode == "paused" and not pending else "reconciling",
-            local_hold_verified=False,
-            owner_control_enabled=False,
-        )
-    result.update(desired_control=intent.mode, control_revision=intent.revision)
-    result["api_version"] = 1
-    result = health_snapshot(result)
+        result.update(state="pausing" if intent.mode == "paused" and not pending else "reconciling")
+    proof = ControlProof(
+        shared=result.get("owner_control_enabled") is True,
+        hold_verified=result.get("local_hold_verified") is True,
+    ).retain(
+        control,
+        scope_current=scope_current and intent_current,
+        released=phase.active and c.released_epoch == g._charger_epoch,
+    )
+    result.update(
+        api_version=1,
+        desired_control=intent.mode,
+        control_revision=intent.revision,
+        owner_control_enabled=proof.shared,
+        local_hold_verified=proof.hold_verified,
+    )
+    result = health_snapshot(result, delivery_blocked=runtime.delivery_blocked)
     if result["state"] in ("healthy", "local_only") and not result["healthy"]:
         result["state"] = "local_only" if result["local_healthy"] else "degraded"
     result["can_pause"] = not c.stopping

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import ssl
 import uuid
 from pathlib import Path
@@ -16,6 +17,7 @@ from websockets.exceptions import InvalidStatus
 
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN, call
+from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
 
@@ -67,6 +69,23 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert (await call(socket, "receipt", request_id=request))["result"]["state"] == "completed"
                     status = (await call(socket, "status"))["result"]
                     assert status["healthy"] and status["local_hold_verified"] and status["can_return"]
+                    # Fail the real delivery pump after the last complete poll.
+                    async def refuse_flush():
+                        raise sqlite3.OperationalError("delivery storage unavailable")
+
+                    runtime = session.runtime.status
+                    with monkeypatch.context() as blocked:
+                        blocked.setattr(session.gateway, "flush", refuse_flush)
+                        await until(lambda: runtime.delivery_blocked_cause == "storage")
+                        waiting = (await call(socket, "status"))["result"]
+                        assert waiting["checked_at"] == status["checked_at"]
+                        assert waiting["local_hold_verified"] and waiting["cloud_connected"]
+                        assert not waiting["owner_control_enabled"]
+                        assert not waiting["healthy"] and not waiting["local_healthy"]
+                        assert not waiting["can_return"] and not waiting["can_start"]
+                        assert waiting["state"] == "degraded"
+                    await until(lambda: not runtime.delivery_blocked)
+                    assert (await call(socket, "status"))["result"]["can_return"]
                     assert rig.bench.received_limits[len(before) :] == [0] and not starts(rig)
                     await socket.send(
                         '{"id":"' + uuid.uuid4().hex + '","command":"pause","command":"app_control","revision":1}'
