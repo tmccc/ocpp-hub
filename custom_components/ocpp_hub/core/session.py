@@ -337,7 +337,7 @@ class ChargerSession:
     # The snapshot is what Home Assistant shows, and the purpose spares the next write the purposes that were refused.
     # A session whose connection has ended records nothing: the charger may already be on a newer session, and an
     # old snapshot must not overwrite what the entities show.
-    def record_limit(self, amps: float | None, purpose: str | None) -> None:
+    def record_limit(self, amps: float | None, purpose: str | None, *, from_plan: bool = False) -> None:
         if not self._snapshot.connected:
             return
         # New knowledge replaces the old answer of the charger, which no longer describes what is in effect. The hub's
@@ -347,7 +347,7 @@ class ChargerSession:
             limit_purpose=purpose,
             composite_limit_a=None,
             hub_limit_restored=False,
-            profile_writes=self._snapshot.profile_writes + 1,
+            external_profile_writes=self._snapshot.external_profile_writes + int(not from_plan),
         )
 
     # Keep the planning that the Raedian app set in the charger, as the windows it wrote or the charger answered.

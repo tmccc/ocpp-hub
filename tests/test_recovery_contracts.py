@@ -256,10 +256,6 @@ def test_failure_kinds_do_not_create_business_waits(kind):
     assert result.failure is error and error.__cause__ is not None
 
 
-# Intent: only exact verified timer supersession may yield even when the old rollback lost its own claim.
-# Why: a pending newer zero is not the old attempt's zero proof, and strict/storage failures still dominate it.
-
-
 # Intent: published effect snapshots cannot be changed, and a new operation does not inherit an old failure.
 # Why: same-attempt monotonic provenance must coexist with legitimate fresh recovery after an earlier operation.
 def test_effect_snapshot_is_immutable_and_fresh_operation_policy_is_independent():

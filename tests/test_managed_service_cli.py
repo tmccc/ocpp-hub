@@ -10,10 +10,12 @@ import ssl
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_native_repair import REVOCATIONS, repair_pending, repair_revoked
 from ocpp_hub_core.prototype.native_bounded import NativeBoundedSpec
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.rpc import UnavailableError
@@ -25,6 +27,8 @@ from tests.connected_rig import connected_bench
 from tests.management_peer import TOKEN, call
 from tests.prototype_rig import BOOT
 from tests.runtime_rig import FAST, until
+from tests.test_native_repair_storage import refused_write
+from tests.test_ordinary_legacy_transport_recovery import legacy_fault
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 from tools import managed_proxy
@@ -296,7 +300,8 @@ async def test_stop_request_fences_inflight_release_before_positive_send(
 # Intent: the actual managed runner handles a stop signal by retaining zero and writing a stopped report.
 # Why: systemd shutdown must retire both connections and the journal without clearing profiles or restoring32.
 @pytest.mark.parametrize(
-    "management_enabled,failed_output", [(False, None), (True, None), (True, "status"), (True, "events")]
+    "management_enabled,failed_output,repair",
+    [(False, None, False), (True, None, False), (True, "status", False), (True, "events", False), (True, None, True)],
 )
 async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
     tmp_path: Path,
@@ -306,6 +311,7 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
     unused_tcp_port_factory: Any,
     management_enabled: bool,
     failed_output: str | None,
+    repair: bool,
 ) -> None:
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         value = rig.spec.value()
@@ -314,6 +320,7 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
         spec_path = tmp_path / "native-spec.json"
         save_private(spec_path, value)
         sessions = []
+        controllers = []
         callbacks: dict[Any, Any] = {}
         removed = []
         notifications = []
@@ -326,6 +333,12 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
             rig.sessions.append(session)
             return session
 
+        # Observe the runner's real controller without substituting its work or its poll cadence.
+        def create_controller(session: TrialSession) -> ManagedController:
+            controller = ManagedController(session)
+            controllers.append(controller)
+            return controller
+
         # Signal registration is the outer runner boundary, separate from the real engine under test.
         def register(signum: Any, callback: Any) -> None:
             callbacks[signum] = callback
@@ -337,6 +350,7 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
 
         monkeypatch.setattr(managed_proxy, "preflight", lambda path: rig.prepared)
         monkeypatch.setattr(managed_proxy, "TrialSession", create_session)
+        monkeypatch.setattr(managed_proxy, "ManagedController", create_controller)
         monkeypatch.setattr(managed_proxy, "notify", notifications.append)
         monkeypatch.setattr(loop, "add_signal_handler", register)
         monkeypatch.setattr(loop, "remove_signal_handler", remove)
@@ -381,6 +395,27 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                                     break
                                 await asyncio.sleep(0.1)
                         assert rig.bench.firmware.effective_limit() == 0
+                        if repair:
+                            controller, j = controllers[0], session.journal
+                            b = SimpleNamespace(c=controller, rig=rig, session=session)
+                            fault = await legacy_fault(b, "NativeTransportUnavailableError")
+                            before = dict(rig.peer.configuration)
+                            with refused_write(j, REVOCATIONS, "statement"):
+                                rig.peer.configuration["untouched"] = "independent native contradiction"
+                                paused = await call(socket, "pause", revision=controller.requests.intent().revision)
+                                assert paused["ok"]
+                                async with asyncio.timeout(12):
+                                    while True:
+                                        assert not running.done()
+                                        status = (await call(socket, "status"))["result"]
+                                        if status.get("fault") == "native_repair_publication_pending":
+                                            break
+                                        await asyncio.sleep(0.05)
+                                assert repair_pending(j, fault) and not status["can_return"]
+                                rig.peer.configuration = before
+                            await until(lambda: repair_revoked(j, fault), timeout=10)
+                            assert not running.done() and sessions == [session] and not repair_pending(j, fault)
+                            assert rig.bench.firmware.effective_limit() == 0
                         if failed_output is not None:
                             before = (await call(socket, "status"))["result"]
                             async with asyncio.timeout(12):
@@ -414,7 +449,3 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                     callbacks[signal.SIGTERM]()
                 running.cancel()
                 await asyncio.gather(running, return_exceptions=True)
-
-
-# Intent: the production service's independent deadline task protects a full open car while its main poll is stalled.
-# Why: invoking the controller in a test cannot detect a missing, prematurely cancelled, or unwired service task.

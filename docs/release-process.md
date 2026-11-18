@@ -18,11 +18,9 @@ charging test. Follow the owner's current testing and operational constraints.
 ## Versioning
 
 Keep the version aligned in `pyproject.toml`, both integration manifests and the newest numeric release heading in
-`CHANGELOG.md`. `python tools/version.py bump X.Y.Z` updates the package and older `ocpp_hub` manifest only; update
-the separate `ics_proxy` manifest and changelog heading/notes explicitly. The helper's `check` action compares the
-package and older manifest and looks for a matching changelog heading. It does not check the client manifest or
-prove that the matching heading is the newest numeric release; inspect those separately. The `Unreleased` section
-records work after that release; documentation changes alone do not require a version bump.
+`CHANGELOG.md`. `python tools/version.py bump X.Y.Z` updates the package and both manifests. Add the changelog
+heading and release notes separately. The helper's `check` action compares all four versions. The `Unreleased`
+section records work after the latest release. Documentation changes alone do not require a version bump.
 Version comparison preserves dotted components and normalizes the documented prerelease spelling only. The
 release job uses `python -m tools.release_notes "$GITHUB_REF_NAME" --output /tmp/release_notes.md` to select that
 exact numeric heading, skipping `Unreleased`. Missing or empty notes fail the release instead of selecting another

@@ -112,17 +112,19 @@ class ManagementServer:
             if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
                 raise SecurityError("management receipt identifier is invalid")
             return self.read_only(value["id"], command, request_id=identifier)
-        if command == "set_current" and set(value) == {"id", "command", "revision", "current_a"}:
-            result = self.controller.command(value["id"], command, value["revision"], current_a=value["current_a"])
-            return {"id": value["id"], "ok": True, "result": result}
-        if command in ("pause", "app_control", "start", "start_test", "arm_cloud_test") and set(value) == {
-            "id",
-            "command",
-            "revision",
-        }:
-            result = self.controller.command(value["id"], command, value["revision"])
-            return {"id": value["id"], "ok": True, "result": result}
-        raise SecurityError("management command is not supported")
+        fields = {"id", "command", "revision"}
+        if command == "set_current":
+            fields.add("current_a")
+        elif command not in ("pause", "app_control", "start", "start_test", "arm_cloud_test"):
+            raise SecurityError("management command is not supported")
+        if set(value) != fields:
+            raise SecurityError("management command is not supported")
+        try:
+            result = self.controller.command(value["id"], command, value["revision"], current_a=value.get("current_a"))
+        except sqlite3.Error:
+            # A reply read can fail after admission commits, so preserve uncertainty and allow a receipt lookup.
+            return {"id": value["id"], "ok": False, "error": "outcome_unknown"}
+        return {"id": value["id"], "ok": True, "result": result}
 
     # A failed journal read returns no guessed state; sent controls retain their separate unknown-outcome handling.
     def read_only(self, identifier: str, command: str, *, request_id: str | None = None) -> dict[str, Any]:

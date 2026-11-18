@@ -146,7 +146,12 @@ async def test_the_limit_is_saved_and_shown_again_after_a_reload(
 # fail to load on every start until the file was removed by hand.
 @pytest.mark.parametrize(
     "stored",
-    [["not", "an", "object"], {"limits": ["x"]}, {"limits": {"TEST0001": "x", "OTHER": {"hub_a": 6.0}}}],
+    [
+        ["not", "an", "object"],
+        {"limits": ["x"]},
+        {"limits": {"TEST0001": "x", "OTHER": {"hub_a": 6.0}}},
+        {"limits": {"TEST0001": {"hub_a": 10**400}, "OTHER": {"hub_a": 6.0}}},
+    ],
 )
 async def test_damaged_limit_storage_does_not_stop_the_setup(
     hass: HomeAssistant,

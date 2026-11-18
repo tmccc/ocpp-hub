@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
-from .connection_scope import control_scope_matches, current_control_scope, current_scope
+from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
 from .local_control import local_start_receipt
 from .managed_charging import ManagedCharging
@@ -21,7 +21,7 @@ from .managed_current_recovery import capture_interrupted_collision
 from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault
 from .managed_intent import ManagedRequests, write_intent
-from .managed_native_repair import NativeRepairAudits
+from .managed_native_repair import NativeRepairAudits, RepairPublicationError
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
 from .managed_release_wait import awaiting_known_stops
 from .managed_settlement import (
@@ -94,6 +94,8 @@ class ManagedController:
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
+        self.status_scope: ControlScope | None = None
+        self.status_vendor_epoch: int | None = None
 
         self.current = ManagedCurrentLimits(self)
         self.charging = ManagedCharging(self)
@@ -750,8 +752,11 @@ class ManagedController:
 
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
     async def tick(self) -> dict[str, Any]:
-        status = await self._tick()
-        return status
+        try:
+            return await self._tick()
+        except RepairPublicationError:
+            self.latest_native = None
+            return poll_status(self, PollStatus("attention", "native_repair_publication_pending"), pending=True)
 
     # A poll first joins owned work, then supervises, assesses current authority and publishes one view.
     async def _tick(self) -> dict[str, Any]:

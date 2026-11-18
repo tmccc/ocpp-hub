@@ -46,8 +46,8 @@ window  = enabled (01, or 00 for a window that is switched off),
 ```
 
 An answer to a read has the same layout. An empty plan answers `00 00`. The app switches a window off instead of
-removing it, so a write can contain disabled windows; the hub drops them. The plan is kept by the hub, not by the
-charger: the charger answers an empty plan to a read.
+removing it, so the hub keeps disabled windows in the stored plan and excludes them from the active profile.
+The charger answers an empty plan to a read. The hub returns its stored plan to the app.
 
 ## Reading an unknown command
 

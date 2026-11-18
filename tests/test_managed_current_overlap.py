@@ -321,10 +321,6 @@ async def test_explicit_pause_preempts_current_recovery(
         assert set(b.stops()) == {local} and b.device.plans == {9: original} and not starts(b.rig)
 
 
-# Intent: after a real one-off cutoff and physical cleanup, a later failed increase preserves both daily windows.
-# Why: historical timer completion must not create or remove authority over unrelated future daily transactions.
-
-
 # Intent: source changes during final send validation revoke positive recovery and retain zero until reidentified.
 # Why: an earlier matching native plan cannot authorize a release after fresher evidence contradicts its source.
 @pytest.mark.parametrize("reject_rollback", [False, True])

@@ -7,17 +7,6 @@ import pytest
 from tests_model.ha_cases import OutageCase, outage_exclusion
 from tests_model.recovery_cases import StartRecoveryCase, start_exclusion
 
-# Intent: each side of the source-loss boundary is independently named and classified with its causal reason.
-# Why: reversing the comparison preserves sixty admitted orders and would pass denominator-only checks.
-
-
-# Intent: an equal-count membership swap fails the named witness contract despite preserving the denominator.
-# Why: this explicit negative control demonstrates why a correct aggregate count is insufficient evidence.
-
-
-# Intent: cutoff ordering and physical departure each retain their separately stated admission boundary.
-# Why: a generic event permutation count cannot identify either causal exclusion getting inverted.
-
 
 # Intent: replay and startup replacement require their specific predecessors; a timed test remains six amperes.
 # Why: these exclusions encode distinct command receipt and fresh-startup obligations rather than a count target.

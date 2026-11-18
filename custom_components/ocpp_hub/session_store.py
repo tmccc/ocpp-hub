@@ -37,7 +37,7 @@ class SessionStore:
         for record in records if isinstance(records, list) else []:
             try:
                 loaded.append(ChargeSession.from_dict(record))
-            except KeyError, TypeError, ValueError:
+            except KeyError, TypeError, ValueError, OverflowError:
                 _LOGGER.warning("Skipping an unreadable charge record in the session history")
         self._sessions = loaded
 
@@ -82,7 +82,7 @@ class LimitStore:
         for cp_id, record in records.items() if isinstance(records, dict) else []:
             try:
                 self._limits[cp_id] = LimitMemory.from_dict(record)
-            except KeyError, TypeError, ValueError, AttributeError:
+            except KeyError, TypeError, ValueError, AttributeError, OverflowError:
                 _LOGGER.warning("Skipping an unreadable limit record in storage")
         return dict(self._limits)
 
@@ -125,7 +125,7 @@ class PlanStore:
                 self._plans[cp_id] = [
                     PlanWindow(int(w[0]), int(w[1]), int(w[2]), bool(w[3]) if len(w) > 3 else True) for w in windows
                 ]
-            except KeyError, TypeError, ValueError, IndexError:
+            except KeyError, TypeError, ValueError, IndexError, OverflowError:
                 _LOGGER.warning("Skipping an unreadable plan in storage")
         switches = stored.get("planning") if isinstance(stored, dict) else None
         self._planning = {cp: bool(on) for cp, on in switches.items()} if isinstance(switches, dict) else {}

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from .connection_scope import control_scope_matches, current_control_scope
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .store import Journal
 from .supervision import HealthVerdict, PollStatus
@@ -234,6 +235,8 @@ def observed_status(
 
     j, g = c.session.journal, c.session.gateway
     history = summarize_charger_history(native.history)
+    c.status_scope = current_control_scope(g)
+    c.status_vendor_epoch = g._vendor_epoch
     return {
         **base,
         "start_authorization": c.charging.authorization_status(),
@@ -335,6 +338,20 @@ def _return_refusal(c: ManagedController, mode: str, status: dict[str, Any]) -> 
 def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[str, Any]:
     result = dict(published)
     intent = c.requests.intent()
+    g, runtime = c.session.gateway, c.session.runtime.status
+    if not runtime.charger_connected or g.charger.sender is None:
+        result["charger_connected"] = False
+    if not g.current_boot_seen(g._charger_epoch):
+        result["boot_verified"] = False
+    if (
+        not runtime.vendor_connected
+        or g.vendor.sender is None
+        or g.vendor_registration != "Accepted"
+        or c.status_vendor_epoch != g._vendor_epoch
+    ):
+        result["cloud_connected"] = False
+    if c.stopping or not result.get("charger_connected") or not control_scope_matches(g, c.status_scope):
+        result.update(local_hold_verified=False, owner_control_enabled=False)
     if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
         pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
         result.update(

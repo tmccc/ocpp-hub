@@ -185,7 +185,7 @@ def _control_policy(entry: OcppHubConfigEntry) -> ControlPolicy:
     wanted = entry.options.get(CONF_MAX_CURRENT, DEFAULT_MAX_CURRENT)
     try:
         return ControlPolicy(max_current_a=float(wanted))
-    except TypeError, ValueError:
+    except TypeError, ValueError, OverflowError:
         # The lowest ceiling that can work, not the default: an unreadable ceiling must never be wider than meant.
         _LOGGER.error("The current ceiling %r is not valid; using the minimum of %s A", wanted, CHARGING_MIN_A)
         return ControlPolicy(max_current_a=CHARGING_MIN_A)

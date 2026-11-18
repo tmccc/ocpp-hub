@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from ..frames import Frame, build_call_error, build_call_result, parse_frame
+from ..frames import ERROR_FORMATION_VIOLATION, Frame, build_call_error, build_call_result
 from .auth_info import InfoBook, expiry, validate_info
 from .authorisation import VendorAuthorisation
 from .connection_scope import control_scope_matches, current_control_scope
@@ -44,6 +44,10 @@ from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, enco
 from .vendor_read_recovery import recover_legacy_vendor_read
 
 
+class MalformedCallError(DeniedError):
+    """A malformed request with a usable correlation ID."""
+
+
 # Reject malformed or non-finite input before handing it to the upstream frame vocabulary.
 def decode(raw: str | bytes) -> Frame:
     if not isinstance(raw, str):
@@ -51,14 +55,22 @@ def decode(raw: str | bytes) -> Frame:
     try:
         if len(raw.encode()) > 131072:
             raise DeniedError("frame must be bounded text")
-        encoded(json.loads(raw, object_pairs_hook=unique_object))
-        frame = parse_frame(raw)
+        frame = json.loads(raw, object_pairs_hook=unique_object)
+        encoded(frame)
     except ValueError, RecursionError:
         raise DeniedError("invalid JSON frame") from None
-    if frame is None or type(frame[0]) is not int or not isinstance(frame[1], str) or not 1 <= len(frame[1]) <= 36:
+    if (
+        not isinstance(frame, list)
+        or len(frame) < 2
+        or type(frame[0]) is not int
+        or not isinstance(frame[1], str)
+        or not 1 <= len(frame[1]) <= 36
+    ):
         raise DeniedError("invalid frame identifier")
-    if frame[0] == 2 and len(frame) == 4 and isinstance(frame[2], str) and isinstance(frame[3], dict):
-        return frame
+    if frame[0] == 2:
+        if len(frame) == 4 and isinstance(frame[2], str) and isinstance(frame[3], dict):
+            return frame
+        raise MalformedCallError(frame[1])
     if frame[0] == 3 and len(frame) == 3 and isinstance(frame[2], dict):
         return frame
     if (
@@ -251,8 +263,13 @@ class Gateway:
         current_epoch = self._charger_epoch if side == "charger" else self._vendor_epoch
         if epoch is not None and epoch != current_epoch:
             raise UnavailableError("retired connection")
-        frame = decode(raw)
         peer = self.charger if side == "charger" else self.vendor
+        try:
+            frame = decode(raw)
+        except MalformedCallError as error:
+            if peer.sender is not None:
+                await peer.sender(build_call_error(str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape"))
+            return
         if frame[0] != 2:
             peer.receive(frame)
             return
@@ -511,7 +528,7 @@ class Gateway:
             validate_observation(action, payload, self.journal, check_history=False)
             with self.journal.atomic():
                 published = self._observations.accept(self._charger_epoch, token.partition(":")[2], action, payload)
-                if action == "StatusNotification":
+                if published and action == "StatusNotification":
                     self.journal.put("last_status", payload)
                 elif published and action == "MeterValues" and type(payload.get("transactionId")) is int:
                     rows = payload.get("meterValue", [])

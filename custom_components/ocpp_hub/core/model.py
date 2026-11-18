@@ -112,9 +112,8 @@ class ChargerSnapshot:
     # that schedule starts. Empty when the charger did not say.
     schedule_start: datetime | None = None
     schedule_periods: tuple[tuple[int, float], ...] = ()
-    # How many times the hub has written or cleared its own profile on this connection; whoever keeps a plan that rides
-    # on that profile uses it to notice that something else replaced it.
-    profile_writes: int = 0
+    # Accepted profile changes outside the plan, counted per connection.
+    external_profile_writes: int = 0
     # The planning windows the Raedian app has set in the charger, as (weekday 1-7, start, end in seconds after
     # midnight); None until the app has written or read it on this connection.
     app_plan: tuple[tuple[int, int, int], ...] | None = None
@@ -178,16 +177,23 @@ class ChargeSession:
     # Rebuild a session from what to_dict wrote; a record that is damaged raises, so the caller can skip it.
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ChargeSession:
+        started_at = datetime.fromisoformat(data["started_at"])
+        ended_at = datetime.fromisoformat(data["ended_at"])
+        if (started_at.tzinfo is None) != (ended_at.tzinfo is None):
+            raise ValueError("session timestamps must use the same timezone convention")
+        energy = data.get("energy_wh")
+        if energy is not None and (type(energy) not in (float, int) or not math.isfinite(energy)):
+            raise ValueError("session energy must be a finite number")
         return cls(
             cp_id=str(data["cp_id"]),
             connector_id=int(data["connector_id"]),
             transaction_id=int(data["transaction_id"]),
             id_tag=data.get("id_tag"),
-            started_at=datetime.fromisoformat(data["started_at"]),
-            ended_at=datetime.fromisoformat(data["ended_at"]),
+            started_at=started_at,
+            ended_at=ended_at,
             meter_start_wh=data.get("meter_start_wh"),
             meter_stop_wh=data.get("meter_stop_wh"),
-            energy_wh=data.get("energy_wh"),
+            energy_wh=energy,
             max_power_w=data.get("max_power_w"),
             average_power_w=data.get("average_power_w"),
             max_current_a=dict(data.get("max_current_a") or {}),
@@ -236,7 +242,7 @@ class LimitMemory:
                 return None
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise TypeError(f"{key} is not a number")
-            if not math.isfinite(value) or not 0 <= value <= MAX_STORED_LIMIT_A:
+            if not 0 <= value <= MAX_STORED_LIMIT_A:
                 raise ValueError(f"{key} is outside what a charger can have")
             return float(value)
 

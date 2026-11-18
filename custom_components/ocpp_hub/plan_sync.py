@@ -7,8 +7,9 @@ the plan is kept only when that worked. The app is answered from the plan when i
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections import Counter
+from collections import defaultdict
 from collections.abc import Mapping
 
 from homeassistant.core import HomeAssistant
@@ -16,7 +17,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import CONF_SCHEDULE_INSIDE, CONF_SCHEDULE_OUTSIDE, plan_signal
 from .core.central import CentralSystem
-from .core.control import ChargerControl, ControlError
+from .core.control import ControlError
 from .core.model import ChargerSnapshot
 from .core.plan_bridge import windows_to_blocks
 from .core.raedian import PlanWindow
@@ -47,9 +48,8 @@ class PlanSync:
         self._store = store
         self._options = options
         self._central: CentralSystem | None = None
-        # How many profile writes the plan has seen per charger, and the chargers the plan is writing to right now.
         self._seen: dict[str, int] = {}
-        self._writing: Counter[str] = Counter()
+        self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     # Give the plan the central system it writes through; it is made after the mirror that needs the plan.
     def bind(self, central: CentralSystem) -> None:
@@ -85,31 +85,33 @@ class PlanSync:
     # is no longer held outside the windows, on writes the profile of the plan again.
     async def planning_switched(self, cp_id: str, on: bool) -> None:
         self._store.set_planning(cp_id, on)
-        windows = self._store.get(cp_id)
-        error_code = None
-        if windows:
-            try:
-                await self._apply(cp_id, windows, on)
-            except (ControlError, SchedulePlanError) as error:
-                error_code = error.code if isinstance(error, ControlError) else "invalid_schedule"
-                _LOGGER.warning(
-                    "[plan] Switching the planning %s for %s failed: %s", "on" if on else "off", cp_id, error
-                )
-        current = self._store.get(cp_id)
-        # A failed clear still matters to a replacement plan; only an exact matching success can clear an error.
-        if self._store.planning_on(cp_id) == on and (current == windows or error_code is not None and current):
-            self._store.set_profile_sync_error(cp_id, error_code)
+        async with self._locks[cp_id]:
+            if self.planning_on(cp_id) != on:
+                return
+            windows = self._store.get(cp_id)
+            error_code = None
+            if windows:
+                try:
+                    await self._apply(cp_id, windows, on)
+                except (ControlError, SchedulePlanError) as error:
+                    error_code = error.code if isinstance(error, ControlError) else "invalid_schedule"
+                    _LOGGER.warning(
+                        "[plan] Switching the planning %s for %s failed: %s", "on" if on else "off", cp_id, error
+                    )
+            if self.planning_on(cp_id) == on and self._store.get(cp_id) == windows:
+                self._store.set_profile_sync_error(cp_id, error_code)
         async_dispatcher_send(self._hass, plan_signal(self._entry_id, cp_id))
 
     # Set the plan: turn the windows into one recurring profile and write it, then keep the plan. An empty plan clears
     # the hub's profile instead, because a profile of nothing but the outside limit would hold the charger at that limit
     # all week. Raises ControlError or SchedulePlanError when it cannot be written, and keeps the old plan then.
     async def set_plan(self, cp_id: str, windows: list[PlanWindow]) -> None:
-        on = self.planning_on(cp_id)
-        await self._apply(cp_id, windows, on)
-        if self.planning_on(cp_id) == on:
-            self._store.set_profile_sync_error(cp_id, None)
-        self._keep(cp_id, windows)
+        async with self._locks[cp_id]:
+            on = self.planning_on(cp_id)
+            await self._apply(cp_id, windows, on)
+            if self.planning_on(cp_id) == on:
+                self._store.set_profile_sync_error(cp_id, None)
+            self._keep(cp_id, windows)
 
     # Write the plan to the charger as a profile, or clear the profile when the planning is off, while the snapshot
     # guard knows that the write is the plan's own.
@@ -117,20 +119,7 @@ class PlanSync:
         control = self._central.control(cp_id) if self._central is not None else None
         if control is None:
             raise ControlError("not_connected", "the charger is not connected")
-        self._writing[cp_id] += 1
-        try:
-            await self._write(control, windows if on else [])
-        finally:
-            self._writing[cp_id] -= 1
-            if not self._writing[cp_id]:
-                del self._writing[cp_id]
-            session = self._central.session(cp_id) if self._central is not None else None
-            if session is not None:
-                self._seen[cp_id] = session.snapshot.profile_writes
-
-    # Write the windows to the charger as one profile, or clear the hub's profile when there are none.
-    async def _write(self, control: ChargerControl, windows: list[PlanWindow]) -> None:
-        if any(window.enabled for window in windows):
+        if on and any(window.enabled for window in windows):
             inside = self._options.get(CONF_SCHEDULE_INSIDE)
             outside = self._options.get(CONF_SCHEDULE_OUTSIDE)
             plan = plan_week(
@@ -138,9 +127,9 @@ class PlanSync:
                 float(control.policy.max_current_a if inside is None else inside),  # type: ignore[arg-type]
                 float(0 if outside is None else outside),  # type: ignore[arg-type]
             )
-            await control.set_schedule(anchor_for(plan), plan.periods, plan.kind)
+            await control.set_schedule(anchor_for(plan), plan.periods, plan.kind, from_plan=True)
         else:
-            await control.clear_current_limit()
+            await control.clear_current_limit(from_plan=True)
 
     # Save the plans now; used when the entry unloads.
     async def async_flush(self) -> None:
@@ -151,11 +140,11 @@ class PlanSync:
     # emptied and the app is told so, instead of both going on to claim what the charger no longer follows.
     def snapshot_changed(self, snapshot: ChargerSnapshot) -> None:
         cp_id = snapshot.cp_id
-        if cp_id in self._writing or not snapshot.connected:
+        if not snapshot.connected:
             return
-        seen = self._seen.get(cp_id, snapshot.profile_writes)
-        self._seen[cp_id] = snapshot.profile_writes
-        if snapshot.profile_writes > seen and self._store.get(cp_id):
+        seen = self._seen.get(cp_id, 0)
+        self._seen[cp_id] = snapshot.external_profile_writes
+        if snapshot.external_profile_writes > seen and self._store.get(cp_id):
             _LOGGER.info("[plan] The profile of %s was replaced by another write; the plan is now empty", cp_id)
             self._keep(cp_id, [])
 

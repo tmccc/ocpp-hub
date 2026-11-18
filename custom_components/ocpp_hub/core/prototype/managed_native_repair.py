@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import uuid
 from collections.abc import Callable
@@ -83,6 +84,10 @@ class RepairAttempt:
         }
 
 
+class RepairPublicationError(sqlite3.Error):
+    """Storage refused an exact repair outcome still owned by the live controller."""
+
+
 class NativeRepairAudits:
     """One live audit may settle its own fence; replacement cannot invent its missing outcome."""
 
@@ -96,7 +101,10 @@ class NativeRepairAudits:
     def flush(self) -> None:
         if self.pending is not None:
             attempt, outcome, refusal = self.pending
-            self._publish(attempt, outcome, refusal)
+            try:
+                self._publish(attempt, outcome, refusal)
+            except sqlite3.Error as error:
+                raise RepairPublicationError("native repair publication awaits storage") from error
             self.pending = None
             self.active = None
 

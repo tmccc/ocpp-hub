@@ -87,10 +87,12 @@ async def sequence(tmp_path, model_tls, monkeypatch, record_property, case, fami
             monkeypatch.setattr(sock, "send", gate)
             after_boot = len(rig.bench.device_calls)
             after_boot_replies, reusable_zero = 0, False
+            failed_native_read = False
             await rig.bench.call(sock, uuid.uuid4().hex, "BootNotification", BOOT)
             if case.boundary == "native503":
                 async with asyncio.timeout(3):
-                    assert (await rig.peer.failed_reads.get())["action"] == "getConfig"
+                    failed_native_read = (await rig.peer.failed_reads.get())["action"] == "getConfig"
+                    assert failed_native_read
             else:
                 await asyncio.wait_for(entered.wait(), 3)
             try:
@@ -133,7 +135,7 @@ async def sequence(tmp_path, model_tls, monkeypatch, record_property, case, fami
                 record_property("model_input_sha256", input_digest(family, case))
                 record_property("completed_events", events)
                 record_property("suffix_complete", suffix_complete)
-                record_property("boundary_entered", bool(held) or case.boundary == "native503")
+                record_property("boundary_entered", bool(held) or failed_native_read)
 
 
 # Intent: all delayed old-proof reply/Boot/Pause orders require new proof and recover two ordinary sessions.

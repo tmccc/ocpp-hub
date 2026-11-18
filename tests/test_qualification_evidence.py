@@ -171,7 +171,20 @@ def test_auditor_accepts_complete_fixture(audit_fixture):
 
 # Intent: dynamic execution may differ from the old round-robin partition but still needs exact owner evidence.
 # Why: uneven assignment is expected when one worker is faster, while lost or fabricated grants must fail.
-@pytest.mark.parametrize("problem", [None, "duplicate", "wrong_worker", "grant_after_start", "premature_teardown"])
+@pytest.mark.parametrize(
+    "problem",
+    [
+        None,
+        "duplicate",
+        "wrong_worker",
+        "grant_after_start",
+        "premature_teardown",
+        "call_first",
+        "late_lookahead",
+        "late_terminal_grant",
+        "after_finish",
+    ],
+)
 def test_auditor_checks_dynamic_grants(audit_fixture, problem):
     batch, metadata = audit_fixture
     ids = json.loads((batch / "selected-ids.json").read_text())
@@ -200,6 +213,14 @@ def test_auditor_checks_dynamic_grants(audit_fixture, problem):
         first[2], first[4] = first[4], first[2]
     elif problem == "premature_teardown":
         first.insert(2, first.pop(7))
+    elif problem == "call_first":
+        first[5], first[6] = first[6], first[5]
+    elif problem == "late_lookahead":
+        first.insert(7, first.pop(3))
+    elif problem == "late_terminal_grant":
+        first.insert(-1, first.pop(8))
+    elif problem == "after_finish":
+        first.append({"event": "exception", "id": ids[1]})
     for path, assigned, rows in zip(paths, (ids, []), (first, second), strict=True):
         write_json(path.parent / "assigned-ids.json", assigned)
         path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -284,3 +305,43 @@ def test_default_validator_requires_raw_qualification():
         [sys.executable, "-B", "tools/validate.py", "--tests-only"], cwd=root, env=env, capture_output=True, text=True
     )
     assert result.returncode == 1 and "requires --qualification-report" in result.stdout
+
+
+# Intent: an unverified snapshot launches neither the manifest generator nor the independent collector.
+# Why: the raw failure report must not execute code from rejected qualification inputs.
+@pytest.mark.parametrize("changed", ["content", "commit", "directory"])
+def test_rejected_snapshot_runs_no_source_helper(audit_fixture, monkeypatch, changed):
+    batch, metadata = audit_fixture
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a source helper ran on a rejected snapshot")
+
+    monkeypatch.setattr(audit, "canonical_manifest", forbidden)
+    monkeypatch.setattr(audit, "canonical_collection", forbidden)
+    if changed == "commit":
+        write_json(batch / "snapshot.json", {**metadata, "commit": "0" * 40})
+    elif changed == "directory":
+        (batch / "source/duplicate").symlink_to(batch / "source/tools", target_is_directory=True)
+    else:
+        path = batch / "source/tests_ha_proxy/test_fixture.py"
+        path.chmod(0o644)
+        path.write_text("# changed bytes\n")
+    assert (
+        audit.main(
+            [str(batch), "--expected-commit", metadata["commit"], "--expected-source-digest", metadata["source_digest"]]
+        )
+        == 1
+    )
+
+
+# Intent: contradictory validation modes fail argument parsing.
+# Why: a release gate must never return success with zero checks.
+def test_validator_rejects_conflicting_check_modes():
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-B", "tools/validate.py", "--quick", "--tests-only"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2

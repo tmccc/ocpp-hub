@@ -138,9 +138,8 @@ changes rather than a cumulative total. Further simplification remains open.
   without collapsing dotted components. These tooling fixes do not change a charger session.
 - [x] Complete Claude's scoped fix review and addendum, all four full 20-worker suites, and verified deployment
   of the backend and thin HA client from `8f73bf9`. Focused regressions remain separate development evidence.
-- [ ] In the separate older Raedian integration, keep a successful planning-on profile aligned with a plan that
-  Home Assistant replaces concurrently while planning is off. The native app switching planning on during that
-  write can leave old windows active without an error. This pre-existing race does not affect the current iCS path.
+- [x] In the separate older Raedian integration, read the latest saved windows when applying a native planning
+  switch. Retire the saved plan when an accepted external profile write replaces it during a plan edit.
 
 ## iCS implementation history — 15–17 November 2026
 

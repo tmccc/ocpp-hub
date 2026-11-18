@@ -160,7 +160,3 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             with suppress(asyncio.CancelledError):
                 await supervisor
             await server.close()
-
-
-# Intent: the HA client can observe a scheduled full car reach the cutoff and recover its normal daily window.
-# Why: zero watts and an accepted Stop do not complete the schedule receipt or establish closure.

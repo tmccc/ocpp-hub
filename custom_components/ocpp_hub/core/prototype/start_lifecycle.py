@@ -171,6 +171,10 @@ class StartLifecycle:
     # Admission owns the new metadata and receipt row, while retaining an older wire receipt until preparation.
     def admit(self, lease: ChargeLease, action: str, startup: float, duration: float) -> None:
         j = self.journal
+        accepted_at = time.time()
+        local = lease.source == "local"
+        state = "accepted" if local else "completed"
+        result = {"accepted_at": accepted_at} if local else {"armed": True, "charging_started": False}
         with j.atomic():
             j.put(
                 "managed_test_charge",
@@ -179,9 +183,9 @@ class StartLifecycle:
                     "source": lease.source,
                     "kind": "normal" if lease.normal else "test",
                     "revision": lease.revision,
-                    "state": "starting" if lease.source == "local" else "armed",
-                    "accepted_at": time.time(),
-                    "hard_deadline_epoch": time.time() + startup + (0 if lease.normal else duration),
+                    "state": "starting" if local else "armed",
+                    "accepted_at": accepted_at,
+                    "hard_deadline_epoch": accepted_at + startup + (0 if lease.normal else duration),
                     "duration_seconds": None if lease.normal else duration,
                     "start_rpc_accepted": False,
                     "start_attempted": False,
@@ -189,8 +193,8 @@ class StartLifecycle:
                 },
             )
             j.db.execute(
-                "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
-                (lease.identifier, action, lease.revision, json.dumps({"accepted_at": time.time()})),
+                "INSERT INTO managed_requests VALUES(?,?,?,?,?)",
+                (lease.identifier, action, lease.revision, state, json.dumps(result)),
             )
         self.lease = lease
 

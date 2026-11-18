@@ -310,8 +310,6 @@ class ManagedCharging:
         self.timer = asyncio.create_task(self._deadline(lease))
         if source == "local":
             self.worker = asyncio.create_task(self._start(lease))
-        else:
-            c.requests.finish(identifier, "completed", {"armed": True, "charging_started": False})
         return c.requests.receipt(identifier)
 
     # Pause, deadline, shutdown, introduction, permission changes and a replaced request all revoke positive sends.
@@ -377,9 +375,9 @@ class ManagedCharging:
     # The service owns the worker after client disappearance; failures revoke only this Start's authority.
     async def _start(self, lease: ChargeLease) -> None:
         c, j = self.controller, self.journal
-        previous_current = current_candidate(c) if lease.normal else None
         effects = False
         try:
+            previous_current = current_candidate(c) if lease.normal else None
             self.guard(lease)
             renewed_tag = await self._renew_start_tag(lease) if lease.normal else None
             self.guard(lease)

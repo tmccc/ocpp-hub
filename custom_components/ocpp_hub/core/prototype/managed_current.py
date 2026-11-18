@@ -430,7 +430,7 @@ class ManagedCurrentLimits:
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
         previous_value = self.selected()
         with j.atomic():
-            write_intent(j, intent, intent.mode)
+            expected = write_intent(j, intent, intent.mode)
             j.current_change.begin(identifier, value, previous_value, intent.mode, j.get("next_transaction"))
             j.db.execute("INSERT INTO managed_current_requests VALUES(?,?)", (identifier, value))
             j.db.execute(
@@ -439,7 +439,6 @@ class ManagedCurrentLimits:
             )
             control = j.get("control", {})
             j.control.select(control, value, app=intent.mode == "app")
-        expected = c.requests.intent()
         self.worker = asyncio.create_task(
             self._apply(identifier, value, previous_value, expected.mode, expected.revision)
         )

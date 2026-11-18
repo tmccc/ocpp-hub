@@ -116,6 +116,53 @@ async def test_a_limit_written_after_the_plan_empties_the_plan(
     assert entry.runtime_data.plans.plan("TEST0001") == []
 
 
+# Intent: an accepted manual limit during a rejected plan replacement retires the old plan.
+# Why: a plan's pending fallback does not own the separate scalar ACK.
+async def test_rejected_replacement_cannot_hide_external_limit(hass, setup_hub, connect_charger):
+    charger, entry = await _booted(hass, setup_hub, connect_charger)
+    await _call(hass, charger, {"windows": [MONDAY_NOON]})
+    plans = entry.runtime_data.plans
+    replacement = asyncio.create_task(plans.app_wrote("TEST0001", [PlanWindow(2, 46800, 61200)]))
+    first = await charger.next_hub_call()
+    control = entry.runtime_data.central.control("TEST0001")
+    scalar = asyncio.create_task(control.set_current_limit(10))
+    await asyncio.sleep(0)
+    await charger.answer(first, {"status": "Rejected"})
+    manual = await charger.next_hub_call()
+    assert manual[3]["csChargingProfiles"]["chargingProfileKind"] != "Recurring"
+    await charger.answer(manual, {"status": "Accepted"})
+    await scalar
+    fallback = await charger.next_hub_call()
+    assert fallback[3]["csChargingProfiles"]["chargingProfileKind"] == "Recurring"
+    await charger.answer(fallback, {"status": "Rejected"})
+    assert not await replacement
+    assert plans.plan("TEST0001") == []
+
+
+# Intent: a native enable waiting on a plan edit uses the replacement windows after the edit's ACK.
+# Why: keeping the new windows in HA while reinstalling the earlier ones would misreport what the charger follows.
+async def test_native_enable_uses_concurrent_plan_replacement(hass, setup_hub, connect_charger):
+    charger, entry = await _booted(hass, setup_hub, connect_charger)
+    await _call(hass, charger, {"windows": [MONDAY_NOON]})
+    plans = entry.runtime_data.plans
+    off = asyncio.create_task(plans.planning_switched("TEST0001", False))
+    await charger.answer(await charger.next_hub_call(), {"status": "Accepted"})
+    await off
+    replacement = asyncio.create_task(plans.app_wrote("TEST0001", [PlanWindow(2, 46800, 61200)]))
+    clearing = await charger.next_hub_call()
+    assert clearing[2] == "ClearChargingProfile"
+    on = asyncio.create_task(plans.planning_switched("TEST0001", True))
+    await wait_for(hass, lambda: plans.planning_on("TEST0001"), "native on not saved")
+    await charger.answer(clearing, {"status": "Accepted"})
+    assert await replacement
+    request = await charger.next_hub_call()
+    periods = request[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+    assert [(p["startPeriod"], p["limit"]) for p in periods] == [(0, 0.0), (133200, 16.0), (147600, 0.0)]
+    await charger.answer(request, {"status": "Accepted"})
+    await on
+    assert plans.plan("TEST0001") == [PlanWindow(2, 46800, 61200)]
+
+
 # Intent: when the app switches its planning off the hub's profile is cleared but the plan stays; switching it on writes
 # the profile of the plan again, and the sensor says which of the two it is.
 # Why: with the planning off the charger must charge freely, yet the windows are what the owner set up for later.

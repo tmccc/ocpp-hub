@@ -92,6 +92,7 @@ async def map_unknown_retry(rig, tmp_path, capsys):
         },
     )
     assert await mapping.run("reconcile-start", *args, path, port) == 0
+    return candidate
 
 
 # Approve the Stop separately using the independently observed backend lifecycle as evidence provenance.

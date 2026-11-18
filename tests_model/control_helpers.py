@@ -10,7 +10,7 @@ from tests_model.test_start_recovery_sequences import close_daily
 
 
 # Verify fresh Pause/Return, two genuine ordinary lifecycles and real native loss without replayed owner commands.
-async def ordinary_recovery(b, expected, demand, *, first_close="native"):
+async def ordinary_recovery(b, expected, demand, *, first_close="native", events=None):
     c, rig, firmware = b.controller, b.rig, b.rig.bench.firmware
     closed_before = b.session.journal.db.execute("SELECT COUNT(*) FROM transactions WHERE stop IS NOT NULL").fetchone()[
         0
@@ -18,9 +18,13 @@ async def ordinary_recovery(b, expected, demand, *, first_close="native"):
     pause, revision = uuid.uuid4().hex, c.requests.intent().revision
     c.command(pause, "pause", revision)
     assert (await completed_control(b, pause, mode="paused", revision=revision + 1, ceiling=0))["local_hold_verified"]
+    if events is not None:
+        events.append("pause")
     assert (await returned_to_app(b, expected))["normal_start_ready"]
+    if events is not None:
+        events.append("return")
     locals_seen = []
-    for number in range(2):
+    for number in (1, 2):
         beginning, meter_start = fresh_daily_values(rig)
         local = await positive_flow(
             b,
@@ -35,7 +39,11 @@ async def ordinary_recovery(b, expected, demand, *, first_close="native"):
             rig.peer.permission_enabled, firmware.requested_current = False, 0
         await healthy(c)
         assert firmware.current == (expected if demand else 0)
+        if events is not None:
+            events.append(f"lifecycle-{number}")
         assert await witnessed_native_loss(b, expected, local) >= 3
+        if events is not None:
+            events.append(f"outage-{number}")
         await close_daily(
             b,
             local,

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Keep accepted current selections running through reply-read failures. Commit cloud arm with its completed
+  receipt, settle unsent Start preflight failures, and retry publication of a known native repair outcome.
+- Refresh control availability against the live connection. Keep management sockets usable after storage
+  failures, correlate malformed OCPP calls, and keep old status retries from replacing the latest observation.
+- Serialize legacy plan writes and distinguish profile changes made outside the plan. Reconcile accepted
+  clear-all and skip malformed stored limits and session rows.
+- Verify dynamic test phases and grants in order. Give preparation and execution one worker deadline,
+  and package checked HA deployments from their validated source snapshot.
+
 - Retry replay-safe introduction metadata and zero preparation after SQLite failure; diagnose later storage
   failures without replaying Stop-capable work.
 - Let normal managed Start request fresh cloud approval for an aged Accepted local tag before any charger effect.

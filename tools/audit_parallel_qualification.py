@@ -282,28 +282,39 @@ def main(argv=None):
         errors.append("missing/empty/duplicate/foreign selection")
     if config.get("mode") == "full" and selected != collected:
         errors.append("full selection differs from entire ordered collection")
-    if any(
+    identities_match = not any(
         item.get("commit") != args.expected_commit or item.get("source_digest") != args.expected_source_digest
         for item in (config, metadata, result)
-    ):
+    )
+    if not identities_match:
         errors.append("snapshot/commit identity differs from caller pins")
+    source = root / "source"
+    expected_files = {row["path"] for row in metadata.get("files", [])}
+    actual_files = set()
+    ordinary_tree = not source.is_symlink()
+    if ordinary_tree:
+        for path in source.rglob("*"):
+            if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                ordinary_tree = False
+            if path.is_file():
+                actual_files.add(path.relative_to(source).as_posix())
+    inventory_matches = ordinary_tree and actual_files == expected_files
+    if not inventory_matches:
+        errors.append("snapshot contains missing or additional files")
     digest = hashlib.sha256()
     snapshot_bad = []
-    for row in sorted(metadata.get("files", []), key=lambda item: os.fsencode(item["path"])):
-        path = root / "source" / row["path"]
-        if not path.is_file() or path.is_symlink():
-            snapshot_bad.append(row["path"])
-            continue
-        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
-        if checksum != row["sha256"]:
-            snapshot_bad.append(row["path"])
-        digest.update(os.fsencode(row["path"]) + b"\0" + bytes.fromhex(checksum))
-    if snapshot_bad or not metadata.get("files") or digest.hexdigest() != args.expected_source_digest:
+    if inventory_matches:
+        # Exact inventory equality also rejects noncanonical, absolute and traversal paths.
+        for row in sorted(metadata.get("files", []), key=lambda item: os.fsencode(item["path"])):
+            path = source / row["path"]
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+            if checksum != row["sha256"]:
+                snapshot_bad.append(row["path"])
+            digest.update(os.fsencode(row["path"]) + b"\0" + bytes.fromhex(checksum))
+    bytes_match = not snapshot_bad and bool(metadata.get("files")) and digest.hexdigest() == args.expected_source_digest
+    if not bytes_match:
         errors.append("actual snapshot bytes differ from original source digest")
-    expected_files = {row["path"] for row in metadata.get("files", [])}
-    actual_files = {str(path.relative_to(root / "source")) for path in (root / "source").rglob("*") if path.is_file()}
-    if actual_files != expected_files:
-        errors.append("snapshot contains missing or additional files")
+    source_verified = identities_match and bytes_match and inventory_matches
     assignments = []
     evidence = defaultdict(list)
     starts = Counter()
@@ -328,6 +339,7 @@ def main(argv=None):
         started_ids = []
         outstanding = set()
         active = None
+        phase = None
         path = directory / "results.jsonl"
         if not path.exists():
             continue
@@ -338,38 +350,58 @@ def main(argv=None):
                 malformed.append(f"{index}:{number}")
                 continue
             identifier = row.get("id")
+            event = row.get("event")
+            if dynamic and index in sessions:
+                errors.append("worker evidence continued after session finish: " + str(index))
             if identifier is not None and identifier not in assigned:
                 errors.append("worker evidence has an unassigned ID: " + str(identifier))
-            if row.get("event") == "start":
+            if event == "start":
                 starts[identifier] += 1
                 started_ids.append(identifier)
                 if dynamic:
-                    if identifier not in outstanding or active is not None:
-                        errors.append("test started without its grant or overlapped another test: " + str(identifier))
+                    if (
+                        identifier not in outstanding
+                        or active is not None
+                        or len(acknowledged_grants) != len(started_ids) + 1
+                        or acknowledged_grants[-2][1] != identifier
+                    ):
+                        errors.append("test started without ordered grant and lookahead: " + str(identifier))
                     active = identifier
-            elif row.get("event") == "report":
+                    phase = "setup"
+            elif event == "report":
                 evidence[identifier].append({**row, "worker": index})
                 if dynamic:
-                    if active is None or identifier != active:
-                        errors.append("phase report does not belong to the worker's active test: " + str(identifier))
-                    elif row["phase"] == "teardown":
+                    if active is None or identifier != active or row["phase"] != phase:
+                        errors.append("phase report out of order for the active test: " + str(identifier))
+                    elif phase == "teardown":
                         outstanding.discard(identifier)
                         active = None
-            elif row.get("event") == "grant":
+                        phase = None
+                    else:
+                        phase = "call" if phase == "setup" and row["outcome"] == "passed" else "teardown"
+            elif event == "grant":
+                if dynamic and (active is not None or index not in worker_collections):
+                    errors.append("worker acknowledged a grant outside its dispatch boundary: " + str(index))
                 acknowledged_grants.append((row.get("sequence"), identifier))
                 if identifier is not None:
                     outstanding.add(identifier)
                     if len(outstanding) > 2:
                         errors.append("worker exceeded the one-case lookahead: " + str(index))
-            elif row.get("event") == "worker_namespace":
+            elif event == "worker_namespace":
                 namespaces.setdefault(index, []).append(row)
-            elif row.get("event") == "collection":
+            elif event == "collection":
+                if dynamic and index not in namespaces:
+                    errors.append("worker collected before its namespace record: " + str(index))
                 worker_collections.setdefault(index, []).append(row["ids"])
                 if not valid_collection_contract(row):
                     errors.append(
                         "worker collection filtered or lacks raw-item/effective-argument evidence: " + str(index)
                     )
-            elif row.get("event") == "session_finish":
+            elif event == "session_finish":
+                if dynamic and (
+                    active is not None or not acknowledged_grants or acknowledged_grants[-1][1] is not None
+                ):
+                    errors.append("worker finished before its terminal grant or test teardown: " + str(index))
                 sessions.setdefault(index, []).append(row["exitstatus"])
                 runtime_ends.setdefault(index, []).append(row.get("runtime"))
         if dynamic and (acknowledged_grants != expected_grants or started_ids != assigned):
@@ -440,7 +472,7 @@ def main(argv=None):
         manifest = [json.loads(line) for line in manifest_path.read_text().splitlines()]
     expected_model = {}
     try:
-        canonical, summary = canonical_manifest(root, config.get("suite"))
+        canonical, summary = canonical_manifest(root, config.get("suite")) if source_verified else ([], None)
         if summary is not None:
             if manifest != canonical or read_json(root / "sequence-manifest.summary.json", None) != summary:
                 errors.append("manifest inputs/denominators differ from independently regenerated pinned registry")
@@ -457,8 +489,8 @@ def main(argv=None):
         errors.append("canonical model manifest failed: " + str(exc))
     independently_collected = None
     try:
-        if snapshot_bad or digest.hexdigest() != args.expected_source_digest or actual_files != expected_files:
-            raise ValueError("source snapshot rejected; no recollection helper executed")
+        if not source_verified:
+            raise ValueError("source snapshot rejected; no source helper executed")
         independently_collected = canonical_collection(
             root, config, args.expected_commit, args.expected_source_digest, args.collection_executors
         )

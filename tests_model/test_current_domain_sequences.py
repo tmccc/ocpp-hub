@@ -60,11 +60,11 @@ async def test_current_domain_sequences(tmp_path, model_tls, monkeypatch, record
             assert receipt["id"] == identifier
             require_completed_current(b, identifier, revision, case.target, case.intent)
             events.append("replay")
-            await ordinary_recovery(b, case.target, case.demand)
-            events.extend(case.events[2:])
+            await ordinary_recovery(b, case.target, case.demand, events=events)
             assert c.requests.receipt(identifier) == completed
             assert c.current.selected() == case.target
             assert firmware.plans == plans and b.rig.peer.configuration == configuration
+            assert events == list(case.events)
             complete = True
     finally:
         record_property("model_case", case.identifier)

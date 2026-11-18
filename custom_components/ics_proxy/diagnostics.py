@@ -34,7 +34,7 @@ def software() -> dict[str, Any]:
         result["client_source_sha256"] = digest.hexdigest()
         if (root / "BUILD").is_file():
             build = (root / "BUILD").read_text().strip()
-            if re.fullmatch(r"[a-f0-9]{7,40}(?:-dirty)?", build):
+            if re.fullmatch(r"[a-f0-9]{7,40}(?:[+-]dirty)?", build):
                 result["client_build"] = build
     except OSError, ValueError:
         pass  # Missing public version metadata is unknown, never inferred from another checkout.

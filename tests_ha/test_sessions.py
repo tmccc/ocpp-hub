@@ -44,11 +44,13 @@ async def test_malformed_history_records_keep_valid_siblings(
 ) -> None:
     started = datetime(2026, 11, 17, tzinfo=UTC)
     valid = ChargeSession("TEST0001", 1, 321, None, started, started + timedelta(hours=1), energy_wh=1000)
+    mixed_time = valid.to_dict() | {"ended_at": "2026-11-17T01:00:00"}
+    oversized_energy = valid.to_dict() | {"energy_wh": 10**400}
     hass_storage["ocpp_hub.sessions"] = {
         "version": 1,
         "minor_version": 1,
         "key": "ocpp_hub.sessions",
-        "data": {"sessions": [None, {}, valid.to_dict()]},
+        "data": {"sessions": [None, {}, mixed_time, oversized_energy, valid.to_dict()]},
     }
     entry = await setup_hub()
     assert entry.runtime_data.sessions.newest_first() == [valid]

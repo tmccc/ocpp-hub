@@ -24,6 +24,7 @@ async def test_bound_owner_delivery_sequences(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, capsys, record_property, case
 ):
     events, complete = [], False
+    actual_sigkill = independent_mapping = False
     try:
         async with process_rig(
             tmp_path,
@@ -46,6 +47,8 @@ async def test_bound_owner_delivery_sequences(
             assert stage == ("issued" if case.phase == "before-accepted-commit" else "accepted")
             tag = starts(child.rig)[-1][3]["idTag"]
             await child.kill()
+            actual_sigkill = child.kills[-1]["returncode"] == -9
+            assert actual_sigkill
             await asyncio.gather(request, return_exceptions=True)
             events.append("sigkill")
             await child.start()
@@ -110,9 +113,13 @@ async def test_bound_owner_delivery_sequences(
             events.append("local-settled")
             await child.close()
             if case.cloud == "silent":
-                await map_unknown_retry(child.rig, tmp_path, capsys)
+                admission = await map_unknown_retry(child.rig, tmp_path, capsys)
+                token = admission["start_token"]
             else:
-                await approve_retry(child.rig, tmp_path, capsys)
+                admission = await approve_retry(child.rig, tmp_path, capsys)
+                token = admission["delivery_token"]
+            independent_mapping = token == head["token"]
+            assert independent_mapping
             events.append("attest")
             await child.start()
             await child.delivered(local, closed=True)
@@ -138,5 +145,5 @@ async def test_bound_owner_delivery_sequences(
         record_property("model_input_sha256", input_digest("bound_owner_delivery", case))
         record_property("completed_events", events)
         record_property("suffix_complete", complete)
-        record_property("actual_sigkill", complete)
-        record_property("independent_mapping", complete)
+        record_property("actual_sigkill", actual_sigkill)
+        record_property("independent_mapping", independent_mapping)

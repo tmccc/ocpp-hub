@@ -5,13 +5,29 @@ import uuid
 import pytest
 
 from tests.charge_rig import positive_flow
-from tests.current_rig import commissioned
+from tests.current_rig import adjustable, commissioned
 from tests.managed_rig import healthy
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import START
 from tests_model.test_start_recovery_sequences import close_daily
+
+
+# Intent: an identifiable bad CALL gets a correlated error and an old status retry cannot replace newer state.
+# Why: neither ordinary peer mistake should close a valid TLS connection or corrupt the current observation.
+async def test_malformed_call_and_status_replay_are_isolated(tmp_path, model_tls, monkeypatch):
+    async with adjustable(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch) as b:
+        peer, charger, j = b.rig.bench, b.charger, b.session.journal
+        result = await peer.call(charger, "malformed-call", "Heartbeat", [])
+        assert result[:3] == [4, "malformed-call", "FormationViolation"]
+        status = {"connectorId": 1, "status": "Preparing", "errorCode": "NoError"}
+        assert (await peer.call(charger, "prior-status", "StatusNotification", status))[0] == 3
+        latest = status | {"status": "Available"}
+        assert (await peer.call(charger, "latest-status", "StatusNotification", latest))[0] == 3
+        assert (await peer.call(charger, "prior-status", "StatusNotification", status))[0] == 3
+        assert j.get("last_status") == latest
+        assert (await peer.call(charger, "same-connection", "Heartbeat", {}))[0] == 3
 
 
 # Intent: parsed dates that overflow UTC normalization are rejected with a correlated reply before any durable effect.

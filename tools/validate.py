@@ -106,14 +106,20 @@ def check_yaml(python: str, results: dict[str, bool]) -> None:
 
 # Re-audit raw evidence against the exact clean source; a saved green boolean cannot establish qualification.
 def run_full_qualification(
-    path: Path | None, python: str, results: dict[str, bool], collection_executors: Path | None = None
+    path: Path | None,
+    python: str,
+    results: dict[str, bool],
+    collection_executors: Path | None = None,
+    *,
+    validated_snapshot: Path | None = None,
 ) -> None:
     if path is None:
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
         results["full qualification"] = False
         return
     try:
-        metadata = freeze(ROOT)
+        source = validated_snapshot / "source" if validated_snapshot is not None else None
+        metadata = freeze(ROOT, source)
         bundle = json.loads(path.read_text())
         required = {"engine-model", "ha-proxy", "ha-legacy", "ha-proxy-legacy"}
         if (
@@ -132,7 +138,7 @@ def run_full_qualification(
                 [
                     python,
                     "-B",
-                    str(ROOT / "tools/audit_parallel_qualification.py"),
+                    str((source or ROOT) / "tools/audit_parallel_qualification.py"),
                     str(batch),
                     "--expected-commit",
                     metadata["commit"],
@@ -154,6 +160,8 @@ def run_full_qualification(
             ):
                 results[f"qualification ({suite})"] = False
                 raise ValueError("fresh raw audit did not establish full qualification for this exact suite/source")
+        if validated_snapshot is not None and all(results.values()):
+            (validated_snapshot / "snapshot.json").write_text(json.dumps(metadata) + "\n")
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"Full qualification is invalid: {type(error).__name__}: {error}")
         results["full qualification"] = False
@@ -163,14 +171,18 @@ def run_full_qualification(
 # Release candidates need CI parity before a tag is pushed (a failing hassfest once shipped in a tag).
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--quick", action="store_true", help="skip pytest")
-    parser.add_argument("--tests-only", action="store_true", help="run only pytest")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--quick", action="store_true", help="skip pytest")
+    mode.add_argument("--tests-only", action="store_true", help="run only pytest")
     parser.add_argument("-k", dest="expression", default="", help="engine pytest -k expression; not full qualification")
     parser.add_argument("--qualification-report", type=Path, default=os.environ.get("OCPP_QUALIFICATION_REPORT"))
     parser.add_argument(
         "--collection-executors", type=Path, help="explicit trusted source-pinned collection executor map"
     )
+    parser.add_argument("--validated-snapshot", type=Path, help="retain the source that passed full qualification")
     args = parser.parse_args()
+    if args.validated_snapshot and (args.quick or args.tests_only or args.expression):
+        parser.error("--validated-snapshot requires full validation")
     python = venv_python()
     results: dict[str, bool] = {}
 
@@ -196,7 +208,13 @@ def main() -> int:
             print(f"  NEW FAILURE: {item}")
         print("Targeted engine tests only; full qualification requires all four20-worker suites.")
     elif not args.quick:
-        run_full_qualification(args.qualification_report, python, results, args.collection_executors)
+        run_full_qualification(
+            args.qualification_report,
+            python,
+            results,
+            validated_snapshot=args.validated_snapshot,
+            collection_executors=args.collection_executors,
+        )
 
     print("\nSummary")
     for name, ok in results.items():

@@ -8,7 +8,11 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from tools import parallel_worker
 from tools.audit_parallel_qualification import dispatch_grants
 from tools.parallel_worker import WorkQueue
 
@@ -41,6 +45,75 @@ def test_wait():
 def test_short(case):
     pass
 """
+
+
+# Intent: collection and manifest generation share one monotonic deadline before any containers launch.
+# Why: a slow preparation phase previously received a fresh timeout or no bound at all.
+def test_preparation_consumes_the_worker_deadline(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    (source / "tests_model").mkdir(parents=True)
+    (source / "tests_model/catalog.py").touch()
+    config = {
+        "mode": "full",
+        "scheduler": "pull-v1",
+        "workers": 2,
+        "timeout_seconds": 10,
+        "label": "unit",
+        "commit": "commit",
+        "source_digest": "digest",
+        "image": "unused",
+        "harness_hashes": {},
+        "runner": "tools/offline_validate.py",
+        "runner_args": [],
+        "specs": ["tests"],
+        "suite": "engine-model",
+        "expected_packages": {},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "snapshot.json").write_text(json.dumps({"commit": config["commit"]}))
+    clock = SimpleNamespace(seconds=0)
+    monkeypatch.setattr(
+        parallel_worker, "time", SimpleNamespace(monotonic=lambda: clock.seconds, time=lambda: 300 - clock.seconds)
+    )
+    monkeypatch.setattr(parallel_worker, "signal", SimpleNamespace(signal=lambda *_: None, SIGTERM=1, SIGINT=2))
+    monkeypatch.setattr(parallel_worker, "ROOT", tmp_path)
+    monkeypatch.setattr(parallel_worker, "SOURCE", source)
+    monkeypatch.setattr(parallel_worker, "ABORT", None)
+    monkeypatch.setattr(parallel_worker, "snapshot_digest", lambda _: config["source_digest"])
+    monkeypatch.setattr(parallel_worker, "runtime_digest", lambda _: "runtime")
+    monkeypatch.setattr(parallel_worker, "container_command", lambda *_: ["docker"])
+    monkeypatch.setattr(parallel_worker, "telemetry", lambda _: None)
+    monkeypatch.setattr(parallel_worker.os, "sched_getaffinity", lambda _: set(range(6)))
+    cleanup = []
+    monkeypatch.setattr(parallel_worker, "cleanup_containers", lambda rows: cleanup.extend(rows) or [])
+    budgets = []
+
+    # Stub only the child-process boundary to advance the deterministic clock between actual supervisor phases.
+    def child(command, **kwargs):
+        if not (timeout := kwargs.get("timeout")):
+            assert command[2].endswith("/audit_parallel_qualification.py")
+            return subprocess.CompletedProcess(command, 1)
+        budgets.append(timeout)
+        if "--collect-only" in command:
+            (tmp_path / "collection/results.jsonl").write_text(
+                json.dumps({"event": "collection", "ids": ["tests/test_sample.py::test_first"]}) + "\n"
+            )
+            clock.seconds = 7
+            return subprocess.CompletedProcess(command, 0)
+        assert "manifest" in command[-2]
+        raise subprocess.TimeoutExpired(command[:1], timeout)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a worker launched after preparation timed out")
+
+    monkeypatch.setattr(
+        parallel_worker, "subprocess", SimpleNamespace(run=child, Popen=forbidden, STDOUT=subprocess.STDOUT)
+    )
+    assert parallel_worker.main() == 1
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert budgets == [10, 3] and not result["complete"] and result["groups"] == []
+    assert result["abort_reason"].startswith("TimeoutExpired")
+    assert len(cleanup) == 1 and cleanup[0]["container_name"].endswith("-collection")
 
 
 # Run the real offline runner and queue plugin against a small local synthetic test source.

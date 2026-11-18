@@ -30,9 +30,10 @@ class ControlIntent:
 
 
 # Apply the shared revision transition inside the caller's original transaction, without creating request work.
-def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesce: bool = False) -> None:
+def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesce: bool = False) -> ControlIntent:
     intent = current.next(mode, coalesce=coalesce)
     journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
+    return intent
 
 
 class ManagedRequests:
@@ -111,6 +112,7 @@ class ManagedRequests:
             raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
         if action == "app_control" and (current.revision != revision or self.return_in_progress()):
             raise RecoveryRequiredError("return requires the current revision and no pending return")
+        result = {"accepted_at": time.time()}
         with self.journal.atomic():
             if action == "pause":
                 # One newest restrictive receipt survives even a legacy full ordinary pool; all prior UUID rows remain.
@@ -131,9 +133,9 @@ class ManagedRequests:
                 )
             self.journal.db.execute(
                 "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
-                (identifier, action, revision, json.dumps({"accepted_at": time.time()})),
+                (identifier, action, revision, json.dumps(result)),
             )
-        return self.receipt(identifier)
+        return {"id": identifier, "action": action, "state": "accepted", "result": result}
 
     # Expose a redacted receipt rather than any protocol payload, identity or database row.
     def receipt(self, identifier: str) -> dict[str, Any]:

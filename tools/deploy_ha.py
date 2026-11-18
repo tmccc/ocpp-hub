@@ -128,12 +128,6 @@ def write_build_stamp(root: Path = ROOT, integration: Path = INTEGRATION) -> str
     return stamp
 
 
-# Compute the sha256 of every local file to deploy.
-# The server copy is verified against these digests after the swap.
-def local_digests(files: list[str], root: Path = ROOT, integration: Path = INTEGRATION) -> dict[str, str]:
-    return {name: hashlib.sha256((root / integration / name).read_bytes()).hexdigest() for name in files}
-
-
 # Turn `sha256sum` output into a {relative path: digest} mapping; paths may start with './'.
 # The remote listing is plain text and must be compared with the local digests.
 def parse_sha256sum(output: str) -> dict[str, str]:
@@ -194,41 +188,68 @@ def ssh_command(
 
 # Run the CI-equivalent checks and abort the deploy when they fail.
 # A failing tree must never reach the server; one command gives the same answer as CI.
-def run_checks(root: Path = ROOT, collection_executors: Path | None = None) -> None:
+def run_checks(root: Path = ROOT, collection_executors: Path | None = None, *, snapshot: Path | None = None) -> None:
     command = [sys.executable, str(root / "tools" / "validate.py")]
     if collection_executors is not None:
         command += ["--collection-executors", str(collection_executors)]
+    if snapshot is not None:
+        command += ["--validated-snapshot", str(snapshot)]
     result = subprocess.run(command, cwd=root)
     if result.returncode:
         raise SystemExit("Checks failed; nothing was deployed. Fix them (or use --skip-checks if you know why).")
 
 
-# Start tar writing the files, relative to the integration folder, to its stdout.
-# Entries are root-owned so the server copy matches the other components regardless of local user ids.
-def stream_tar(files: list[str], root: Path = ROOT) -> subprocess.Popen[bytes]:
-    command = [
-        "tar",
-        "-C",
-        str(root / INTEGRATION),
-        "--owner=0",
-        "--group=0",
-        "--numeric-owner",
-        "--null",
-        "-T",
-        "-",
-        "-cf",
-        "-",
-    ]
-    tar = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    assert tar.stdin is not None
-    tar.stdin.write(("\0".join(files) + "\0").encode())
-    tar.stdin.close()
-    return tar
+# Both transports send the same archive and verify the same bytes that were packaged.
+def make_archive(directory: Path, files: list[str], pinned: dict[str, str]) -> tuple[bytes, dict[str, str]]:
+    data = io.BytesIO()
+    digests = {}
+    with tarfile.open(fileobj=data, mode="w") as package:
+        for name in files:
+            path = directory / name
+            if path.is_symlink() or not path.is_file():
+                raise SystemExit("Deployment accepts regular files only")
+            content = path.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            if name in pinned and digest != pinned[name]:
+                raise SystemExit("Validated integration bytes changed before packaging")
+            info = tarfile.TarInfo(name)
+            info.mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
+            info.size = len(content)
+            package.addfile(info, io.BytesIO(content))
+            digests[name] = digest
+    return data.getvalue(), digests
+
+
+# Select the exact validated inventory, or the explicitly requested unchecked working tree.
+def prepare_archive(
+    integration: Path, scratch: Path, *, skip_checks: bool, collection_executors: Path | None
+) -> tuple[Path, bytes, dict[str, str]]:
+    source = ROOT
+    pinned: dict[str, str] = {}
+    if skip_checks:
+        files = relative_files(source, integration)
+        stamp = write_build_stamp(source, integration)
+    else:
+        run_checks(source, collection_executors, snapshot=scratch)
+        metadata = json.loads((scratch / "snapshot.json").read_text())
+        source = scratch / "source"
+        prefix = integration.as_posix() + "/"
+        pinned = {
+            row["path"][len(prefix) :]: row["sha256"] for row in metadata["files"] if row["path"].startswith(prefix)
+        }
+        files = sorted(pinned)
+        stamp = metadata["commit"][:12]
+        (source / integration / BUILD_FILE).write_text(stamp + "\n")
+    if not files:
+        raise SystemExit(f"No files found under {integration}.")
+    print(f"Build {stamp}")
+    data, digests = make_archive(source / integration, sorted({*files, BUILD_FILE}), pinned)
+    return source, data, digests
 
 
 # Open the shared connection, install the files, and verify every file by checksum.
 # The swap is only reported as done when the server copy is byte-identical to the local files.
-def deploy(target: Target, files: list[str], control_path: str, batch: bool = False) -> None:
+def deploy(target: Target, archive: bytes, expected: dict[str, str], control_path: str, batch: bool = False) -> None:
     # Build an ssh command line for this target on the shared connection.
     # Every remote step must use the same control path and batch setting.
     def ssh(*remote: str, master: bool = False) -> list[str]:
@@ -236,22 +257,17 @@ def deploy(target: Target, files: list[str], control_path: str, batch: bool = Fa
 
     subprocess.run(ssh("true", master=True), check=True)
     try:
-        tar = stream_tar(files)
-        subprocess.run(ssh(privileged(remote_install_script(target), target.sudo)), stdin=tar.stdout, check=True)
-        assert tar.stdout is not None
-        tar.stdout.close()
-        if tar.wait():
-            raise SystemExit("tar failed locally; verify the server copy before restarting anything.")
+        subprocess.run(ssh(privileged(remote_install_script(target), target.sudo)), input=archive, check=True)
         listing = subprocess.run(
             ssh(f"cd '{target.remote_dir}' && find . -type f -exec sha256sum {{}} +"),
             capture_output=True,
             text=True,
             check=True,
         ).stdout
-        missing, extra, different = compare(local_digests(files), parse_sha256sum(listing))
+        missing, extra, different = compare(expected, parse_sha256sum(listing))
         if missing or extra or different:
             raise SystemExit(f"Verification failed. missing={missing} unexpected={extra} different={different}")
-        print(f"Deployed and verified {len(files)} files in {target.remote_dir}")
+        print(f"Deployed and verified {len(expected)} files in {target.remote_dir}")
     finally:
         subprocess.run(
             ["ssh", "-O", "exit", "-o", f"ControlPath={control_path}", f"{target.user}@{target.host}"],
@@ -334,24 +350,20 @@ def main() -> int:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", args.container) is None:
             raise SystemExit("Invalid container name")
         integration = Path("custom_components") / args.domain
-        files = sorted({*relative_files(integration=integration), BUILD_FILE})
+        files = sorted({*relative_files(ROOT, integration), BUILD_FILE})
         if args.dry_run:
             print(f"Dry run: {args.domain}, container {args.container}, {len(files)} files; no changes")
             return 0
-        if not args.skip_checks:
-            run_checks(collection_executors=args.collection_executors)
-        print(f"Build {write_build_stamp(integration=integration)}")
-        data = io.BytesIO()
-        with tarfile.open(fileobj=data, mode="w") as package:
-            for name in files:
-                package.add(ROOT / integration / name, arcname=name, recursive=False)
-        expected = local_digests(files, integration=integration)
-        installer = (ROOT / "tools/ha_container_deploy.py").read_text()
-        subprocess.run(
-            ["docker", "exec", "-i", args.container, "python", "-c", installer, args.domain, json.dumps(expected)],
-            input=data.getvalue(),
-            check=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source, archive, expected = prepare_archive(
+                integration, Path(tmp), skip_checks=args.skip_checks, collection_executors=args.collection_executors
+            )
+            installer = (source / "tools/ha_container_deploy.py").read_text()
+            subprocess.run(
+                ["docker", "exec", "-i", args.container, "python", "-c", installer, args.domain, json.dumps(expected)],
+                input=archive,
+                check=True,
+            )
         if args.restart:
             if args.ha_api_config is not None:
                 private = json.loads(args.ha_api_config.read_text())
@@ -364,7 +376,7 @@ def main() -> int:
     if args.domain != "ocpp_hub":
         raise SystemExit("The separate proxy client requires explicit container transport")
     target = replace(target_from_env(env, args.host, args.user, args.key), sudo=not args.no_sudo)
-    files = relative_files()
+    files = relative_files(ROOT)
     if not files:
         raise SystemExit(f"No files found under {INTEGRATION}.")
     files = sorted({*files, BUILD_FILE})
@@ -377,11 +389,11 @@ def main() -> int:
         print("\n".join(f"  {name}" for name in files))
         print("Dry run: would run the checks, back up, deploy and verify. Nothing was changed.")
         return 0
-    if not args.skip_checks:
-        run_checks(collection_executors=args.collection_executors)
-    print(f"Build {write_build_stamp()}")
     with tempfile.TemporaryDirectory() as tmp:
-        deploy(target, files, os.path.join(tmp, "ssh-%C"), args.batch)
+        _, archive, expected = prepare_archive(
+            INTEGRATION, Path(tmp), skip_checks=args.skip_checks, collection_executors=args.collection_executors
+        )
+        deploy(target, archive, expected, os.path.join(tmp, "ssh-%C"), args.batch)
     if args.restart:
         restart_home_assistant(env, args.yes)
     else:

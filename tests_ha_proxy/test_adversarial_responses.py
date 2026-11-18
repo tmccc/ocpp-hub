@@ -48,6 +48,29 @@ async def test_adversarial_status_retains_outage_and_recovery(actual_hass, peer,
     assert set(peer["commands"]) == {"status"}
 
 
+# Intent: malformed native history leaves last energy unknown and preserves valid, redacted older rows.
+# Why: entity publication cannot trust nested shape or substitute an older row for an invalid latest record.
+async def test_invalid_nested_history_preserves_siblings(actual_hass, peer):
+    valid = peer["state"]["charger_sessions"][0].copy()
+    peer["state"]["charger_sessions"] = [
+        None,
+        {**valid, "energy_kwh": 10**400},
+        {**valid, "energy_kwh": -1},
+        {**valid, "stopped_at": "2025-01-01T00:00:00Z"},
+        {**valid, "private_detail": "not public"},
+    ]
+    entry = await setup(actual_hass, peer)
+    sensor_id = "sensor.ics_proxy_last_session_energy"
+    state = actual_hass.states.get(sensor_id)
+    assert state.state == "unknown"
+    assert state.attributes["charger_sessions"] == [
+        {key: valid[key] for key in ("started_at", "stopped_at", "energy_kwh")}
+    ]
+    peer["state"]["charger_sessions"] = [valid]
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(sensor_id).state == str(valid["energy_kwh"])
+
+
 # Intent: even a direct enormous-integer current request gets a safe validation error before any management command.
 # Why: HA's normal service coercion is not the numeric boundary's only callable path.
 async def test_huge_integer_current_is_safely_rejected(actual_hass, peer):

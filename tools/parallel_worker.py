@@ -363,11 +363,23 @@ def telemetry(workers):
 # Execute the entire frozen collection or explicit preflight under unchanged test/production time budgets.
 def main():
     global ABORT
+    started_monotonic = time.monotonic()
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     config = json.loads((ROOT / "config.json").read_text())
     metadata = json.loads((ROOT / "snapshot.json").read_text())
     started = time.time()
+    deadline = started_monotonic + config["timeout_seconds"]
+
+    # Collection, manifest preparation and dispatch all draw from one budget.
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("qualification_timeout")
+        if ABORT:
+            raise RuntimeError(ABORT)
+        return seconds
+
     workers = []
     preparation = []
     queue = None
@@ -448,7 +460,7 @@ def main():
                 env=env,
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                timeout=config["timeout_seconds"],
+                timeout=remaining(),
             )
         if collection.returncode or ABORT:
             raise RuntimeError("Collection failed or was interrupted")
@@ -489,6 +501,7 @@ def main():
                     env=env,
                     stdout=output,
                     stderr=subprocess.STDOUT,
+                    timeout=remaining(),
                 )
             if generated.returncode or ABORT:
                 raise RuntimeError("Manifest generation failed or interrupted")
@@ -499,6 +512,7 @@ def main():
         ledger = (ROOT / "dispatch.jsonl").open("x")
         queue = WorkQueue(ROOT, selected, ledger)
         for index, cpu in enumerate(cpus):
+            remaining()
             directory = ROOT / str(index)
             directory.mkdir()
             output = (directory / "pytest.log").open("w")
@@ -512,6 +526,7 @@ def main():
             }
             container_name = "icsq-" + hashlib.sha256(config["label"].encode()).hexdigest()[:20] + "-" + str(index)
             docker = container_command(config, directory, cpu, container_name, worker_env)
+            remaining()
             process = subprocess.Popen(
                 [
                     *docker,
@@ -547,11 +562,11 @@ def main():
         stop_at = None
         while any(item["process"].poll() is None for item in workers):
             now = time.monotonic()
-            if time.time() - started >= config["timeout_seconds"]:
-                ABORT = ABORT or "qualification_timeout"
             if now >= next_telemetry:
                 telemetry(workers)
                 next_telemetry = now + 5
+            if time.monotonic() >= deadline:
+                ABORT = ABORT or "qualification_timeout"
             failed = [item for item in workers if item["process"].poll() not in (None, 0)]
             if failed and ABORT is None:
                 ABORT = "worker_" + str(failed[0]["index"]) + "_exit_" + str(failed[0]["process"].returncode)
@@ -588,6 +603,8 @@ def main():
         if summary["runtime_digest_before"] != summary["runtime_digest_after"]:
             raise RuntimeError("Mounted test runtime changed during qualification")
         summary["source_digest_after"] = snapshot_digest(metadata)
+        if time.monotonic() >= deadline:
+            ABORT = ABORT or "qualification_timeout"
         summary["complete"] = ABORT is None and all(group["rc"] == 0 for group in summary["groups"])
     except Exception as error:
         # This is the outer process boundary: preserve failure evidence and stop only owned worker descendants.

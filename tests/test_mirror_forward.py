@@ -67,6 +67,22 @@ async def test_a_forwarded_command_reaches_the_charger_and_its_answer_returns(st
     assert answer[0] == 3 and answer[2] == {"status": "Accepted"}
 
 
+# Intent: accepted clear-all forgets both profiles, while an accepted explicit unrelated ID preserves them.
+# Why: local policy and plan publication must match the scope of the forwarded charger ACK.
+@pytest.mark.parametrize("payload", [{}, {"id": 9, "connectorId": 0}])
+async def test_forwarded_clear_ack_updates_exact_profile_scope(start_rig, payload):
+    rig, charger = await _forwarding_rig(start_rig)
+    session = rig.hub.central.session(CHARGER)
+    session.record_limit(10, "ChargePointMaxProfile")
+    session.record_vendor_limit(8, 5, "TxDefaultProfile")
+    task = asyncio.create_task(rig.vendor.command("ClearChargingProfile", payload))
+    request = await charger.next_hub_call()
+    assert request[2:] == ["ClearChargingProfile", payload]
+    await charger.answer(request, {"status": "Accepted"})
+    assert (await task)[2] == {"status": "Accepted"}
+    assert (session.snapshot.charge_limit_a, session.snapshot.vendor_limit_a) == ((10, 8) if payload else (None, None))
+
+
 # Intent: Reset, UpdateFirmware and GetDiagnostics stay refused with forwarding on, and nothing reaches the charger.
 # Why: the owner kept reset and firmware out of the first phase.
 @pytest.mark.parametrize(

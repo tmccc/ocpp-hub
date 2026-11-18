@@ -1,6 +1,7 @@
 """Live worker cleanup survives real SQLite refusal without repeating positive effects or replacing the service."""
 
 import asyncio
+import sqlite3
 import uuid
 
 import pytest
@@ -13,6 +14,63 @@ from tests.native_peer_failures import InterruptedNativePeer
 from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
 from tests.tls_support import tls as tls
+
+
+# Intent: a real Start preflight read can fail before any physical effect and still settle its receipt.
+# Why: one failed worker must not fail the supervisor or turn an unsent Start into uncertain device work.
+async def test_start_preflight_storage_refusal_settles(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        refused = []
+
+        # Refuse only the candidate table statement, before the worker reaches any OCPP call.
+        def authorize(action, table, column, database, trigger):
+            if not refused and action == sqlite3.SQLITE_READ and table == "managed_current_requests":
+                refused.append(table)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        j.db.set_authorizer(authorize)
+        try:
+            await asyncio.wait_for(asyncio.shield(c.charging.worker), 3)
+        finally:
+            j.db.set_authorizer(None)
+        assert refused and c.requests.receipt(identifier)["state"] == "failed"
+        assert c.charging.state()["failure"]["effects_started"] is False
+        assert not starts(b.rig)
+        assert (await healthy(c))["owner_control_enabled"]
+        await pause(c)
+        assert (await healthy(c))["local_hold_verified"]
+
+
+# Intent: a cloud-arm receipt and its armed metadata commit together, with no live lease on a failed COMMIT.
+# Why: a partial acceptance can arm a later cloud request even though the caller only sees an error.
+async def test_cloud_arm_storage_is_atomic(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        j.db.execute("CREATE TABLE arm_parent(id INTEGER PRIMARY KEY)")
+        j.db.execute("CREATE TABLE arm_child(id REFERENCES arm_parent(id) DEFERRABLE INITIALLY DEFERRED)")
+        for event in ("INSERT", "UPDATE"):
+            j.db.execute(
+                f"CREATE TEMP TRIGGER fail_arm_{event} AFTER {event} ON managed_requests "
+                "WHEN NEW.action='arm_cloud_test' AND NEW.state='completed' "
+                "BEGIN INSERT INTO arm_child VALUES(1); END"
+            )
+        identifier, revision = uuid.uuid4().hex, c.requests.intent().revision
+        before = c.charging.state()
+        with pytest.raises(sqlite3.IntegrityError):
+            c.command(identifier, "arm_cloud_test", revision)
+        assert c.charging.state() == before and c.requests.receipt(identifier)["state"] == "not_found"
+        assert c.charging.lease is None and c.charging.timer is None
+        for event in ("INSERT", "UPDATE"):
+            j.db.execute(f"DROP TRIGGER fail_arm_{event}")
+        receipt = c.command(identifier, "arm_cloud_test", revision)
+        timer = c.charging.timer
+        assert receipt["state"] == "completed" and receipt["result"] == {"armed": True, "charging_started": False}
+        assert c.command(identifier, "arm_cloud_test", revision) == receipt and c.charging.timer is timer
+        assert c.charging.state()["state"] == "armed" and not starts(b.rig)
 
 
 # An actual SQLite trigger records separate cleanup attempts before refusing that write; no result is mocked.

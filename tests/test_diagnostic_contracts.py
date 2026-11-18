@@ -300,10 +300,6 @@ def test_fault_vocabulary_is_accepted_by_client():
     assert FAULTS <= client_projection().FAULTS.keys()
 
 
-# Intent: each actual temporary-schedule alarm remains a current diagnostic fault.
-# Why: a useful base alarm must not become an empty support-download cause.
-
-
 # Intent: absent pending-operation connection facts remain unknown without creating positive health.
 # Why: unknown does not mean disconnected, and correcting that label cannot grant control authority.
 def test_unknown_connections_do_not_become_disconnected():

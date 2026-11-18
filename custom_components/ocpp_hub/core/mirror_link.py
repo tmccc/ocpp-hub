@@ -538,9 +538,8 @@ class MirrorLink:
         elif action == "ClearChargingProfile":
             if "id" not in payload or payload["id"] == snapshot.vendor_profile_id:
                 self._session.record_vendor_limit(None, None, None)
-            if set(payload) - {"id"}:
+            if "id" not in payload:
                 self._session.record_limit(None, None)
-                self._session.record_vendor_limit(None, None, None)
         else:
             return
         self._session.request_effective_limit()

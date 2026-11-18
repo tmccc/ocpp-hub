@@ -156,10 +156,22 @@ async def test_actual_strict_result_survives_publication_refusal(
             peer.configuration["untouched"] = "independent native contradiction"
         else:
             b.rig.bench.history[0]["original_record"]["preserve"].append(4)
-        with refused_write(j, REVOCATIONS, failure), pytest.raises(sqlite3.Error):
-            await c.tick()
+        with refused_write(j, REVOCATIONS, failure):
+            status = await c.tick()
+        assert (status["state"], status["fault"]) == ("attention", "native_repair_publication_pending")
         assert repair_pending(j, fault) and not repair_revoked(j, fault) and j.get(ACK) == ack
         assert c.native.repair_audits.pending[1] == "strict"
+
+        # A different failed poll read remains fatal even while the exact repair outcome is in memory.
+        def deny_read(action, table, column, database, source):
+            return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == "meta" else sqlite3.SQLITE_OK
+
+        j.db.set_authorizer(deny_read)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                await c.tick()
+        finally:
+            j.db.set_authorizer(None)
         peer.configuration, b.rig.bench.history = configuration, history
         assert (await c.tick())["state"] == "attention"
         assert repair_revoked(j, fault) and not repair_pending(j, fault) and j.get(ACK) is None
@@ -182,8 +194,9 @@ async def test_valid_native_publication_sql_wait_recovers_same_process(
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
         diagnostic, ack = copy.deepcopy(j.get("managed_native_failure")), copy.deepcopy(j.get(ACK))
-        with refused_write(j, "unused", failure, resource_update=True), pytest.raises(sqlite3.Error):
-            await c.tick()
+        with refused_write(j, "unused", failure, resource_update=True):
+            status = await c.tick()
+        assert (status["state"], status["fault"]) == ("attention", "native_repair_publication_pending")
         assert repair_pending(j, fault) and not repair_revoked(j, fault) and j.get(ACK) == ack
         assert c.native.repair_audits.pending[1] == "readiness"
         assert j.get("managed_control_fault") == fault and j.get("managed_native_failure") == diagnostic

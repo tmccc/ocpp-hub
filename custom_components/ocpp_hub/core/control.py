@@ -162,7 +162,7 @@ class ChargerControl:
     # to what the charger says it supports (ChargingScheduleMaxPeriods) when the hub knows it. A weekly schedule starts
     # on the weekday of `anchor`.
     async def set_schedule(
-        self, anchor: datetime, periods: Sequence[tuple[int, object]], recurrency: str
+        self, anchor: datetime, periods: Sequence[tuple[int, object]], recurrency: str, *, from_plan: bool = False
     ) -> list[tuple[int, float]]:
         weekly = recurrency == "Weekly"
         known = self._session.snapshot.configuration.get("ChargingScheduleMaxPeriods", "")
@@ -190,7 +190,7 @@ class ChargerControl:
             status = await self._ask("SetChargingProfile", payload)
             outcomes.append(f"{purpose}={status}")
             if status == "Accepted":
-                self._session.record_limit(None, purpose)
+                self._session.record_limit(None, purpose, from_plan=from_plan)
                 self._session.request_effective_limit()
                 _LOGGER.info(
                     "[write] %s schedule %s accepted by %s as %s", recurrency, schedule, self._session.cp_id, purpose
@@ -201,11 +201,11 @@ class ChargerControl:
 
     # Remove the hub's own limit again, so the charger goes back to what it had.
     # Only the hub's profile id is cleared.
-    async def clear_current_limit(self) -> None:
+    async def clear_current_limit(self, *, from_plan: bool = False) -> None:
         status = await self._ask("ClearChargingProfile", commands.clear_charging_profile(HUB_PROFILE_ID))
         if status not in ("Accepted", "Unknown"):
             raise ControlError("rejected", f"ClearChargingProfile={status}")
-        self._session.record_limit(None, None)
+        self._session.record_limit(None, None, from_plan=from_plan)
         self._session.request_effective_limit()
         _LOGGER.info("[write] Charge limit of %s cleared (%s)", self._session.cp_id, status)
 

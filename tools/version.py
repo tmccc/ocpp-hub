@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Keep the release version identical across the places that carry it.
 
-The version lives in three places:
+The version lives in four files:
 
 - ``pyproject.toml`` (PEP 440: ``1.8.0rc2``)
-- ``custom_components/ocpp_hub/manifest.json`` (display: ``1.8.0-rc2``)
-- a matching numeric ``## <version>`` heading in ``CHANGELOG.md``
+- ``both integration manifests`` (display: ``1.8.0-rc2``)
+- the newest numeric ``## <version>`` heading in ``CHANGELOG.md``
 
 ``bump`` converts the input ``X.Y.Z-rcN`` form to the PEP 440 ``X.Y.ZrcN``
 for ``pyproject.toml`` and keeps the display form (hyphen) elsewhere::
@@ -14,9 +14,9 @@ for ``pyproject.toml`` and keeps the display form (hyphen) elsewhere::
     python tools/version.py bump 1.8.0
     python tools/version.py bump 1.8.0-rc3  # pyproject gets 1.8.0rc3
 
-``check`` exits non-zero when the three do not agree. It is enforced by
+``check`` exits non-zero when the files do not agree. It is enforced by
 ``tests/test_version_consistency.py`` so CI fails on drift. ``bump`` updates
-``pyproject.toml`` and ``manifest.json``; add the matching CHANGELOG heading
+``pyproject.toml`` and both manifests; add the matching CHANGELOG heading
 yourself because release notes are human-written.
 """
 
@@ -29,7 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
-MANIFEST = ROOT / "custom_components" / "ocpp_hub" / "manifest.json"
+MANIFESTS = tuple(ROOT / "custom_components" / domain / "manifest.json" for domain in ("ocpp_hub", "ics_proxy"))
 CHANGELOG = ROOT / "CHANGELOG.md"
 
 # Pre-release suffixes that must lose their hyphen to be valid PEP 440.
@@ -51,7 +51,6 @@ def pyproject_version(version: str) -> str:
 
 
 # Read the version from pyproject.toml.
-# It is one of the three places that must agree.
 def read_pyproject() -> str:
     match = re.search(r'^version\s*=\s*"([^"]+)"', PYPROJECT.read_text(), re.MULTILINE)
     if match is None:
@@ -61,8 +60,8 @@ def read_pyproject() -> str:
 
 # Read the version from the integration manifest.
 # Home Assistant and HACS show this version.
-def read_manifest() -> str:
-    return str(json.loads(MANIFEST.read_text())["version"])
+def read_manifest(path: Path) -> str:
+    return str(json.loads(path.read_text())["version"])
 
 
 # List the version headings of the changelog.
@@ -71,50 +70,42 @@ def read_changelog_headings() -> list[str]:
     return re.findall(r"^##\s+(\S+)", CHANGELOG.read_text(), re.MULTILINE)
 
 
-# Compare the three places and report drift.
+# Compare the package with both manifests and the newest numeric changelog heading.
 # CI must fail when they disagree.
 def check() -> int:
-    pyproject, manifest, headings = read_pyproject(), read_manifest(), read_changelog_headings()
+    pyproject = read_pyproject()
     problems: list[str] = []
-    if canonical(pyproject) != canonical(manifest):
-        problems.append(f"pyproject.toml ({pyproject}) != manifest.json ({manifest})")
-    if not any(canonical(heading) == canonical(manifest) for heading in headings):
-        problems.append(f"CHANGELOG.md has no '## {manifest}' heading")
+    for path in MANIFESTS:
+        manifest = read_manifest(path)
+        if canonical(pyproject) != canonical(manifest):
+            problems.append(f"pyproject.toml ({pyproject}) differs from {path.parent.name} manifest ({manifest})")
+    latest = next((heading for heading in read_changelog_headings() if re.match(r"\d", heading)), "")
+    if canonical(latest) != canonical(pyproject):
+        problems.append(f"CHANGELOG.md latest numeric heading is {latest or 'missing'}, expected {pyproject}")
     if problems:
         for problem in problems:
             print(f"VERSION MISMATCH: {problem}", file=sys.stderr)
         return 1
-    print(f"version in sync: {manifest}")
+    print(f"version in sync: {pyproject}")
     return 0
 
 
-# Write a new version to pyproject.toml and the manifest.
+# Prepare each version change before writing the package and both manifests.
 # Release notes stay human-written, but the numbers should not be.
 def bump(new: str) -> int:
-    pyproject_text = PYPROJECT.read_text()
-    pyproject_new = re.sub(
-        r'(^version\s*=\s*")([^"]+)(")',
-        lambda m: f"{m.group(1)}{pyproject_version(new)}{m.group(3)}",
-        pyproject_text,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    if pyproject_new == pyproject_text:
-        print("version not found in pyproject.toml", file=sys.stderr)
-        return 1
-    PYPROJECT.write_text(pyproject_new)
-
-    manifest_text = MANIFEST.read_text()
-    manifest_new = re.sub(
-        r'("version"\s*:\s*")([^"]+)(")',
-        lambda m: f"{m.group(1)}{new}{m.group(3)}",
-        manifest_text,
-        count=1,
-    )
-    if manifest_new == manifest_text:
-        print("version not found in manifest.json", file=sys.stderr)
-        return 1
-    MANIFEST.write_text(manifest_new)
+    updates = [(PYPROJECT, r'(^version\s*=\s*")([^"]+)(")', pyproject_version(new))]
+    updates.extend((path, r'("version"\s*:\s*")([^"]+)(")', new) for path in MANIFESTS)
+    staged = {}
+    for path, pattern, value in updates:
+        updated, count = re.subn(
+            pattern, lambda m: f"{m.group(1)}{value}{m.group(3)}", path.read_text(), count=1, flags=re.MULTILINE
+        )
+        if not count:
+            print(f"version not found in {path}", file=sys.stderr)
+            return 1
+        staged[path] = updated
+    for path, updated in staged.items():
+        path.write_text(updated)
     message = (
         f"bumped to {new} (pyproject uses {pyproject_version(new)}); "
         f"add the matching '## {new}' heading to CHANGELOG.md"

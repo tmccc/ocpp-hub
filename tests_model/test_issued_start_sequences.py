@@ -28,6 +28,7 @@ async def test_issued_start_proof_sequences(
     tmp_path, model_tls, monkeypatch, capsys, record_property, unused_tcp_port_factory, case
 ):
     events, complete = [], False
+    actual_sigkill = independent_durable_read = peers_survived = independent_mapping = False
     try:
         async with process_rig(
             tmp_path,
@@ -39,6 +40,7 @@ async def test_issued_start_proof_sequences(
             native_peer=InterruptedNativePeer,
             bench_type=StartReplyBench,
         ) as child:
+            peer, bench = child.rig.peer, child.rig.bench
             ledger = PeerStartLedger(child.rig.bench)
             child.rig.bench.before_reply = ledger.observe
             await child.start()
@@ -54,11 +56,14 @@ async def test_issued_start_proof_sequences(
             snapshot = child.durable()
             state, receipt = snapshot["metadata"]["managed_test_charge"], snapshot["metadata"]["local_start_receipt"]
             assert receipt["stage"] == ("accepted" if case.phase == "after-accepted-commit" else "issued")
-            assert state["start_rpc_accepted"] is False and receipt["request_id"] == identifier
+            independent_durable_read = state["start_rpc_accepted"] is False and receipt["request_id"] == identifier
+            assert independent_durable_read
             wire_count = int(case.phase != "after-issued-commit")
             assert len(starts(child.rig)) == wire_count
             events.append("durable-read")
             await child.kill()
+            actual_sigkill = child.kills[-1]["returncode"] == -9
+            assert actual_sigkill
             events.append("sigkill")
             await asyncio.gather(pending, return_exceptions=True)
             await child.start()
@@ -78,6 +83,12 @@ async def test_issued_start_proof_sequences(
             await child.close()
             before = list(child.rig.bench.device_calls)
             settlement = ledger.settle(identifier, starts(child.rig))
+            independent_mapping = (
+                settlement["request_id"] == identifier
+                and {row["token"] for row in settlement["received"]} == {frame[1] for frame in starts(child.rig)}
+                and settlement in ledger.events
+            )
+            assert independent_mapping
             args = (tmp_path / "trial.json", tmp_path / "process-strategy.json")
             port = child.rig.prepared.observer.port
             assert await operator.run("inspect", *args, None, port, kind="local-start") == 0
@@ -125,6 +136,8 @@ async def test_issued_start_proof_sequences(
             assert len(set(locals_seen)) == 2 and len(starts(child.rig)) == wire_count
             assert len(child.rig.bench.backend_starts) == 2
             assert all(entry["closed"] for entry in child.rig.bench.backend_starts)
+            peers_survived = child.rig.peer is peer and child.rig.bench is bench
+            assert peers_survived
             assert not child.rig.bench.backend_errors
             assert len(child.kills) == 1 and child.kills[0]["returncode"] == -9
             events.append("two-lifecycles")
@@ -136,7 +149,7 @@ async def test_issued_start_proof_sequences(
         record_property("model_input_sha256", input_digest("issued_start_proof", case))
         record_property("completed_events", events)
         record_property("suffix_complete", complete)
-        record_property("actual_sigkill", complete)
-        record_property("independent_durable_read", complete)
-        record_property("peers_survived", complete)
-        record_property("independent_mapping", complete)
+        record_property("actual_sigkill", actual_sigkill)
+        record_property("independent_durable_read", independent_durable_read)
+        record_property("peers_survived", peers_survived)
+        record_property("independent_mapping", independent_mapping)
