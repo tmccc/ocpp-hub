@@ -66,8 +66,9 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
             published = await healthy(b.c)
             assert published["power_w"] == 0 and b.session.journal.active() == local
         if early:
-            gateway = b.session.gateway
-            prepare = gateway.prepare_report_hold
+            reports = b.session.gateway.start_reports
+            assert reports is not None
+            prepare = reports.prepare_hold
             report_arrived = asyncio.Event()
 
             # Hold the actual zero ACK until the charger's genuine Start reaches the gateway on its other channel.
@@ -81,7 +82,7 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                 await prepare(payload)
 
             b.rig.bench.before_reply = wait_for_report
-            monkeypatch.setattr(gateway, "prepare_report_hold", trace_report)
+            monkeypatch.setattr(reports, "prepare_hold", trace_report)
         before_starts = list(starts(b.rig))
         port = unused_tcp_port_factory()
         server = ManagementServer(
