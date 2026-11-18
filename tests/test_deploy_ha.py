@@ -90,6 +90,7 @@ def test_checked_deployment_packages_only_the_pinned_snapshot(tmp_path, monkeypa
         (root / installer).write_text("# changed installer\n")
         capture.append(metadata["commit"][:12])
 
+    # Inspect the outbound archive and its byte-for-byte digest map without opening a connection.
     def receive(data, expected):
         with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
             assert sorted(archive.getnames()) == ["BUILD", "main.py"]
@@ -116,6 +117,7 @@ def test_checked_deployment_packages_only_the_pinned_snapshot(tmp_path, monkeypa
         args = ["--domain", domain, "--container", "unit-home-assistant"]
     else:
 
+        # Capture the SSH package at the same boundary as the container package.
         def transport(target, archive, expected, control_path, batch):
             receive(archive, expected)
 

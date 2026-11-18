@@ -83,6 +83,7 @@ async def test_current_reply_storage_and_cached_disconnect(tmp_path, tls, unused
                 return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
 
+        # Arm the refused read only for the commit that inserted this current selection.
         def trace(sql):
             nonlocal committed
             if sql.startswith("INSERT INTO managed_current_requests"):
@@ -99,6 +100,12 @@ async def test_current_reply_storage_and_cached_disconnect(tmp_path, tls, unused
                 additional_headers={"Authorization": "Bearer " + TOKEN},
                 subprotocols=["ics-proxy.v1"],
             ) as socket:
+                j.db.set_authorizer(authorize)
+                refused_reply = await call(socket, "set_current", id=identifier, revision=revision, current_a=16)
+                j.db.set_authorizer(None)
+                assert refused_reply == {"id": identifier, "ok": False, "error": "not_ready"}
+                assert c.current.worker is None and c.requests.receipt(identifier)["state"] == "not_found"
+                refused.clear()
                 j.db.set_trace_callback(trace)
                 reply = await call(socket, "set_current", id=identifier, revision=revision, current_a=16)
                 j.db.set_trace_callback(None)

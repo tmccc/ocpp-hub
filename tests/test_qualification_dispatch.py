@@ -103,6 +103,7 @@ def test_preparation_consumes_the_worker_deadline(tmp_path, monkeypatch):
         assert "manifest" in command[-2]
         raise subprocess.TimeoutExpired(command[:1], timeout)
 
+    # Any worker launch means the supervisor ignored its exhausted preparation budget.
     def forbidden(*args, **kwargs):
         pytest.fail("a worker launched after preparation timed out")
 

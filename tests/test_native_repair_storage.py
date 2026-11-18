@@ -164,7 +164,11 @@ async def test_actual_strict_result_survives_publication_refusal(
 
         # A different failed poll read remains fatal even while the exact repair outcome is in memory.
         def deny_read(action, table, column, database, source):
-            return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == "meta" else sqlite3.SQLITE_OK
+            return (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_READ and table == "trial_resources"
+                else sqlite3.SQLITE_OK
+            )
 
         j.db.set_authorizer(deny_read)
         try:

@@ -313,6 +313,7 @@ def test_default_validator_requires_raw_qualification():
 def test_rejected_snapshot_runs_no_source_helper(audit_fixture, monkeypatch, changed):
     batch, metadata = audit_fixture
 
+    # Neither executable helper is allowed to receive a rejected checkout.
     def forbidden(*args, **kwargs):
         pytest.fail("a source helper ran on a rejected snapshot")
 

@@ -122,7 +122,14 @@ class ManagementServer:
         try:
             result = self.controller.command(value["id"], command, value["revision"], current_a=value.get("current_a"))
         except sqlite3.Error:
-            # A reply read can fail after admission commits, so preserve uncertainty and allow a receipt lookup.
+            # An absent receipt outside a transaction proves this request was not admitted.
+            if not self.controller.session.journal.db.in_transaction:
+                try:
+                    if self.controller.requests.receipt(value["id"])["state"] == "not_found":
+                        return {"id": value["id"], "ok": False, "error": "not_ready"}
+                except sqlite3.Error:
+                    pass
+            # A reply read can fail after admission commits. The client may look up the receipt.
             return {"id": value["id"], "ok": False, "error": "outcome_unknown"}
         return {"id": value["id"], "ok": True, "result": result}
 
