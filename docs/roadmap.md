@@ -10,6 +10,16 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 ## Current iCS implementation — 18 November 2026
 
+- [x] Backend `bb10464` implements the five simplification stages below. The four full suites passed with
+  20 workers each and identical test IDs: 12,990 engine/model, 618 HA 2026.11.0 client, 618 HA 2026.10.4
+  client and 57 older-integration tests. The normal validator and independent evidence audit passed.
+- [x] The standalone proxy was replaced once and independently verified healthy in app/schedule mode at
+  revision 62 with the 32 A ceiling, a closed session and zero output. The journal, history, native configuration
+  and daily schedule were preserved. The 16 files of the HA client match the candidate, and HA retained its
+  running process, BUILD `8f73bf9`, settings and automation states.
+
+## Previous findings deployment — 18 November 2026
+
 - [x] Implementation `8f73bf9` addresses the six findings from the earlier full review: introduction storage
   retry and diagnostics, guarded approval renewal for normal Start, legacy planning/history handling and release
   tooling. The thin `ics_proxy` HA client is installed from the same implementation with BUILD `8f73bf9`.
