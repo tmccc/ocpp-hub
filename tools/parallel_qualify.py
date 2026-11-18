@@ -102,6 +102,7 @@ def main() -> int:
         mounts.append({"source": source, "target": target})
     config = {
         "mode": "full",
+        "scheduler": "pull-v1",
         "suite": args.suite,
         "workers": args.workers,
         "label": label,

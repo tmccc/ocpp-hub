@@ -32,6 +32,42 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+class WorkQueue:
+    """Assign the next case to the worker that asks for it."""
+
+    # The supervisor is the only writer of the global dispatch ledger.
+    def __init__(self, root, selected, ledger):
+        self.root = root
+        self.pending = iter(selected)
+        self.ledger = ledger
+        self.assigned = defaultdict(list)
+        self.finished = set()
+
+    # A worker asks for exactly one further grant at a time. Keep the grant even when its worker aborts.
+    def dispatch(self, index):
+        if index in self.finished:
+            return
+        directory = self.root / str(index)
+        request = directory / "request.json"
+        if not request.exists():
+            return
+        sequence = json.loads(request.read_text())
+        assigned = self.assigned[index]
+        if type(sequence) is not int or sequence not in (len(assigned) - 1, len(assigned)):
+            raise RuntimeError(f"Worker {index} made an out-of-order queue request")
+        if sequence != len(assigned):
+            return
+        identifier = next(self.pending, None)
+        grant = {"sequence": sequence, "id": identifier}
+        self.ledger.write(json.dumps({"worker": index, **grant}) + "\n")
+        self.ledger.flush()
+        if identifier is None:
+            self.finished.add(index)
+        else:
+            assigned.append(identifier)
+        write_json(directory / "grant.json", grant)
+
+
 # Verify snapshot files before and after execution using the original path/digest convention.
 def snapshot_digest(metadata):
     digest = hashlib.sha256()
@@ -334,8 +370,11 @@ def main():
     started = time.time()
     workers = []
     preparation = []
+    queue = None
+    ledger = None
     summary = {
         "mode": config["mode"],
+        "scheduler": config.get("scheduler"),
         "commit": config["commit"],
         "source_digest": config["source_digest"],
         "started_epoch": started,
@@ -349,6 +388,8 @@ def main():
     summary["worker_network"] = "none, one namespace per worker"
     write_json(ROOT / "result.json", summary)
     try:
+        if config.get("scheduler") != "pull-v1":
+            raise RuntimeError("Unsupported qualification scheduler")
         if snapshot_digest(metadata) != config["source_digest"] or metadata["commit"] != config["commit"]:
             raise RuntimeError("Snapshot identity mismatch")
         for filename, expected in config["harness_hashes"].items():
@@ -455,11 +496,11 @@ def main():
         write_json(ROOT / "selected-ids.json", selected)
         write_json(ROOT / "selection.json", reasons)
         summary.update({"collected_cases": len(ids), "selected_cases": len(selected), "selection": reasons})
+        ledger = (ROOT / "dispatch.jsonl").open("x")
+        queue = WorkQueue(ROOT, selected, ledger)
         for index, cpu in enumerate(cpus):
-            group_ids = selected[index :: len(cpus)]
             directory = ROOT / str(index)
             directory.mkdir()
-            write_json(directory / "assigned-ids.json", group_ids)
             output = (directory / "pytest.log").open("w")
             worker_env = {
                 **env,
@@ -478,7 +519,8 @@ def main():
                     "-p",
                     "qualification_evidence",
                     "-x",
-                    *group_ids,
+                    "--qualification-work-queue",
+                    *config["specs"],
                     "--tb=short",
                     "--basetemp=" + str(directory / "tmp"),
                 ],
@@ -496,7 +538,7 @@ def main():
                     "output": output,
                     "container_name": container_name,
                     "started_epoch": time.time(),
-                    "cases": len(group_ids),
+                    "cases": 0,
                 }
             )
         next_telemetry = 0.0
@@ -513,6 +555,10 @@ def main():
             failed = [item for item in workers if item["process"].poll() not in (None, 0)]
             if failed and ABORT is None:
                 ABORT = "worker_" + str(failed[0]["index"]) + "_exit_" + str(failed[0]["process"].returncode)
+            if not ABORT:
+                for item in workers:
+                    if item["process"].poll() is None:
+                        queue.dispatch(item["index"])
             if ABORT and not stopped:
                 cleanup_containers(workers)
                 for item in workers:
@@ -531,6 +577,7 @@ def main():
         telemetry(workers)
         for item in workers:
             item["output"].close()
+            item["cases"] = len(queue.assigned[item["index"]])
             group = {key: item[key] for key in ("index", "cpu", "cases", "started_epoch")}
             group.update(
                 {key: item.get(key) for key in ("container_name", "container_id", "pytest_pid", "network_namespace")}
@@ -555,11 +602,22 @@ def main():
                     pass
                 kill_survivors(identities)
         summary["groups"] = [
-            {"index": item["index"], "cpu": item["cpu"], "cases": item["cases"], "rc": item["process"].poll()}
+            {
+                "index": item["index"],
+                "cpu": item["cpu"],
+                "cases": len(queue.assigned[item["index"]]) if queue is not None else 0,
+                "rc": item["process"].poll(),
+            }
             for item in workers
         ]
     finally:
         cleanup_errors = cleanup_containers(workers + preparation)
+        if queue is not None:
+            for item in workers:
+                index = item["index"]
+                write_json(ROOT / str(index) / "assigned-ids.json", queue.assigned[index])
+        if ledger is not None:
+            ledger.close()
         if cleanup_errors:
             ABORT = ABORT or "task_container_cleanup_failed"
             summary["complete"] = False

@@ -17,6 +17,11 @@ COLLECTION_ERRORS = []
 EFFECTIVE_SETTINGS = None
 
 
+# Only the supervisor opts its execution workers into dispatch. Collectors and static CI retain the normal loop.
+def pytest_addoption(parser):
+    parser.addoption("--qualification-work-queue", action="store_true")
+
+
 # Resolve the reviewed helper by source path, independent of installed tools packages or copied plugin locations.
 def collection_settings(config):
     helper = Path(config.rootpath).resolve() / "tools/qualification_collection.py"
@@ -101,6 +106,49 @@ def pytest_collection_finish(session):
 def emit(row):
     with Path(os.environ["SCENARIO_RESULTS"]).open("a") as output:
         output.write(json.dumps({"epoch": time.time(), **row}, default=str) + "\n")
+
+
+# Request work through this worker's own scratch directory. The supervisor grants each ID at most once.
+def next_grant(directory, sequence):
+    request = directory / "request.json"
+    temporary = request.with_suffix(".new")
+    temporary.write_text(json.dumps(sequence) + "\n")
+    temporary.replace(request)
+    grant_path = directory / "grant.json"
+    while True:
+        if grant_path.exists():
+            grant = json.loads(grant_path.read_text())
+            if grant["sequence"] == sequence:
+                emit({"event": "grant", **grant})
+                return grant["id"]
+        time.sleep(0.02)
+
+
+# Use pytest's normal protocol and one real next item so session fixtures retain their normal lifetimes.
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtestloop(session):
+    if not session.config.getoption("--qualification-work-queue") or session.config.option.collectonly:
+        return None
+    if session.testsfailed:
+        raise session.Interrupted("Worker collection failed")
+    items = {item.nodeid: item for item in session.items}
+    if not items or len(items) != len(session.items):
+        raise session.Interrupted("Worker collection is empty or contains duplicate IDs")
+    directory = Path(os.environ["SCENARIO_RESULTS"]).parent
+    sequence = 0
+    identifier = next_grant(directory, sequence)
+    while identifier is not None:
+        sequence += 1
+        following = next_grant(directory, sequence)
+        session.config.hook.pytest_runtest_protocol(
+            item=items.pop(identifier), nextitem=items[following] if following is not None else None
+        )
+        if session.shouldfail:
+            raise session.Failed(session.shouldfail)
+        if session.shouldstop:
+            raise session.Interrupted(session.shouldstop)
+        identifier = following
+    return True
 
 
 # Record an attempted node before setup, so forced interruption differs from an unrun node.

@@ -59,6 +59,11 @@ Host-runtime mode explicitly mounts the worker's `/usr` and virtualenv; image-ru
 interpreter/libraries and mounts its matching virtualenv at `/venv`. Package/interpreter identity and the mounted
 virtualenv digest are recorded and checked; source and executed harness bytes are checked before and after the run.
 
+The supervisor keeps one queue of the collected cases. A worker finishing a case pulls more work from that queue,
+with one case of lookahead so pytest can keep its session fixtures. Each container keeps its own CPU, namespace,
+port range and scratch directory for the entire session. The dispatch log and worker evidence must agree on every
+grant, start and completion. An interrupted grant stays recorded and is never retried within the attempt.
+
 For an existing provisioned Linux worker, the invocation has this form; all capitalized paths/IDs are operator inputs:
 
 ```bash

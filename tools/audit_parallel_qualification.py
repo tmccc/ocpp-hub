@@ -145,6 +145,37 @@ def canonical_collection(root, config, commit, checksum, executors=None):
     return payload
 
 
+# Reconstruct supervisor decisions independently of worker evidence and final assignment summaries.
+def dispatch_grants(root, selected, workers):
+    grants = defaultdict(list)
+    position = 0
+    ended = set()
+    try:
+        for line in (root / "dispatch.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            index, sequence, identifier = row["worker"], row["sequence"], row["id"]
+            if (
+                set(row) != {"worker", "sequence", "id"}
+                or type(index) is not int
+                or not 0 <= index < workers
+                or index in ended
+                or type(sequence) is not int
+                or sequence != len(grants[index])
+                or identifier != (selected[position] if position < len(selected) else None)
+            ):
+                raise ValueError("out-of-order or invalid queue grant")
+            grants[index].append((sequence, identifier))
+            if identifier is None:
+                ended.add(index)
+            else:
+                position += 1
+    except OSError, ValueError, KeyError, TypeError:
+        return grants, ["malformed or inconsistent dispatch ledger"]
+    if position != len(selected) or len(ended) != workers:
+        return grants, ["dispatch did not exhaust the complete queue"]
+    return grants, []
+
+
 # Reconcile raw phase evidence against the exact collection, assignment, manifest and caller-pinned snapshot.
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -162,6 +193,16 @@ def main(argv=None):
     collected = read_json(root / "collected-ids.json", [])
     selected = read_json(root / "selected-ids.json", [])
     errors = []
+    scheduler = config.get("scheduler", "static")
+    dynamic = scheduler == "pull-v1"
+    if scheduler not in ("static", "pull-v1"):
+        errors.append("unknown qualification scheduler")
+    grants = {}
+    if dynamic:
+        if result.get("scheduler") != scheduler:
+            errors.append("supervisor scheduler differs from configuration")
+        grants, dispatch_errors = dispatch_grants(root, selected, config.get("workers", 0))
+        errors.extend(dispatch_errors)
     suites = {
         "engine-model": ["tests", "tests_model"],
         "ha-proxy": ["tests_ha_proxy"],
@@ -275,8 +316,18 @@ def main(argv=None):
         directory = root / str(index)
         assigned = read_json(directory / "assigned-ids.json", [])
         assignments.extend(assigned)
-        if assigned != selected[index :: config["workers"]]:
-            errors.append("worker assignment differs from deterministic partition: " + str(index))
+        expected_grants = grants.get(index, [])
+        expected = (
+            [identifier for _, identifier in expected_grants if identifier is not None]
+            if dynamic
+            else selected[index :: config["workers"]]
+        )
+        if assigned != expected:
+            errors.append("worker assignment differs from scheduler records: " + str(index))
+        acknowledged_grants = []
+        started_ids = []
+        outstanding = set()
+        active = None
         path = directory / "results.jsonl"
         if not path.exists():
             continue
@@ -291,8 +342,25 @@ def main(argv=None):
                 errors.append("worker evidence has an unassigned ID: " + str(identifier))
             if row.get("event") == "start":
                 starts[identifier] += 1
+                started_ids.append(identifier)
+                if dynamic:
+                    if identifier not in outstanding or active is not None:
+                        errors.append("test started without its grant or overlapped another test: " + str(identifier))
+                    active = identifier
             elif row.get("event") == "report":
                 evidence[identifier].append({**row, "worker": index})
+                if dynamic:
+                    if active is None or identifier != active:
+                        errors.append("phase report does not belong to the worker's active test: " + str(identifier))
+                    elif row["phase"] == "teardown":
+                        outstanding.discard(identifier)
+                        active = None
+            elif row.get("event") == "grant":
+                acknowledged_grants.append((row.get("sequence"), identifier))
+                if identifier is not None:
+                    outstanding.add(identifier)
+                    if len(outstanding) > 2:
+                        errors.append("worker exceeded the one-case lookahead: " + str(index))
             elif row.get("event") == "worker_namespace":
                 namespaces.setdefault(index, []).append(row)
             elif row.get("event") == "collection":
@@ -304,9 +372,12 @@ def main(argv=None):
             elif row.get("event") == "session_finish":
                 sessions.setdefault(index, []).append(row["exitstatus"])
                 runtime_ends.setdefault(index, []).append(row.get("runtime"))
+        if dynamic and (acknowledged_grants != expected_grants or started_ids != assigned):
+            errors.append("worker grants or start order differ from dispatch ledger: " + str(index))
     for index in range(config.get("workers", 0)):
-        if worker_collections.get(index) != [selected[index :: config["workers"]]]:
-            errors.append("worker actual collection differs from assignment: " + str(index))
+        collection = selected if dynamic else selected[index :: config["workers"]]
+        if worker_collections.get(index) != [collection]:
+            errors.append("worker actual collection differs from expected scope: " + str(index))
         records = namespaces.get(index, [])
         if (
             len(records) != 1
@@ -445,6 +516,7 @@ def main(argv=None):
         "mode": config.get("mode"),
         "suite": config.get("suite"),
         "workers": config.get("workers"),
+        "scheduler": scheduler,
         "commit": args.expected_commit,
         "source_digest": args.expected_source_digest,
         "actual_source_digest": digest.hexdigest(),

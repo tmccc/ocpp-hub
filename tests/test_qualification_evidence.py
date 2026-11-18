@@ -169,6 +169,46 @@ def test_auditor_accepts_complete_fixture(audit_fixture):
     )
 
 
+# Intent: dynamic execution may differ from the old round-robin partition but still needs exact owner evidence.
+# Why: uneven assignment is expected when one worker is faster, while lost or fabricated grants must fail.
+@pytest.mark.parametrize("problem", [None, "duplicate", "wrong_worker", "grant_after_start", "premature_teardown"])
+def test_auditor_checks_dynamic_grants(audit_fixture, problem):
+    batch, metadata = audit_fixture
+    ids = json.loads((batch / "selected-ids.json").read_text())
+    config_path = batch / "config.json"
+    config = json.loads(config_path.read_text())
+    write_json(config_path, {**config, "scheduler": "pull-v1"})
+    result_path = batch / "result.json"
+    write_json(result_path, {**json.loads(result_path.read_text()), "scheduler": "pull-v1"})
+    paths = [batch / str(index) / "results.jsonl" for index in range(2)]
+    records = [[json.loads(line) for line in path.read_text().splitlines()] for path in paths]
+    grants = [
+        {"worker": 0, "sequence": 0, "id": ids[0]},
+        {"worker": 0, "sequence": 1, "id": ids[1]},
+        {"worker": 1, "sequence": 0, "id": None},
+        {"worker": 0, "sequence": 2, "id": None},
+    ]
+    claims = [{"event": "grant", "sequence": row["sequence"], "id": row["id"]} for row in grants]
+    first = [records[0][0], synthetic_collection_row(ids), *claims[:2], *records[0][2:-1]]
+    first += [claims[3], *records[1][2:-1], records[0][-1]]
+    second = [records[1][0], synthetic_collection_row(ids), claims[2], records[1][-1]]
+    if problem == "duplicate":
+        grants.insert(1, grants[0])
+    elif problem == "wrong_worker":
+        grants[1] = {**grants[1], "worker": 1, "sequence": 0}
+    elif problem == "grant_after_start":
+        first[2], first[4] = first[4], first[2]
+    elif problem == "premature_teardown":
+        first.insert(2, first.pop(7))
+    for path, assigned, rows in zip(paths, (ids, []), (first, second), strict=True):
+        write_json(path.parent / "assigned-ids.json", assigned)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (batch / "dispatch.jsonl").write_text("".join(json.dumps(row) + "\n" for row in grants))
+    assert audit.main(
+        [str(batch), "--expected-commit", metadata["commit"], "--expected-source-digest", metadata["source_digest"]]
+    ) == int(problem is not None)
+
+
 # Intent: no individual missing phase, retry, skipped test, source drift or runtime mismatch can remain green.
 # Why: a report's own success flag is not evidence that the exact assigned candidate completed.
 @pytest.mark.parametrize(
