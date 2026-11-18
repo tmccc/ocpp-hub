@@ -359,16 +359,16 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     if (
         c.stopping
         or j.fault.latched()
-        or not phase.active
         or not result.get("charger_connected")
         or c.latest_native is None
         or c.status_authority is None
         or c.authority() != c.status_authority
     ):
         result.update(local_hold_verified=False, owner_control_enabled=False)
-    if not control.shared or c.released_epoch != g._charger_epoch:
+    if not phase.active or not control.shared or c.released_epoch != g._charger_epoch:
         result["owner_control_enabled"] = False
-    if not control.local_hold or control.values.get("uncertain"):
+    # Physical zero can be verified while delivery or recovery still blocks shared control.
+    if not control.local_hold:
         result["local_hold_verified"] = False
     if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
         pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
