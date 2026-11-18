@@ -5,16 +5,14 @@ import uuid
 
 import pytest
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench
+from tests.managed_rig import starts
 from tests.model_tls_support import model_tls as model_tls
 from tests.model_tls_support import tls_for_case
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import process_rig
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import starts
+from tests.prototype_rig import START
 from tests.test_managed_start_delivery_recovery import approve_retry, map_unknown_retry
-from tests.test_prototype import START
 from tests_model.catalog import input_digest
 from tests_model.review_cases import bound_owner_delivery_candidates
 
@@ -25,8 +23,6 @@ from tests_model.review_cases import bound_owner_delivery_candidates
 async def test_bound_owner_delivery_sequences(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, capsys, record_property, case
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     events, complete = [], False
     try:
         async with process_rig(
@@ -36,6 +32,8 @@ async def test_bound_owner_delivery_sequences(
             unused_tcp_port_factory(),
             monkeypatch,
             case.selected,
+            bench_type=StartReplyBench,
+            native_peer=InterruptedNativePeer,
         ) as child:
             await child.start()
             state = await child.status()

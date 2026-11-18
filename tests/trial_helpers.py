@@ -19,7 +19,7 @@ from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource, native_pr
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests.test_prototype import Rig
+from tests.prototype_rig import Rig
 
 
 # Model native tenths-of-an-ampere fields independently from the proxy's requested OCPP payload.

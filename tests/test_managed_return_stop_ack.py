@@ -9,12 +9,12 @@ from datetime import UTC, datetime
 import pytest
 from ocpp_hub_core.frames import build_call_error
 
+from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 # Intent: one accepted Return waits at zero for a known Stop ACK and completes without a new UUID.
@@ -63,7 +63,7 @@ async def test_return_with_pending_stop_ack(tmp_path, tls, unused_tcp_port, monk
     monkeypatch.setattr(Bench, "vendor", gated_vendor)
     report = {"delayed": delayed, "stages": []}
     try:
-        async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
             j, g = b.session.journal, b.session.gateway
             g.policy = replace(g.policy, allowed_tags=frozenset({"APP_OWNER", *g.policy.allowed_tags}))
             g.controls.policy = g.policy

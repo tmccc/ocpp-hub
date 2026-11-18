@@ -24,18 +24,17 @@ from ocpp_hub_core.prototype.managed_stop_delivery import REJECTION
 from ocpp_hub_core.prototype.store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig, positive_flow
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.connected_rig import strategy_file
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
-from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tools import reconcile_managed_delivery as mapping
 
 pytestmark = pytest.mark.asyncio
@@ -330,11 +329,18 @@ async def test_cloud_ack_storage_recovery(
 async def storage_recovery_case(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, selected, action, failure, replaced
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StorageBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with AsyncExitStack() as stack:
         b = await stack.enter_async_context(
-            commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True)
+            commissioned(
+                tmp_path,
+                tls,
+                unused_tcp_port,
+                monkeypatch,
+                selected,
+                cli_route=True,
+                bench_type=StorageBench,
+                native_peer=InterruptedNativePeer,
+            )
         )
         strategy_file(b.rig, tmp_path)
         original_configuration = dict(b.rig.peer.configuration)
@@ -403,11 +409,18 @@ async def storage_recovery_case(
 async def test_negative_cloud_reply_storage_keeps_quarantine(
     tmp_path, tls, unused_tcp_port, monkeypatch, selected, failure, replaced, negative
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StorageBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with AsyncExitStack() as stack:
         b = await stack.enter_async_context(
-            commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True)
+            commissioned(
+                tmp_path,
+                tls,
+                unused_tcp_port,
+                monkeypatch,
+                selected,
+                cli_route=True,
+                bench_type=StorageBench,
+                native_peer=InterruptedNativePeer,
+            )
         )
         if negative == "denied-start":
             b.rig.bench.start_replies = ["Blocked"]
@@ -562,11 +575,18 @@ async def test_saved_reply_identity_and_cleanup_contract(tmp_path, tamper):
 async def test_malformed_start_reply_cache_quarantines_without_replay(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, selected, replaced
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StorageBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with AsyncExitStack() as stack:
         b = await stack.enter_async_context(
-            commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True)
+            commissioned(
+                tmp_path,
+                tls,
+                unused_tcp_port,
+                monkeypatch,
+                selected,
+                cli_route=True,
+                bench_type=StorageBench,
+                native_peer=InterruptedNativePeer,
+            )
         )
         strategy_file(b.rig, tmp_path)
         b.rig.bench.start_replies = ["bad-info"]

@@ -11,15 +11,14 @@ from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 
-import tests.test_managed_proxy as managed_helpers
-import tests.test_native_bounded_session as native_bench
-import tests.test_trial_session as independent_peer
+import tests.managed_rig as managed_helpers
+import tests.trial_peer as independent_peer
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 class GatedNativePeer(NativeVehiclePeer):
@@ -85,8 +84,7 @@ class CorrelatedOwnerBench(managed_helpers.OwnerBench):
 # Why: fresh physical evidence does not preserve time-dependent or connection-specific permission to dispatch.
 @pytest.mark.parametrize("crossed", ["expiry", "vendor", "pause"])
 async def test_vendor_start_rechecks_authority_after_native_http(tmp_path, tls, unused_tcp_port, monkeypatch, crossed):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", GatedNativePeer)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, native_peer=GatedNativePeer) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
@@ -159,8 +157,7 @@ async def test_vendor_start_rechecks_authority_after_native_http(tmp_path, tls, 
 # Intent: one real HTTP503 yields a bounded failure that same-id retries receive without executing the Start.
 # Why: expected native availability errors must not cancel a cached response or turn a retry into a physical command.
 async def test_vendor_native503_has_stable_correlated_failure(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, native_peer=InterruptedNativePeer) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
@@ -199,7 +196,7 @@ async def test_vendor_native503_has_stable_correlated_failure(tmp_path, tls, unu
 async def test_cancelled_dispatched_vendor_call_has_stable_no_replay_result(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
@@ -249,8 +246,7 @@ async def test_cancelled_dispatched_vendor_call_has_stable_no_replay_result(
 # Intent: old harmless reads cannot deny the mapped cloud Stop or erase its completed exact-id outcome.
 # Why: a healthy long-lived connection must keep accepting Stop after thousands of completed read requests.
 async def test_vendor_read_history_does_not_exhaust_stop_capacity(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(managed_helpers, "OwnerBench", CorrelatedOwnerBench)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, bench_type=CorrelatedOwnerBench) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)

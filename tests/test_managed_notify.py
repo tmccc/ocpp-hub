@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-PROBE = r'''
+PROBE = r"""
 import asyncio, json, os, socket, sys, time
 name = sys.argv[1]
 address = "\0" + name
@@ -71,7 +71,7 @@ async def run():
         print(json.dumps({"elapsed": elapsed, "filled": filled, "packets": len(packets)}))
 
 asyncio.run(run())
-'''
+"""
 
 
 # Intent: full and empty real supervisor queues both leave the actual watchdog's event loop responsive.

@@ -7,13 +7,13 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
+from tests.current_rig import selected_ready
+from tests.managed_rig import managed_bench, managed_session
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
 from tests.test_introduction_readiness_retry import no_synthetic_lifecycle
-from tests.test_managed_introduction_retry import selected_ready
-from tests.test_managed_proxy import managed_bench, managed_session
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
 from tests.test_worker_storage_recovery import failing_cleanup
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.asyncio
 # Intent: first-Boot history beyond the reserved allocation is refused even when the output offer is not yet zero.
 # Why: a readiness wait cannot hide an observed strict history contradiction that may later roll off the charger.
 async def test_initial_history_refusal_precedes_closed_zero_readiness(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         c, g, j = ManagedController(session), session.gateway, session.journal

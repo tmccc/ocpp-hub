@@ -10,21 +10,20 @@ import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import owner_start, positive_flow
+from tests.current_rig import selected_ready
 from tests.handover_helpers import crash
-from tests.test_managed_introduction_retry import InterruptedNativePeer, selected_ready
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_test_charge import owner_start, positive_flow
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: an ordinary same-connection zero hold during a genuine cloud outage preserves the owner's app revision.
 # Why: recovering phase alone does not mean a replacement introduction retired the owner's authority.
 async def test_same_connection_outage_hold_preserves_app_authority(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32, native_peer=InterruptedNativePeer) as b:
         c, g, j = b.controller, b.session.gateway, b.session.journal
         intent = c.requests.intent()
         epoch, boot = g._charger_epoch, g.boot_observation
@@ -135,8 +134,9 @@ async def test_known_ordinary_session_recovers_without_temporary_lease(
 async def test_ordinary_http_outage_retries_zero_and_recovers(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, open_session
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as b:
         local = await positive_flow(b, "daily") if open_session else None
         await healthy(b.controller)
         revision = b.controller.requests.intent().revision
@@ -190,8 +190,9 @@ class SlowOrTruncatedPeer(InterruptedNativePeer):
 async def test_ordinary_native_eof_and_real_stale_audit_recover(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, mode
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SlowOrTruncatedPeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=SlowOrTruncatedPeer
+    ) as b:
         revision = b.controller.requests.intent().revision
         b.rig.peer.transport_mode = mode
         for _ in range(3):

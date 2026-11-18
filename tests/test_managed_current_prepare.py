@@ -6,8 +6,6 @@ import copy
 import json
 import ssl
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -18,39 +16,11 @@ from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import ChargeRig, actual_stop, positive_flow, ready
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-
-
-# Establish Pause through the actual command, TLS profile effect and independent native readback before yielding.
-@asynccontextmanager
-async def paused_ready(
-    directory: Path,
-    contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path],
-    port: int,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    cli_route: bool = False,
-) -> AsyncIterator[ChargeRig]:
-    async with ready(directory, contexts, port, monkeypatch, cli_route=cli_route) as test:
-        test.controller.command(uuid.uuid4().hex, "pause", 0)
-        status = await healthy(test.controller)
-        assert status["local_hold_verified"] and status["station_ceiling_a"] == 0
-        assert test.rig.bench.firmware.effective_limit() == 0
-        yield test
-
-
-# The only injected native writer changes the independently held USER scalar, never journal authority or OCPP state.
-def native_writer(test: ChargeRig, writes: list[dict[str, str]]) -> Callable[[], Awaitable[None]]:
-    # Model only the authorized native USER scalar and its runtime readback, leaving the independent zero intact.
-    async def patch() -> None:
-        writes.append({"AmpLmt": "32"})
-        test.rig.peer.configuration.update(writes[-1])
-        test.rig.peer.runtime_user = 320
-
-    return patch
+from tests.charge_rig import ChargeRig, actual_stop, positive_flow, ready
+from tests.current_rig import native_writer, paused_ready
+from tests.managed_rig import starts
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Preserve every admission binding and historical policy rather than replacing the original six-ampere specification.

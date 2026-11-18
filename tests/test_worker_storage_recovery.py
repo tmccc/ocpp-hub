@@ -5,15 +5,14 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import owner_rig
 from tests.cloud_start_helpers import two_later_sessions
-from tests.test_managed_current import adjustable
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # An actual SQLite trigger records separate cleanup attempts before refusing that write; no result is mocked.
@@ -62,8 +61,9 @@ def fail_boundary(j, boundary, failure):
 # Why: a diagnostic write cannot occupy the worker or foreground poll after critical settlement succeeds.
 @pytest.mark.parametrize("tick_awaits", [False, True])
 async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unused_tcp_port, monkeypatch, tick_awaits):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=1) as b:
+    async with owner_rig(
+        tmp_path, tls, unused_tcp_port, monkeypatch, startup=1, native_peer=InterruptedNativePeer
+    ) as b:
         c, j = b.controller, b.session.journal
         original_session = b.session
         for cycle, failure in enumerate(("statement", "commit")):
@@ -105,8 +105,7 @@ async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unus
 async def test_current_completion_eventually_recovers_same_service(
     tmp_path, tls, unused_tcp_port, monkeypatch, tick_awaits
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer) as b:
         c, j = b.controller, b.session.journal
         original_session = b.session
         for cycle, failure in enumerate(("statement", "commit")):

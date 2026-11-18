@@ -13,14 +13,14 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 from websockets.asyncio.client import connect
 
-from tests import test_native_bounded_session as native_bench
-from tests.handover_helpers import crash
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import FAST, until
+from tests.charge_rig import ChargeRig
+from tests.current_rig import commissioned
+from tests.handover_helpers import NativeVehiclePeer, crash
+from tests.managed_rig import OwnerBench
+from tests.management_peer import TOKEN, call
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import FAST, until
 from tools import managed_proxy
 
 
@@ -67,9 +67,19 @@ class RunningService:
 
 # Supply only fixture endpoints and capture actual signal callbacks; all service, API and worker code stays real.
 @asynccontextmanager
-async def running_service(tmp_path, tls, ports, monkeypatch, current):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with commissioned(tmp_path, tls, ports(), monkeypatch, current, cli_route=True) as original:
+async def running_service(
+    tmp_path,
+    tls,
+    ports,
+    monkeypatch,
+    current,
+    *,
+    native_peer: type[NativeVehiclePeer] = InterruptedNativePeer,
+    bench_type: type[OwnerBench] = OwnerBench,
+):
+    async with commissioned(
+        tmp_path, tls, ports(), monkeypatch, current, cli_route=True, native_peer=native_peer, bench_type=bench_type
+    ) as original:
         await original.controller.current.close()
         await original.controller.charging.close()
         await crash(original.session)

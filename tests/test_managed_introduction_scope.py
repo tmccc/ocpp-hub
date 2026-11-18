@@ -14,21 +14,32 @@ import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import selected_ready
+from tests.handover_helpers import NativeVehiclePeer
+from tests.managed_rig import OwnerBench, healthy, introduced, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
 from tests.test_managed_current_tick_race import OneNativeResponseGate
-from tests.test_managed_introduction_retry import InterruptedNativePeer, selected_ready
-from tests.test_managed_proxy import healthy, introduced, starts
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
 
 # Reconnect an already commissioned service and stop before the controller acknowledges its real zero introduction.
 @asynccontextmanager
-async def pending_introduction(tmp_path, tls, port, monkeypatch):
-    async with selected_ready(tmp_path, tls, port, monkeypatch, 32) as b:
+async def pending_introduction(
+    tmp_path,
+    tls,
+    port,
+    monkeypatch,
+    *,
+    native_peer: type[NativeVehiclePeer] = NativeVehiclePeer,
+    bench_type: type[OwnerBench] = OwnerBench,
+):
+    async with selected_ready(
+        tmp_path, tls, port, monkeypatch, 32, native_peer=native_peer, bench_type=bench_type
+    ) as b:
         session, g, j = b.session, b.session.gateway, b.session.journal
         await b.charger.close()
         await until(lambda: not session.runtime.status.charger_connected)
@@ -100,8 +111,9 @@ def no_start_or_stop(b):
 async def test_acknowledged_lineage_survives_matching_boot_and_ordinary_outage(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with pending_introduction(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with pending_introduction(
+        tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer
+    ) as b:
         c, g, j, peer = b.controller, b.session.gateway, b.session.journal, b.rig.peer
         native, intent = c.native, c.requests.intent()
         initial = current_scope(g)
@@ -189,8 +201,9 @@ async def test_resume_acknowledges_lineage_only_after_real_commit(tmp_path, tls,
 async def test_matching_boot_fences_proof_and_failed_attempt_without_erasing_origin(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with pending_introduction(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with pending_introduction(
+        tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate
+    ) as b:
         c, g, j, peer = b.controller, b.session.gateway, b.session.journal, b.rig.peer
         # Change the environment's backoff after setup; the accepted A connection will adopt it when closed.
         monkeypatch.setattr(

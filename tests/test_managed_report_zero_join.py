@@ -6,14 +6,14 @@ from datetime import UTC, datetime
 
 from ocpp_hub_core.prototype.gateway import decode
 
-import tests.test_managed_proxy as managed_helpers
+import tests.managed_rig as managed_helpers
+from tests.managed_rig import healthy, starts
 from tests.managed_scenario_helpers import close_in_order, next_daily, originals, select_current, settle
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import healthy, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_start_overlap import owner_tag
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 class CompositeReplyPeer:
@@ -85,8 +85,7 @@ class HeldZeroBench(managed_helpers.OwnerBench):
 # Intent: an unconfirmed real zero yields a retryable wire error without allocating the delayed lifecycle.
 # Why: physical zero alone is insufficient; a later identical report must succeed only after actual verification.
 async def test_delayed_report_retries_after_zero_join_timeout(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(managed_helpers, "OwnerBench", HeldZeroBench)
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, bench_type=HeldZeroBench) as b:
         await select_current(b, 32)
         saved = originals(b)
         owner_tag(b)

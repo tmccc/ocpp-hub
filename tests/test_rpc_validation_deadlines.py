@@ -12,12 +12,11 @@ from ocpp_hub_core.frames import build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.rpc import Peer, UnavailableError
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import owner_rig
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, starts
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -100,8 +99,7 @@ def assert_retired(peer):
 async def test_native_audit_and_wire_reply_have_independent_budgets(
     tmp_path, tls, unused_tcp_port, monkeypatch, audit_delay, reply_delay
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", NativeAuditPeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as test:
         c, g, peer = test.controller, test.session.gateway, test.rig.peer
         g.charger.timeout = 0.30
         peer.delay = audit_delay
@@ -133,8 +131,7 @@ async def test_native_audit_and_wire_reply_have_independent_budgets(
 # Intent: a real newer Pause applies zero and retires a held pre-Start audit before HTTP is released.
 # Why: extending the audit allowance must not make a protective control wait behind fifteen seconds of old evidence.
 async def test_pause_cancels_held_native_audit_before_start(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", NativeAuditPeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as test:
         c, g, peer, j = test.controller, test.session.gateway, test.rig.peer, test.session.journal
 
         # Trigger latency from actual device effects, after positive cap validation but before RemoteStart validation.
@@ -207,8 +204,7 @@ async def test_missing_wire_reply_keeps_start_uncertain(tmp_path, tls, unused_tc
 # Intent: cancelling real native validation retires only prepared vendor work and closes its actual HTTP reader.
 # Why: no orphan validation task may retain the gate, grant or correlation entry after its caller exits.
 async def test_cancelled_native_validation_retires_unsent_vendor_work(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", NativeAuditPeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as test:
         g, j, peer = test.session.gateway, test.session.journal, test.rig.peer
         peer.arm = "hold"
         frame = [2, "cancel-native-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}]
@@ -236,8 +232,7 @@ async def test_cancelled_native_validation_retires_unsent_vendor_work(tmp_path, 
 # Intent: retiring the real charger connection cannot dispatch a Start from its outstanding native audit.
 # Why: the independently completed HTTP snapshot cannot revive an obsolete socket generation or leave its gate owned.
 async def test_retired_charger_cancels_native_validation_without_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", NativeAuditPeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as test:
         g, j, peer = test.session.gateway, test.session.journal, test.rig.peer
         epoch = g._charger_epoch
         peer.arm = "hold"
@@ -262,8 +257,7 @@ async def test_retired_charger_cancels_native_validation_without_dispatch(tmp_pa
 # Intent: a real native HTTP refusal retires its prepared mutation without weakening the exact validation boundary.
 # Why: deadline separation must preserve both fast validation failures and later fresh command admission.
 async def test_native503_retires_prepared_vendor_work(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", NativeAuditPeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as test:
         g, j, peer = test.session.gateway, test.session.journal, test.rig.peer
         peer.arm = "503"
         result = await test.rig.bench.cloud_call(

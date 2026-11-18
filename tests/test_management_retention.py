@@ -10,9 +10,9 @@ import pytest
 from ocpp_hub_core.prototype.managed_intent import ManagedRequests
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 
-from tests.test_managed_proxy import healthy
-from tests.test_managed_test_charge import actual_stop, positive_flow, ready
-from tests.test_prototype_tls import tls as tls
+from tests.charge_rig import actual_stop, positive_flow, ready
+from tests.managed_rig import healthy
+from tests.tls_support import tls as tls
 
 
 # Seed historical results or legacy unresolved work without altering the production admission/counting implementation.
@@ -65,9 +65,7 @@ def test_terminal_history_retains_uuid_results_without_consuming_capacity(tmp_pa
 
 # Intent: every non-Pause command class reserves capacity for a later immediate restrictive intent.
 # Why: timed or cloud charge admission must not consume a slot that normal Start and Return deliberately reserve.
-@pytest.mark.parametrize(
-    "action", ["start", "start_test", "arm_cloud_test", "set_current", "app_control"]
-)
+@pytest.mark.parametrize("action", ["start", "start_test", "arm_cloud_test", "set_current", "app_control"])
 def test_all_ordinary_admissions_reserve_the_pause_slot(tmp_path, action):
     journal = Journal(tmp_path / "requests.db", "OFFLINE001")
     try:

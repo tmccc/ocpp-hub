@@ -7,8 +7,8 @@ import pytest
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal
 
-from tests.test_native_bounded_session import connected_bench
-from tests.test_prototype_tls import tls as tls
+from tests.connected_rig import connected_bench
+from tests.tls_support import tls as tls
 
 
 # Intent: incomplete or malformed retired state is refused before a listener, observation or command can start.

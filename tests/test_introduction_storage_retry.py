@@ -6,12 +6,12 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_introduction_retry import InterruptedNativePeer, selected_ready
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 class GatedIntroductionPeer(InterruptedNativePeer):
@@ -50,8 +50,9 @@ def current_probe(runtime, epoch):
 async def test_paused_introduction_read_storage_recovers_on_same_boot(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, storage_fault
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", GatedIntroductionPeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=GatedIntroductionPeer
+    ) as b:
         c, j, g, peer = b.controller, b.session.journal, b.session.gateway, b.rig.peer
         pause = uuid.uuid4().hex
         c.command(pause, "pause", c.requests.intent().revision)

@@ -4,11 +4,11 @@ import copy
 
 import pytest
 
+from tests.charge_rig import positive_flow
+from tests.managed_rig import healthy
 from tests.recovery_barriers import witnessed_native_loss
 from tests.test_combined_recovery_proofs import selected_service
-from tests.test_managed_proxy import healthy
-from tests.test_managed_test_charge import positive_flow
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests_model.test_start_recovery_sequences import close_daily
 
 

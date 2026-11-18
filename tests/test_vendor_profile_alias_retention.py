@@ -9,8 +9,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.store import Journal
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.tls_support import tls as tls
 
 
 # Intent: independently verified old aliases survive more turnover than the small live allowance without blocking work.
@@ -18,7 +18,7 @@ from tests.test_prototype_tls import tls as tls
 async def test_absent_profile_alias_history_does_not_exhaust_live_namespace(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         actual = rig.bench.firmware.answer
 
         # Only the independent fake device replaces same-purpose/stack profiles as it receives real requests.
@@ -84,7 +84,7 @@ async def test_absent_profile_alias_history_does_not_exhaust_live_namespace(
 # Why: missing a ledger row or an unconfirmed profile is not independent evidence that physical ownership retired.
 @pytest.mark.parametrize("state", ["confirmed", "pending", "uncertain", "unknown"])
 async def test_unverified_or_live_aliases_cannot_be_discounted(tmp_path, tls, unused_tcp_port, monkeypatch, state):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         session.journal.capacity = 2
         await session.start()
@@ -152,7 +152,7 @@ def test_nontrial_alias_capacity_stays_conservative(tmp_path):
 async def test_full_live_alias_budget_rejects_retired_reactivation_but_allows_live_update(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         actual = rig.bench.firmware.answer
 
         # Only the independent device replaces a matching purpose and stack, leaving other live stacks intact.

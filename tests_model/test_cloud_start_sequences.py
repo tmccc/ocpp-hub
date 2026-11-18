@@ -8,19 +8,18 @@ import pytest
 from ocpp_hub_core.prototype import managed_start_delivery
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT, START
 from tests.recovery_barriers import require_zero_held
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
 from tests_model.catalog import input_digest
 from tests_model.review_cases import cloud_start_candidates
 
@@ -29,12 +28,17 @@ from tests_model.review_cases import cloud_start_candidates
 # Why: an initial zero hold is incomplete coverage unless real Stop delivery and two later sessions also succeed.
 @pytest.mark.parametrize("case", cloud_start_candidates(), ids=lambda case: case.identifier)
 async def test_cloud_start_recovery_sequences(tmp_path, model_tls, monkeypatch, record_property, case):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     monkeypatch.setattr(managed_start_delivery, "RETRY_INTERVAL", 0.01)
     events, complete = [], False
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, case.selected, owner_tag="APP_OWNER"
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        case.selected,
+        owner_tag="APP_OWNER",
+        bench_type=StartReplyBench,
+        native_peer=InterruptedNativePeer,
     ) as b:
         stack = AsyncExitStack()
         try:

@@ -15,10 +15,10 @@ from ocpp_hub_core.prototype.recovery_contracts import FailureKind, GateDecision
 from ocpp_hub_core.prototype.rpc import UnavailableError
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,7 +84,7 @@ async def assert_daily_recovery(b, local, original, demand, prior_stops=()):
 @pytest.mark.parametrize("applied", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
 async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, applied) as (request, release):
             local = await b.start_plan(9, demand=demand)
@@ -103,7 +103,7 @@ async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeyp
 async def test_native_first_awaits_real_daily_report(
     tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand, restart
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, applied) as (request, release):
             provisional = b.session.journal.get("next_transaction") + 1
@@ -147,10 +147,8 @@ async def test_native_first_awaits_real_daily_report(
 # Why: both unapplied and physically applied writes must recover the previous verified ceiling from durable state.
 @pytest.mark.parametrize("applied", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
-async def test_restart_during_pending_increase(
-    tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand
-):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+async def test_restart_during_pending_increase(tmp_path, tls, unused_tcp_port, monkeypatch, applied, demand):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, applied) as (_, release):
             local = await b.start_plan(9, demand=demand)
@@ -176,7 +174,7 @@ async def test_restart_during_pending_increase(
 # Why: a helper-only transaction test would miss removal of the production caller's atomic boundary.
 @pytest.mark.parametrize("failure", ["metadata", "receipt", "commit", "unknown-source", "new-pause"])
 async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tcp_port, monkeypatch, failure):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         async with interrupted_increase(b, True) as (identifier, release):
             local = await b.start_plan(9)
             await b.c.native.read()
@@ -274,7 +272,7 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
 @pytest.mark.parametrize("plan", [None, 987654])
 @pytest.mark.parametrize("demand", [False, True])
 async def test_unknown_source_holds_zero(tmp_path, tls, unused_tcp_port, monkeypatch, plan, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9, demand=demand)
@@ -296,7 +294,7 @@ async def test_unknown_source_holds_zero(tmp_path, tls, unused_tcp_port, monkeyp
 async def test_explicit_pause_preempts_current_recovery(
     tmp_path, tls, unused_tcp_port, monkeypatch, applied, during_worker
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         pause = uuid.uuid4().hex
         async with interrupted_increase(b, applied) as (_, release):
@@ -330,10 +328,8 @@ async def test_explicit_pause_preempts_current_recovery(
 # Intent: source changes during final send validation revoke positive recovery and retain zero until reidentified.
 # Why: an earlier matching native plan cannot authorize a release after fresher evidence contradicts its source.
 @pytest.mark.parametrize("reject_rollback", [False, True])
-async def test_source_changes_before_positive_send(
-    tmp_path, tls, unused_tcp_port, monkeypatch, reject_rollback
-):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+async def test_source_changes_before_positive_send(tmp_path, tls, unused_tcp_port, monkeypatch, reject_rollback):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9)
@@ -419,7 +415,7 @@ async def test_source_changes_before_positive_send(
 # Intent: repeated unavailable native reads retain zero recovery instead of consuming permission or inventing Pause.
 # Why: loss of source evidence must remain recoverable once the same daily transaction is positively identified.
 async def test_native_outage_during_recovery(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9)
@@ -450,7 +446,7 @@ async def test_native_outage_during_recovery(tmp_path, tls, unused_tcp_port, mon
 # Why: recovery of the older pending increase must neither replace the Pause ticket nor promote its unverified target.
 @pytest.mark.parametrize("applied", [False, True])
 async def test_restart_after_explicit_pause_of_pending_increase(tmp_path, tls, unused_tcp_port, monkeypatch, applied):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         async with interrupted_increase(b, applied) as (_, release):
             local = await b.start_plan(9)
             await b.c.native.read()
@@ -475,7 +471,7 @@ async def test_restart_after_explicit_pause_of_pending_increase(tmp_path, tls, u
 # Intent: idle replacement retains Pause and the previous verified current after an interrupted increase.
 # Why: process loss cannot promote an unverified target or implicitly return control to the app.
 async def test_idle_restart_keeps_existing_fail_closed_policy(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         async with interrupted_increase(b, True) as (_, release):
             b.c.current.worker.cancel()
             await asyncio.gather(b.c.current.worker, return_exceptions=True)
@@ -495,7 +491,7 @@ async def test_idle_restart_keeps_existing_fail_closed_policy(tmp_path, tls, unu
 # Why: a StopTransaction alone or an idle native observation cannot release an unresolved operation hold.
 @pytest.mark.parametrize("first", ["native", "ocpp"])
 async def test_closure_disagreement_stays_zero(tmp_path, tls, unused_tcp_port, monkeypatch, first):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9)
@@ -526,7 +522,7 @@ async def test_closure_disagreement_stays_zero(tmp_path, tls, unused_tcp_port, m
 # Intent: a lost zero acknowledgement leaves retryable operation recovery without Stop or a positive restoration.
 # Why: accepting the target earlier must not turn failed restriction into Pause authority over the independent daily.
 async def test_zero_rejection_retries_without_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         answer = b.device.answer
 
@@ -555,7 +551,7 @@ async def test_zero_rejection_retries_without_stop(tmp_path, tls, unused_tcp_por
 # Intent: a new owner Pause at the actual positive send gate revokes recovery and still stops the genuine daily.
 # Why: successful earlier source checks cannot let an old operation bypass newer owner intent.
 async def test_pause_at_positive_send_gate(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         async with interrupted_increase(b, True) as (_, release):
             local = await b.start_plan(9)
             await b.c.native.read()

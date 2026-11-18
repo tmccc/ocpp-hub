@@ -6,15 +6,15 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, recoverable_fault
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
-from tests.test_managed_test_charge import positive_flow
+from tests.charge_rig import positive_flow
+from tests.current_rig import release_bench
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
 from tests.test_ordinary_recovery import SlowOrTruncatedPeer
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: an actual HTTP503 or elapsed stale audit during repair cannot become a permanent strict-native refusal.
@@ -23,8 +23,7 @@ from tests.test_prototype_tls import tls as tls
 async def test_legacy_native_repair_availability_wait_remains_recoverable(
     tmp_path, tls, unused_tcp_port, monkeypatch, mode
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SlowOrTruncatedPeer)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=SlowOrTruncatedPeer) as b:
         c, j, peer = b.c, b.session.journal, b.rig.peer
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
@@ -49,7 +48,7 @@ async def test_legacy_native_repair_availability_wait_remains_recoverable(
 async def test_legacy_native_repair_closure_waits_do_not_revoke_availability_proof(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, rig = b.c, b.session.journal, b.rig
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         assert (await healthy(c))["current_a"] == 6

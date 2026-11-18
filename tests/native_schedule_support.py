@@ -13,14 +13,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
 
-from tests import test_native_bounded_session as native_bench
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype import START
+from tests.managed_rig import OwnerBench, healthy, introduced, managed_bench, managed_session
+from tests.prototype_rig import START
 
 ORIGINAL_PLAN = {
     "planId": 9,
@@ -118,9 +116,6 @@ class TimerBench:
         self.c = ManagedController(session)
         self.start = int(clock.now) + 180
         self.device = rig.bench.firmware
-
-
-
 
     # Drive a new transaction only when the wire plan is scheduled on this exact local minute.
     async def fire(self, plan_id: int, *, demand: bool = True) -> int:
@@ -222,16 +217,16 @@ async def timer_bench(
     tmp_path: Path,
     tls: Any,
     port: int,
-    monkeypatch: pytest.MonkeyPatch,
     now: int = MORNING,
     *,
     peer_type: type[SchedulePeer] | None = None,
+    bench_type: type[OwnerBench] = OwnerBench,
 ) -> AsyncIterator[TimerBench]:
     clock = SchedulerClock(now)
     selected_peer = SchedulePeer if peer_type is None else peer_type
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", selected_peer)
-    monkeypatch.setitem(native_bench.ORIGINAL, "timeZone", ZONE.key)
-    async with managed_bench(tmp_path, tls, port, monkeypatch) as rig:
+    async with managed_bench(
+        tmp_path, tls, port, native_peer=selected_peer, bench_type=bench_type, time_zone=ZONE.key
+    ) as rig:
         session = managed_session(rig)
         await session.start()
         rig.route_to_trial()

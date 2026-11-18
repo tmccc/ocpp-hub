@@ -18,11 +18,11 @@ from ocpp_hub_core.prototype.rpc import Peer
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, Admission
 from websockets.asyncio.server import ServerConnection, serve
 
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import NOW, Bench, until
-from tests.test_prototype_tls import accept_cap
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import NOW, Bench, until
+from tests.tls_support import accept_cap
+from tests.tls_support import admission as admission
+from tests.tls_support import tls as tls
 
 UTC_SECONDS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 LEGACY_TIME = "2026-01-01T01:02:03.456+00:00"

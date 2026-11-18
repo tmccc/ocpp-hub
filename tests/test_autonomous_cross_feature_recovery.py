@@ -9,14 +9,12 @@ from contextlib import closing
 
 import pytest
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import process_rig
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
 from tests.test_cloud_ack_storage import HeldReply, StorageBench, wire_count
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Install only an actual deferred-COMMIT fault for this one cloud event on the child-owned scratch database.
@@ -87,10 +85,15 @@ async def close_after_wire_stop(child, local):
 async def test_service_three_failures_pause_return_boot_and_later_sessions(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, selected, repair_order
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StorageBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with process_rig(
-        tmp_path, tls, unused_tcp_port_factory(), unused_tcp_port_factory(), monkeypatch, selected
+        tmp_path,
+        tls,
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        selected,
+        bench_type=StorageBench,
+        native_peer=InterruptedNativePeer,
     ) as child:
         await child.start()
         await child.status()

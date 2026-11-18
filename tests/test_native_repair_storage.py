@@ -18,10 +18,11 @@ from ocpp_hub_core.prototype.managed_release_recovery import recoverable_fault
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
+from tests.current_rig import release_bench
+from tests.managed_rig import healthy, starts
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Refuse an actual BEGIN, statement or deferred COMMIT at one selected publication.
@@ -145,7 +146,7 @@ def test_repair_strict_publication_keeps_foreign_fault(tmp_path):
 async def test_actual_strict_result_survives_publication_refusal(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure, conflict
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, peer = b.c, b.session.journal, b.rig.peer
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         await explicit_release_pause(b)
@@ -176,7 +177,7 @@ async def test_actual_strict_result_survives_publication_refusal(
 async def test_valid_native_publication_sql_wait_recovers_same_process(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j = b.c, b.session.journal
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)

@@ -13,13 +13,13 @@ from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.ics import is_safe_transaction_query
 from ocpp_hub_core.prototype.policy import DeniedError
 
-from tests.test_native_bounded_recovery import crash
-from tests.test_native_bounded_session import connected_bench
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.connected_rig import connected_bench
+from tests.handover_helpers import crash
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 from tests.trial_helpers import TrialRig
+from tests.trial_peer import Bench
 
 
 # Construct only the evidenced string-body extension, independently of namespace translation in the engine.

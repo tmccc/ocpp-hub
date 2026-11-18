@@ -8,12 +8,12 @@ import pytest
 from ocpp_hub_core.prototype.native_bounded_handover import NativeBoundedHandover
 from ocpp_hub_core.prototype.recovery_coordinator import RecoveryCoordinator
 
+from tests.managed_rig import healthy, starts
 from tests.native_fault_support import FinalReleaseHttpPeer, coroutine_locals
 from tests.native_schedule_support import timer_bench
 from tests.peer_mutation_helpers import observe_device_replies
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -26,7 +26,7 @@ def profile_limit(frame):
 # Intent: session retirement must finish owned Return SQL before propagating repeated caller cancellation.
 # Why: shielding only the drain leaves a live native completion using a journal that its caller just closed.
 async def test_cancelled_close_joins_held_return_before_closing_journal(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch, peer_type=FinalReleaseHttpPeer) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=FinalReleaseHttpPeer) as b:
         c, g, j, peer = b.c, b.session.gateway, b.session.journal, b.rig.peer
         pause = uuid.uuid4().hex
         c.command(pause, "pause", c.requests.intent().revision)

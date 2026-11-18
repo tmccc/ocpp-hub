@@ -11,11 +11,11 @@ from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from websockets.asyncio.server import serve
 
-from tests.test_prototype import START
-from tests.test_prototype_runtime import Bench, until
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench as TrialBench
+from tests.prototype_rig import START
+from tests.runtime_rig import Bench, until
+from tests.tls_support import admission as admission
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench as TrialBench
 
 
 # Intent: an accepted profile replacement without a transaction remains clearable after the old session ends.

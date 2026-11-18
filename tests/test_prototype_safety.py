@@ -15,9 +15,9 @@ from ocpp_hub_core.prototype.policy import DeniedError, Policy
 from ocpp_hub_core.prototype.rpc import Peer, UnavailableError
 from ocpp_hub_core.prototype.store import ConflictError, RecoveryRequiredError
 
-from tests.test_prototype import START, Rig
+from tests.prototype_rig import START, Rig
+from tests.runtime_rig import until
 from tests.test_prototype_ics_writes import PLAN, POLICY, plan, ready
-from tests.test_prototype_runtime import until
 
 
 # Intent: a native timer cannot charge after a local stop, even without a transaction or a new cloud CALL.

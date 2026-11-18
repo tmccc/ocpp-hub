@@ -20,7 +20,7 @@ from ocpp_hub_core.prototype.policy import DeniedError, Policy
 from ocpp_hub_core.prototype.rpc import Peer
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.test_prototype import Rig
+from tests.prototype_rig import Rig
 
 CAPTURE_PATH = Path(__file__).parent / "fixtures" / "ics-log7628.sanitized.json"
 CAPTURE = json.loads(CAPTURE_PATH.read_text())

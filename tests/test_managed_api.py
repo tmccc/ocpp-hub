@@ -14,19 +14,9 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype_tls import tls as tls
-
-TOKEN = "a" * 64  # Synthetic bearer used only by loopback test peers.
-
-
-# Send one bounded protocol message and correlate its real socket response.
-async def call(socket: Any, command: str, **fields: Any) -> dict[str, Any]:
-    identifier = fields.pop("id", uuid.uuid4().hex)
-    await socket.send(json.dumps({"id": identifier, "command": command, **fields}))
-    value = json.loads(await socket.recv())
-    assert value.get("id") == identifier or value.get("ok") is False
-    return value
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.management_peer import TOKEN, call
+from tests.tls_support import tls as tls
 
 
 # Intent: authenticated status/history are passive, and duplicate Pause is one durable/physical operation.
@@ -37,7 +27,7 @@ async def test_real_management_socket_reads_and_idempotent_pause(
     unused_tcp_port_factory: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port_factory()) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -97,7 +87,7 @@ async def test_management_rejects_unauthorized_handshakes_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
     case: str,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port_factory()) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -145,7 +135,7 @@ async def test_management_validation_precedes_durable_mutation(
     monkeypatch: pytest.MonkeyPatch,
     payload: dict[str, Any],
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)

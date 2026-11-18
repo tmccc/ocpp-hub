@@ -6,15 +6,15 @@ from dataclasses import replace
 import pytest
 
 from tests.native_schedule_support import timer_bench
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: an intervening Boot change revokes the old registration even if the original body returns before polling.
 # Why: comparing only the current body can erase a real A-to-B-to-A introduction revocation.
 async def test_intervening_boot_change_revokes_cloud(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         gateway, runtime = b.session.gateway, b.session.runtime
         epoch = gateway._vendor_epoch
         settings, permitted = runtime.settings, runtime.vendor_session_enabled
@@ -50,7 +50,7 @@ async def test_intervening_boot_change_revokes_cloud(tmp_path, tls, unused_tcp_p
 # Why: temporary zero verification may retain a session only while its actual admitted Boot binding agrees.
 @pytest.mark.parametrize("changed", [False, True])
 async def test_cloud_registration_remains_bound_to_boot(tmp_path, tls, unused_tcp_port, monkeypatch, changed):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         gateway, runtime = b.session.gateway, b.session.runtime
         epoch = gateway._vendor_epoch
         cloud_boots = [frame for frame in b.rig.bench.calls if frame[0] == 2 and frame[2] == "BootNotification"]

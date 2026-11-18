@@ -11,8 +11,8 @@ from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.trial_resources import Baseline
 
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.tls_support import tls as tls
 from tests.trial_helpers import TrialRig
 
 
@@ -20,8 +20,8 @@ from tests.trial_helpers import TrialRig
 # Why: Stop may retire cloud mappings before the firmware removes the actual profile.
 async def test_rollback_receipts_survive_transaction_retirement(tmp_path, tls, unused_tcp_port):
 
+    from tests.runtime_rig import until
     from tests.test_native_bounded_handover import native_ready
-    from tests.test_prototype_runtime import until
 
     async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
         await session.command({"command": "release"})

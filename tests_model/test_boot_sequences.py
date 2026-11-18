@@ -10,16 +10,15 @@ import pytest
 from ocpp_hub_core.prototype.gateway import decode
 
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy, starts
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import require_zero_held
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
+from tests.runtime_rig import until
 from tests_model.catalog import input_digest
 from tests_model.control_cases import boot_reply_candidates, boot_retry_candidates
 from tests_model.control_helpers import ordinary_recovery, station_limit
@@ -38,10 +37,14 @@ def fresh_zero(calls):
 
 # Drive either real reply withholding or a real HTTP503 prefix, then run every declared owner/Boot order.
 async def sequence(tmp_path, model_tls, monkeypatch, record_property, case, family):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     events, suffix_complete = [], False
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, case.selected
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        case.selected,
+        native_peer=InterruptedNativePeer,
     ) as b:
         rig, c, s = b.rig, b.controller, b.session
         plan, config = copy.deepcopy(rig.bench.firmware.plans), copy.deepcopy(rig.peer.configuration)

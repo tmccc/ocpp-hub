@@ -5,12 +5,11 @@ import copy
 import json
 import uuid
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_current import adjustable
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
+from tests.tls_support import tls as tls
 
 
 # Intent: only the exact failed current generation can settle physical uncertainty after native HTTP recovers.
@@ -18,8 +17,7 @@ from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
 async def test_failed_idle_hold_binds_request_cause_boot_and_existing_control(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer) as b:
         c, j = b.controller, b.session.journal
         fail_boundary(j, "current", "statement")
         reached, _ = failing_cleanup(

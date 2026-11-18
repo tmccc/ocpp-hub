@@ -8,11 +8,11 @@ from contextlib import contextmanager
 import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
 
-from tests.test_managed_proxy import healthy, starts
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
 from tests.test_managed_start_cancelled_outer import selected_source
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Cancel the genuine owned coroutine only at scheduling; the outer worker and every native/wire gate remain real.

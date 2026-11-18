@@ -5,13 +5,12 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, introduced, starts
-from tests.test_managed_test_charge import positive_flow, ready
+from tests.charge_rig import positive_flow, ready
+from tests.managed_rig import healthy, introduced, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_ordinary_recovery import close_session
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,8 +36,7 @@ async def refuse_unsent_start(b, action):
 # Why: a refused or unsent Start must not strand later supervision, Pause or owner readiness.
 @pytest.mark.parametrize("action", [None, "start", "start_test"])
 async def test_outage_after_unsent_refusal(tmp_path, tls, unused_tcp_port, monkeypatch, action):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer) as b:
         await refuse_unsent_start(b, action)
         local = await positive_flow(b, "daily")
         await healthy(b.controller)

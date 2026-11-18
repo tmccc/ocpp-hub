@@ -7,13 +7,12 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.charge_rig import owner_rig
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -24,8 +23,9 @@ pytestmark = pytest.mark.asyncio
 async def test_return_during_start_ack_restores_zero_without_native_http(
     tmp_path, tls, unused_tcp_port, monkeypatch, matching_boot
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=10) as b:
+    async with owner_rig(
+        tmp_path, tls, unused_tcp_port, monkeypatch, startup=10, native_peer=InterruptedNativePeer
+    ) as b:
         c, g, j, rig = b.controller, b.session.gateway, b.session.journal, b.rig
         assert isinstance(rig.peer, InterruptedNativePeer)
         plans, configuration = copy.deepcopy(rig.bench.firmware.plans), copy.deepcopy(rig.peer.configuration)

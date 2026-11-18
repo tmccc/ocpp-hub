@@ -7,16 +7,14 @@ from contextlib import AsyncExitStack
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, owner_rig
 from tests.cloud_start_helpers import two_later_sessions
-from tests.test_managed_current import adjustable
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, introduced, starts
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy, introduced, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_worker_storage_recovery import fail_boundary
+from tests.tls_support import tls as tls
 
 
 # Refuse the real restrictive settlement transaction while leaving a newer owner's Pause writes available.
@@ -63,11 +61,10 @@ def current_settlement_unavailable(j, failure="statement"):
 async def test_storage_cleanup_preserves_new_pause_and_boot(
     tmp_path, tls, unused_tcp_port, monkeypatch, operation, replacement_boot
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     context = (
-        owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=1)
+        owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=1, native_peer=InterruptedNativePeer)
         if operation == "start"
-        else adjustable(tmp_path, tls, unused_tcp_port, monkeypatch)
+        else adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer)
     )
     async with context as b, AsyncExitStack() as sockets:
         c, s, rig = b.controller, b.session, b.rig

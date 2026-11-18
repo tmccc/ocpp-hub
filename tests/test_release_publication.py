@@ -22,13 +22,13 @@ from ocpp_hub_core.prototype.local_control import LocalControl
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, Prerequisite, RestoreState, WireReply
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
+from tests.charge_rig import owner_rig
+from tests.managed_rig import healthy, starts
 from tests.peer_mutation_helpers import observe_device_replies
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 

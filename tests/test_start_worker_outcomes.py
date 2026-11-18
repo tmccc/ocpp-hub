@@ -6,22 +6,21 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import actual_stop, owner_rig, positive_flow
 from tests.cloud_start_helpers import two_later_sessions
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_worker_storage_recovery import failing_cleanup
+from tests.tls_support import tls as tls
 
 
 # Intent: actual HTTP failure before effects cannot acquire Pause/Stop authority through a diagnostic outage.
 # Why: keeping a dead worker's optional diagnostic alive must not turn a known-unsent request into a timeout hold.
 async def test_start_preflight_failure_settles_before_optional_diagnostic(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=1) as b:
+    async with owner_rig(
+        tmp_path, tls, unused_tcp_port, monkeypatch, startup=1, native_peer=InterruptedNativePeer
+    ) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         await healthy(c)
         intent, control, wires = c.requests.intent(), j.get("control"), list(b.rig.bench.device_calls)
@@ -63,8 +62,9 @@ async def test_start_preflight_failure_settles_before_optional_diagnostic(tmp_pa
 async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
     tmp_path, tls, unused_tcp_port, monkeypatch, issued
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=1) as b:
+    async with owner_rig(
+        tmp_path, tls, unused_tcp_port, monkeypatch, startup=1, native_peer=InterruptedNativePeer
+    ) as b:
         c, s, rig = b.controller, b.session, b.rig
         loop, captured, wire_entered, release = (
             asyncio.get_running_loop(),

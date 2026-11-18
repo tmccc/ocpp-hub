@@ -8,12 +8,12 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, managed_session, starts
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import healthy, managed_session, starts
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
 from tests.test_managed_start_overlap import expire, owner_tag
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: lost zero/composite replies after an audited daily recovery retry zero without repeating introduction or Stop.
@@ -21,7 +21,7 @@ from tests.test_prototype_tls import tls as tls
 @pytest.mark.parametrize("lost_action", ["SetChargingProfile", "GetCompositeSchedule"])
 async def test_open_introduction_retries_only_zero(tmp_path, tls, unused_tcp_port, monkeypatch, lost_action):
     async with (
-        timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b,
+        timer_bench(tmp_path, tls, unused_tcp_port) as b,
         AsyncExitStack() as replacements,
     ):
         owner_tag(b)

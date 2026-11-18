@@ -22,13 +22,13 @@ from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.test_managed_current import adjustable, locally_ready, select
-from tests.test_managed_proxy import OwnerBench, healthy, managed_session, starts
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_native_bounded_recovery import crash
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.charge_rig import ChargeRig
+from tests.current_rig import adjustable, locally_ready, select
+from tests.handover_helpers import crash
+from tests.managed_rig import OwnerBench, healthy, managed_session, starts
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 @dataclass
@@ -553,9 +553,7 @@ async def test_normal_start_owner_epoch_persistence_failure_keeps_pause_authorit
             effect = "INSERT INTO review_owner_epoch_child VALUES(123);"
         j.db.execute(
             "CREATE TEMP TRIGGER review_owner_epoch_refusal BEFORE INSERT ON meta "
-            "WHEN NEW.key='managed_owner_epoch' BEGIN SELECT review_owner_epoch_attempt(NEW.value); "
-            + effect
-            + " END"
+            "WHEN NEW.key='managed_owner_epoch' BEGIN SELECT review_owner_epoch_attempt(NEW.value); " + effect + " END"
         )
         identifier = uuid.uuid4().hex
         try:

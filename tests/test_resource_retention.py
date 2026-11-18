@@ -14,14 +14,14 @@ from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, finger
 from ocpp_hub_core.prototype.trial_evidence import Evidence
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.tls_support import tls as tls
 
 
 # Intent: more than127 independently absent turnover profiles cannot exhaust normal new-ID cloud operation.
 # Why: a two-profile physical inventory should remain usable while historical ownership/reappearance evidence survives.
 async def test_real_turnover_retains_history_without_lifetime_exhaustion(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         actual = rig.bench.firmware.answer
 
         # Model only the independent device's same-purpose/stack replacement, preserving station and engine policy.

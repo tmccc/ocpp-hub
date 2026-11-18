@@ -15,17 +15,17 @@ from ocpp_hub_core.prototype.store import ConflictError, RecoveryRequiredError, 
 from ocpp_hub_core.prototype.trial_session import save_private
 
 from tests import conftest as _core_setup  # noqa: F401 - load the HA-free source package.
+from tests.charge_rig import ChargeRig
 from tests.cloud_start_helpers import two_later_sessions
+from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_combined_recovery_proofs import selected_service
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_stop_reply_recovery import pause, running
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 from tools import reconcile_managed_debt as debt_tool
 from tools import reconcile_managed_delivery as delivery_tool
 

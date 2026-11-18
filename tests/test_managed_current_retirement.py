@@ -7,8 +7,8 @@ import uuid
 
 import pytest
 
-from tests.test_managed_current import adjustable
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import adjustable
+from tests.tls_support import tls as tls
 
 
 # Build a labeled stored-state contract fixture; real wire reachability is covered by the SIGKILL family.

@@ -6,11 +6,11 @@ import pytest
 from ocpp_hub_core.frames import build_call_error
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 class ReportReplyFilter:
@@ -63,7 +63,7 @@ async def test_rejected_report_does_not_block_lifecycle(tmp_path, tls, unused_tc
         await actual(bench, ReportReplyFilter(connection, action))
 
     monkeypatch.setattr(Bench, "vendor", cloud)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         s = managed_session(rig)
         await s.start()
         c = ManagedController(s)

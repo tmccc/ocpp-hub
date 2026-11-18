@@ -9,15 +9,14 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG
 from websockets.asyncio.server import serve
 
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import Bench as RuntimeBench
+from tests.runtime_rig import until
 from tests.test_introduction_storage_retry import GatedIntroductionPeer, current_probe
-from tests.test_managed_introduction_retry import selected_ready
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import Bench as RuntimeBench
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import admission as admission
+from tests.tls_support import tls as tls
 
 
 # Intent: actual post-read metadata refusals retry on the same Boot, retaining zero and a newer owner Pause.
@@ -28,8 +27,9 @@ from tests.test_prototype_tls import tls as tls
 async def test_postread_introduction_write_recovers_on_same_boot(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, newer_pause, cut
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", GatedIntroductionPeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as test:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=GatedIntroductionPeer
+    ) as test:
         c, j, g, peer = test.controller, test.session.journal, test.session.gateway, test.rig.peer
         pause = uuid.uuid4().hex
         c.command(pause, "pause", c.requests.intent().revision)

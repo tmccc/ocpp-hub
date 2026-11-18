@@ -13,9 +13,9 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from tests.prototype_firmware import Firmware
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import charger_reply
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.tls_support import charger_reply
 
 
 class ObservationTLS:

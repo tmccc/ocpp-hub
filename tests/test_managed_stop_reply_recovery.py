@@ -18,12 +18,12 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
+from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
 
 
@@ -162,8 +162,7 @@ async def return_after_ack(rig, s, c, *, expected_starts=0):
 # Why: a Stop repair must preserve the ordinary lifecycle and not label a valid fractional timestamp malformed.
 @pytest.mark.parametrize("info", [None, {"status": "Accepted", "expiryDate": "2030-01-01T00:00:00.123456789Z"}])
 async def test_valid_stop_reply_needs_no_reconciliation(tmp_path, tls, unused_tcp_port, monkeypatch, info):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         s = mp.managed_session(rig)
         await s.start()
         c = ManagedController(s)
@@ -192,8 +191,7 @@ async def test_valid_stop_reply_needs_no_reconciliation(tmp_path, tls, unused_tc
 async def test_stop_retry_requires_exact_evidence_then_wire_ack(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, info
 ):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         strategy = strategy_file(rig, tmp_path)
         config, port = tmp_path / "trial.json", rig.prepared.observer.port
         s = mp.managed_session(rig)
@@ -292,8 +290,7 @@ async def test_stop_retry_requires_exact_evidence_then_wire_ack(
 # Why: no approval can ignore a different reply, while a newer independently verified retry must remain possible.
 @pytest.mark.parametrize("call_error", [False, True])
 async def test_changed_stop_reply_requires_new_proof(tmp_path, tls, unused_tcp_port, monkeypatch, capsys, call_error):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         async with running(rig, "first-rejection") as (s, c, charger):
             await mp.healthy(c)
             await stop_lifecycle(rig, s, charger, {"status": "invalid-first"})
@@ -336,8 +333,7 @@ async def test_changed_stop_reply_requires_new_proof(tmp_path, tls, unused_tcp_p
 # Intent: actual wire evidence and dequeue roll back together on a real SQLite deletion failure.
 # Why: receiving a CallResult cannot manufacture a committed delivery proof when its journal transaction failed.
 async def test_stop_wire_ack_and_dequeue_are_atomic(tmp_path, tls, unused_tcp_port, monkeypatch, capsys):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         async with running(rig, "atomic-first-rejection") as (s, c, charger):
             await mp.healthy(c)
             await stop_lifecycle(rig, s, charger, {"status": "invalid"})
@@ -365,8 +361,7 @@ async def test_stop_wire_ack_and_dequeue_are_atomic(tmp_path, tls, unused_tcp_po
 # Intent: a retained pre-upgrade Stop may really drain after replacement, then its recorded fault can be reconciled.
 # Why: a drained unexplained latch must not be waived by selecting an arbitrary closed transaction.
 async def test_drained_stop_fault_needs_preserved_wire_receipt(tmp_path, tls, unused_tcp_port, monkeypatch, capsys):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         async with running(rig, "legacy-retained-stop") as (s, c, charger):
             await mp.healthy(c)
             await stop_lifecycle(rig, s, charger, {"status": "invalid"})
@@ -406,8 +401,7 @@ async def test_drained_stop_fault_needs_preserved_wire_receipt(tmp_path, tls, un
 # Why: exact retry approval must neither discard queued pairs nor block recovery of the next actual rejected Stop.
 @pytest.mark.parametrize("invalid", [False, True])
 async def test_stop_recovery_preserves_closed_queued_tail(tmp_path, tls, unused_tcp_port, monkeypatch, capsys, invalid):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         async with running(rig, "queued-tail-boot") as (s, c, charger):
             await mp.healthy(c)
             rig.bench.stop_gate = asyncio.Event()

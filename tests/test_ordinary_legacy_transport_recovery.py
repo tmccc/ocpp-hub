@@ -7,8 +7,9 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed_release_recovery import ACK
 
-from tests.test_managed_release_recovery import recover_then_return, release_bench
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import release_bench
+from tests.test_managed_release_recovery import recover_then_return
+from tests.tls_support import tls as tls
 
 
 # Preserve an exact old-version durable diagnostic; current runtime no longer creates this transport-only latch.
@@ -34,7 +35,7 @@ async def legacy_fault(b, kind):
 async def test_classified_legacy_availability_fault_requires_new_pause(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, kind
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, current) as b:
         fault = await legacy_fault(b, kind)
         for _ in range(2):
             assert (await b.c.tick())["state"] == "attention"
@@ -49,7 +50,7 @@ async def test_classified_legacy_availability_fault_requires_new_pause(
 async def test_legacy_availability_pause_cannot_clear_unrelated_authority(
     tmp_path, tls, unused_tcp_port, monkeypatch, blocker
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         fault = await legacy_fault(b, "SecurityError" if blocker == "security" else "NativeTransportUnavailableError")
         if blocker == "old_diagnostic":
             failure = b.session.journal.get("managed_native_failure")

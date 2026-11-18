@@ -5,7 +5,7 @@ import pytest
 from tests.model_tls_support import model_tls as model_tls
 from tests.model_tls_support import tls_for_case
 from tests.observation_helpers import ObservationTLS, observation_payload, observation_suffix
-from tests.test_prototype import START
+from tests.prototype_rig import START
 from tests_model.catalog import input_digest
 from tests_model.review_cases import observation_candidates
 

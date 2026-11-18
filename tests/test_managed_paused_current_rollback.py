@@ -8,20 +8,18 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import adjustable
 from tests.handover_helpers import crash
-from tests.test_managed_current import adjustable
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.test_managed_current_tick_race import OneNativeResponseGate, chain
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: compare normal paused selection with a newer Pause during its genuine native verification.
 # Why: separate retained desired preference and failed receipt semantics from any unrequested positive effect.
 @pytest.mark.parametrize("supersede", [False, True])
 async def test_future_selection_after_pause(tmp_path, tls, unused_tcp_port, monkeypatch, supersede):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         c, peer = b.controller, b.rig.peer
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         assert (await healthy(c))["local_hold_verified"] and c.current.selected() == 6
@@ -84,8 +82,7 @@ async def test_future_selection_after_pause(tmp_path, tls, unused_tcp_port, monk
 async def test_pending_paused_selection_restarts_at_previous_current(
     tmp_path, tls, unused_tcp_port, monkeypatch, previous, target
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         c, peer = b.controller, b.rig.peer
         if previous != 6:
             c.command(uuid.uuid4().hex, "set_current", c.requests.intent().revision, current_a=previous)

@@ -10,9 +10,9 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG
 from websockets.asyncio.server import serve
 
-from tests.test_prototype_runtime import Bench, until
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import Bench, until
+from tests.tls_support import admission as admission
+from tests.tls_support import tls as tls
 
 
 # Keep all effects and replies on actual independent peers, with a configurable charger result body.

@@ -6,15 +6,14 @@ from contextlib import AsyncExitStack
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, owner_start, positive_flow
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy, introduced, starts
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, introduced, starts
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig, owner_start, positive_flow
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests_model.test_start_recovery_sequences import close_daily, observe
 
 
@@ -27,9 +26,14 @@ from tests_model.test_start_recovery_sequences import close_daily, observe
 async def test_verified_normal_source_outage_and_closure(
     tmp_path, model_tls, monkeypatch, current, demand, closure, reconnect
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, current, owner_tag="APP_OWNER"
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        current,
+        owner_tag="APP_OWNER",
+        native_peer=InterruptedNativePeer,
     ) as b:
         c, s, rig, sock = b.controller, b.session, b.rig, b.charger
         identifier = uuid.uuid4().hex
@@ -78,9 +82,14 @@ async def test_verified_normal_source_outage_and_closure(
 # Why: allowing normal sessions into outage supervision must not broaden source attribution or waive uncertainty.
 @pytest.mark.parametrize("changed", ["native-marker", "receipt-request", "request-state", "unrelated-fault"])
 async def test_normal_recovery_requires_unchanged_exact_completed_source(tmp_path, model_tls, monkeypatch, changed):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, 6, owner_tag="APP_OWNER"
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        6,
+        owner_tag="APP_OWNER",
+        native_peer=InterruptedNativePeer,
     ) as b:
         c, j, rig = b.controller, b.session.journal, b.rig
         identifier = uuid.uuid4().hex
@@ -123,9 +132,14 @@ async def test_normal_recovery_requires_unchanged_exact_completed_source(tmp_pat
 # Why: recovery must use the active immutable lifecycle, even before a poll retires old running metadata.
 @pytest.mark.parametrize("source", ["daily", "cloud"])
 async def test_old_normal_source_does_not_block_new_external_session(tmp_path, model_tls, monkeypatch, source):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, 6, owner_tag="APP_OWNER"
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        6,
+        owner_tag="APP_OWNER",
+        native_peer=InterruptedNativePeer,
     ) as b:
         c, rig = b.controller, b.rig
         c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)

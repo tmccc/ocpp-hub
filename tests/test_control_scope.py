@@ -5,15 +5,15 @@ from dataclasses import replace
 from ocpp_hub_core.prototype.connection_scope import control_scope_matches, current_control_scope
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype import BOOT
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.prototype_rig import BOOT
+from tests.tls_support import tls as tls
 
 
 # Intent: all identity components must agree, and a new real Boot must invalidate an earlier captured identity.
 # Why: shared checks must neither accept two missing observations nor reuse pre-await permission after replacement.
 async def test_exact_control_scope_requires_current_complete_observation(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         c, g = ManagedController(session), session.gateway

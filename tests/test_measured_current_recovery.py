@@ -10,17 +10,16 @@ from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import positive_flow, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import commissioned
+from tests.management_peer import TOKEN, call
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
 from tests.recovery_barriers import completed_control
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import positive_flow, ready
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: a pure measured current trip recovers only after new Pause, actual closure/ACK and full native zero.
@@ -39,12 +38,27 @@ from tests.test_prototype_tls import tls as tls
 async def test_measured_current_trip_fresh_pause_recovers_after_genuine_closed_zero(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, selected, measured, trip, power_only, native32
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
     factory = (
-        commissioned(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, selected, cli_route=True)
+        commissioned(
+            tmp_path,
+            tls,
+            unused_tcp_port_factory(),
+            monkeypatch,
+            selected,
+            cli_route=True,
+            native_peer=InterruptedNativePeer,
+            bench_type=StartReplyBench,
+        )
         if native32
-        else ready(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, cli_route=True)
+        else ready(
+            tmp_path,
+            tls,
+            unused_tcp_port_factory(),
+            monkeypatch,
+            cli_route=True,
+            native_peer=InterruptedNativePeer,
+            bench_type=StartReplyBench,
+        )
     )
     async with factory as b:
         c, j, peer, firmware = b.controller, b.session.journal, b.rig.peer, b.rig.bench.firmware

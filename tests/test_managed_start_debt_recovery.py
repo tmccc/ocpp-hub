@@ -11,10 +11,10 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_rollback import require_lifecycle_idle
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
 from tests.test_managed_start_overlap import close_in_order, delayed_owner, expire, owner_tag
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: same-tag owner debt survives daily recovery, source loss, explicit Pause and actual owner closure.
@@ -27,7 +27,7 @@ async def test_expired_debt_preserves_verified_daily(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, selected, demand, boundary, distinct
 ):
     async with (
-        timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b,
+        timer_bench(tmp_path, tls, unused_tcp_port_factory()) as b,
         AsyncExitStack() as replacements,
     ):
         if distinct:

@@ -8,8 +8,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_view import poll_base, poll_status
 from ocpp_hub_core.prototype.supervision import ControlFacts, Observation, PollStatus, assess
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.tls_support import tls as tls
 
 
 # Intent: a complete observation has one explicit verdict for app control, intentional holds and lost authority.
@@ -80,7 +80,7 @@ def test_health_product_preserves_independent_constraints():
 # Why: pending work cannot look freshly observed, and a malformed unrelated grant must not replace the real fault.
 @pytest.mark.parametrize("corrupt", ["vendor_start_grant", "uncertain_vendor_command"])
 async def test_real_poll_shapes_and_post_fault_read_order(tmp_path, tls, unused_tcp_port, monkeypatch, corrupt):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)

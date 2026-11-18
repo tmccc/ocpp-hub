@@ -639,9 +639,7 @@ async def test_terminal_test_status_returns_to_ordinary_mode(actual_hass, peer, 
 async def test_measured_output_alarm(actual_hass, peer):
     entry = await setup(actual_hass, peer)
     c = entry.runtime_data
-    peer["state"].update(
-        native_age_seconds=0, healthy=False, state="degraded", fault="measured_output_limit_exceeded"
-    )
+    peer["state"].update(native_age_seconds=0, healthy=False, state="degraded", fault="measured_output_limit_exceeded")
     await c.async_refresh()
     assert actual_hass.states.get("binary_sensor.ics_proxy_problem").state == "on" and not c.notified
     c.problem_since = time.monotonic() - 61

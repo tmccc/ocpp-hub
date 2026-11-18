@@ -9,15 +9,13 @@ import pytest
 from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as managed_bench_module
-from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench
+from tests.managed_rig import starts
 from tests.model_tls_support import model_tls as model_tls
 from tests.model_tls_support import tls_for_case
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.peer_start_ledger import PeerStartLedger
 from tests.process_helpers import process_rig
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import starts
 from tests_model.catalog import input_digest
 from tests_model.review_cases import issued_start_candidates
 from tools import reconcile_managed_debt as operator
@@ -29,8 +27,6 @@ from tools import reconcile_managed_debt as operator
 async def test_issued_start_proof_sequences(
     tmp_path, model_tls, monkeypatch, capsys, record_property, unused_tcp_port_factory, case
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(managed_bench_module, "OwnerBench", StartReplyBench)
     events, complete = [], False
     try:
         async with process_rig(
@@ -40,6 +36,8 @@ async def test_issued_start_proof_sequences(
             unused_tcp_port_factory(),
             monkeypatch,
             case.selected,
+            native_peer=InterruptedNativePeer,
+            bench_type=StartReplyBench,
         ) as child:
             ledger = PeerStartLedger(child.rig.bench)
             child.rig.bench.before_reply = ledger.observe

@@ -10,14 +10,15 @@ from datetime import UTC, datetime
 
 import aiohttp
 import pytest
+from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 
 from custom_components.ics_proxy.api import ProxyClient
 from tests import conftest as _engine  # noqa: F401 - register the standalone engine package.
+from tests.managed_rig import healthy, starts
+from tests.management_peer import TOKEN
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_api import TOKEN, ManagementServer, ManagementSettings
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.tls_support import tls as tls
 
 
 # Intent: HA Pause closes an otherwise open, full scheduled session; Return restores ordinary app/schedule operation.
@@ -34,7 +35,7 @@ from tests.test_prototype_tls import tls as tls
     ],
 )
 async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory, monkeypatch, delayed_owner, early):
-    async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port_factory()) as b:
         if delayed_owner in ("APP_OWNER", "NATIVE_TIMER"):
             gateway = b.session.gateway
             gateway.policy = replace(

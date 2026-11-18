@@ -7,8 +7,8 @@ from zoneinfo import ZoneInfo
 
 from ocpp_hub_core.prototype.recovery_contracts import Prerequisite, WireReply
 
+from tests.managed_rig import healthy, starts
 from tests.peer_mutation_helpers import observe_device_replies as observe_device_replies
-from tests.test_managed_proxy import healthy, starts
 
 
 # Observe the actual owned attempt only after the independent firmware has applied its positive profile.

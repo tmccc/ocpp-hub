@@ -6,14 +6,13 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, actual_stop, positive_flow, ready
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig, actual_stop, positive_flow, ready
+from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.test_ordinary_recovery import close_session
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -79,8 +78,7 @@ async def test_unissued_start_has_no_lifecycle_debt(tmp_path, tls, unused_tcp_po
 # Intent: a crash during zero-only cleanup cannot suppress supervision of a later daily session.
 # Why: replacement rewrites transient lifecycle state, but explicit proof that Start was never attempted survives.
 async def test_zero_refusal_cleanup_survives_replacement(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 32, native_peer=InterruptedNativePeer) as b:
         actual, refused = b.rig.bench.firmware.answer, False
 
         # Reject the first physical zero command at the independent charger, before any Start RPC.

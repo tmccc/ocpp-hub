@@ -10,10 +10,11 @@ from ocpp_hub_core.prototype.managed_native_repair import AUDITS, REVOCATIONS
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, PROOF, recoverable_fault
 from ocpp_hub_core.prototype.store import fingerprint
 
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
+from tests.current_rig import release_bench
+from tests.managed_rig import healthy, starts
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: actual strict HTTP content during supported legacy repair cannot later be acknowledged as availability alone.
@@ -23,7 +24,7 @@ from tests.test_prototype_tls import tls as tls
 async def test_legacy_native_repair_retains_strict_refusal_after_original_content_returns(
     tmp_path, tls, unused_tcp_port, monkeypatch, kind, conflict
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, g = b.c, b.session.journal, b.session.gateway
         original_configuration = copy.deepcopy(b.rig.peer.configuration)
         original_history = copy.deepcopy(b.rig.bench.history)

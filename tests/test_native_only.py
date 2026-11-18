@@ -7,9 +7,9 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_session import TrialSession
 
-from tests.test_native_bounded_session import connected_bench
-from tests.test_prototype_runtime import FAST
-from tests.test_prototype_tls import tls as tls
+from tests.connected_rig import connected_bench
+from tests.runtime_rig import FAST
+from tests.tls_support import tls as tls
 
 
 # Intent: a missing or unparsed specification cannot select a default session mode or create a journal.

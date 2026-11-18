@@ -6,7 +6,6 @@ import asyncio
 import copy
 import ssl
 import uuid
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -19,16 +18,13 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
 
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_test_charge import ChargeRig, actual_stop, owner_start, positive_flow, ready
-from tests.test_native_bounded_recovery import crash
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-
-# A distinct command tag identifies even an owner lifecycle that closes entirely between native observations.
-owner_rig = partial(ready, owner_tag="APP_OWNER")
+from tests.charge_rig import ChargeRig, actual_stop, owner_rig, owner_start, positive_flow
+from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.management_peer import TOKEN, call
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # A known real transaction may wait at zero watts while the vehicle decides whether to accept its six-ampere offer.

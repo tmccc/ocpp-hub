@@ -4,14 +4,13 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import positive_flow
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import positive_flow
-from tests.test_prototype import START
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
 from tests_model.test_start_recovery_sequences import close_daily
 
 
@@ -24,8 +23,9 @@ from tests_model.test_start_recovery_sequences import close_daily
 async def test_wire_timezone_boundary_is_rejected_and_next_lifecycle_works(
     tmp_path, model_tls, monkeypatch, stamp, action
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with commissioned(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, 6) as b:
+    async with commissioned(
+        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, 6, native_peer=InterruptedNativePeer
+    ) as b:
         local = await positive_flow(b, "daily") if action == "StopTransaction" else None
         await healthy(b.controller)
         before = [tuple(row) for row in b.session.journal.db.execute("SELECT * FROM transactions ORDER BY local")]

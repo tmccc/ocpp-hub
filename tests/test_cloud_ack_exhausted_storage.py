@@ -12,18 +12,17 @@ from ocpp_hub_core.prototype.managed_start_delivery import RETRIES
 from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
 from tests.cloud_start_helpers import two_later_sessions
+from tests.connected_rig import strategy_file
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_cloud_ack_storage import HeldReply, StorageBench, assert_retained, close_local, replacement, wire_count
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_managed_stop_reply_recovery import pause
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
 
 
@@ -32,12 +31,19 @@ from tools import reconcile_managed_debt as operator
 async def test_exhausted_start_refusal_storage_failure_retains_zero_and_supported_recovery(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StorageBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     monkeypatch.setattr(managed_start_delivery, "RETRY_INTERVAL", 0.01)
     async with AsyncExitStack() as stack:
         b = await stack.enter_async_context(
-            commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16, cli_route=True)
+            commissioned(
+                tmp_path,
+                tls,
+                unused_tcp_port,
+                monkeypatch,
+                16,
+                cli_route=True,
+                bench_type=StorageBench,
+                native_peer=InterruptedNativePeer,
+            )
         )
         strategy = strategy_file(b.rig, tmp_path)
         j = b.session.journal

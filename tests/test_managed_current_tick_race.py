@@ -10,13 +10,12 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
-import tests.test_managed_proxy as managed_helpers
-from tests import test_native_bounded_session as native_bench
+import tests.managed_rig as managed_helpers
+from tests.current_rig import adjustable
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_current import adjustable
-from tests.test_managed_proxy import healthy
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy
+from tests.management_peer import TOKEN, call
+from tests.tls_support import tls as tls
 
 
 class OneNativeResponseGate(NativeVehiclePeer):
@@ -135,9 +134,14 @@ class CorrelatedCloudBench(managed_helpers.OwnerBench):
 async def test_controller_current_acceptance_during_tick_resource_wait_completes(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    monkeypatch.setattr(managed_helpers, "OwnerBench", CorrelatedCloudBench)
-    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+    async with adjustable(
+        tmp_path,
+        tls,
+        unused_tcp_port_factory(),
+        monkeypatch,
+        native_peer=OneNativeResponseGate,
+        bench_type=CorrelatedCloudBench,
+    ) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         before = await healthy(c)
         assert before["station_ceiling_a"] == 6 and c.current.selected() == 6

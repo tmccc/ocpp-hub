@@ -11,20 +11,18 @@ from ocpp_hub_core.prototype.managed_release_recovery import ACK, reconcile_owne
 from ocpp_hub_core.prototype.managed_settlement import current_candidate, internal_pause_matches, require_record
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, owner_start, positive_flow, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import adjustable
+from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.native_schedule_support import SelectiveConfigPeer
-from tests.test_managed_current import adjustable
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_test_charge import ChargeRig, owner_start, positive_flow, ready
-from tests.test_native_bounded_recovery import crash
+from tests.runtime_rig import until
 from tests.test_ordinary_recovery import close_session
 from tests.test_pause_stop_recovery import genuine_stop
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
 from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -134,9 +132,16 @@ async def test_same_socket_fault_retires_closed_local_start(
 # Why: an interrupted test record cannot disable the two later genuine ordinary sessions' outage recovery.
 @pytest.mark.parametrize("source", ["local", "cloud", "cloud-arm"])
 async def test_interrupted_test_retires_after_real_closed_zero(tmp_path, tls, unused_tcp_port, monkeypatch, source):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=60, startup=60) as b:
+    async with ready(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        duration=60,
+        startup=60,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
+    ) as b:
         identifier = uuid.uuid4().hex
         b.controller.command(identifier, "start_test" if source == "local" else "arm_cloud_test", 0)
         if source == "local":
@@ -184,9 +189,16 @@ async def test_interrupted_test_retires_after_real_closed_zero(tmp_path, tls, un
 # Why: local Start, timed power verification and cloud arming have different durable confirmation contracts.
 @pytest.mark.parametrize("action", ["start", "start_test", "arm_cloud_test"])
 async def test_interrupted_request_retains_its_action_outcome(tmp_path, tls, unused_tcp_port, monkeypatch, action):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=60, startup=60) as b:
+    async with ready(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        duration=60,
+        startup=60,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
+    ) as b:
         c, j = b.controller, b.session.journal
         identifier, local = uuid.uuid4().hex, None
         if action == "arm_cloud_test":
@@ -253,8 +265,7 @@ async def test_interrupted_request_retains_its_action_outcome(tmp_path, tls, unu
 # Intent: the exact failed selection retires after fresh verified Pause without claiming its unknown target succeeded.
 # Why: physical zero may heal while stale metadata would still disable ordinary or later fault recovery.
 async def test_failed_current_record_retires_after_verified_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer) as b:
         c, j = b.controller, b.session.journal
         fail_boundary(j, "current", "statement")
         reached, _ = failing_cleanup(
@@ -292,9 +303,8 @@ async def test_failed_current_record_retires_after_verified_pause(tmp_path, tls,
 # Why: neither a selection before its first source read nor a failed timed Start creates an owner Pause marker.
 @pytest.mark.parametrize("case", ["app-current", "paused-current", "timed-start"])
 async def test_internal_pause_recovers_after_first_read_failure(tmp_path, tls, unused_tcp_port, monkeypatch, case):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     factory = adjustable if case != "timed-start" else ready
-    async with factory(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with factory(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer) as b:
         c, j = b.controller, b.session.journal
         if case == "paused-current":
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
@@ -337,8 +347,7 @@ async def test_internal_pause_recovers_after_first_read_failure(tmp_path, tls, u
 # Intent: an explicit device Rejected result can settle only its exact existing Start ticket after fresh zero.
 # Why: a rejected Start is known not to have created a session, but a failed follow-up read must not strand it.
 async def test_explicit_rejected_start_settles_its_current_ticket(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, startup=60) as b:
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, startup=60, native_peer=InterruptedNativePeer) as b:
         c, j = b.controller, b.session.journal
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         await healthy(c)
@@ -383,8 +392,7 @@ async def test_explicit_rejected_start_settles_its_current_ticket(tmp_path, tls,
 async def test_terminal_current_snapshot_is_revoked_during_native_read(
     tmp_path, tls, unused_tcp_port, monkeypatch, change
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SelectiveConfigPeer)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=SelectiveConfigPeer) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         identifier, revision = uuid.uuid4().hex, c.requests.intent().revision
         peer.fail_at = peer.config_requests + 1

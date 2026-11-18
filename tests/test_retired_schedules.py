@@ -58,8 +58,13 @@ def test_unfinished_journal_refuses_without_changing_bytes(tmp_path, state):
 @pytest.mark.parametrize(
     "flag",
     [
-        "idle_cutoff_hold", "recovery_session", "closure_gap", "unreported_native",
-        "pending_native_reports", "temporary_attempts", "unidentified_local",
+        "idle_cutoff_hold",
+        "recovery_session",
+        "closure_gap",
+        "unreported_native",
+        "pending_native_reports",
+        "temporary_attempts",
+        "unidentified_local",
     ],
 )
 def test_completed_occurrence_with_remaining_debt_refuses(tmp_path, flag):

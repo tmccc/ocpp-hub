@@ -10,17 +10,16 @@ import pytest
 from ocpp_hub_core.prototype.native_history import NativeHistoryArchive
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 
-from tests import test_native_bounded_session as native_bench
+from tests.connected_rig import strategy_file
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.management_peer import TOKEN
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import ServiceProcess
-from tests.test_managed_api import TOKEN
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import FAST, until
 from tests.test_native_history_archive import unassigned
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import FAST, until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tools import managed_proxy
 
 
@@ -59,8 +58,9 @@ async def publication(service, status_path, predicate):
 async def test_service_history_commit_failure_allows_zero_stop_and_uncertainty(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with commissioned(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 32, cli_route=True) as original:
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 32, cli_route=True, native_peer=InterruptedNativePeer
+    ) as original:
         await original.controller.current.close()
         await original.controller.charging.close()
         await crash(original.session)

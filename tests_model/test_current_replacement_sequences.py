@@ -8,13 +8,12 @@ import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_proxy import healthy, introduced, managed_session
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig
 from tests_model.catalog import input_digest
 from tests_model.control_cases import current_replacement_candidates
 from tests_model.control_helpers import ordinary_recovery
@@ -31,10 +30,9 @@ def cases():
 # Why: a canceled worker's delayed response cannot confer authority on a replacement process or transport.
 @pytest.mark.parametrize("case", cases(), ids=lambda case: case.identifier)
 async def test_current_replacement_sequences(tmp_path, model_tls, monkeypatch, record_property, case):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BoundaryPeer)
     events, suffix_complete = [], False
     tls = tls_for_case(tmp_path, model_tls)
-    async with commissioned(tmp_path, tls, listener_port(), monkeypatch, case.initial) as b:
+    async with commissioned(tmp_path, tls, listener_port(), monkeypatch, case.initial, native_peer=BoundaryPeer) as b:
         c, s, peer = b.controller, b.session, b.rig.peer
         if case.boundary == "paused-native":
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)

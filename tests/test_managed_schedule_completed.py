@@ -10,11 +10,11 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
+from tests.runtime_rig import until
 from tests.test_managed_start_overlap import close_in_order, delayed_owner, owner_tag
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 END = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
 NEXT = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
@@ -24,7 +24,7 @@ NEXT = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
 # Why: startup's zero hold cannot turn the missing owner lifecycle into authority to Stop a different charge.
 @pytest.mark.parametrize("demand", [False, True])
 async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
@@ -71,7 +71,7 @@ async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port,
 # Why: startup recovery owns zero while it establishes source, without borrowing an owner Stop.
 @pytest.mark.parametrize("demand", [False, True])
 async def test_reconnect_following_daily(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
         b.clock.now = NEXT
         daily = await b.start_plan(9, demand=demand)

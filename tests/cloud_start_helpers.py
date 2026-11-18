@@ -7,9 +7,9 @@ from datetime import UTC, datetime, timedelta
 from ocpp_hub_core.frames import build_call_error, build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
+from tests.charge_rig import positive_flow
 from tests.recovery_barriers import fresh_daily_values, returned_to_app, witnessed_native_loss
-from tests.test_managed_test_charge import positive_flow
 from tests_model.test_start_recovery_sequences import close_daily
 
 

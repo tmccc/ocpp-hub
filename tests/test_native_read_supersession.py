@@ -14,9 +14,9 @@ from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
 from ocpp_hub_core.prototype.ordinary_recovery import SOURCE
 
 from tests import native_schedule_support as schedule_bench
+from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import ZONE, SchedulePeer, timer_bench
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 class OrderedNativePeer(SchedulePeer):
@@ -97,9 +97,12 @@ async def old_result(task, mode, *, superseded):
         assert not isinstance(result, BaseException)
         return result
     expected = (
-        asyncio.CancelledError if mode == "cancelled"
-        else AuditSupersededError if superseded
-        else NativeContentError if mode == "strict-content"
+        asyncio.CancelledError
+        if mode == "cancelled"
+        else AuditSupersededError
+        if superseded
+        else NativeContentError
+        if mode == "strict-content"
         else NativeTransportUnavailableError
     )
     assert isinstance(result, expected), result
@@ -124,14 +127,12 @@ async def later_daily(b, local, selected):
 # Why: handling an old exception before checking sequence can create an unnecessary hold or borrowed Stop at cutoff.
 @pytest.mark.parametrize("selected", [6, 32])
 @pytest.mark.parametrize("newer_read", [False, True], ids=["current-failure-control", "obsolete-finishes-last"])
-@pytest.mark.parametrize(
-    "mode", ["valid-other-source", "strict-content", "transport503", "cancelled"]
-)
+@pytest.mark.parametrize("mode", ["valid-other-source", "strict-content", "transport503", "cancelled"])
 async def test_native_read_outcome_belongs_to_its_sequence(
     tmp_path, tls, unused_tcp_port, monkeypatch, selected, newer_read, mode
 ):
     monkeypatch.setattr(schedule_bench, "SchedulePeer", OrderedNativePeer)
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         if selected != 6:
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
             await b.c.current.settle()
@@ -211,7 +212,7 @@ async def test_current_native_authority_sql_refusal_removes_freshness(
     tmp_path, tls, unused_tcp_port, monkeypatch, selected
 ):
     monkeypatch.setattr(schedule_bench, "SchedulePeer", OrderedNativePeer)
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         if selected != 6:
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
             await b.c.current.settle()

@@ -5,9 +5,9 @@ import uuid
 import pytest
 
 from tests.cloud_start_helpers import two_later_sessions
+from tests.managed_rig import starts
 from tests.test_combined_recovery_proofs import selected_service
-from tests.test_managed_proxy import starts
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: an early legitimate Return completes before the common suffix asserts restored app ceiling and charging.

@@ -6,10 +6,10 @@ import pytest
 from ocpp_hub_core.frames import build_call_error, build_call_result
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.prototype_rig import START
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 class AuthorizationPeer:
@@ -60,7 +60,7 @@ async def test_cached_denial_uses_fresh_cloud_decision(tmp_path, tls, unused_tcp
         await actual(bench, peer)
 
     monkeypatch.setattr(Bench, "vendor", vendor)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)

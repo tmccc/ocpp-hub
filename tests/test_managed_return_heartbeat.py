@@ -6,13 +6,12 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_current import adjustable
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy, starts
+from tests.runtime_rig import until
 from tests.test_managed_current_tick_race import OneNativeResponseGate
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 class HeartbeatPeer:
@@ -44,9 +43,7 @@ class HeartbeatPeer:
 # Intent: a Heartbeat arriving during native validation retains one accepted Return; genuine queued debt does not.
 # Why: fresh proof can wait before dispatch, while pending history and uncertain outcomes retain their own guards.
 @pytest.mark.parametrize("case", ["fast", "heartbeat", "observation_debt", "new_pause"])
-async def test_return_waits_for_cloud_rpc_before_positive_dispatch(
-    tmp_path, tls, unused_tcp_port, monkeypatch, case
-):
+async def test_return_waits_for_cloud_rpc_before_positive_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch, case):
     armed, seen, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     actual = Bench.vendor
 
@@ -55,8 +52,7 @@ async def test_return_waits_for_cloud_rpc_before_positive_dispatch(
         await actual(bench, HeartbeatPeer(connection, armed, seen, release))
 
     monkeypatch.setattr(Bench, "vendor", cloud)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         c, peer, g = b.controller, b.rig.peer, b.session.gateway
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         assert (await healthy(c))["local_hold_verified"]

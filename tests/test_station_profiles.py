@@ -26,9 +26,9 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_evidence import native_profile_projection, profile_projection
 
 from tests.prototype_firmware import Firmware
-from tests.test_prototype import BOOT, START, Rig
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import BOOT, START, Rig
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 from tests.trial_helpers import TrialRig
 
 ANCHOR = "2020-01-01T00:00:00Z"

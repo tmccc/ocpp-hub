@@ -12,17 +12,16 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests import conftest as _engine  # noqa: F401 - initialize the HA-free package before importing it.
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, positive_flow
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, managed_session, starts
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
+from tests.prototype_rig import BOOT, START
 from tests.recovery_barriers import returned_to_app, witnessed_native_loss
-from tests.test_managed_proxy import healthy, managed_session, starts
+from tests.runtime_rig import until
 from tests.test_managed_start_cap_failure import BeforeCapFailurePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
 from tests_model.catalog import input_digest
 from tests_model.recovery_cases import start_cases
 
@@ -81,10 +80,14 @@ async def close_daily(b, local, first, *, timestamp=None, meter_stop=1100):
 # Why: a refused command must not leave metadata that disables a later session's outage or reconnect protection.
 @pytest.mark.parametrize("case", selected_cases(), ids=lambda case: case.identifier)
 async def test_start_failure_recovery_sequences(tmp_path, model_tls, monkeypatch, record_property, case):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BeforeCapFailurePeer)
     completed, suffix_complete = [], False
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, case.selected
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        case.selected,
+        native_peer=BeforeCapFailurePeer,
     ) as b:
         c, s, sock, rig = b.controller, b.session, b.charger, b.rig
         peer, firmware = rig.peer, rig.bench.firmware

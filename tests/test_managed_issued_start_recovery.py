@@ -11,18 +11,16 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as managed_bench_module
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.peer_start_ledger import PeerStartLedger
 from tests.test_managed_debt_reconciliation import ErrorReplyPeer, strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, starts
 from tests.test_managed_stop_reply_recovery import pause, running
-from tests.test_managed_test_charge import ChargeRig, ready
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 from tools import reconcile_managed_debt as operator
 
 
@@ -31,8 +29,6 @@ from tools import reconcile_managed_debt as operator
 @pytest.mark.parametrize("fault", ["late-reply", "call-error"])
 @pytest.mark.parametrize("paused", [False, True])
 async def test_ordinary_issued_start_exact_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, capsys, fault, paused):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(managed_bench_module, "OwnerBench", StartReplyBench)
     trace = []
     if fault == "call-error":
         actual = Bench.read_charger
@@ -43,7 +39,16 @@ async def test_ordinary_issued_start_exact_recovery(tmp_path, tls, unused_tcp_po
 
         monkeypatch.setattr(Bench, "read_charger", erroneous_peer)
     async with ready(
-        tmp_path, tls, unused_tcp_port, monkeypatch, startup=3, duration=0.02, owner_tag="APP_OWNER", cli_route=True
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        startup=3,
+        duration=0.02,
+        owner_tag="APP_OWNER",
+        cli_route=True,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
     ) as b:
         c, s, rig = b.controller, b.session, b.rig
         ledger = PeerStartLedger(rig.bench)

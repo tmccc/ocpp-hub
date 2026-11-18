@@ -9,7 +9,7 @@ from ocpp_hub_core.prototype.managed_intent import ManagedRequests
 from ocpp_hub_core.prototype.start_settlement import RetirementCandidate, RetirementDecision, RetirementRule
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # Supply the real process-local identity without restoring it from persisted metadata.

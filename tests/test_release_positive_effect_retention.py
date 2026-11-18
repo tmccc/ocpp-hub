@@ -10,10 +10,10 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, WireReply
 
 from tests.handover_helpers import crash
+from tests.managed_rig import introduced, managed_session, starts
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import introduced, managed_session, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -22,7 +22,7 @@ pytestmark = pytest.mark.asyncio
 # Why: whole-attempt dispatch facts cannot be replaced by the last RPC's transport failure or a later zero result.
 async def test_applied_positive_then_unsent_composite_keeps_release_fault(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with (
-        timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b,
+        timer_bench(tmp_path, tls, unused_tcp_port) as b,
         AsyncExitStack() as replacements,
     ):
         plan, configuration = copy.deepcopy(b.device.plans[9]), copy.deepcopy(b.rig.peer.configuration)

@@ -9,16 +9,16 @@ import pytest
 from ocpp_hub_core.frames import build_call_error
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_debt_recovery import KEY
-from ocpp_hub_core.prototype.native_bounded import NativeBoundedSpec
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
+from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 from tools import reconcile_managed_debt as operator
 
 
@@ -51,16 +51,6 @@ class ErrorReplyPeer:
         await self.connection.send(raw)
 
 
-# Preserve native strategy binding through CLI preflight without changing the actual production route contract.
-def strategy_file(rig, tmp_path):
-    value = rig.spec.value()
-    value["trial_route"].update(sDomain=rig.prepared.config.listener_name, sURL="/charger/")
-    rig.spec = NativeBoundedSpec.parse(value)
-    strategy = tmp_path / "native-spec.json"
-    save_private(strategy, value)
-    return strategy
-
-
 # Intent: a real correlated vendor error stays quarantined until exact independent evidence and a fresh Pause.
 # Why: a generic CALLERROR cannot justify retry, positive release, or successful-command reporting.
 @pytest.mark.parametrize("legacy_marker", [False, True])
@@ -73,7 +63,7 @@ async def test_vendor_error_operator_reconciliation(tmp_path, tls, unused_tcp_po
         await actual(bench, ErrorReplyPeer(connection, trace))
 
     monkeypatch.setattr(Bench, "read_charger", charger_peer)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         strategy = strategy_file(rig, tmp_path)
         config, native_port = tmp_path / "trial.json", rig.prepared.observer.port
         assert await operator.run("check", config, strategy, None, native_port, kind="vendor-write") == 0
@@ -209,9 +199,9 @@ async def test_vendor_error_operator_reconciliation(tmp_path, tls, unused_tcp_po
 async def test_unattributed_start_requires_exact_operator_evidence(tmp_path, tls, unused_tcp_port, monkeypatch, capsys):
     from datetime import UTC, datetime
 
-    from tests.test_prototype import START
+    from tests.prototype_rig import START
 
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         strategy = strategy_file(rig, tmp_path)
         config, native_port = tmp_path / "trial.json", rig.prepared.observer.port
         s = managed_session(rig)
@@ -340,7 +330,7 @@ class HeldReportPeer:
 async def test_legacy_observation_recovery_preserves_queued_lifecycle(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys
 ):
-    from tests.test_prototype import START
+    from tests.prototype_rig import START
 
     gate = {"armed": False, "seen": asyncio.Event(), "release": asyncio.Event()}
     actual = Bench.vendor
@@ -350,7 +340,7 @@ async def test_legacy_observation_recovery_preserves_queued_lifecycle(
         await actual(bench, HeldReportPeer(connection, gate))
 
     monkeypatch.setattr(Bench, "vendor", cloud)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         strategy = strategy_file(rig, tmp_path)
         config, native_port = tmp_path / "trial.json", rig.prepared.observer.port
         s = managed_session(rig)

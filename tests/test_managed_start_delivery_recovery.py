@@ -12,17 +12,16 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
+from tests.connected_rig import strategy_file
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause, running
 from tests.test_managed_stop_reply_recovery import statement as stop_statement
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
 from tools import reconcile_managed_delivery as mapping
 
@@ -125,10 +124,10 @@ async def approve_stop_after_start(rig, tmp_path, capsys):
 async def test_start_retry_can_itself_fail_and_recover(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, recovery_fault
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     monkeypatch.setattr(managed_start_delivery, "RETRY_INTERVAL", 0.01)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench, native_peer=InterruptedNativePeer
+    ) as rig:
         async with running(rig, "start-exhausted") as (s, c, sock):
             await mp.healthy(c)
             rig.bench.start_replies = ["error"] * 3
@@ -221,9 +220,9 @@ async def test_start_retry_can_itself_fail_and_recover(
 # Why: denial mapping and recovery evidence cannot depend on fault-poll scheduling or global historical uniqueness.
 @pytest.mark.parametrize("poll_before_stop", [False, True])
 async def test_denied_zero_id_recovery_is_repeatable(tmp_path, tls, unused_tcp_port, monkeypatch, poll_before_stop):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench, native_peer=InterruptedNativePeer
+    ) as rig:
         async with running(rig, "repeated-zero-denial") as (s, c, sock):
             await mp.healthy(c)
             rig.bench.fixed_vendor = 0

@@ -9,12 +9,12 @@ from typing import Any
 
 from ocpp_hub_core.prototype.native_start_attempts import matching_unassigned_start, start_millisecond_range
 
+from tests.managed_rig import healthy, introduced, starts
 from tests.native_schedule_support import ZONE, TimerBench, timer_bench
-from tests.test_managed_proxy import healthy, introduced, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_native_history_archive import unassigned
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Populate a new native start-only record while SESSION still exposes no assigned OCPP transaction number.
@@ -37,7 +37,7 @@ def unnumbered(b: TimerBench, instant: int, name: str) -> tuple[dict[str, Any], 
 # Why: allocation under zero grants no current until native and local source identifiers actually converge.
 async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with (
-        timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b,
+        timer_bench(tmp_path, tls, unused_tcp_port) as b,
         AsyncExitStack() as connections,
     ):
         await b.sock.close()
@@ -58,9 +58,7 @@ async def test_unnumbered_original_needs_matching_source_and_attempt(tmp_path, t
         competing = attempt | {"filename": "same-second.json", "startMs": 175}
         assert matching_unassigned_start((attempt, competing), body, datetime.fromisoformat(body["timestamp"])) is None
         assert matching_unassigned_start((attempt,), body, datetime.fromisoformat(body["timestamp"])) is not None
-        refused = await b.rig.bench.call(
-            b.sock, uuid.uuid4().hex, "StartTransaction", body | {"idTag": "CLOUD_OWNER"}
-        )
+        refused = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body | {"idTag": "CLOUD_OWNER"})
         assert refused[0] == 4 and b.session.journal.active() is None and b.device.effective_limit() == 0
         accepted = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
         assert accepted[0] == 3

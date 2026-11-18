@@ -6,15 +6,14 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, recoverable_fault
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import positive_flow
 from tests.cloud_start_helpers import StartReplyBench
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import positive_flow
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import commissioned
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: any explicit strict member of a three-failure run prevents measured-only recovery provenance.
@@ -25,9 +24,16 @@ from tests.test_prototype_tls import tls as tls
 async def test_mixed_native_run_keeps_strict_fault(
     tmp_path, tls, unused_tcp_port, monkeypatch, strict_kind, strict_at, measurement
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16, cli_route=True) as b:
+    async with commissioned(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        16,
+        cli_route=True,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
+    ) as b:
         c, j, peer, firmware = b.controller, b.session.journal, b.rig.peer, b.rig.bench.firmware
         original_configuration = copy.deepcopy(peer.configuration)
         original_plans = copy.deepcopy(firmware.plans)

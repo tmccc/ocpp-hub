@@ -5,14 +5,13 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import owner_rig
 from tests.cloud_start_helpers import two_later_sessions
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
+from tests.tls_support import tls as tls
 
 
 # Intent: real pre-dispatch SQL and persistent diagnostic refusal retain zero while native loss is supervised.
@@ -21,8 +20,9 @@ from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
 async def test_start_diagnostic_refusal_does_not_block_native_recovery(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=1) as b:
+    async with owner_rig(
+        tmp_path, tls, unused_tcp_port, monkeypatch, startup=1, native_peer=InterruptedNativePeer
+    ) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         first = await healthy(c)
         fail_boundary(j, "start", failure)
@@ -47,9 +47,12 @@ async def test_start_diagnostic_refusal_does_not_block_native_recovery(
             peer.unavailable = False
             restored = await healthy(c)
             assert restored["local_hold_verified"] and b.rig.bench.firmware.effective_limit() == 0
-            assert attempts and j.db.execute(
-                "SELECT 1 FROM sqlite_temp_master WHERE type='trigger' AND name='review_cleanup_unavailable'"
-            ).fetchone()
+            assert (
+                attempts
+                and j.db.execute(
+                    "SELECT 1 FROM sqlite_temp_master WHERE type='trigger' AND name='review_cleanup_unavailable'"
+                ).fetchone()
+            )
             j.db.execute("DROP TRIGGER review_worker_boundary")
             j.db.execute("DROP TRIGGER review_cleanup_unavailable")
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)

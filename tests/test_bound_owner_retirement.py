@@ -7,13 +7,13 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
 from tests.cloud_start_helpers import StartReplyBench
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import running
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
 
 
 # Intent: each real SQLite refusal retains the exact local lease/request and all cloud evidence until one commit.
@@ -23,8 +23,9 @@ from tests.test_prototype_runtime import until
 async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
     tmp_path, model_tls, monkeypatch, boundary, legacy_metadata
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with mp.managed_bench(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), bench_type=StartReplyBench
+    ) as rig:
         async with running(rig, "atomic-unmapped-owner", owner_tag="APP_OWNER") as (s, c, sock):
             await mp.healthy(c)
             identifier = uuid.uuid4().hex
@@ -80,9 +81,7 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             assert c.pause_task is not None
             await c.pause_task
             assert (
-                c.charging.lease is lease
-                and c.charging.state() == state
-                and c.requests.receipt(identifier) == receipt
+                c.charging.lease is lease and c.charging.state() == state and c.requests.receipt(identifier) == receipt
             )
             assert not j.db.in_transaction and rig.bench.firmware.effective_limit() == 0
             native = await c.native.read()
@@ -90,9 +89,7 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             with pytest.raises(sqlite3.IntegrityError):
                 await c.tick()
             assert (
-                c.charging.lease is lease
-                and c.charging.state() == state
-                and c.requests.receipt(identifier) == receipt
+                c.charging.lease is lease and c.charging.state() == state and c.requests.receipt(identifier) == receipt
             )
             assert [tuple(row) for row in j.db.execute("SELECT * FROM outbox")] == retained
             assert j.get("managed_control_fault") == fault and j.vendor_id(local) is None

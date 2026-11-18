@@ -6,16 +6,15 @@ from contextlib import AsyncExitStack
 
 import pytest
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
-from tests.test_managed_introduction_retry import InterruptedNativePeer
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_start_delivery_recovery import map_unknown_retry
 from tests.test_managed_stop_reply_recovery import pause, running
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: lifecycle closure and owner revocation before the Start reply never lose real mapping or later recovery.
@@ -24,9 +23,9 @@ from tests.test_prototype_tls import tls as tls
 @pytest.mark.parametrize("source", ["daily", "local"])
 @pytest.mark.parametrize("cut", ["close-before-reply", "pause-before-reply", "restart-before-reply"])
 async def test_cloud_start_reply_ordering(tmp_path, tls, unused_tcp_port, monkeypatch, capsys, reply, source, cut):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench, native_peer=InterruptedNativePeer
+    ) as rig:
         stack, gate = AsyncExitStack(), asyncio.Event()
         try:
             s, c, sock = await stack.enter_async_context(running(rig, "before-start-reply", owner_tag="APP_OWNER"))

@@ -5,11 +5,11 @@ import uuid
 
 import pytest
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig, positive_flow
 from tests.cloud_start_helpers import StartReplyBench
 from tests.test_managed_stop_reply_recovery import running
-from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests_model.test_start_recovery_sequences import close_daily
 
 COMMANDS = (("setTransaction", {"eco": "Fast"}), ("delayStop", {"stopTime": "2030-01-01T00:00:00Z"}), ("delayStop", {}))
@@ -41,8 +41,7 @@ async def commands(rig, vendor, expected_local):
 async def test_managed_cloud_controls_translate_zero_and_reused_mapping(
     tmp_path, tls, unused_tcp_port, monkeypatch, vendor
 ):
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench) as rig:
         rig.bench.fixed_vendor = vendor
         async with running(rig, "cloud-mapping-controls") as (session, controller, charger):
             await mp.healthy(controller)

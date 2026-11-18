@@ -8,17 +8,16 @@ import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.native_bounded_handover import NativeBoundedHandover
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, positive_flow
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy, starts
 from tests.native_fault_support import coroutine_locals
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import returned_to_app
+from tests.runtime_rig import until
 from tests.test_introduction_storage_retry import GatedIntroductionPeer, current_probe
-from tests.test_managed_introduction_retry import selected_ready
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import ChargeRig, positive_flow
 from tests.test_ordinary_recovery import close_session
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: ordinary zero/source repair waits for the real reconnect introducer before restoring selected current.
@@ -27,8 +26,9 @@ from tests.test_prototype_tls import tls as tls
 async def test_ordinary_zero_cannot_publish_unfinished_introduction(
     tmp_path, tls, unused_tcp_port, monkeypatch, current
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", GatedIntroductionPeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=GatedIntroductionPeer
+    ) as b:
         c, s, rig = b.controller, b.session, b.rig
         g, j, peer = s.gateway, s.journal, rig.peer
         original_plan, original_config = copy.deepcopy(rig.bench.firmware.plans), copy.deepcopy(peer.configuration)
@@ -163,8 +163,9 @@ async def test_new_pause_repairs_superseded_late_introduction_zero(
 # Why: completion repair cannot borrow the quiet gap before that same service starts another restrictive attempt.
 @pytest.mark.parametrize("current", [6, 32])
 async def test_deferred_retry_sleep_retains_introduction_service(tmp_path, tls, unused_tcp_port, monkeypatch, current):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", GatedIntroductionPeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=GatedIntroductionPeer
+    ) as b:
         c, s, rig = b.controller, b.session, b.rig
         g, j, peer = s.gateway, s.journal, rig.peer
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)

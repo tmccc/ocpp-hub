@@ -27,7 +27,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import InvalidStatus
 from websockets.http11 import Request
 
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 
 

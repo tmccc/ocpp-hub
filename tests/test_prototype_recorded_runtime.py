@@ -19,10 +19,10 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 
 from tests.prototype_firmware import Firmware
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import FAST, NOW, until
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import FAST, NOW, until
+from tests.tls_support import admission as admission
+from tests.tls_support import tls as tls
 
 
 # Compare embedded JSON without requiring whitespace/key order to remain identical after translation.

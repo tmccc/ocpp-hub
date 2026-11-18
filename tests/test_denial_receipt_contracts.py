@@ -18,7 +18,7 @@ from ocpp_hub_core.prototype.managed_stop_delivery import WIRE_ACK, record_stop_
 from ocpp_hub_core.prototype.store import Journal
 
 from tests import conftest as _core_setup  # noqa: F401 - load the HA-free source package.
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # Use genuine immutable Journal Start/Stop allocation and acknowledgement callbacks, never invented receipt bodies.

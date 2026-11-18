@@ -11,17 +11,16 @@ from ocpp_hub_core.frames import build_call_error
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig, positive_flow
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import fresh_daily_values, returned_to_app
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Retire each actual service with its own socket still available; tested process loss explicitly uses crash instead.
@@ -75,9 +74,16 @@ async def reconnect(stack, rig, monkeypatch, fault):
 async def test_partial_paused_introduction_recovers_after_genuine_stop(
     tmp_path, tls, unused_tcp_port, monkeypatch, selected, fault
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True) as original:
+    async with commissioned(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        selected,
+        cli_route=True,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
+    ) as original:
         rig, b = original.rig, original
         original_config, original_plans = copy.deepcopy(rig.peer.configuration), copy.deepcopy(rig.bench.firmware.plans)
         async with AsyncExitStack() as stack:

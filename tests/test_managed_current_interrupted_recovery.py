@@ -14,12 +14,12 @@ from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
+from tests.current_rig import adjustable
 from tests.handover_helpers import crash
-from tests.test_managed_current import adjustable
+from tests.managed_rig import healthy, introduced, managed_session
 from tests.test_managed_current_tick_race import OneNativeResponseGate
-from tests.test_managed_proxy import healthy, introduced, managed_session
 from tests.test_managed_release_recovery import explicit_release_pause, recover_then_return
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Persist the old tick's real fault/request shape before the current worker can write a terminal diagnostic.
@@ -88,10 +88,8 @@ async def test_interrupted_collision_requires_new_pause_and_preserves_previous_s
 async def test_interrupted_native_http_diagnostic_can_reconcile_only_through_pause(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
-    from tests import test_native_bounded_session as native_bench
 
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         peer.arm = True
         request = uuid.uuid4().hex

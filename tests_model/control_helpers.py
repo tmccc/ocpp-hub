@@ -3,9 +3,9 @@
 import uuid
 from datetime import timedelta
 
+from tests.charge_rig import positive_flow
+from tests.managed_rig import healthy, starts
 from tests.recovery_barriers import completed_control, fresh_daily_values, returned_to_app, witnessed_native_loss
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import positive_flow
 from tests_model.test_start_recovery_sequences import close_daily
 
 

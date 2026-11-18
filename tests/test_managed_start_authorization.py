@@ -11,15 +11,14 @@ import pytest
 from ocpp_hub_core.frames import build_call_error, build_call_result
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
+from tests.charge_rig import actual_stop, owner_rig, positive_flow
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
 from tests.test_managed_cached_authorization import AuthorizationPeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 class RenewalPeer(AuthorizationPeer):

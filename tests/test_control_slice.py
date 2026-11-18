@@ -126,8 +126,11 @@ def test_historical_publication_never_reclaims_newer_pause(pause_first):
 # Why: unknown delivery cannot be replayed or relabelled merely because a later read was not sent.
 @pytest.mark.parametrize(
     "outcome,expected",
-    [(StartOutcome.UNKNOWN, frozenset(StartDebt)), (StartOutcome.REJECTED, frozenset()),
-     (StartOutcome.ERROR, frozenset(StartDebt))],
+    [
+        (StartOutcome.UNKNOWN, frozenset(StartDebt)),
+        (StartOutcome.REJECTED, frozenset()),
+        (StartOutcome.ERROR, frozenset(StartDebt)),
+    ],
 )
 def test_terminal_wire_outcomes_do_not_share_one_failure_flag(outcome, expected):
     state = step(dispatched(), StartAnswered("wire-A", outcome)).state
@@ -210,22 +213,40 @@ def test_close_revokes_candidates_but_keeps_outcomes_until_ports_retire():
 
 # Intent: the Return branch retains production whole-operation interpretation and historical physical facts.
 # Why: a later Pause makes successful old sharing stale, and rollback zero cannot turn prior positive into unsent.
-@pytest.mark.parametrize("case,expected", [("shared", ReleaseDisposition.SHARED),
-                                         ("new_pause", ReleaseDisposition.STALE),
-                                         ("rollback", ReleaseDisposition.FAULT)])
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("shared", ReleaseDisposition.SHARED),
+        ("new_pause", ReleaseDisposition.STALE),
+        ("rollback", ReleaseDisposition.FAULT),
+    ],
+)
 def test_return_uses_existing_whole_operation_policy(case, expected):
     before = authority()
     published = replace(before, intent=ControlIntent("app", 8))
     result = OwnedReleaseResult(
-        before, True, True, published, ReleaseEffects(True, WireReply.ACCEPTED, True, False, False),
-        None, None, None, None, False, False,
+        before,
+        True,
+        True,
+        published,
+        ReleaseEffects(True, WireReply.ACCEPTED, True, False, False),
+        None,
+        None,
+        None,
+        None,
+        False,
+        False,
     )
     current = published
     if case == "new_pause":
         current = replace(before, intent=ControlIntent("paused", 9), ticket="pause-B")
     elif case == "rollback":
-        result = replace(result, published=False, published_authority=None,
-                         effects=ReleaseEffects(True, WireReply.ACCEPTED, False, True, True))
+        result = replace(
+            result,
+            published=False,
+            published_authority=None,
+            effects=ReleaseEffects(True, WireReply.ACCEPTED, False, True, True),
+        )
         current = before
     transition = step(SliceState(current), ReturnCompleted("return-A", result, True, False))
     assert transition.state.returns[-1].disposition is expected
@@ -237,9 +258,13 @@ def test_return_uses_existing_whole_operation_policy(case, expected):
 # Why: cheap execution does not justify accepting impossible input grammars.
 def test_impossible_events_and_identity_reuse_are_rejected():
     state = prepared()
-    for event in [StartAnswered("wire-A", StartOutcome.ACCEPTED), OutcomeCommitted("wire-A", StartOutcome.ACCEPTED),
-                  LifecycleBound("wire-A", 41), PublicationCommitted("wire-A", authority()),
-                  PublicationFailed("wire-A", FailureKind.STORAGE)]:
+    for event in [
+        StartAnswered("wire-A", StartOutcome.ACCEPTED),
+        OutcomeCommitted("wire-A", StartOutcome.ACCEPTED),
+        LifecycleBound("wire-A", 41),
+        PublicationCommitted("wire-A", authority()),
+        PublicationFailed("wire-A", FailureKind.STORAGE),
+    ]:
         with pytest.raises(ValueError):
             step(state, event)
     with pytest.raises(ValueError, match="twice"):

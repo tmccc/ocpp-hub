@@ -13,8 +13,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_view import charger_history, session_history, summarize_charger_history
 from ocpp_hub_core.prototype.store import Journal
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.tls_support import tls as tls
 
 
 # Intent: a completed session is not cloud acknowledged while its actual Stop remains in the delivery queue.
@@ -73,7 +73,7 @@ async def test_pause_and_hold_claim_are_atomic(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)

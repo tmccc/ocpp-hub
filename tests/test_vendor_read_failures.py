@@ -13,9 +13,9 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current_prepare import prepare_current_capability
 from ocpp_hub_core.prototype.store import Journal, fingerprint
 
-from tests.test_managed_proxy import OwnerBench, healthy, introduced, managed_bench, managed_session
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import OwnerBench, healthy, introduced, managed_bench, managed_session
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 class LostReplyBench(OwnerBench):
@@ -82,10 +82,8 @@ async def cloud(rig, token, action, payload):
     ],
 )
 async def test_lost_read_ack_retains_real_owner_control(tmp_path, tls, unused_tcp_port, monkeypatch, action, payload):
-    import tests.test_managed_proxy as managed_helpers
 
-    monkeypatch.setattr(managed_helpers, "OwnerBench", LostReplyBench)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, bench_type=LostReplyBench) as rig:
         async with operating(rig, "read-boot") as (session, controller):
             assert (await cloud(rig, "good-read", action, payload))[0] == 3
             assert (await healthy(controller))["owner_control_enabled"]
@@ -105,10 +103,7 @@ async def test_lost_read_ack_retains_real_owner_control(tmp_path, tls, unused_tc
 async def test_lost_start_ack_keeps_real_ambiguity(tmp_path, tls, unused_tcp_port, monkeypatch):
     from ocpp_hub_core.prototype.vendor_read_recovery import recover_legacy_vendor_read
 
-    import tests.test_managed_proxy as managed_helpers
-
-    monkeypatch.setattr(managed_helpers, "OwnerBench", LostReplyBench)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, bench_type=LostReplyBench) as rig:
         async with operating(rig, "write-boot") as (session, controller):
             rig.bench.drop_action, rig.bench.drop_mode = "RemoteStartTransaction", "no-reply"
             result = await cloud(
@@ -127,10 +122,8 @@ async def test_lost_start_ack_keeps_real_ambiguity(tmp_path, tls, unused_tcp_por
 # Intent: a dropped read during actual TLS loss must recover through genuine Boot and fresh native protection.
 # Why: clearing transient connection state must not leave false durable command debt blocking owner control.
 async def test_read_link_loss_recovers_on_actual_reconnection(tmp_path, tls, unused_tcp_port, monkeypatch):
-    import tests.test_managed_proxy as managed_helpers
 
-    monkeypatch.setattr(managed_helpers, "OwnerBench", LostReplyBench)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, bench_type=LostReplyBench) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -163,7 +156,7 @@ async def test_read_link_loss_recovers_on_actual_reconnection(tmp_path, tls, unu
 async def test_legacy_read_restart_stays_paused_until_return(tmp_path, tls, unused_tcp_port, monkeypatch, selected):
     from ocpp_hub_core.prototype.vendor_read_recovery import recover_legacy_vendor_read
 
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         async with operating(rig, "initial-boot") as (session, controller):
             if selected == 32:
                 controller.command(uuid.uuid4().hex, "pause", controller.requests.intent().revision)

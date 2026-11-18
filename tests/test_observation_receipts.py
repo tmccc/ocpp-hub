@@ -10,8 +10,8 @@ import pytest
 from ocpp_hub_core.prototype import managed_start_delivery
 
 from tests.observation_helpers import ObservationTLS, observation_payload, observation_suffix
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import BOOT, START
+from tests.tls_support import tls as tls
 
 
 # Intent: receipt, publication and local status effects all roll back when BEGIN, statement or COMMIT fails.

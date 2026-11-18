@@ -10,12 +10,12 @@ from ocpp_hub_core.prototype.managed_diagnostics import snapshot
 from ocpp_hub_core.prototype.managed_view import health_snapshot
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.test_managed_proxy import healthy, starts
+from tests.charge_rig import owner_start, positive_flow, ready
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_service_cli import healthy_status
-from tests.test_managed_test_charge import owner_start, positive_flow, ready
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: a real accepted but unbound cloud Start is explicitly unhealthy before and after its grant expires.
@@ -72,7 +72,9 @@ async def test_return_waits_for_timed_test_settlement(
         await asyncio.wait_for(b.rig.bench.remote_stop.wait(), 3)
         assert c.charging.state()["state"] == "stopping" and c.requests.intent().mode == "paused"
         reply = await b.rig.bench.call(
-            b.charger, "test-closed-before-return", "StopTransaction",
+            b.charger,
+            "test-closed-before-return",
+            "StopTransaction",
             {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
         )
         assert reply[0] == 3

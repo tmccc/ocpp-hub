@@ -7,16 +7,15 @@ import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import commissioned
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
 
 
 class HeldZeroInput:
@@ -62,9 +61,15 @@ class DenialBoundaryBench(StartReplyBench):
 @pytest.mark.parametrize("selected", [6, 16, 32])
 @pytest.mark.parametrize("denial", ["Blocked", "Expired", "Invalid", "ConcurrentTx"])
 async def test_denied_mapping_precedes_independently_confirmed_zero(tmp_path, model_tls, monkeypatch, selected, denial):
-    monkeypatch.setattr(mp, "OwnerBench", DenialBoundaryBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with commissioned(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, selected) as b:
+    async with commissioned(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        selected,
+        bench_type=DenialBoundaryBench,
+        native_peer=InterruptedNativePeer,
+    ) as b:
         rig, s, c, sock = b.rig, b.session, b.controller, b.charger
         rig.bench.start_reply_gate = asyncio.Event()
         rig.bench.start_replies = [denial]

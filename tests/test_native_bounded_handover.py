@@ -18,10 +18,10 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.station import StationChoice
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.test_native_bounded_session import ConnectedBench, connected_bench
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.connected_rig import ConnectedBench, connected_bench
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Introduce the real connected device through both TLS legs, with the native HTTP peer retaining the USER6 guard.

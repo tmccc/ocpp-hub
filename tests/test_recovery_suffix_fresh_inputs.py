@@ -8,7 +8,7 @@ import pytest
 from tests.cloud_start_helpers import two_later_sessions
 from tests.recovery_barriers import completed_control
 from tests.test_combined_recovery_proofs import selected_service
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests_model.control_helpers import ordinary_recovery
 
 
@@ -64,8 +64,8 @@ async def test_completed_barrier_requires_exact_action_and_submitted_revision(
 async def test_native_suffix_waits_for_actual_zero_ack(tmp_path, tls, unused_tcp_port, monkeypatch):
     import asyncio
 
+    from tests.charge_rig import positive_flow
     from tests.recovery_barriers import witnessed_native_loss
-    from tests.test_managed_test_charge import positive_flow
     from tests_model.test_start_recovery_sequences import close_daily
 
     async with selected_service(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:

@@ -11,7 +11,7 @@ except ImportError:  # HA10 exposes the same real notification store from the co
     from homeassistant.components.persistent_notification import _async_get_or_create_notifications
 
 from tests import conftest as _engine  # noqa: F401 - register the standalone engine package.
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_client import setup
 
@@ -86,7 +86,7 @@ async def test_native_history_to_actual_ha_sensor(
     from ocpp_hub_core.prototype.managed import ManagedController
     from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 
-    from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
+    from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
     from tests_ha_proxy.test_client import TOKEN
 
     now = int(time.time())
@@ -97,7 +97,7 @@ async def test_native_history_to_actual_ha_sensor(
     elif clock == "future_stop":
         latest["stopTime"] = now + 45
     original = [latest, old]
-    async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, initial_history=original) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), initial_history=original) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)

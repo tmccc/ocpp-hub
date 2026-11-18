@@ -10,12 +10,11 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
 
+from tests.charge_rig import actual_stop, owner_rig, positive_flow
+from tests.managed_rig import healthy, starts
 from tests.recovery_barriers import completed_control
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 

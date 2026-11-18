@@ -6,13 +6,12 @@ import time
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import positive_flow
+from tests.current_rig import selected_ready
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_introduction_retry import selected_ready
-from tests.test_managed_proxy import healthy
-from tests.test_managed_test_charge import positive_flow
+from tests.managed_rig import healthy
 from tests.test_ordinary_recovery import close_session
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,8 +44,7 @@ class SlowCompleteReplies(NativeVehiclePeer):
 # Intent: aggregate native deadlines enter the same restrictive recovery as individually unavailable reads.
 # Why: individually timely HTTP responses must not leave an unobserved positive offer indefinitely.
 async def test_complete_native_audit_timeout_enters_zero_recovery(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SlowCompleteReplies)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32, native_peer=SlowCompleteReplies) as b:
         local = await positive_flow(b, "daily")
         before = await healthy(b.controller)
         assert before["station_ceiling_a"] == before["current_a"] == 32

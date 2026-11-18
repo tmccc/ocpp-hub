@@ -13,14 +13,13 @@ from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import release_bench
 from tests.recovery_barriers import completed_control
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_native_repair_sources import RepairWirePeer, wire_response
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Retain complete independently observed journal facts before and after the actual read outcome and later recovery.
@@ -56,10 +55,14 @@ async def interrupted_read(b, monkeypatch, case):
                 except RuntimeError:
                     task = None
                 if task is target:
-                    classifications.append({
-                        "type": type(error).__name__, "stage": getattr(error, "stage", None),
-                        "detail": str(error), "loop_time": asyncio.get_running_loop().time(),
-                    })
+                    classifications.append(
+                        {
+                            "type": type(error).__name__,
+                            "stage": getattr(error, "stage", None),
+                            "detail": str(error),
+                            "loop_time": asyncio.get_running_loop().time(),
+                        }
+                    )
         return trace_classification
 
     # Capture the genuine aggregate context; rescheduling its deadline selects an ordering without a wall-time claim.
@@ -78,12 +81,15 @@ async def interrupted_read(b, monkeypatch, case):
         actual_close(writer)
         if asyncio.current_task() is target and classifications and not closes:
             waiter = writer._protocol._get_close_waiter(writer)
-            closes.append({
-                "transport_closing": writer.is_closing(), "actual_close_waiter_pending": not waiter.done(),
-                "peer_port": writer.get_extra_info("peername")[1],
-                "audit_before_cleanup": copy.deepcopy(b.session.journal.get(AUDITS)),
-                "loop_time": asyncio.get_running_loop().time(),
-            })
+            closes.append(
+                {
+                    "transport_closing": writer.is_closing(),
+                    "actual_close_waiter_pending": not waiter.done(),
+                    "peer_port": writer.get_extra_info("peername")[1],
+                    "audit_before_cleanup": copy.deepcopy(b.session.journal.get(AUDITS)),
+                    "loop_time": asyncio.get_running_loop().time(),
+                }
+            )
             if case == "strict-newer-pause":
                 identifier = uuid.uuid4().hex
                 c.command(identifier, "pause", c.requests.intent().revision)
@@ -121,13 +127,18 @@ async def interrupted_read(b, monkeypatch, case):
         assert deadlines and (deadlines[0].expired() or type(result) is NativeContentError)
     else:
         assert type(result) in (asyncio.CancelledError, NativeContentError)
-    return {"classifications": classifications, "actual_close": closes, "result_type": type(result).__name__,
-            "task_cancelled": target.cancelled(), "task_cancelling": target.cancelling(),
-            "newer_pause": newer_pause[0] if newer_pause else None,
-            "cancel_callback_results": cancellation_results,
-            "aggregate_deadline_rescheduled": case == "strict-observation-deadline",
-            "aggregate_deadline_expired": deadlines[0].expired() if deadlines else False,
-            "wall_time_15s_elapsed_claimed": False}
+    return {
+        "classifications": classifications,
+        "actual_close": closes,
+        "result_type": type(result).__name__,
+        "task_cancelled": target.cancelled(),
+        "task_cancelling": target.cancelling(),
+        "newer_pause": newer_pause[0] if newer_pause else None,
+        "cancel_callback_results": cancellation_results,
+        "aggregate_deadline_rescheduled": case == "strict-observation-deadline",
+        "aggregate_deadline_expired": deadlines[0].expired() if deadlines else False,
+        "wall_time_15s_elapsed_claimed": False,
+    }
 
 
 # Complete only real supported owner commands if recovery was actually granted, recording both later lifecycles.
@@ -155,15 +166,22 @@ async def observe_later_recovery(b, pause, should_block):
 
 # Intent: real strict bytes remain disqualifying through close cancellation, with availability and new-Pause controls.
 # Why: cancellation during cleanup must not relabel an already classified current strict refusal as availability.
-@pytest.mark.parametrize("case", [
-    "strict-cancel", "strict-observation-deadline", "availability-cancel", "strict-newer-pause", "strict-no-cancel",
-])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "strict-cancel",
+        "strict-observation-deadline",
+        "availability-cancel",
+        "strict-newer-pause",
+        "strict-no-cancel",
+    ],
+)
 async def test_classified_native_refusal_survives_actual_close_cancellation(
     tmp_path, tls, unused_tcp_port, monkeypatch, case
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", RepairWirePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(
+        tmp_path, tls, unused_tcp_port, 6, native_peer=RepairWirePeer, bench_type=StartReplyBench
+    ) as b:
         b.controller = b.c
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
@@ -174,8 +192,12 @@ async def test_classified_native_refusal_survives_actual_close_cancellation(
         should_block = case in ("strict-cancel", "strict-observation-deadline", "strict-no-cancel")
         recovery = await observe_later_recovery(b, observed["newer_pause"] or pause, should_block)
         witness = {
-            "case": case, "legacy_input_explicit": True, "fault": fault,
-            "before": before, "actual_read": observed, "immediately_after": immediately_after,
+            "case": case,
+            "legacy_input_explicit": True,
+            "fault": fault,
+            "before": before,
+            "actual_read": observed,
+            "immediately_after": immediately_after,
             "later_recovery": recovery,
         }
         (tmp_path / "native-close-witness.json").write_text(json.dumps(witness, indent=2) + "\n")

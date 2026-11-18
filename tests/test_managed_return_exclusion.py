@@ -7,14 +7,13 @@ import pytest
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ready
+from tests.current_rig import adjustable
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_current import adjustable
+from tests.managed_rig import healthy, starts
+from tests.management_peer import TOKEN, call
 from tests.test_managed_current_tick_race import OneNativeResponseGate, chain
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import ready
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 class SlowSnapshotPeer(NativeVehiclePeer):
@@ -40,8 +39,7 @@ class SlowSnapshotPeer(NativeVehiclePeer):
 # Why: leaving its receipt running forever hides healthy admission behind an operation that no longer exists.
 @pytest.mark.parametrize("slow", [False, True])
 async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_port, monkeypatch, slow):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", SlowSnapshotPeer)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=SlowSnapshotPeer) as b:
         c, peer = b.controller, b.rig.peer
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         assert (await healthy(c))["local_hold_verified"]
@@ -72,11 +70,17 @@ async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_por
 async def test_running_return_keeps_positive_admission_closed(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, action
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
     context = (
-        adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch)
+        adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, native_peer=OneNativeResponseGate)
         if action == "set_current"
-        else ready(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, owner_tag="APP_OWNER")
+        else ready(
+            tmp_path,
+            tls,
+            unused_tcp_port_factory(),
+            monkeypatch,
+            owner_tag="APP_OWNER",
+            native_peer=OneNativeResponseGate,
+        )
     )
     async with context as b:
         c, peer = b.controller, b.rig.peer

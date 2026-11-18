@@ -13,11 +13,11 @@ from ocpp_hub_core.prototype.security import TRANSPORT_LOG
 from ocpp_hub_core.prototype.store import Journal
 from websockets.asyncio.server import serve
 
+from tests.prototype_rig import START
+from tests.runtime_rig import Bench, until
 from tests.test_native_history_archive import row
-from tests.test_prototype import START
-from tests.test_prototype_runtime import Bench, until
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import admission as admission
+from tests.tls_support import tls as tls
 
 
 # Deny only the real vendor receipt retirement statement and retain the exact attempts for independent assertions.

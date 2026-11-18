@@ -11,14 +11,13 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
 from ocpp_hub_core.prototype.rpc import UnavailableError
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ChargeRig, positive_flow
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import ChargeRig, positive_flow
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.test_ordinary_recovery import close_session
 
 
@@ -78,8 +77,14 @@ class BeforeCapFailurePeer(InterruptedNativePeer):
 async def test_positive_cap_failure_recovers_and_supervises_next_daily(
     tmp_path, model_tls, monkeypatch, current, failure, replace
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BeforeCapFailurePeer)
-    async with commissioned(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, current) as b:
+    async with commissioned(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        current,
+        native_peer=BeforeCapFailurePeer,
+    ) as b:
         c, j = b.controller, b.session.journal
         actual, send, failed = b.rig.bench.firmware.answer, b.charger.send, []
         b.rig.peer.start_journal = j
@@ -152,8 +157,14 @@ async def test_positive_cap_failure_recovers_and_supervises_next_daily(
 # Why: successful-restart permutation grammars must not credit commands skipped while no real service exists.
 @pytest.mark.parametrize("current", [6, 16, 32])
 async def test_failed_native_startup_recovers_without_premature_controller(tmp_path, model_tls, monkeypatch, current):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BeforeCapFailurePeer)
-    async with commissioned(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, current) as b:
+    async with commissioned(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        current,
+        native_peer=BeforeCapFailurePeer,
+    ) as b:
         await b.controller.charging.close()
         await crash(b.session)
         b.rig.peer.unavailable = True

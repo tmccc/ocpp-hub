@@ -13,15 +13,14 @@ from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError,
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 from websockets.asyncio.client import connect
 
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import FAST, until
-from tests.test_prototype_tls import tls as tls
+from tests.management_peer import TOKEN, call
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import FAST, until
 from tests.test_worker_storage_recovery import fail_boundary, failing_cleanup
+from tests.tls_support import tls as tls
 from tools import managed_proxy
 
 
@@ -64,11 +63,10 @@ class BetweenReadOutagePeer(InterruptedNativePeer):
 async def test_native_outage_between_successful_reads_remains_observable(
     tmp_path, tls, unused_tcp_port, monkeypatch, after, failed_request
 ):
-    from tests.test_managed_current import adjustable
-    from tests.test_managed_proxy import healthy, starts
+    from tests.current_rig import adjustable
+    from tests.managed_rig import healthy, starts
 
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BetweenReadOutagePeer)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=BetweenReadOutagePeer) as b:
         c, peer, j = b.controller, b.rig.peer, b.session.journal
         before = await healthy(c)
         intent, offer = c.requests.intent(), b.rig.bench.firmware.effective_limit()
@@ -136,8 +134,9 @@ def waits_for_current_worker(task):
 async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, first_failure
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with commissioned(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 6, cli_route=True) as original:
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port_factory(), monkeypatch, 6, cli_route=True, native_peer=InterruptedNativePeer
+    ) as original:
         await original.controller.current.close()
         await original.controller.charging.close()
         await crash(original.session)

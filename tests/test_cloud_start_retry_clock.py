@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from ocpp_hub_core.prototype import managed_start_delivery as delivery
 from ocpp_hub_core.prototype.store import Journal
 
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # Intent: wall jumps cannot erase an in-process wait or turn a restarted one-minute backoff into a day-long hold.

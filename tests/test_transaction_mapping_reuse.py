@@ -8,8 +8,8 @@ import pytest
 from ocpp_hub_core.prototype.store import ConflictError, Journal
 
 from tests.observation_helpers import ObservationTLS, observation_payload
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.tls_support import tls as tls
 
 
 # Build only the actual pre-upgrade schema and immutable facts needed to exercise its real SQLite migration.

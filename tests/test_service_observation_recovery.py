@@ -7,13 +7,13 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
 
+from tests.charge_rig import positive_flow
+from tests.managed_rig import starts
+from tests.management_peer import call
+from tests.runtime_rig import until
 from tests.service_recovery_helpers import running_service
-from tests.test_managed_api import call
-from tests.test_managed_proxy import starts
-from tests.test_managed_test_charge import positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
 from tests.test_worker_storage_recovery import failing_cleanup
+from tests.tls_support import tls as tls
 
 
 # Intent: a failed optional diagnostic never exits serve or stops its independently known daily session.

@@ -11,10 +11,10 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from ocpp_hub_core.prototype.managed_diagnostics import FAULTS
 from ocpp_hub_core.prototype.managed_view import health_snapshot
 
-from tests.test_managed_current import adjustable
-from tests.test_managed_proxy import healthy
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy
 from tests.test_managed_service_cli import healthy_status
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tools.managed_reporting import Reporting
 
 ROOT = Path(__file__).resolve().parents[1]

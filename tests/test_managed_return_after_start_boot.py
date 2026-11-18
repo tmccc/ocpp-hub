@@ -13,15 +13,13 @@ from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.local_control import LocalControl
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import actual_stop, owner_rig, positive_flow
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,8 +30,9 @@ pytestmark = pytest.mark.asyncio
 async def test_current_pause_protects_post_child_matching_boot_return(
     tmp_path, tls, unused_tcp_port, monkeypatch, storage_failure
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=20) as b:
+    async with owner_rig(
+        tmp_path, tls, unused_tcp_port, monkeypatch, startup=20, native_peer=InterruptedNativePeer
+    ) as b:
         c, g, j, rig = b.controller, b.session.gateway, b.session.journal, b.rig
         assert isinstance(rig.peer, InterruptedNativePeer)
         initial_pause = uuid.uuid4().hex

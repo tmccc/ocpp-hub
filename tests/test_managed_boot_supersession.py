@@ -6,9 +6,9 @@ import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests.test_managed_proxy import healthy, managed_bench, managed_session
-from tests.test_prototype import BOOT
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, managed_bench, managed_session
+from tests.prototype_rig import BOOT
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -18,7 +18,7 @@ pytestmark = pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["SetChargingProfile", "GetCompositeSchedule"])
 @pytest.mark.parametrize("duplicate", [False, True], ids=["normal-control", "identical-boot"])
 async def test_introduction_eventually_healthy(tmp_path, tls, unused_tcp_port, monkeypatch, duplicate, boundary):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)

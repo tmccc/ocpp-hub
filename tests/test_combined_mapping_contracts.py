@@ -10,7 +10,7 @@ from ocpp_hub_core.prototype.managed_intent import ManagedRequests
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 
 from tests import conftest as _core_setup  # noqa: F401 - load the HA-free source package.
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # Create real journal command/Start/Stop preimages; this fixture claims neither native zero nor operator authority.

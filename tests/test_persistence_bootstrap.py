@@ -15,10 +15,10 @@ from ocpp_hub_core.prototype.trial_bootstrap import pristine_interrupted_bootstr
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 from ocpp_hub_core.prototype.trial_session import TrialSession
 
-from tests.test_managed_proxy import healthy, introduced, managed_session
-from tests.test_native_bounded_session import connected_bench
-from tests.test_prototype_runtime import FAST
-from tests.test_prototype_tls import tls as tls
+from tests.connected_rig import connected_bench
+from tests.managed_rig import healthy, introduced, managed_session
+from tests.runtime_rig import FAST
+from tests.tls_support import tls as tls
 
 CHILD = """
 import json, os, sys

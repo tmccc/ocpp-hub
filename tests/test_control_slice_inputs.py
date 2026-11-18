@@ -95,8 +95,10 @@ def test_authority_observations_cannot_overwrite_a_newer_owner(case):
     state = SliceState(authority())
     older = replace(authority(), intent=ControlIntent("paused", 6))
     event = (
-        StartPrepared(StartIdentity("wire-A", "request-A", "a" * 64, older)) if case == "prepared"
-        else AuthorityChanged(older, authority()) if case == "previous"
+        StartPrepared(StartIdentity("wire-A", "request-A", "a" * 64, older))
+        if case == "prepared"
+        else AuthorityChanged(older, authority())
+        if case == "previous"
         else AuthorityChanged(authority(), older)
     )
     with pytest.raises(ValueError):
@@ -117,8 +119,9 @@ def test_nonterminal_answers_and_commits_are_invalid(outcome):
 
 # Intent: duplicate wire observations are idempotent, while conflicting real replies remain invalid.
 # Why: event delivery retries must neither repeat effects nor reinterpret a definite peer answer.
-@pytest.mark.parametrize("outcome", [StartOutcome.ACCEPTED, StartOutcome.REJECTED, StartOutcome.ERROR,
-                                     StartOutcome.UNKNOWN])
+@pytest.mark.parametrize(
+    "outcome", [StartOutcome.ACCEPTED, StartOutcome.REJECTED, StartOutcome.ERROR, StartOutcome.UNKNOWN]
+)
 def test_duplicate_reply_does_not_repeat_persistence_or_recovery(outcome):
     state = step(dispatched(), StartAnswered("wire-A", outcome)).state
     repeated = step(state, StartAnswered("wire-A", outcome))
@@ -151,8 +154,17 @@ def test_binding_and_cloud_ack_preserve_exact_lifecycle_identity():
 def test_closing_or_revoked_publication_keeps_return_result_stale(closing, allowed):
     published = replace(authority(), intent=ControlIntent("app", 8))
     result = OwnedReleaseResult(
-        authority(), True, True, published, ReleaseEffects(True, WireReply.ACCEPTED, True, False, False),
-        None, None, None, None, False, False,
+        authority(),
+        True,
+        True,
+        published,
+        ReleaseEffects(True, WireReply.ACCEPTED, True, False, False),
+        None,
+        None,
+        None,
+        None,
+        False,
+        False,
     )
     state = SliceState(published)
     if closing:
@@ -182,8 +194,10 @@ def test_current_accepted_reply_only_requests_its_evidence_record():
 # Why: failure or success at the evidence COMMIT precedes, and differs from, final handoff COMMIT.
 def test_uncommitted_acceptance_cannot_enter_final_publication():
     state = accepted()
-    for event in [PublicationFailed("wire-A", FailureKind.STORAGE),
-                  PublicationCommitted("wire-A", replace(authority(), intent=ControlIntent("app", 8)))]:
+    for event in [
+        PublicationFailed("wire-A", FailureKind.STORAGE),
+        PublicationCommitted("wire-A", replace(authority(), intent=ControlIntent("app", 8))),
+    ]:
         with pytest.raises(ValueError, match="separately committed"):
             step(state, event)
 
@@ -202,7 +216,8 @@ def test_debt_free_live_preparation_cannot_be_replaced():
 def test_historical_publication_requires_a_possible_committed_revision_order(replacement):
     state = accepted(committed=True)
     newer = (
-        replace(authority(), intent=ControlIntent("paused", 8), ticket="pause-B") if replacement == "pause"
+        replace(authority(), intent=ControlIntent("paused", 8), ticket="pause-B")
+        if replacement == "pause"
         else replace(authority(), scope=replace(authority().scope, boot="boot-B"))
     )
     state = step(state, AuthorityChanged(state.authority, newer)).state

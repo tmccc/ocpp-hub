@@ -12,14 +12,14 @@ from ocpp_hub_core.prototype.managed_denial_faults import denial_source_fault, r
 from ocpp_hub_core.prototype.managed_release_recovery import release_evidence
 from ocpp_hub_core.prototype.managed_start_delivery import DENIALS, denied_start_evidence
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
 from tests.handover_helpers import crash
+from tests.runtime_rig import until
 from tests.test_combined_recovery_proofs import queue_closed_pairs
 from tests.test_denial_operator_composition import selected
 from tests.test_managed_start_delivery_recovery import approve_retry
 from tests.test_managed_stop_reply_recovery import pause, running
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Generate every lifecycle, receipt and proof through real TLS and the real offline tool before testing boundaries.
@@ -183,9 +183,9 @@ async def test_operator_proof_without_prior_fault_completes(tmp_path, tls, unuse
     from ocpp_hub_core.prototype.store import fingerprint
     from ocpp_hub_core.prototype.trial_session import save_private
 
+    from tests.charge_rig import ChargeRig
     from tests.test_managed_debt_reconciliation import ErrorReplyPeer, strategy_file
-    from tests.test_managed_test_charge import ChargeRig
-    from tests.test_trial_session import Bench
+    from tests.trial_peer import Bench
     from tools import reconcile_managed_debt as operator
 
     trace, actual = [], Bench.read_charger

@@ -21,11 +21,11 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 from websockets.asyncio.client import connect
 
-from tests.test_managed_api import TOKEN, call
-from tests.test_native_bounded_session import connected_bench
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import FAST, until
-from tests.test_prototype_tls import tls as tls
+from tests.connected_rig import connected_bench
+from tests.management_peer import TOKEN, call
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import FAST, until
+from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 from tools import managed_proxy
 

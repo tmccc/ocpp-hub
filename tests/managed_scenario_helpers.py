@@ -10,10 +10,10 @@ from datetime import UTC, datetime, timedelta
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import ZONE
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 
 END = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
 
@@ -117,7 +117,7 @@ async def replace_controller(b):
     policy = b.session.gateway.policy
     await b.c.charging.close()
     await crash(b.session)
-    from tests.test_managed_proxy import managed_session
+    from tests.managed_rig import managed_session
 
     b.session = managed_session(b.rig)
     b.session.gateway.policy = policy

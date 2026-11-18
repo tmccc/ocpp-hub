@@ -63,4 +63,3 @@ def tls_for_case(path, material):
 # Allocate only inside this worker's checked non-ephemeral pool, then start its sole scenario listener immediately.
 def listener_port():
     return listener_port_factory(int(os.environ.get("MODEL_WORKER_INDEX", "0")))()
-

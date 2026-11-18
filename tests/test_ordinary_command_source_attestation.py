@@ -6,11 +6,11 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests.managed_rig import healthy, pending_cloud_offer, starts
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import healthy, pending_cloud_offer, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: exact manual source survives a real native outage; absent, changed and contradictory sources stay zero.
@@ -21,7 +21,7 @@ from tests.test_prototype_tls import tls as tls
 async def test_manual_command_source_is_stable_across_native_outage(
     tmp_path, tls, unused_tcp_port, monkeypatch, source
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         c, j = b.c, b.session.journal
         c.command(uuid.uuid4().hex, "set_current", c.requests.intent().revision, current_a=32)
         await c.current.settle()

@@ -10,17 +10,17 @@ from ocpp_hub_core.prototype.native_bounded_handover import NativeBoundedHandove
 from ocpp_hub_core.prototype.recovery_contracts import Prerequisite, RestoreState
 from ocpp_hub_core.prototype.recovery_coordinator import RecoveryCoordinator
 
+from tests.charge_rig import ChargeRig, positive_flow
+from tests.current_rig import locally_ready
+from tests.managed_rig import healthy, starts
 from tests.managed_scenario_helpers import next_daily, originals
 from tests.native_fault_support import FinalReleaseHttpPeer, coroutine_locals
 from tests.native_schedule_support import timer_bench
 from tests.recovery_barriers import completed_control, require_zero_held
-from tests.test_managed_current import locally_ready
+from tests.runtime_rig import until
 from tests.test_managed_normal_start import natural_stop
 from tests.test_managed_offline_recovery import local_boot, replacement_offline
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -76,7 +76,7 @@ async def new_return_after_preflight_recovery(test, identifier, original, intent
 # Intent: a genuine HTTP503 in explicit Return preflight makes that UUID unconfirmed without a positive claim.
 # Why: fresh telemetry cannot silently replay an accepted positive request whose preflight already terminated.
 async def test_explicit_return_native503_preflight_requires_a_new_request(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch, peer_type=FinalReleaseHttpPeer) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=FinalReleaseHttpPeer) as b:
         test = ChargeRig(b.rig, b.session, b.c, b.sock)
         c, g, j, peer = b.c, b.session.gateway, b.session.journal, b.rig.peer
         assert isinstance(peer, FinalReleaseHttpPeer)

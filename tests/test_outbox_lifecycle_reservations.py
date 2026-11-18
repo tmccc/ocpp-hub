@@ -11,10 +11,10 @@ from ocpp_hub_core.prototype.store import Journal
 from websockets.asyncio.client import connect
 
 from tests.prototype_firmware import Firmware
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_tls import admission as admission
-from tests.test_prototype_tls import charger_reply
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import BOOT, START
+from tests.tls_support import admission as admission
+from tests.tls_support import charger_reply
+from tests.tls_support import tls as tls
 
 METER = {"connectorId": 1, "meterValue": [{"timestamp": "2026-01-01T00:01:00Z", "sampledValue": [{"value": "1001"}]}]}
 

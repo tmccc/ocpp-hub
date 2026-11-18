@@ -45,9 +45,11 @@ def test_pause_return_revocation_is_atomic_under_real_storage_failure(tmp_path):
         requests.accept(previous, "app_control", 0)
         requests = ManagedRequests(j)
         before = [tuple(row) for row in j.db.execute("SELECT * FROM managed_requests ORDER BY rowid")]
-        j.db.execute("CREATE TRIGGER refuse_return_revocation BEFORE UPDATE ON managed_requests "
-                     "WHEN OLD.action='app_control' AND NEW.state='failed' "
-                     "BEGIN SELECT RAISE(ABORT,'synthetic revocation refusal'); END")
+        j.db.execute(
+            "CREATE TRIGGER refuse_return_revocation BEFORE UPDATE ON managed_requests "
+            "WHEN OLD.action='app_control' AND NEW.state='failed' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic revocation refusal'); END"
+        )
         with pytest.raises(sqlite3.IntegrityError) as error:
             requests.accept(pause, "pause", 0)
         assert error.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER

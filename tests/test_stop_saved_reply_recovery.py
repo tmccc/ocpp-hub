@@ -15,8 +15,8 @@ from ocpp_hub_core.prototype.trial_allocation import initialize_allocation, obse
 from ocpp_hub_core.prototype.trial_evidence import Resource, profile_projection
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
+from tests.prototype_rig import START
 from tests.test_native_bounded import BOOT, HARDWARE, IDENTITY, native, spec
-from tests.test_prototype import START
 
 
 # Establish the complete original-zero proof and exact mapped closed lifecycle using production constructors.

@@ -13,15 +13,15 @@ from ocpp_hub_core.prototype.managed_release_recovery import ACK, PROOF, recover
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
+from tests.current_rig import release_bench
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_native_repair_storage import refused_write
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype import BOOT
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 class HeldRepairPeer(InterruptedNativePeer):
@@ -72,9 +72,9 @@ class HeldRepairPeer(InterruptedNativePeer):
 # Why: read generation and real owner authority must be checked before a raw sample becomes a strict fact.
 @pytest.mark.parametrize("change", ["pause", "boot"])
 async def test_new_authority_supersedes_held_old_native_content(tmp_path, tls, unused_tcp_port, monkeypatch, change):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", HeldRepairPeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(
+        tmp_path, tls, unused_tcp_port, 6, native_peer=HeldRepairPeer, bench_type=StartReplyBench
+    ) as b:
         c, j, peer, g = b.c, b.session.journal, b.rig.peer, b.session.gateway
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
@@ -112,7 +112,7 @@ async def test_new_authority_supersedes_held_old_native_content(tmp_path, tls, u
 # Intent: a changed diagnostic cannot complete an older acknowledgement, while a newly bound valid Pause can recover.
 # Why: fresh native zero does not itself authorize reusing a mismatched diagnostic/proof snapshot.
 async def test_changed_diagnostic_cannot_borrow_old_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j = b.c, b.session.journal
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
@@ -134,7 +134,7 @@ async def test_changed_diagnostic_cannot_borrow_old_pause(tmp_path, tls, unused_
 # Why: absent/mismatched private preimages are not evidence that the earlier attempt never existed.
 @pytest.mark.parametrize("row", [None, {}, {"fault": {"classification": "different"}}])
 async def test_malformed_current_fault_fence_stays_pending(tmp_path, tls, unused_tcp_port, monkeypatch, row):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j = b.c, b.session.journal
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         await explicit_release_pause(b)
@@ -154,7 +154,7 @@ async def test_malformed_current_fault_fence_stays_pending(tmp_path, tls, unused
 async def test_resource_conflict_survives_its_diagnostic_sql_failure(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, peer = b.c, b.session.journal, b.rig.peer
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         await explicit_release_pause(b)
@@ -201,9 +201,9 @@ async def test_resource_conflict_survives_its_diagnostic_sql_failure(
 # Intent: a real pending safe TLS read postpones native repair, then the exact Pause recovers after its actual reply.
 # Why: native readiness must not turn ordinary in-flight protocol work into a permanent strict or unknown cause.
 async def test_actual_pending_charger_read_remains_recoverable(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(
+        tmp_path, tls, unused_tcp_port, 6, native_peer=InterruptedNativePeer, bench_type=StartReplyBench
+    ) as b:
         c, j, rig = b.c, b.session.journal, b.rig
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)

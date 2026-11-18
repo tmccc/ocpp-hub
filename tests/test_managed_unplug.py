@@ -13,9 +13,9 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.trial_handover_evidence import HandoverEvidence
 from ocpp_hub_core.prototype.trial_session import TrialSession
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.test_native_bounded import IDENTITY, native, spec
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Model the actual idle native pilot and connection pair while retaining independent measurements and history.
@@ -73,7 +73,7 @@ async def test_managed_unplug_and_replug_remain_healthy_without_control_commands
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -115,7 +115,7 @@ async def test_managed_restart_while_unplugged_preserves_zero_proofs_and_never_s
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         first = managed_session(rig)
         await first.start()
         controller = ManagedController(first)
@@ -151,7 +151,7 @@ async def test_managed_unplugged_fresh_admission_remains_blocked(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         rig.bench.cp, rig.bench.connection = "A", "Unplug"
         session = managed_session(rig)
         with pytest.raises(SecurityError):
@@ -170,7 +170,7 @@ async def test_unplugged_option_requires_native_bounded_mode_and_disabled_local_
     bounded: bool,
     local_start: bool,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         message = "disabled local Start" if bounded else "explicit native bounded specification"
         with pytest.raises(SecurityError, match=message):
             TrialSession(

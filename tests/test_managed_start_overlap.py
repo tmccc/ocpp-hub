@@ -15,11 +15,11 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, TimerBench, timer_bench
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Keep the owner command distinct from the unchanged, independently scheduled native daily identity.
@@ -91,7 +91,7 @@ async def test_daily_survives_owner_start_timeout_and_following_nights(
     demand: bool,
     selected: int,
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         if selected != 6:
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
@@ -166,7 +166,7 @@ async def test_automatic_pause_return_survives_delayed_owner_and_both_closure_or
     first: str,
     native_first: bool,
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
         if native_first:
@@ -211,7 +211,7 @@ async def test_automatic_pause_return_survives_delayed_owner_and_both_closure_or
 async def test_unidentified_daily_at_timeout_holds_zero_without_guessed_stop(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, demand: bool
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
@@ -238,7 +238,7 @@ async def test_timeout_rechecks_previously_identified_daily_without_persistent_p
     source: str,
     demand: bool,
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
@@ -273,7 +273,7 @@ async def test_timeout_rechecks_previously_identified_daily_without_persistent_p
 async def test_explicit_pause_still_owns_daily_and_supersedes_return(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
@@ -311,7 +311,7 @@ async def test_explicit_pause_still_owns_daily_and_supersedes_return(
 async def test_explicit_pause_preempts_expired_daily_restoration(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
@@ -343,7 +343,7 @@ async def test_explicit_pause_preempts_expired_daily_restoration(
 async def test_unknown_source_at_daily_release_gate_retains_zero_and_recovers(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
@@ -381,7 +381,7 @@ async def test_unknown_source_at_daily_release_gate_retains_zero_and_recovers(
 async def test_replacement_preserves_expired_daily_and_eventual_owner_closure(
     tmp_path: Path, tls: Any, unused_tcp_port: int, monkeypatch: pytest.MonkeyPatch, demand: bool
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()

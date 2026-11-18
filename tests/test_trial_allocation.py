@@ -16,7 +16,7 @@ from ocpp_hub_core.prototype.trial_allocation import initialize_allocation, obse
 from ocpp_hub_core.prototype.trial_evidence import Evidence
 from ocpp_hub_core.prototype.trial_resources import Baseline, ResourceBook
 
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # Construct only ordinary preparation metadata before the real allocator is exercised.

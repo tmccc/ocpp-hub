@@ -8,11 +8,11 @@ from contextlib import AsyncExitStack, closing, contextmanager
 
 import pytest
 
-from tests.test_managed_proxy import healthy, introduced
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy, introduced
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Observe actual physical flow, cloud frames and an independent committed lifecycle before each retirement.

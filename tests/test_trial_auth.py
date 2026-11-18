@@ -15,17 +15,8 @@ from ocpp_hub_core.prototype.policy import DeniedError, Policy
 from ocpp_hub_core.prototype.rpc import RegistrationDeferredError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 
-from tests.test_prototype import START, Rig
-
-
-# Produce fresh actual-looking metadata without treating fixture-shifted 2030 dates as the test clock.
-def info(**changes: Any) -> dict[str, Any]:
-    return {
-        "status": "Accepted",
-        "expiryDate": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-        "parentIdTag": "PARENT",
-        **changes,
-    }
+from tests.prototype_rig import START, Rig
+from tests.trial_peer import info
 
 
 class StrictRig(Rig):
@@ -379,7 +370,7 @@ async def test_tagged_stop_metadata_is_an_immutable_fact(tmp_path: Path) -> None
 @pytest.mark.parametrize("change", ["stop", "revoked", "expired"])
 @pytest.mark.parametrize("registration", ["Accepted", "Pending"])
 async def test_authorize_rechecks_permission_after_cap_readback(tmp_path: Path, change: str, registration: str) -> None:
-    from tests.test_prototype_runtime import until
+    from tests.runtime_rig import until
 
     rig = StrictRig(tmp_path / "state.db")
     await rig.boot()

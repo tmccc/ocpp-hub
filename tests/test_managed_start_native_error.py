@@ -6,12 +6,10 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import actual_stop, owner_rig, positive_flow
 from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_normal_start import owner_rig
-from tests.test_managed_proxy import starts
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import starts
+from tests.tls_support import tls as tls
 
 
 class OneShot503Peer(NativeVehiclePeer):
@@ -53,8 +51,7 @@ class OneShot503Peer(NativeVehiclePeer):
 # Why: errors injected at validate_send alone do not establish reachability through the real native boundary.
 @pytest.mark.parametrize("fail", [False, True])
 async def test_real_native503_before_remote_start(tmp_path, tls, unused_tcp_port, monkeypatch, fail):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneShot503Peer)
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneShot503Peer) as test:
         c, j, g, native = test.controller, test.session.journal, test.session.gateway, test.rig.peer
         assert g.charger.validate_send.__self__ is c.native
         assert g.charger.validate_send.__func__ is type(c.native).validate_send

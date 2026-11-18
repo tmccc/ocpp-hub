@@ -6,11 +6,10 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.recovery_contracts import Prerequisite
 
-from tests import test_native_bounded_session as native_bench
+from tests.charge_rig import ready
+from tests.managed_rig import healthy, starts
 from tests.test_managed_current_tick_race import OneNativeResponseGate
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import ready
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: the actual healthy-status path completes only the old accepted app-mode Return, without physical work.
@@ -81,8 +80,7 @@ async def test_return_prelaunch_disposition_uses_actual_owner(tmp_path, tls, unu
 # Intent: a Return behind an actual suspended automatic restore stays accepted without launching another attempt.
 # Why: busy completion is a scheduling prerequisite, distinct from an attempted positive release's uncertainty.
 async def test_return_waits_for_actual_existing_restore(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         c, peer = b.controller, b.rig.peer
         peer.arm = True
         automatic = asyncio.create_task(c.recovery.restore())

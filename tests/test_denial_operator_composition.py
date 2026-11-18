@@ -11,19 +11,18 @@ from ocpp_hub_core.prototype.managed_release_recovery import release_evidence
 from ocpp_hub_core.prototype.managed_start_delivery import DENIALS
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.connected_rig import strategy_file
+from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_combined_recovery_proofs import queue_closed_pairs
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
 from tests.test_managed_start_delivery_recovery import approve_retry, approve_stop_after_start
-from tests.test_managed_start_refusal_native32 import commissioned
 from tests.test_managed_stop_reply_recovery import pause, running
-from tests.test_managed_test_charge import ChargeRig, ready
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
 
 
@@ -72,12 +71,27 @@ class NonacceptingBench(StartReplyBench):
 # Admit native6 or genuine native32 before choosing the current through the actual managed worker.
 @asynccontextmanager
 async def selected(tmp_path, tls, port, monkeypatch, current):
-    monkeypatch.setattr(mp, "OwnerBench", NonacceptingBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     factory = (
-        ready(tmp_path, tls, port, monkeypatch, cli_route=True)
+        ready(
+            tmp_path,
+            tls,
+            port,
+            monkeypatch,
+            cli_route=True,
+            bench_type=NonacceptingBench,
+            native_peer=InterruptedNativePeer,
+        )
         if current == 6
-        else commissioned(tmp_path, tls, port, monkeypatch, current, cli_route=True)
+        else commissioned(
+            tmp_path,
+            tls,
+            port,
+            monkeypatch,
+            current,
+            cli_route=True,
+            bench_type=NonacceptingBench,
+            native_peer=InterruptedNativePeer,
+        )
     )
     async with factory as b:
         strategy_file(b.rig, tmp_path)

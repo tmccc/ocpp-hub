@@ -13,11 +13,11 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, pending_cloud_offer, starts
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Reach the existing ordinary native-outage hold through actual failed loopback HTTP reads.
@@ -45,7 +45,7 @@ async def native_outage_at_zero(b):
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("keep_old_native", [False, True])
 async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypatch, demand, keep_old_native):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         await b.acknowledge_older_owner_start()
         j = b.session.journal
         grant = j.get("vendor_start_grant")
@@ -100,7 +100,7 @@ async def test_daily_and_unbound_owner(tmp_path, tls, unused_tcp_port, monkeypat
 # Why: a fresh Boot and daily closure cannot consume that accepted command or authorize replay or positive release.
 @pytest.mark.parametrize("demand", [False, True])
 async def test_restart_retains_unbound_owner_at_zero(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         await b.acknowledge_older_owner_start()
         grant = b.session.journal.get("vendor_start_grant")
         daily = await b.start_plan(9, demand=demand)
@@ -135,7 +135,7 @@ async def test_restart_retains_unbound_owner_at_zero(tmp_path, tls, unused_tcp_p
 # Intent: an original daily lifecycle retains a distinct previously acknowledged local owner's Start.
 # Why: both a successful Start report and the positive profile restoration used to clear the one shared pending flag.
 async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         g, j = b.session.gateway, b.session.journal
         g.policy = replace(g.policy, allowed_tags=frozenset({"APP_OWNER", *g.policy.allowed_tags}))
         g.controls.policy = g.policy
@@ -175,7 +175,7 @@ async def test_independent_daily_preserves_local_owner(tmp_path, tls, unused_tcp
 # Why: ordinary app permission allows the original daily; only the real cloud owner's lifecycle spends its grant.
 @pytest.mark.parametrize("changed", ["mutation", "digest"])
 async def test_unproven_pending_grant_does_not_bind_daily(tmp_path, tls, unused_tcp_port, monkeypatch, changed):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         await b.acknowledge_older_owner_start()
         j = b.session.journal
         original = j.get("vendor_start_grant")
@@ -214,7 +214,7 @@ async def test_unproven_pending_grant_does_not_bind_daily(tmp_path, tls, unused_
 @pytest.mark.parametrize("restart", ["none", "restart", "upgrade"])
 @pytest.mark.parametrize("demand", [False, True])
 async def test_normal_start_debt_before_hold(tmp_path, tls, unused_tcp_port, monkeypatch, before_ack, restart, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         selected = 32 if before_ack else 6
         if selected != 6:
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
@@ -299,7 +299,7 @@ async def test_normal_start_debt_before_hold(tmp_path, tls, unused_tcp_port, mon
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("close_between_ticks", [False, True])
 async def test_ack_after_owner_pause(tmp_path, tls, unused_tcp_port, monkeypatch, restart, close_between_ticks):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         j = b.session.journal
         pause = uuid.uuid4().hex
 
@@ -357,7 +357,7 @@ async def test_ack_after_owner_pause(tmp_path, tls, unused_tcp_port, monkeypatch
 # Why: prior releases had a tag and receipt but no command-time allocation floor to disambiguate reused tags.
 @pytest.mark.parametrize("ambiguous", [False, True])
 async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypatch, ambiguous):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         j = b.session.journal
 
         # The actual owner uses the same tag as the daily timer; its independently numbered source distinguishes it.
@@ -414,7 +414,7 @@ async def test_no_reopened_legacy_debt(tmp_path, tls, unused_tcp_port, monkeypat
 # Why: a missing reply can have a real lifecycle under zero; a positively rejected command cannot.
 @pytest.mark.parametrize("outcome", ["late", "rejected"])
 async def test_late_or_rejected_local_start(tmp_path, tls, unused_tcp_port, monkeypatch, outcome):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         g = b.session.gateway
         g.charger.timeout = 0.4
         answer = b.device.answer
@@ -480,7 +480,7 @@ async def test_late_or_rejected_local_start(tmp_path, tls, unused_tcp_port, monk
 # Intent: a crash during native Start validation retains the normal physical Pause and no impossible report debt.
 # Why: the exclusive replacement process can distinguish prepared intent from the final transport dispatch receipt.
 async def test_replacement_after_prepared_local_start(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         j = b.session.journal
         old_path = j.path
         entered, proceed = asyncio.Event(), asyncio.Event()
@@ -532,7 +532,7 @@ async def test_replacement_after_prepared_local_start(tmp_path, tls, unused_tcp_
 async def test_return_after_automatic_start_timeout_waits_for_real_owner_closure(
     tmp_path, tls, unused_tcp_port, monkeypatch, first
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()
         b.c.charging.lease.deadline = asyncio.get_running_loop().time() - 1

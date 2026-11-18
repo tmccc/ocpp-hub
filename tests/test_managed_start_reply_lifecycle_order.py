@@ -12,12 +12,13 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 from websockets.asyncio.client import connect
 
+from tests.charge_rig import owner_rig
+from tests.managed_rig import healthy, starts
+from tests.management_peer import TOKEN, call
 from tests.native_fault_support import coroutine_locals
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_normal_start import natural_stop, owner_rig
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.test_managed_normal_start import natural_stop
+from tests.tls_support import tls as tls
 
 
 # Exercise one explicit real TLS frame ordering while observing the actual atomic publication boundary.
@@ -72,9 +73,9 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
                             "intent": c.requests.intent(),
                             "control": copy.deepcopy(j.get("control")),
                             "metadata": copy.deepcopy(c.charging.state()),
-                                "lease": None
-                                if c.charging.lease is None
-                                else (c.charging.lease.mode, c.charging.lease.revision),
+                            "lease": None
+                            if c.charging.lease is None
+                            else (c.charging.lease.mode, c.charging.lease.revision),
                             "positive": rig.bench.firmware.effective_limit() == 6,
                             "pending_worker": worker is not None and not worker.done(),
                             "shield_wait": worker is not None

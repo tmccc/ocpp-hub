@@ -11,9 +11,9 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session
 from tests.test_native_history_recovery import closed_records
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: a normally commissioned USER32 installation can reconcile later native history rollover.
@@ -21,7 +21,7 @@ from tests.test_prototype_tls import tls as tls
 @pytest.mark.parametrize("native_limit", [6, 32])
 @pytest.mark.parametrize("fault", ["none", "missing-capability", "mutation-debt", "changed-config"])
 async def test_native32_history_acknowledgement(tmp_path, tls, unused_tcp_port, monkeypatch, native_limit, fault):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         rig.bench.history = closed_records()
         first = managed_session(rig)
         await first.start()

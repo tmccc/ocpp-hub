@@ -13,11 +13,12 @@ from types import SimpleNamespace
 from ocpp_hub_core.prototype.trial_session import save_private
 from websockets.asyncio.client import connect
 
-from tests.handover_helpers import crash
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_prototype import BOOT, START
+from tests.connected_rig import strategy_file
+from tests.current_rig import commissioned
+from tests.handover_helpers import NativeVehiclePeer, crash
+from tests.managed_rig import OwnerBench
+from tests.management_peer import TOKEN, call
+from tests.prototype_rig import BOOT, START
 
 
 class ServiceProcess:
@@ -246,20 +247,22 @@ class ServiceProcess:
             # Correlate the actual cloud's allocation and final Stop with the independently read durable mapping.
             cloud = self.rig.bench
             start_calls = [
-                frame for frame in cloud.calls
-                if frame[0] == 2 and frame[2] == "StartTransaction"
+                frame
+                for frame in cloud.calls
+                if frame[0] == 2
+                and frame[2] == "StartTransaction"
                 and frame[3]["timestamp"] == f"2026-01-01T00:{start_minute + epoch * 2:02}:00Z"
                 and frame[3]["meterStart"] == 2000 + epoch * 100
             ]
             tokens = {frame[1] for frame in start_calls}
             assert len(tokens) == 1
             allocations = {
-                frame[2]["transactionId"] for frame in cloud.sent_vendor_replies
-                if frame[0] == 3 and frame[1] in tokens
+                frame[2]["transactionId"] for frame in cloud.sent_vendor_replies if frame[0] == 3 and frame[1] in tokens
             }
             assert allocations == {row["vendor"]}
             assert any(
-                frame[0] == 2 and frame[2] == "StopTransaction"
+                frame[0] == 2
+                and frame[2] == "StopTransaction"
                 and frame[3]["transactionId"] == row["vendor"]
                 and frame[3]["timestamp"] == f"2026-01-01T00:{start_minute + epoch * 2 + 1:02}:00Z"
                 for frame in cloud.calls
@@ -301,8 +304,20 @@ class ServiceProcess:
 
 # Commission actual bounded authority once, then release journal ownership before any child is created.
 @asynccontextmanager
-async def process_rig(directory, tls, listener, management, monkeypatch, current=6):
-    async with commissioned(directory, tls, listener, monkeypatch, current, cli_route=True) as original:
+async def process_rig(
+    directory,
+    tls,
+    listener,
+    management,
+    monkeypatch,
+    current=6,
+    *,
+    native_peer: type[NativeVehiclePeer] = NativeVehiclePeer,
+    bench_type: type[OwnerBench] = OwnerBench,
+):
+    async with commissioned(
+        directory, tls, listener, monkeypatch, current, cli_route=True, native_peer=native_peer, bench_type=bench_type
+    ) as original:
         rig = original.rig
         value = json.loads((directory / "trial.json").read_text())
         value["local_tags"] = ["APP_OWNER", "NATIVE_TIMER"]

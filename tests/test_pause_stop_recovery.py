@@ -8,17 +8,15 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.gateway import decode
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import positive_flow
 from tests.cloud_start_helpers import StartReplyBench
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_release_recovery import release_bench
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import positive_flow
+from tests.current_rig import commissioned, release_bench
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Close only after the independent peer really receives the correct known-session Stop.
@@ -43,8 +41,7 @@ async def genuine_stop(b, local):
 # Why: a late accepted reply must retain its original generation instead of suppressing the current Pause's Stop.
 @pytest.mark.parametrize("timing", ["during_reply", "after_reply"])
 async def test_boot_cannot_reuse_earlier_stop_ack(tmp_path, tls, unused_tcp_port, monkeypatch, timing):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=InterruptedNativePeer) as b:
         c, rig, g = b.c, b.rig, b.session.gateway
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         await mp.healthy(c)
@@ -91,8 +88,7 @@ async def test_boot_cannot_reuse_earlier_stop_ack(tmp_path, tls, unused_tcp_port
 async def test_faulted_pause_availability_witness(
     tmp_path, tls, unused_tcp_port, monkeypatch, pause503, stale_revision
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=InterruptedNativePeer) as b:
         c, j, rig = b.c, b.session.journal, b.rig
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         assert (await mp.healthy(c))["current_a"] == 6
@@ -124,9 +120,16 @@ async def test_faulted_pause_availability_witness(
 # Why: the existing below-absolute selected-overdraw test does not cross the native reader's own error boundary.
 @pytest.mark.parametrize("selected,measured", [(6, 8), (32, 32.6)], ids=["selected-bound-control", "absolute-bound"])
 async def test_faulted_pause_persistent_meter_witness(tmp_path, tls, unused_tcp_port, monkeypatch, selected, measured):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True) as b:
+    async with commissioned(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        selected,
+        cli_route=True,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
+    ) as b:
         c, j, rig, peer = b.controller, b.session.journal, b.rig, b.rig.peer
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         assert (await mp.healthy(c))["current_a"] == selected
@@ -174,7 +177,7 @@ async def test_faulted_pause_persistent_meter_witness(tmp_path, tls, unused_tcp_
 async def test_clean_pause_settles_failed_stop_after_genuine_closure(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure, return_before_tick
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, rig, controls = b.c, b.session.journal, b.rig, b.session.gateway.controls
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         await mp.healthy(c)
@@ -245,7 +248,7 @@ async def test_clean_pause_settles_failed_stop_after_genuine_closure(
 async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, rig, controls = b.c, b.session.journal, b.rig, b.session.gateway.controls
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         await mp.healthy(c)
@@ -278,9 +281,7 @@ async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
         j.db.execute(
             "CREATE TEMP TRIGGER review_pause_binding_refusal BEFORE INSERT ON meta "
             "WHEN NEW.key='managed_owner_stop' BEGIN "
-            "SELECT review_pause_binding_attempt(json_extract(NEW.value,'$.ticket')); "
-            + effect
-            + " END"
+            "SELECT review_pause_binding_attempt(json_extract(NEW.value,'$.ticket')); " + effect + " END"
         )
         try:
             assert c.pause_task is not None

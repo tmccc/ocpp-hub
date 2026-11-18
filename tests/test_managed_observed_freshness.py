@@ -12,12 +12,12 @@ import pytest
 from ocpp_hub_core.prototype import trial_evidence
 from ocpp_hub_core.prototype.security import StaleEvidenceError
 
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_test_charge import owner_start, positive_flow, ready
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.charge_rig import owner_start, positive_flow, ready
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 # Intent: the same actual native sample can expire at observed's final Pause check without ending supervision.
@@ -141,11 +141,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                         if native is None or native.physical is not physical:
                             return now + offset
                         sample = (id(native), id(physical), physical.observed_at)
-                        if (
-                            caller is not None
-                            and caller.f_code is supervise_code
-                            and caller.f_locals.get("self") is c
-                        ):
+                        if caller is not None and caller.f_code is supervise_code and caller.f_locals.get("self") is c:
                             seen_tick.append((sample, now + offset - physical.observed_at))
                         elif (
                             caller is not None

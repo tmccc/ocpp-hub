@@ -9,13 +9,12 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_release_recovery import ACK
 
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import adjustable
 from tests.handover_helpers import crash
-from tests.test_managed_current import adjustable
+from tests.managed_rig import introduced, managed_session
 from tests.test_managed_current_tick_race import OneNativeResponseGate
-from tests.test_managed_proxy import introduced, managed_session
 from tests.test_managed_release_recovery import explicit_release_pause, recover_then_return
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Fail the real request during native HTTP and refuse only its optional legacy diagnostic write.
@@ -49,11 +48,8 @@ async def bound_collision(b):
 # Intent: a diagnostic-only outage cannot erase the real cause, before or after an actual replacement Boot.
 # Why: the old global error may belong to a different operation and supplies no authority for this recovery.
 @pytest.mark.parametrize("restart", [False, True])
-async def test_bound_failure_recovers_without_optional_diagnostic(
-    tmp_path, tls, unused_tcp_port, monkeypatch, restart
-):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+async def test_bound_failure_recovers_without_optional_diagnostic(tmp_path, tls, unused_tcp_port, monkeypatch, restart):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         request = await bound_collision(b)
         saved = copy.deepcopy(b.session.journal.get("managed_current_change")["failure"])
         if not restart:
@@ -84,14 +80,14 @@ async def test_bound_failure_recovers_without_optional_diagnostic(
 async def test_bound_failure_refuses_unrelated_or_changed_evidence(
     tmp_path, tls, unused_tcp_port, monkeypatch, blocker
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         await bound_collision(b)
         c, j = b.controller, b.session.journal
         j.db.execute("DROP TRIGGER review_optional_diagnostic")
-        j.put("managed_current_failure", {
-            "type": "AuditSupersededError", "detail": "native bounded audit was superseded by local authority"
-        })
+        j.put(
+            "managed_current_failure",
+            {"type": "AuditSupersededError", "detail": "native bounded audit was superseded by local authority"},
+        )
         fault = copy.deepcopy(j.get("managed_control_fault"))
         if blocker == "after_pause":
             await explicit_release_pause(SimpleNamespace(c=c))

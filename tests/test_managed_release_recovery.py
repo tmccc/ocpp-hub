@@ -4,14 +4,11 @@ import asyncio
 import copy
 import sqlite3
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
-from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.managed_release_recovery import (
     ACK,
     reconcile_owner_release,
@@ -20,34 +17,11 @@ from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
+from tests.current_rig import release_bench
 from tests.handover_helpers import crash
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session
-from tests.test_prototype import BOOT
-from tests.test_prototype_tls import tls as tls
-
-
-# Exercise the already established synthetic native32 commissioning fixture without changing engine decisions.
-@asynccontextmanager
-async def release_bench(tmp_path, tls, port, monkeypatch, native_limit):
-    async with managed_bench(tmp_path, tls, port, monkeypatch) as rig:
-        session = managed_session(rig)
-        await session.start()
-        c = ManagedController(session)
-        rig.route_to_trial()
-        async with rig.charger(session) as charger:
-            await introduced(rig, session, charger, "release-recovery-boot")
-            await healthy(c)
-            if native_limit == 32:
-                session.journal.put("managed_current_capability", capability_value(session.journal, rig.spec))
-                session.gateway.policy = replace(session.gateway.policy, max_current_a=32)
-                session.gateway.controls.policy = session.gateway.policy
-                rig.peer.configuration["AmpLmt"] = "32"
-                rig.peer.runtime_user = 320
-                await healthy(c)
-                c.command(uuid.uuid4().hex, "set_current", c.requests.intent().revision, current_a=32)
-                await c.current.settle()
-                await healthy(c)
-            yield SimpleNamespace(rig=rig, session=session, c=c, charger=charger)
+from tests.managed_rig import healthy, introduced, managed_session
+from tests.prototype_rig import BOOT
+from tests.tls_support import tls as tls
 
 
 # Lose only one actual fake-device TLS reply, keeping firmware application and later rollback handling independent.
@@ -135,7 +109,7 @@ async def recover_then_return(b):
 async def test_release_reconciliation_requires_pause_then_return(
     tmp_path, tls, unused_tcp_port, monkeypatch, native_limit, mode, restart
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, native_limit) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, native_limit) as b:
         fault = await fail_one_return(b, monkeypatch, mode)
         assert not await reconcile_owner_release(b.c)
         assert b.session.journal.get("managed_control_fault") == fault
@@ -174,7 +148,7 @@ async def test_release_reconciliation_requires_pause_then_return(
 async def test_release_reconciliation_preserves_unrelated_uncertainty(
     tmp_path, tls, unused_tcp_port, monkeypatch, blocker
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 32) as b:
         await fail_one_return(b, monkeypatch, "lost")
         await explicit_release_pause(b)
         j = b.session.journal
@@ -203,7 +177,7 @@ async def test_release_reconciliation_preserves_unrelated_uncertainty(
 # Intent: accepting a reconciliation Pause is atomic, and retrying its request ID cannot create new authority.
 # Why: failed receipt insertion cannot leave acknowledgement or a new control ticket behind to clear the fault.
 async def test_release_pause_acknowledgement_is_atomic_and_idempotent(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         await fail_one_return(b, monkeypatch, "lost")
         j, c = b.session.journal, b.c
         before = c.requests.intent(), copy.deepcopy(j.get("control")), copy.deepcopy(j.get(ACK))
@@ -235,7 +209,7 @@ async def test_release_pause_acknowledgement_is_atomic_and_idempotent(tmp_path, 
 # Intent: the acknowledgement helper itself performs only native reads before recording successful recovery.
 # Why: proving zero must never be a hidden charger write, Stop or positive release.
 async def test_release_reconciliation_helper_has_no_charger_rpc(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         await fail_one_return(b, monkeypatch, "lost")
         await explicit_release_pause(b)
         calls = len(b.rig.bench.device_calls)
@@ -250,7 +224,7 @@ async def test_release_reconciliation_helper_has_no_charger_rpc(tmp_path, tls, u
 async def test_release_reconciliation_rechecks_authority_after_http(
     tmp_path, tls, unused_tcp_port, monkeypatch, crossed
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 32) as b:
         await fail_one_return(b, monkeypatch, "lost")
         await explicit_release_pause(b)
         j = b.session.journal

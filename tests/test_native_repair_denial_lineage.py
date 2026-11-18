@@ -16,16 +16,16 @@ from ocpp_hub_core.prototype.managed_stop_delivery import WIRE_ACK
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.store import fingerprint
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig
 from tests.cloud_start_helpers import two_later_sessions
 from tests.handover_helpers import crash
+from tests.runtime_rig import until
 from tests.test_combined_recovery_proofs import pause_before_reconciliation, queue_closed_pairs
 from tests.test_denial_operator_composition import selected
 from tests.test_managed_stop_reply_recovery import pause, reconcile, running
-from tests.test_managed_test_charge import ChargeRig
 from tests.test_native_repair_storage import refused_write
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Permit durable begin, then refuse only actual settlement after a known availability outcome.

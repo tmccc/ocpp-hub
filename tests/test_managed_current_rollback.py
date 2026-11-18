@@ -9,12 +9,12 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
+from tests.current_rig import adjustable, select
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_current import adjustable, select
 from tests.test_managed_current_overlap import interrupted_increase
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: both a rejected target and a physically applied but unverified target restore the earlier selection.
@@ -127,7 +127,7 @@ async def test_pause_during_unsent_app_increase_keeps_previous_selection(tmp_pat
 async def test_interrupted_idle_app_increase_keeps_previous_selection(
     tmp_path, tls, unused_tcp_port, monkeypatch, paused, applied
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as bench:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as bench:
         async with interrupted_increase(bench, applied) as (request, release):
             if paused:
                 bench.c.command(uuid.uuid4().hex, "pause", bench.c.requests.intent().revision)

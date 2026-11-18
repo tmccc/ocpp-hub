@@ -10,16 +10,15 @@ from ocpp_hub_core.frames import build_call_error
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control, returned_to_app
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_test_charge import ChargeRig
+from tests.runtime_rig import until
 from tests.test_paused_introduction_recovery import retire
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: first-Boot zero failure retries from fresh native evidence, then its exact Pause/Return and later use work.
@@ -32,9 +31,9 @@ from tests.test_prototype_tls import tls as tls
 async def test_first_pause_recovers_across_pre_marker_zero_failure(
     tmp_path, tls, unused_tcp_port, monkeypatch, fault, early_return
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path, tls, unused_tcp_port, native_peer=InterruptedNativePeer, bench_type=StartReplyBench
+    ) as rig:
         assert isinstance(rig.bench, StartReplyBench)
         session = mp.managed_session(rig)
         await session.start()

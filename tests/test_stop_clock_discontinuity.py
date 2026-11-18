@@ -9,11 +9,11 @@ from datetime import datetime, timedelta
 import pytest
 from ocpp_hub_core.prototype.store import ConflictError, Journal
 
-from tests.test_managed_proxy import healthy
-from tests.test_managed_test_charge import positive_flow, ready
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.charge_rig import positive_flow, ready
+from tests.managed_rig import healthy
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Construct the exact reported terminal body; only its device timestamp moves behind the original raw Start.

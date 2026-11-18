@@ -4,16 +4,16 @@ import copy
 import uuid
 from dataclasses import replace
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_managed_test_charge import ChargeRig, actual_stop, positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.charge_rig import ChargeRig, actual_stop, positive_flow
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: Start retires the earlier Pause without breaking UUID replay or the physical effect of a new Pause.
 # Why: a command receipt cannot remain pending forever after another authorized operation supersedes its hold.
 async def test_normal_start_retires_unconfirmed_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         rig.prepared.config = replace(rig.prepared.config, local_tags=frozenset({"APP_OWNER", "NATIVE_TIMER"}))
         session = managed_session(rig)
         await session.start()

@@ -10,16 +10,17 @@ from typing import Any
 
 import aiohttp
 import pytest
+from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 
 from custom_components.ics_proxy.api import ProxyClient
 from tests import conftest as _engine  # noqa: F401 - load the standalone engine package.
+from tests.managed_rig import introduced, starts
 from tests.managed_scenario_helpers import originals, replace_controller
+from tests.management_peer import TOKEN
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_api import TOKEN, ManagementServer, ManagementSettings
-from tests.test_managed_proxy import introduced, starts
+from tests.runtime_rig import until
 from tests.test_managed_start_overlap import delayed_owner, owner_tag
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 @dataclass
@@ -116,7 +117,7 @@ async def confirmed_status(client, ceiling):
 @pytest.mark.parametrize("trace", ["daily-reconnect", "owner-restart", "ledger-first"])
 @pytest.mark.parametrize("demand", [False, True])
 async def test_n09_management_scheduling_trace(tmp_path, tls, unused_tcp_port_factory, monkeypatch, trace, demand):
-    async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port_factory()) as b:
         port = unused_tcp_port_factory()
         stops = ()
         starts_count = int(trace == "owner-restart")

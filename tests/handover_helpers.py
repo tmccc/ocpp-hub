@@ -9,8 +9,8 @@ from typing import Any
 
 from ocpp_hub_core.frames import basic_auth_header
 
-from tests.test_trial_session import Bench
 from tests.trial_helpers import native_profile
+from tests.trial_peer import Bench
 
 ORIGINAL = {
     "Id": "OFFLINE001",

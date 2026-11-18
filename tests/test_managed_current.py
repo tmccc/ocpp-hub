@@ -6,77 +6,26 @@ import asyncio
 import copy
 import ssl
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
-from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
 
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_proxy import healthy, introduced, managed_session, starts
-from tests.test_managed_test_charge import ChargeRig, actual_stop, owner_start, positive_flow, ready
-from tests.test_native_bounded_recovery import crash
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-
-
-# Activate only the explicit synthetic USER32 capability while retaining the exact original spec and native binding.
-@asynccontextmanager
-async def adjustable(
-    directory: Path,
-    contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path],
-    port: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> AsyncIterator[ChargeRig]:
-    async with ready(directory, contexts, port, monkeypatch) as test:
-        gateway, journal = test.session.gateway, test.session.journal
-        original = copy.deepcopy(journal.get("native_bounded_handover"))
-        binding = copy.deepcopy(journal.get("trial_binding"))
-        journal.put("managed_current_capability", capability_value(journal, test.rig.spec))
-        gateway.policy = replace(gateway.policy, max_current_a=32)
-        gateway.controls.policy = gateway.policy
-        test.rig.peer.configuration["AmpLmt"] = "32"
-        test.rig.peer.runtime_user = 320
-        assert (await healthy(test.controller))["native_limit_a"] == 32
-        assert test.controller.current.selected() == 6
-        try:
-            yield test
-        finally:
-            await test.controller.current.settle()
-            if not test.session.closed:
-                assert journal.get("native_bounded_handover") == original
-                assert journal.get("trial_binding") == binding
-
-
-# Offline readiness depends on fresh local authority even while the genuine cloud path is deliberately retired.
-async def locally_ready(controller: ManagedController) -> dict[str, Any]:
-    async with asyncio.timeout(5):
-        while True:
-            status = await controller.tick()
-            if status.get("local_healthy"):
-                return status
-            assert status["state"] not in ("attention", "stopping"), status
-            await asyncio.sleep(0.02)
-
-
-# Use the real command/worker and inspect its actual physical completion rather than replacing its result.
-async def select(test: ChargeRig, current: int) -> str:
-    identifier = uuid.uuid4().hex
-    revision = test.controller.requests.intent().revision
-    test.controller.command(identifier, "set_current", revision, current_a=current)
-    await test.controller.current.settle()
-    return identifier
+from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
+from tests.current_rig import adjustable, locally_ready, select
+from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.management_peer import TOKEN, call
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: approved current selections preserve real app authority and native HW32.

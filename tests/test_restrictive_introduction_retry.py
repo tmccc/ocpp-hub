@@ -6,11 +6,11 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.gateway import decode
 
-from tests.test_managed_introduction_retry import selected_ready
-from tests.test_managed_proxy import starts
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import selected_ready
+from tests.managed_rig import starts
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: timeout during capability, zero ACK or composite is retried under the same admitted current Boot.
@@ -35,9 +35,12 @@ async def test_restrictive_introduction_retries_whole_zero_sequence(
                 answer = decode(raw)
                 call = next((f for f in rig.bench.device_calls if f[1] == answer[1]), None)
                 target = call is not None and (
-                    stage == "capability" and call[2] == "GetConfiguration"
-                    or stage == "zero" and call[2] == "SetChargingProfile"
-                    or stage == "composite" and call[2] == "GetCompositeSchedule"
+                    stage == "capability"
+                    and call[2] == "GetConfiguration"
+                    or stage == "zero"
+                    and call[2] == "SetChargingProfile"
+                    or stage == "composite"
+                    and call[2] == "GetCompositeSchedule"
                 )
                 if answer[0] == 3 and target and not dropped:
                     dropped.append(call[2])

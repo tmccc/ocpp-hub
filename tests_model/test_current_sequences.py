@@ -11,15 +11,14 @@ from ocpp_hub_core.frames import build_call_error, build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import require_zero_held
 from tests.test_managed_current_tick_race import waiting_locals
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_prototype import BOOT
 from tests_model.catalog import input_digest
 from tests_model.control_cases import current_candidates
 from tests_model.control_helpers import ordinary_recovery, station_limit
@@ -84,10 +83,14 @@ def selected():
 # Why: an applied profile, stale Boot proof or revoked worker cannot silently become authority to resume charging.
 @pytest.mark.parametrize("case", selected(), ids=lambda case: case.identifier)
 async def test_current_resolution_sequences(tmp_path, model_tls, monkeypatch, record_property, case):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BoundaryPeer)
     events, suffix_complete = [], False
     async with commissioned(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, case.initial
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        monkeypatch,
+        case.initial,
+        native_peer=BoundaryPeer,
     ) as b:
         c, rig, sock = b.controller, b.rig, b.charger
         peer, firmware = rig.peer, rig.bench.firmware

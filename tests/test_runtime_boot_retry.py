@@ -8,11 +8,11 @@ from dataclasses import replace
 import pytest
 from ocpp_hub_core.frames import build_call_result
 
-from tests.test_managed_current import adjustable, select
-from tests.test_managed_proxy import healthy, starts
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.current_rig import adjustable, select
+from tests.managed_rig import healthy, starts
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 class RetryBootPeer:

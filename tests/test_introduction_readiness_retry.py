@@ -9,13 +9,13 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
+from tests.charge_rig import ChargeRig
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy, managed_bench, managed_session, starts
+from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control
-from tests.test_managed_introduction_retry import selected_ready
-from tests.test_managed_proxy import healthy, managed_bench, managed_session, starts
-from tests.test_managed_test_charge import ChargeRig
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
@@ -46,10 +46,8 @@ def no_synthetic_lifecycle(rig, journal):
 # Intent: a first Boot with a valid but not-yet-zero offer retries and completes the exact app or Pause/Return intent.
 # Why: temporary output readiness must not strand one socket or substitute for the actual first owned zero receipt.
 @pytest.mark.parametrize("initial", ["app", "paused"])
-async def test_first_boot_readiness_wait_recovers_on_same_boot(
-    tmp_path, tls, unused_tcp_port, monkeypatch, initial
-):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+async def test_first_boot_readiness_wait_recovers_on_same_boot(tmp_path, tls, unused_tcp_port, monkeypatch, initial):
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         c, g, j = ManagedController(session), session.gateway, session.journal
@@ -174,8 +172,9 @@ async def test_strict_introduction_refusal_latches_diagnostic_and_attention(
                 await until(lambda: j.get("trial_phase") == "blocked")
                 status = await c.tick()
                 assert status["state"] == "attention"
-                fault, diagnostic = copy.deepcopy(j.get("managed_control_fault")), copy.deepcopy(
-                    j.get("managed_native_failure")
+                fault, diagnostic = (
+                    copy.deepcopy(j.get("managed_control_fault")),
+                    copy.deepcopy(j.get("managed_native_failure")),
                 )
                 assert fault["classification"] == status["fault"] == "native_authority_or_preservation_failed"
                 assert diagnostic["type"] == "SecurityError" and diagnostic["at_epoch"] > 0

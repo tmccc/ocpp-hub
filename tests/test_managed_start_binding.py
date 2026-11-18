@@ -10,11 +10,11 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, pending_cloud_offer, starts
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.test_managed_proxy import healthy, introduced, managed_session, pending_cloud_offer, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 
 # Intent: exercise a scheduled source on either side of the local ACK, then the still-distinct owner lifecycle.
@@ -23,7 +23,7 @@ from tests.test_prototype_tls import tls as tls
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("distinct", [False, True])
 async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, before_ack, demand, distinct):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         g, j = b.session.gateway, b.session.journal
         if distinct:
             g.policy = replace(g.policy, allowed_tags=frozenset({"APP_OWNER", *g.policy.allowed_tags}))
@@ -100,7 +100,7 @@ async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, be
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("first", ["native", "ledger"])
 async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatch, same_tag, restart, demand, first):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         j = b.session.journal
         tag = b.device.plans[9]["idTag"] if same_tag else "CLOUD_OWNER"
         accepted = await b.rig.bench.cloud_call(
@@ -175,8 +175,10 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
         assert (await healthy(b.c))["local_hold_verified"]
         # A healthy physical Pause can precede cloud Stop delivery; Return requires those actual receipts too.
         await until(
-            lambda: not b.session.journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-            and not b.session.gateway.vendor._pending
+            lambda: (
+                not b.session.journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                and not b.session.gateway.vendor._pending
+            )
         )
         returning = uuid.uuid4().hex
         b.c.command(returning, "app_control", b.c.requests.intent().revision)
@@ -197,7 +199,7 @@ async def test_pending_cloud_same_tag(tmp_path, tls, unused_tcp_port, monkeypatc
 # Why: even both real protocol closures between polls do not record which physical occurrence spent the owner's command.
 @pytest.mark.parametrize("source_observed", [False, True])
 async def test_same_tag_lifecycles_close_between_polls(tmp_path, tls, unused_tcp_port, monkeypatch, source_observed):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         b.clock.now = int(datetime(2026, 11, 11, tzinfo=ZONE).timestamp())
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
         await b.c.charging.settle()

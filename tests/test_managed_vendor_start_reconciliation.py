@@ -12,12 +12,12 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
+from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
 
 
@@ -40,7 +40,7 @@ async def cloud_lifecycle(rig, session, charger, identifier):
 # Intent: a genuine accepted/closed cloud lifecycle needs no evidence tool and leaves ordinary Pause available.
 # Why: repairing an unbound grant must preserve normal one-shot command binding and retirement.
 async def test_completed_vendor_start_needs_no_operator(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
@@ -59,7 +59,7 @@ async def test_completed_vendor_start_needs_no_operator(tmp_path, tls, unused_tc
 async def test_unbound_vendor_start_requires_evidence_and_new_pause(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys
 ):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         strategy = strategy_file(rig, tmp_path)
         config, native_port = tmp_path / "trial.json", rig.prepared.observer.port
         session = managed_session(rig)

@@ -5,13 +5,13 @@ import uuid
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_introduction_retry import InterruptedNativePeer, selected_ready
-from tests.test_managed_proxy import healthy, starts
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy, starts
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
 from tests.test_ordinary_recovery import close_session
-from tests.test_prototype import BOOT, START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Establish the real bounded outage path rather than manufacturing a control-hold receipt.
@@ -29,8 +29,9 @@ async def idle_outage(b):
 async def test_daily_wire_start_during_ordinary_hold_requires_exact_native_source(
     tmp_path, tls, unused_tcp_port, monkeypatch, current
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as b:
         await idle_outage(b)
         body = START | {"idTag": "NATIVE_TIMER"}
         unavailable = await b.rig.bench.call(b.charger, uuid.uuid4().hex, "StartTransaction", body)
@@ -68,8 +69,9 @@ async def test_daily_wire_start_during_ordinary_hold_requires_exact_native_sourc
 async def test_ordinary_idle_hold_does_not_authorize_foreign_or_paused_start(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, superseding
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as b:
         await idle_outage(b)
         b.rig.peer.unavailable = False
         tag = "FOREIGN" if superseding == "foreign_tag" else "NATIVE_TIMER"
@@ -106,8 +108,7 @@ class GatedNativePeer(InterruptedNativePeer):
 async def test_ordinary_daily_report_rejects_unknown_or_superseded_authority(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, superseding
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", GatedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=GatedNativePeer) as b:
         await idle_outage(b)
         b.rig.peer.unavailable = False
         if superseding == "unknown_native":

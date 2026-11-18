@@ -14,8 +14,8 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.tls_support import tls as tls
 
 
 # Give each intentional user operation an independent bounded opaque identifier.
@@ -38,7 +38,7 @@ async def test_pause_and_explicit_return_keep_the_existing_native_safety_boundar
 ) -> None:
     from ocpp_hub_core.prototype.managed_view import health_snapshot
 
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -76,7 +76,7 @@ async def test_restart_remembers_requested_pause_without_automatic_release(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         first = managed_session(rig)
         await first.start()
         controller = ManagedController(first)
@@ -107,7 +107,7 @@ async def test_stale_return_and_conflicting_identifier_are_rejected_before_write
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -133,7 +133,7 @@ async def test_accepted_return_is_not_retried_after_process_replacement(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         first = managed_session(rig)
         await first.start()
         controller = ManagedController(first)
@@ -166,7 +166,7 @@ async def test_newer_pause_preempts_return_during_native_validation(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -237,9 +237,9 @@ async def test_crash_immediately_after_pause_acceptance_reconciles_to_zero(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tests.test_native_bounded_recovery import crash
+    from tests.handover_helpers import crash
 
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         first = managed_session(rig)
         await first.start()
         controller = ManagedController(first)
@@ -274,10 +274,10 @@ async def test_pause_requires_actual_closure_and_works_with_cloud_offline(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tests.test_prototype import START
-    from tests.test_prototype_runtime import until
+    from tests.prototype_rig import START
+    from tests.runtime_rig import until
 
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -322,7 +322,7 @@ async def test_pause_requires_actual_closure_and_works_with_cloud_offline(
 # Intent: an explicit Pause lowers the commissioned charger before waiting on even the first native response.
 # Why: a stalled read can outlast a deadline and zero current alone cannot complete the owner's Pause receipt.
 async def test_pause_restricts_station_while_native_observation_is_stalled(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)

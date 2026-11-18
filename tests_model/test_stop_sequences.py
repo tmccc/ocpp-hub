@@ -9,16 +9,15 @@ from contextlib import AsyncExitStack
 import pytest
 
 from tests import conftest as _engine  # noqa: F401 - initialize the standalone engine before importing it.
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig, positive_flow
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
 from tests.recovery_barriers import returned_to_app, witnessed_native_loss
-from tests.test_managed_introduction_retry import InterruptedNativePeer
+from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import ReplyBench, pause, reconcile, running
-from tests.test_managed_test_charge import ChargeRig, positive_flow
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
 from tests_model.catalog import input_digest
 from tests_model.control_cases import stop_candidates
 from tests_model.test_start_recovery_sequences import observe
@@ -34,10 +33,14 @@ def cases():
 # Why: operator proof alone and an earlier Pause must not become delivery or authorize a later positive release.
 @pytest.mark.parametrize("case", cases(), ids=lambda case: case.identifier)
 async def test_stop_delivery_sequences(tmp_path, model_tls, monkeypatch, capsys, record_property, case):
-    monkeypatch.setattr(mp, "OwnerBench", ReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     events, suffix_complete = [], False
-    async with mp.managed_bench(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener_port(),
+        bench_type=ReplyBench,
+        native_peer=InterruptedNativePeer,
+    ) as rig:
         async with running(rig, "stop-fault-prefix", owner_tag="APP_OWNER") as (s, c, sock):
             await mp.healthy(c)
             if case.origin != "daily":

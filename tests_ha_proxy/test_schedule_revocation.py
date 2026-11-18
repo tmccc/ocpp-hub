@@ -5,11 +5,11 @@ from contextlib import AsyncExitStack
 import pytest
 
 from tests import conftest as _engine  # noqa: F401 - load the standalone engine package.
+from tests.managed_rig import introduced
 from tests.managed_scenario_helpers import END, originals
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import introduced
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 from tests_ha_proxy.test_schedule_scenarios import (
     close_in_order,
     management_client,
@@ -25,7 +25,7 @@ async def test_management_reconnect_revokes_unknown_source(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, loss, demand
 ):
     async with (
-        timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b,
+        timer_bench(tmp_path, tls, unused_tcp_port_factory()) as b,
         AsyncExitStack() as connections,
     ):
         async with management_client(b, tmp_path, unused_tcp_port_factory()) as (client, published):

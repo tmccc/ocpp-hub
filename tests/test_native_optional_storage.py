@@ -4,11 +4,11 @@ import sqlite3
 
 import pytest
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_introduction_retry import InterruptedNativePeer, selected_ready
-from tests.test_managed_proxy import healthy
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.test_worker_storage_recovery import failing_cleanup
+from tests.tls_support import tls as tls
 
 
 # Intent: refusing the first two optional strict-measurement notes does not stop polling or discard failure counts.
@@ -18,8 +18,9 @@ from tests.test_worker_storage_recovery import failing_cleanup
 async def test_optional_strict_diagnostic_does_not_replace_required_fault_storage(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, third_failure
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         original = peer.native
 

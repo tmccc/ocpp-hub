@@ -8,13 +8,13 @@ from ocpp_hub_core.prototype.managed_native_repair import AUDITS
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.store import fingerprint
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
+from tests.current_rig import release_bench
+from tests.runtime_rig import until
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_native_repair_storage import refused_write
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
 from tests.test_rpc_validation_deadlines import NativeAuditPeer
+from tests.tls_support import tls as tls
 
 
 # Intent: real SQLite publication errors survive preemption/timeout; external cancellation retains its cleanup cause.
@@ -23,8 +23,7 @@ from tests.test_rpc_validation_deadlines import NativeAuditPeer
 async def test_native_validation_preserves_failed_cancel_publication(
     tmp_path, tls, unused_tcp_port, monkeypatch, boundary
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", NativeAuditPeer)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=NativeAuditPeer) as b:
         c, g, j, peer = b.c, b.session.gateway, b.session.journal, b.rig.peer
         # This exact older persisted input exercises the existing supported repair compatibility path.
         fault = await legacy_fault(b, "NativeTransportUnavailableError")

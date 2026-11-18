@@ -7,7 +7,7 @@ import uuid
 from ocpp_hub_core.prototype.recovery_contracts import Prerequisite
 
 from tests.native_schedule_support import SelectiveConfigPeer, timer_bench
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Count only actual positive profile writes delivered to the independent charger.
@@ -23,7 +23,7 @@ def positive_writes(b, mark):
 # Intent: losing the current-recovery domain during actual native validation revokes its continuation permission.
 # Why: a known original daily session alone cannot inherit positive authority after its recovery owner retires.
 async def test_continuation_source_rechecked_after_native_send_wait(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with timer_bench(tmp_path, tls, unused_tcp_port, monkeypatch, peer_type=SelectiveConfigPeer) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=SelectiveConfigPeer) as b:
         c, g, j, peer = b.c, b.session.gateway, b.session.journal, b.rig.peer
         wire, reads = len(b.rig.bench.device_calls), peer.config_requests
         unknown = await c.recovery.restore(continuing_local=123456)

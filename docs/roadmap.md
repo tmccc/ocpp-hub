@@ -82,6 +82,9 @@ changes rather than a cumulative total. Further simplification remains open.
   journals without changing their evidence; retain shared physical/resource tests on the native path. Runtime is
   480 physical lines smaller, including new guards and a repeated-cleanup inventory correction. Fast checks and
   independent semantic review cover the implementation.
+- [x] Make daily control prerequisites explicit, centralise status projection, and give the current selection and
+  fault latch their own journal owners. Route charger-reported Start through one handler and move shared rigs into
+  test support modules with explicit peer selection.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current-selection authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties.

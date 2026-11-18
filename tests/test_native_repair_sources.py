@@ -9,17 +9,16 @@ import pytest
 from ocpp_hub_core.prototype.managed_native_repair import REVOCATIONS, repair_revoked
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, recoverable_fault
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import positive_flow
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_release_recovery import explicit_release_pause, release_bench
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import positive_flow
+from tests.current_rig import commissioned, release_bench
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.test_managed_release_recovery import explicit_release_pause
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 class RepairWirePeer(InterruptedNativePeer):
@@ -77,8 +76,7 @@ def wire_response(mode):
 @pytest.mark.parametrize("caller", ["stop", "tick"])
 @pytest.mark.parametrize("mode", ["duplicate", "nonfinite", "framing", "http-version", "unauthorized"])
 async def test_strict_native_wire_refusal_revokes_repair(tmp_path, tls, unused_tcp_port, monkeypatch, caller, mode):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", RepairWirePeer)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=RepairWirePeer) as b:
         c, j, peer = b.c, b.session.journal, b.rig.peer
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
@@ -102,8 +100,7 @@ async def test_strict_native_wire_refusal_revokes_repair(tmp_path, tls, unused_t
 # Why: hard wire contradictions must not broaden to ordinary native unavailability.
 @pytest.mark.parametrize("mode", ["json-unavailable", "envelope-unavailable", "http503"])
 async def test_native_unavailable_wire_keeps_repair(tmp_path, tls, unused_tcp_port, monkeypatch, mode):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", RepairWirePeer)
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=RepairWirePeer) as b:
         c, j, peer = b.c, b.session.journal, b.rig.peer
         fault = await legacy_fault(b, "NativeTransportUnavailableError")
         pause = await explicit_release_pause(b)
@@ -120,9 +117,16 @@ async def test_native_unavailable_wire_keeps_repair(tmp_path, tls, unused_tcp_po
 # Intent: valid residual current above selected6 but below absolute32 must not prevent a real known-session Stop.
 # Why: selected measurement gates health/positive work, while owner Pause still needs genuine Stop and closure.
 async def test_selected_overdraw_cannot_starve_owner_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True) as b:
+    async with commissioned(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        6,
+        cli_route=True,
+        native_peer=InterruptedNativePeer,
+        bench_type=StartReplyBench,
+    ) as b:
         c, j, peer, firmware = b.controller, b.session.journal, b.rig.peer, b.rig.bench.firmware
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         await mp.healthy(c)

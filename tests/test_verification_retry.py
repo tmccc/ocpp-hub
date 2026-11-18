@@ -13,7 +13,7 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import DeniedError, Policy
 from ocpp_hub_core.prototype.rpc import UnavailableError
 
-from tests.test_prototype import BOOT, Rig
+from tests.prototype_rig import BOOT, Rig
 from tests.test_trial_auth import StrictRig
 
 

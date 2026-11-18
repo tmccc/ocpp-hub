@@ -17,11 +17,11 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
-from tests.test_trial_session import Bench
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 from tools import reconcile_managed_delivery as operator
 
 
@@ -81,7 +81,7 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
         await actual_cloud(bench, CloudReplyFilter(connection, trace))
 
     monkeypatch.setattr(Bench, "vendor", cloud_peer)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         value = rig.spec.value()
         value["trial_route"].update(sDomain=rig.prepared.config.listener_name, sURL="/charger/")
         rig.spec = NativeBoundedSpec.parse(value)

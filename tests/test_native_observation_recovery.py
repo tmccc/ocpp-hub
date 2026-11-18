@@ -11,13 +11,12 @@ from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError,
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import commissioned
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.recovery_barriers import completed_control, returned_to_app
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 class UndecodablePeer(InterruptedNativePeer):
@@ -73,9 +72,16 @@ async def pause_return(b):
 async def test_repeated_undecodable_native_observation_recovers(
     tmp_path, tls, unused_tcp_port, monkeypatch, selected, failure
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", UndecodablePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True) as b:
+    async with commissioned(
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        selected,
+        cli_route=True,
+        native_peer=UndecodablePeer,
+        bench_type=StartReplyBench,
+    ) as b:
         c, peer, j, firmware = b.controller, b.rig.peer, b.session.journal, b.rig.bench.firmware
         intent = c.requests.intent()
         epoch, boot = b.session.gateway._charger_epoch, b.session.gateway.boot_observation
@@ -108,8 +114,9 @@ async def test_repeated_undecodable_native_observation_recovers(
 # Why: unusable envelopes cannot turn validated contradictory installation data into an ordinary retry.
 @pytest.mark.parametrize("selected", [6, 32])
 async def test_valid_conflicting_native_content_is_still_latched(tmp_path, tls, unused_tcp_port, monkeypatch, selected):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", UndecodablePeer)
-    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True) as b:
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, selected, cli_route=True, native_peer=UndecodablePeer
+    ) as b:
         c, peer, j = b.controller, b.rig.peer, b.session.journal
         original = peer.configuration["untouched"]
         peer.configuration["untouched"] = "independent-external-configuration-change"

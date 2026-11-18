@@ -3,83 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Any
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests import test_native_bounded_session as native_bench
-from tests.handover_helpers import NativeVehiclePeer
-from tests.test_managed_current import adjustable, select
-from tests.test_managed_proxy import healthy, managed_bench, managed_session, starts
-from tests.test_managed_test_charge import ready
-from tests.test_prototype import BOOT
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import selected_ready
+from tests.managed_rig import healthy, managed_bench, managed_session, starts
+from tests.native_peer_failures import InterruptedNativePeer, retries
+from tests.prototype_rig import BOOT
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
-
-
-class InterruptedNativePeer(NativeVehiclePeer):
-    """The independent native endpoint can withhold only its own HTTP availability."""
-
-    # Retain ordinary native physical state and expose the number of real failed HTTP requests.
-    def __init__(self, bench: Any) -> None:
-        super().__init__(bench)
-        self.unavailable = False
-        self.failed_reads: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
-    # Answer complete received requests with a temporary HTTP failure while ordinary peer behavior stays intact.
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if not self.unavailable:
-            await super().handle(reader, writer)
-            return
-        try:
-            header = await reader.readuntil(b"\r\n\r\n")
-            fields = {
-                line.split(b":", 1)[0].lower(): line.split(b":", 1)[1].strip()
-                for line in header.split(b"\r\n")[1:]
-                if b":" in line
-            }
-            request = json.loads(await reader.readexactly(int(fields[b"content-length"])))
-            self.failed_reads.put_nowait(request)
-            writer.write(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
-            await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-
-# Wait for repeated actual HTTP attempts without invoking or replacing the engine's introduction logic.
-async def retries(peer: InterruptedNativePeer) -> None:
-    async with asyncio.timeout(3):
-        for _ in range(3):
-            assert (await peer.failed_reads.get())["action"] == "getConfig"
-
-
-# Use the existing explicit synthetic capability and normal current worker to establish a real selected ceiling.
-@asynccontextmanager
-async def selected_ready(tmp_path: Any, tls: Any, port: int, monkeypatch: Any, current: int) -> AsyncIterator[Any]:
-    factory = adjustable if current == 32 else ready
-    async with factory(tmp_path, tls, port, monkeypatch) as test:
-        if current == 32:
-            await select(test, 32)
-            await healthy(test.controller)
-        assert test.rig.bench.firmware.effective_limit() == current
-        assert test.session.journal.get("managed_temporary_schedule") is None
-        assert test.session.journal.get("managed_current_change", {}).get("state") != "recovering"
-        yield test
 
 
 # Intent: an interrupted first Boot audit retries on the same socket and establishes zero before any release.
 # Why: recovering native availability must not require a second Boot or bypass the initial owned-profile receipt.
 async def test_first_introduction_recovers_after_native_http503(tmp_path, tls, unused_tcp_port, monkeypatch):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with managed_bench(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+    async with managed_bench(tmp_path, tls, unused_tcp_port, native_peer=InterruptedNativePeer) as rig:
         session = managed_session(rig)
         await session.start()
         controller = ManagedController(session)
@@ -108,8 +50,9 @@ async def test_first_introduction_recovers_after_native_http503(tmp_path, tls, u
 async def test_reconnect_introduction_recovers_after_native_http503(
     tmp_path, tls, unused_tcp_port, monkeypatch, current
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as test:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as test:
         rig, session, controller = test.rig, test.session, test.controller
         await test.charger.close()
         await until(lambda: not session.runtime.status.charger_connected)
@@ -140,8 +83,9 @@ async def test_reconnect_introduction_recovers_after_native_http503(
 async def test_pause_and_return_complete_after_interrupted_introduction(
     tmp_path, tls, unused_tcp_port, monkeypatch, current
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as test:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as test:
         rig, session, controller = test.rig, test.session, test.controller
         await test.charger.close()
         await until(lambda: not session.runtime.status.charger_connected)
@@ -178,8 +122,9 @@ async def test_pause_and_return_complete_after_interrupted_introduction(
 # Why: transport recovery cannot legitimize an altered installation, even if its physical settings are later restored.
 @pytest.mark.parametrize("current", [6, 32])
 async def test_conflicting_binding_does_not_retry_introduction(tmp_path, tls, unused_tcp_port, monkeypatch, current):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as test:
+    async with selected_ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, current, native_peer=InterruptedNativePeer
+    ) as test:
         rig, session, controller = test.rig, test.session, test.controller
         await test.charger.close()
         await until(lambda: not session.runtime.status.charger_connected)

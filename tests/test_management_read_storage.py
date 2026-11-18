@@ -7,17 +7,18 @@ import pytest
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_current import adjustable
-from tests.test_managed_proxy import healthy
-from tests.test_prototype_tls import tls as tls
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy
+from tests.management_peer import TOKEN, call
+from tests.tls_support import tls as tls
 
 
 # Intent: a real failed SQL read cannot return a cached successful status, guessed history or a lost receipt.
 # Why: read-only callers need an honest temporary refusal and must recover without repeating a physical command.
-@pytest.mark.parametrize("command,table", [
-    ("status", "meta"), ("status", "transactions"), ("history", "transactions"), ("receipt", "managed_requests")
-])
+@pytest.mark.parametrize(
+    "command,table",
+    [("status", "meta"), ("status", "transactions"), ("history", "transactions"), ("receipt", "managed_requests")],
+)
 async def test_management_read_storage_refusal_recovers_same_socket(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, command, table
 ):
@@ -41,8 +42,9 @@ async def test_management_read_storage_refusal_recovers_same_socket(
         await api.start()
         try:
             async with connect(
-                f"ws://127.0.0.1:{port}/management", additional_headers={"Authorization": "Bearer " + TOKEN},
-                subprotocols=["ics-proxy.v1"]
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
             ) as socket:
                 assert (await call(socket, "status"))["result"]["healthy"]
                 j.db.set_authorizer(authorize)

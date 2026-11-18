@@ -11,14 +11,13 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import ChargeRig
+from tests.connected_rig import strategy_file
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_debt_reconciliation import strategy_file
-from tests.test_managed_introduction_retry import InterruptedNativePeer
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.test_managed_stop_reply_recovery import pause, running
-from tests.test_managed_test_charge import ChargeRig
 from tests_model.catalog import input_digest
 from tests_model.control_cases import vendor_candidates
 from tests_model.test_start_recovery_sequences import observe
@@ -30,9 +29,10 @@ from tools import reconcile_managed_debt as operator
 # Why: zero, elapsed time and an accepted cloud reply do not prove an unbound or uncertain command has gone away.
 @pytest.mark.parametrize("case", vendor_candidates(), ids=lambda case: case.identifier)
 async def test_vendor_debt_sequences(tmp_path, model_tls, monkeypatch, capsys, record_property, case):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     events, suffix_complete = [], False
-    async with mp.managed_bench(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch) as rig:
+    async with mp.managed_bench(
+        tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), native_peer=InterruptedNativePeer
+    ) as rig:
         stack = AsyncExitStack()
         try:
             s, c, sock = await stack.enter_async_context(running(rig, "vendor-debt-prefix"))

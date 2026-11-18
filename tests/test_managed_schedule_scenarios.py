@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from tests.managed_rig import healthy, introduced, starts
 from tests.managed_scenario_helpers import (
     END,
     close_in_order,
@@ -20,11 +21,10 @@ from tests.managed_scenario_helpers import (
     settle,
 )
 from tests.native_schedule_support import timer_bench
-from tests.test_managed_proxy import healthy, introduced, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_start_overlap import delayed_owner, owner_tag
-from tests.test_prototype import START
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 # Intent: a restart retires an unexpired unbound owner Start without stopping its independent daily session.
@@ -36,7 +36,7 @@ from tests.test_prototype_tls import tls as tls
 async def test_n06_unexpired_start_daily_restart(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, before_ack, selected, demand, first
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port_factory()) as b:
         await select_current(b, selected)
         saved = originals(b)
         owner_tag(b)
@@ -105,7 +105,7 @@ async def confirmed_cloud_owner(b, demand):
 async def test_n07_post_completion_closure(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, cloud_owner, demand, first
 ):
-    async with timer_bench(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port_factory()) as b:
         await select_current(b, 32)
         saved = originals(b)
         stops = ()

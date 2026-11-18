@@ -14,7 +14,7 @@ from ocpp_hub_core.prototype.managed_start_delivery import (
 from ocpp_hub_core.prototype.managed_stop_delivery import record_stop_ack
 from ocpp_hub_core.prototype.store import Journal, fingerprint
 
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # Build a real immutable closed mapped ledger pair and one independently specified owner-request identity.

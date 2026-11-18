@@ -15,8 +15,8 @@ from ocpp_hub_core.prototype.store import Journal
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
 from tests.prototype_firmware import Firmware
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.prototype_rig import START
+from tests.tls_support import tls as tls
 from tests.trial_helpers import TrialRig
 
 

@@ -8,15 +8,13 @@ import uuid
 
 import pytest
 
-from tests import test_managed_proxy as managed_bench_module
-from tests import test_native_bounded_session as native_bench
 from tests.cloud_start_helpers import StartReplyBench
+from tests.managed_rig import starts
 from tests.model_tls_support import model_tls as model_tls
 from tests.model_tls_support import tls_for_case
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import process_rig
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import starts
-from tests.test_prototype import START
+from tests.prototype_rig import START
 from tests_model.catalog import input_digest
 from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
 from tests_model.test_current_sequences import BoundaryPeer
@@ -28,7 +26,6 @@ from tests_model.test_current_sequences import BoundaryPeer
 async def test_process_sigkill_automatic_current_overlap(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", BoundaryPeer)
     events = []
     async with process_rig(
         tmp_path,
@@ -37,6 +34,7 @@ async def test_process_sigkill_automatic_current_overlap(
         unused_tcp_port_factory(),
         monkeypatch,
         case.initial,
+        native_peer=BoundaryPeer,
     ) as child:
         await child.start()
         ready = await child.status()
@@ -194,11 +192,16 @@ async def test_process_sigkill_before_start_dispatch(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
 ):
     phase, events, complete = case.phase, [], False
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     listener, management = unused_tcp_port_factory(), unused_tcp_port_factory()
     assert listener != management
     async with process_rig(
-        tmp_path, tls_for_case(tmp_path, model_tls), listener, management, monkeypatch, case.selected
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener,
+        management,
+        monkeypatch,
+        case.selected,
+        native_peer=InterruptedNativePeer,
     ) as child:
         plans, config = copy.deepcopy(child.rig.bench.firmware.plans), copy.deepcopy(child.rig.peer.configuration)
         await child.start()
@@ -267,7 +270,6 @@ async def test_process_sigkill_before_start_dispatch(
 async def test_process_sigkill_current_selection(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     events = []
     async with process_rig(
         tmp_path,
@@ -276,6 +278,7 @@ async def test_process_sigkill_current_selection(
         unused_tcp_port_factory(),
         monkeypatch,
         case.initial,
+        native_peer=InterruptedNativePeer,
     ) as child:
         await child.start()
         state = await child.status()
@@ -326,10 +329,14 @@ async def test_process_sigkill_current_selection(
 async def test_process_accepted_start_late_lifecycle(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase, cloud_reply
 ):
-    monkeypatch.setattr(managed_bench_module, "OwnerBench", StartReplyBench)
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with process_rig(
-        tmp_path, tls_for_case(tmp_path, model_tls), unused_tcp_port_factory(), unused_tcp_port_factory(), monkeypatch
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        bench_type=StartReplyBench,
+        native_peer=InterruptedNativePeer,
     ) as child:
         await child.start()
         ready = await child.status()
@@ -378,7 +385,6 @@ async def test_process_accepted_start_late_lifecycle(
 async def test_process_return_commit_preserves_honest_receipt(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase, selected
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with process_rig(
         tmp_path,
         tls_for_case(tmp_path, model_tls),
@@ -386,6 +392,7 @@ async def test_process_return_commit_preserves_honest_receipt(
         unused_tcp_port_factory(),
         monkeypatch,
         selected,
+        native_peer=InterruptedNativePeer,
     ) as child:
         await child.start()
         state = await child.status()
@@ -421,9 +428,13 @@ async def test_process_return_commit_preserves_honest_receipt(
 async def test_process_unknown_issued_start_retains_debt(
     tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     async with process_rig(
-        tmp_path, tls_for_case(tmp_path, model_tls), unused_tcp_port_factory(), unused_tcp_port_factory(), monkeypatch
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        native_peer=InterruptedNativePeer,
     ) as child:
         await child.start()
         state = await child.status()

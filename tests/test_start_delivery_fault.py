@@ -6,7 +6,7 @@ import pytest
 from ocpp_hub_core.prototype.managed_start_delivery import record_start_error, supersede_unknown_start_retry
 from ocpp_hub_core.prototype.store import Journal
 
-from tests.test_prototype import START
+from tests.prototype_rig import START
 
 
 # The journal is independent of any supervisor poll, while its original positive control facts remain explicit.

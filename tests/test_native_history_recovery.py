@@ -23,11 +23,11 @@ from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
-from tests.test_managed_proxy import healthy, introduced, managed_bench, managed_session, starts
+from tests.connected_rig import ConnectedBench
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.prototype_rig import START
 from tests.test_native_bounded_handover import restore_original_route, verify_original_backend
-from tests.test_native_bounded_session import ConnectedBench
-from tests.test_prototype import START
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 
 
 @dataclass
@@ -72,7 +72,7 @@ async def missing_history(
     *,
     paused: bool = False,
 ) -> AsyncIterator[HistoryFault]:
-    async with managed_bench(directory, contexts, port, monkeypatch) as rig:
+    async with managed_bench(directory, contexts, port) as rig:
         rig.bench.history = closed_records()
         first = managed_session(rig)
         await first.start()

@@ -7,14 +7,13 @@ import pytest
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
-from tests import test_native_bounded_session as native_bench
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_current import adjustable
+from tests.current_rig import adjustable
+from tests.managed_rig import healthy
+from tests.management_peer import TOKEN, call
 from tests.test_managed_current_tick_race import OneNativeResponseGate
-from tests.test_managed_proxy import healthy
-from tests.test_prototype_tls import tls as tls
 from tests.test_worker_storage_recovery import fail_boundary
 from tests.test_worker_storage_supersession import current_settlement_unavailable
+from tests.tls_support import tls as tls
 
 
 # Intent: a pending physical response or refused restrictive transaction cannot freeze status or invent zero proof.
@@ -23,8 +22,9 @@ from tests.test_worker_storage_supersession import current_settlement_unavailabl
 async def test_current_poll_during_pending_physical_or_sql_work(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, boundary
 ):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", OneNativeResponseGate)
-    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+    async with adjustable(
+        tmp_path, tls, unused_tcp_port_factory(), monkeypatch, native_peer=OneNativeResponseGate
+    ) as b:
         c, j, peer = b.controller, b.session.journal, b.rig.peer
         published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
         prior_checked = published["checked_at"]
@@ -46,8 +46,9 @@ async def test_current_poll_during_pending_physical_or_sql_work(
             if boundary != "native_http":
                 assert len(attempts) >= 2
             async with connect(
-                f"ws://127.0.0.1:{port}/management", additional_headers={"Authorization": "Bearer " + TOKEN},
-                subprotocols=["ics-proxy.v1"]
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
             ) as socket:
                 for _ in range(2):
                     pending = await asyncio.wait_for(c.tick(), 1)
@@ -56,16 +57,23 @@ async def test_current_poll_during_pending_physical_or_sql_work(
                     assert pending["state"] == "reconciling" and pending["fault"] == "current_update_pending"
                     assert c.current.worker is worker and not worker.done() and not worker.cancelled()
                     assert c.latest_native is None
-                    assert all(pending[key] is None for key in (
-                        "current_a", "power_w", "native_observed_at", "station_ceiling_a", "charging_session_open"
-                    ))
+                    assert all(
+                        pending[key] is None
+                        for key in (
+                            "current_a",
+                            "power_w",
+                            "native_observed_at",
+                            "station_ceiling_a",
+                            "charging_session_open",
+                        )
+                    )
                     published = {**pending, "running": True, "certificate_remaining_seconds": 86400}
                     status = (await call(socket, "status"))["result"]
                     assert not status["healthy"] and not status["local_healthy"]
                     assert status["desired_control"] == "app" and status["requested_current_a"] == 16
-                    assert status["can_pause"] and not any(status[key] for key in (
-                        "can_start", "can_start_test", "can_return", "can_set_current"
-                    ))
+                    assert status["can_pause"] and not any(
+                        status[key] for key in ("can_start", "can_start_test", "can_return", "can_set_current")
+                    )
                 # A separate, real owner Pause can enforce zero even while the old operation's settlement waits.
                 newer = await call(socket, "pause", revision=status["control_revision"])
                 assert newer["ok"]

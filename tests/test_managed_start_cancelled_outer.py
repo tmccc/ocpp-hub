@@ -10,28 +10,42 @@ import pytest
 from ocpp_hub_core.prototype import managed_charging
 from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 
-from tests import test_managed_proxy as mp
-from tests import test_native_bounded_session as native_bench
+from tests import managed_rig as mp
+from tests.charge_rig import positive_flow, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
+from tests.current_rig import commissioned
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.recovery_barriers import witnessed_native_loss
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_start_refusal_native32 import commissioned
-from tests.test_managed_test_charge import positive_flow, ready
+from tests.runtime_rig import until
 from tests.test_ordinary_recovery import close_session
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests_model.test_start_recovery_sequences import close_daily
 
 
 # Use real USER6 or commissioned USER32 and the ordinary actual current worker, with distinct owner/daily tags.
 @asynccontextmanager
 async def selected_source(tmp_path, tls, port, monkeypatch, current):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
-    monkeypatch.setattr(mp, "OwnerBench", StartReplyBench)
     factory = (
-        ready(tmp_path, tls, port, monkeypatch, owner_tag="APP_OWNER")
+        ready(
+            tmp_path,
+            tls,
+            port,
+            monkeypatch,
+            owner_tag="APP_OWNER",
+            native_peer=InterruptedNativePeer,
+            bench_type=StartReplyBench,
+        )
         if current == 6
-        else commissioned(tmp_path, tls, port, monkeypatch, current, owner_tag="APP_OWNER")
+        else commissioned(
+            tmp_path,
+            tls,
+            port,
+            monkeypatch,
+            current,
+            owner_tag="APP_OWNER",
+            native_peer=InterruptedNativePeer,
+            bench_type=StartReplyBench,
+        )
     )
     async with factory as b:
         # This declared admission budget is configured before acceptance; no existing lease/deadline is rewritten.

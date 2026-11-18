@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 from ocpp_hub_core.prototype.managed_release_recovery import ACK
 
+from tests.current_rig import adjustable, release_bench
 from tests.handover_helpers import crash
-from tests.test_managed_current import adjustable
-from tests.test_managed_proxy import healthy, introduced, managed_session
-from tests.test_managed_release_recovery import recover_then_return, release_bench
-from tests.test_prototype_tls import tls as tls
+from tests.managed_rig import healthy, introduced, managed_session
+from tests.test_managed_release_recovery import recover_then_return
+from tests.tls_support import tls as tls
 
 
 # Preserve the old version's on-disk shape after a real current request is superseded and physically stopped.
@@ -50,7 +50,7 @@ async def old_current_collision(b, previous, failure):
 async def test_old_current_collision_requires_pause_and_previous_selection(
     tmp_path, tls, unused_tcp_port, monkeypatch, previous, failure, restart
 ):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 32) as b:
         fault = await old_current_collision(b, previous, failure)
         assert (await b.c.tick())["state"] == "attention"
         assert b.session.journal.get("managed_control_fault") == fault
@@ -98,7 +98,7 @@ async def test_old_current_without_completed_selection_retains_commissioned_six(
 # Why: recovery of one historical race must not acknowledge arbitrary owner or delivery uncertainty.
 @pytest.mark.parametrize("blocker", ["security", "changed_failure", "missing_request", "unrelated_write"])
 async def test_old_current_pause_preserves_unrelated_uncertainty(tmp_path, tls, unused_tcp_port, monkeypatch, blocker):
-    async with release_bench(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+    async with release_bench(tmp_path, tls, unused_tcp_port, 32) as b:
         j = b.session.journal
         fault = await old_current_collision(
             b, 6, {"type": "UnavailableError", "detail": "current update was superseded by another control operation"}

@@ -12,7 +12,7 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.ics_writes import validate_write
 from ocpp_hub_core.prototype.policy import DeniedError, Policy
 
-from tests.test_prototype import START, Rig
+from tests.prototype_rig import START, Rig
 
 CAPTURE = json.loads((Path(__file__).parent / "fixtures/ics-app-controls.sanitized.json").read_text())
 CALLS = [row["frame"] for row in CAPTURE["frames"] if row["frame"][0] == 2]

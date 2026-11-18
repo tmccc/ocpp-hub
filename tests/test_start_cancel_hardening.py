@@ -10,14 +10,14 @@ import pytest
 from ocpp_hub_core.prototype.local_control import LocalControl
 from ocpp_hub_core.prototype.managed_diagnostics import snapshot as diagnostic_snapshot
 
-from tests import test_managed_proxy as mp
+from tests import managed_rig as mp
+from tests.charge_rig import actual_stop, positive_flow
 from tests.cloud_start_helpers import two_later_sessions
 from tests.recovery_barriers import fresh_daily_values, witnessed_native_loss
+from tests.runtime_rig import until
 from tests.test_managed_normal_start import natural_stop
 from tests.test_managed_start_cancelled_outer import cancel_outer_before_execution, finish_recovery, selected_source
-from tests.test_managed_test_charge import actual_stop, positive_flow
-from tests.test_prototype_runtime import until
-from tests.test_prototype_tls import tls as tls
+from tests.tls_support import tls as tls
 from tests_model.test_start_recovery_sequences import close_daily
 
 

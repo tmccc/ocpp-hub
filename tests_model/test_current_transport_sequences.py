@@ -8,13 +8,12 @@ import pytest
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
-from tests import test_native_bounded_session as native_bench
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy, starts
+from tests.management_peer import TOKEN, call
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.test_managed_api import TOKEN, call
-from tests.test_managed_introduction_retry import InterruptedNativePeer
-from tests.test_managed_proxy import healthy, starts
-from tests.test_managed_start_refusal_native32 import commissioned
+from tests.native_peer_failures import InterruptedNativePeer
 from tests_model.catalog import input_digest
 from tests_model.current_obligations import require_completed_current, require_transport_summary
 from tests_model.deep_cases import current_transport_candidates
@@ -67,12 +66,16 @@ async def choose(socket, b, value):
 # Why: a reduced recovery suffix cannot stand in for an untested literal frame, pair metadata or same-value receipt.
 @pytest.mark.parametrize("case", current_transport_candidates(), ids=lambda case: case.identifier)
 async def test_current_transport_sequences(tmp_path, model_tls, monkeypatch, record_property, case):
-    monkeypatch.setattr(native_bench, "NativeVehiclePeer", InterruptedNativePeer)
     events, complete = [], False
     evidence = dict.fromkeys(EVIDENCE, False)
     try:
         async with commissioned(
-            tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch, case.initial
+            tmp_path,
+            tls_for_case(tmp_path, model_tls),
+            listener_port(),
+            monkeypatch,
+            case.initial,
+            native_peer=InterruptedNativePeer,
         ) as b:
             c, j, firmware = b.controller, b.session.journal, b.rig.bench.firmware
             plans, configuration = copy.deepcopy(firmware.plans), copy.deepcopy(b.rig.peer.configuration)
