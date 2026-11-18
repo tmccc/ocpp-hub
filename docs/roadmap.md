@@ -10,6 +10,22 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 ## Current iCS implementation — 18 November 2026
 
+- [x] Implementation `8f73bf9` addresses the six findings from the earlier full review: introduction storage
+  retry and diagnostics, guarded approval renewal for normal Start, legacy planning/history handling and release
+  tooling. The thin `ics_proxy` HA client is installed from the same implementation with BUILD `8f73bf9`.
+  The backend and changed client are deployed and independently verified. App/schedule authority, the selected,
+  native and owned 32 A ceilings, closed zero output, original configuration and daily schedule are preserved.
+  Protected journal/history, HA settings, dashboard, entity IDs and automation states are retained. Deployment
+  issued no Start or dedicated charging trial.
+- [x] Implementation `8f73bf9` passed all four complete suites with 20 workers each: 12,990 engine/model tests,
+  618 HA 2026.11.0 client tests, 618 HA 2026.10.4 client tests and 57 older-integration tests, 14,283 tests total.
+  The normal validator and independent evidence audit passed. Documentation-only closure does not change that
+  tested and deployed implementation or the installed client BUILD.
+- [x] Claude's scoped fix review and amended-candidate addendum found no unresolved defect in this batch.
+  They supplement the earlier full-source review below; the separate pre-existing legacy race remains open below.
+
+## Previous lifecycle deployment and full review — 18 November 2026
+
 - [x] Version 0.2.3 implements shared recovery coordination, explicit permission/result/effect contracts, atomic
   Start/Return authority publication and owned shutdown. Reconnect completion remains separate from admission
   auditing and verified zero. Backend implementation `de2d74b`, including the simplifications below and the
@@ -26,13 +42,13 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
   that tested and deployed implementation.
 - [x] After deployment, a separately authorised Return restored app/schedule control at revision 60 and the
   verified 32 A ceiling. Subsequent ordinary charging was observed at 3.5 kW and 14.2 A; no Start command was sent
-  by the deployment work. A separately authorised 06:00 Europe/London Stop for 18 November is armed in a persistent
-  external timer. Its physical completion is not yet verified.
+  by that deployment work. The separately authorised 06:00 Europe/London Stop for 18 November was independently
+  verified closed at zero. A later explicit Return restored app/schedule control at revision 62 and the 32 A ceiling.
 - [x] Claude cleared its context and reviewed the exact deployed source, all code/tests and normal documentation.
   The independent visible-read audit accounts for all 520 normal text files and four limited recorded-data views
   with their complete consumers. Full raw capture bodies and six branding PNGs were not visually reviewed.
   Findings are static, not runtime reproductions: one iCS retry defect, an authorisation renewal/diagnostic gap,
-  two legacy-integration issues and two release-tooling weaknesses. Open corrections are recorded below.
+  two legacy-integration issues and two release-tooling weaknesses. The six corrections are recorded below.
 
 ## Architectural simplification — 17 November 2026
 
@@ -107,8 +123,11 @@ changes rather than a cumulative total. Further simplification remains open.
   containers while retaining valid sibling records.
 - [x] Select release notes by the requested numeric version and fail on missing or empty notes. Compare versions
   without collapsing dotted components. These tooling fixes do not change a charger session.
-- [ ] Complete Claude's scoped fix review, all four full 20-worker suites and deployment of this batch. Focused
-  regressions are development evidence; the currently deployed implementation remains `de2d74b` above.
+- [x] Complete Claude's scoped fix review and addendum, all four full 20-worker suites, and verified deployment
+  of the backend and thin HA client from `8f73bf9`. Focused regressions remain separate development evidence.
+- [ ] In the separate older Raedian integration, keep a successful planning-on profile aligned with a plan that
+  Home Assistant replaces concurrently while planning is off. The native app switching planning on during that
+  write can leave old windows active without an error. This pre-existing race does not affect the current iCS path.
 
 ## iCS implementation history — 15–17 November 2026
 
