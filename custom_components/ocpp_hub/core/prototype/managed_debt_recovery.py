@@ -42,7 +42,7 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "anchor": delivery_anchor(j, spec),
         "intent": j.get("managed_control_intent"),
         "control": j.get("control"),
-        "fault": j.get("managed_control_fault"),
+        "fault": j.fault.read(),
         "mutations": [dict(r) for r in j.db.execute("SELECT * FROM mutations WHERE state!='confirmed' ORDER BY token")],
         "marker": j.get("uncertain_vendor_command"),
         "grant": grant,
@@ -73,11 +73,11 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
 def require_common_debt_idle(j: Journal, kind: str) -> None:
     if (
         any(entry.get("completed") is None and not entry.get("superseded") for entry in j.get(KEY, {}).values())
-        or j.get("managed_control_fault", {}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
+        or j.fault.read({}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
         or kind not in ("observation", "stop-delivery", START_KIND, COMBINED_KIND)
         and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
-        or j.get("managed_current_change", {}).get("state") not in (None, "completed", "cancelled")
+        or not j.current_change.read().settled_or_missing
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
         or kind != "local-start"
         and j.get("control", {}).get("start_pending")
@@ -559,7 +559,7 @@ def reconcile_debt(
             j.db.execute("DELETE FROM outbox WHERE token=?", (head.token,))
         control = j.get("control")
         j.starts.operator_control(control)
-        j.put("managed_control_fault", fault)
+        j.fault.replace(fault)
         proof["resolved"] = resolved_debt(j, kind, proof)
         j.put(KEY, {**records, identifier: {"proof": proof, "completed": None}})
     return {"already_recorded": False, "zero_hold_retained": True, "charging_started": False}

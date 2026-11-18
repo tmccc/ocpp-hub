@@ -104,7 +104,7 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
 # Call inside the existing Pause acceptance transaction after its new paused revision has been recorded.
 def record_release_pause(c: ManagedController, identifier: str) -> None:
     j = c.session.journal
-    fault = j.get("managed_control_fault", {})
+    fault = j.fault.read({})
     evidence = release_evidence(c, fault)
     if evidence is None:
         return
@@ -126,7 +126,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     s, j, g = c.session, c.session.journal, c.session.gateway
     if c.native.repair_audits is not None:
         c.native.repair_audits.flush()
-    fault = j.get("managed_control_fault", {})
+    fault = j.fault.read({})
     ack = j.get(ACK, {})
     intent = c.requests.intent()
     if (
@@ -169,7 +169,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or repair_revoked(j, fault)
             or c.requests.intent() != intent
             or j.get(ACK) != ack
-            or j.get("managed_control_fault") != fault
+            or j.fault.read() != fault
             or not recoverable_fault(c, fault)
             or not acknowledged_evidence(c, fault, ack)
             or g._charger_epoch != epoch
@@ -199,7 +199,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or g.controls._operations
             or g.charger._pending
             or g.vendor._pending
-            or j.get("managed_current_change", {}).get("state") in ("pending", "recovering", "interrupted", "uncertain")
+            or j.current_change.read().unresolved
             and current is None
             and terminal_current is None
             or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
@@ -280,7 +280,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 "charging_started": False,
             },
         )
-        j.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
+        j.fault.clear()
         j.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
         if delivery is not None:
             complete_delivery_recovery(j, delivery, ack["pause_request"])
@@ -290,8 +290,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             complete_denied_start(j, denied, ack["pause_request"])
         if current is not None:
             control = {**control, "resume_limit": current["previous_a"]}
-            j.put(
-                "managed_current_change",
+            j.current_change.replace(
                 {
                     **current["change"],
                     "state": "cancelled",

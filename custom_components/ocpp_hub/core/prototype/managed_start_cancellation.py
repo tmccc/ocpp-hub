@@ -49,7 +49,7 @@ def initial_zero_recovery(owner: ManagedCharging, lease: ChargeLease) -> bool:
         and not c.stopping
         and not c.requests.return_in_progress()
         and j.phase.read().active
-        and not j.get("managed_control_fault")
+        and not j.fault.latched()
         and not j.get("uncertain_vendor_command")
         and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
     )

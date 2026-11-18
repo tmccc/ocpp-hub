@@ -19,7 +19,7 @@ INTERRUPTED = "managed_current_interrupted_fault"
 
 # Preserve a real accepted app update before startup replaces its receipt and pending-operation metadata.
 def capture_interrupted_collision(j: Journal, spec: NativeBoundedSpec) -> None:
-    fault, change = j.get("managed_control_fault", {}), j.get("managed_current_change", {})
+    fault, change = j.fault.read({}), j.current_change.read().value
     if (
         fault.get("classification") != FAULT
         or j.get(INTERRUPTED) is not None
@@ -57,7 +57,7 @@ def capture_interrupted_collision(j: Journal, spec: NativeBoundedSpec) -> None:
 # Startup may normalize an interrupted request but cannot turn a different operation into collision evidence.
 def interrupted_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
     j = c.session.journal
-    saved, change = j.get(INTERRUPTED, {}), j.get("managed_current_change", {})
+    saved, change = j.get(INTERRUPTED, {}), j.current_change.read().value
     original, request = saved.get("change", {}), saved.get("request", {})
     if (
         not saved
@@ -99,7 +99,7 @@ def legacy_current_evidence(c: ManagedController, fault: dict[str, Any]) -> dict
     if managed_current_ceiling(j, c.native.spec) == 32:
         if saved := interrupted_evidence(c, fault):
             return saved
-    change = j.get("managed_current_change", {})
+    change = j.current_change.read().value
     failure = current_failure(j, change)
     if (
         fault.get("classification") != FAULT

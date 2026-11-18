@@ -57,7 +57,7 @@ class RecoveryCoordinator:
     def obligations(self) -> RecoveryFacts:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         intent = c.requests.intent()
-        change, start = j.get("managed_current_change", {}), c.charging.state()
+        change, start = j.current_change.read().value, c.charging.state()
         pending_return = c.requests.pending_return()
         obligations = []
         if change.get("state") == "recovering":
@@ -154,7 +154,7 @@ class RecoveryCoordinator:
                 operation is None
                 or operation.published_authority != self.c.authority()
                 or self.c.stopping
-                or self.c.session.journal.get("managed_control_fault")
+                or self.c.session.journal.fault.latched()
             ):
                 # A newer owner event can run after the completion exits but before this waiter resumes.
                 return RestoreProgress(
@@ -206,7 +206,7 @@ class RecoveryCoordinator:
                 decision = c.ordinary.authority_decision(continuing_local)
                 if isinstance(decision, Pending):
                     return decision
-            current_recovery = j.get("managed_current_change", {}).get("state") == "recovering"
+            current_recovery = j.current_change.read().recovering
             if current_recovery:
                 decision = current_source_decision(g, continuing_local)
                 if isinstance(decision, Pending):
@@ -323,7 +323,7 @@ class RecoveryCoordinator:
             result,
             c.authority(),
             zero_ready=g.controls.ready and g.controls.desired() == 0,
-            faulted=bool(j.get("managed_control_fault")),
+            faulted=j.fault.latched(),
             publication_allowed=not isinstance(decision, Pending),
         )
         if disposition is ReleaseDisposition.WAIT and result.claimed:

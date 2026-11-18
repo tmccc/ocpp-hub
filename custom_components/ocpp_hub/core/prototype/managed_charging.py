@@ -226,7 +226,7 @@ class ManagedCharging:
             return "service_stopping"
         if not (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused"):
             return "intent_not_startable"
-        if facts.fault_latched():
+        if j.fault.latched():
             return "fault_latched"
         if not j.phase.read().active:
             return "installation_not_active"
@@ -337,7 +337,7 @@ class ManagedCharging:
             or not 6 <= g.policy.max_current_a <= 32
             or c.current.selected() != lease.current_a
             or c.current.pending()
-            or j.get("managed_control_fault")
+            or j.fault.latched()
             or not j.phase.read().active
             or self.state().get("id") != lease.identifier
             or self.state().get("state") not in ACTIVE
@@ -693,7 +693,7 @@ class ManagedCharging:
     # Each ordinary recovery owner validates its own delayed original-plan report under its existing zero.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
         c = self.controller
-        if self.journal.get("managed_current_change", {}).get("state") == "recovering":
+        if self.journal.current_change.read().recovering:
             return await c.current.prepare_native_report(payload)
         if c.ordinary.active():
             return await c.ordinary.prepare_native_report(payload)
@@ -753,7 +753,7 @@ class ManagedCharging:
             and self.matches_pending_start(tag)
             and self.journal.active() is None
             and not c.stopping
-            and not self.journal.get("managed_control_fault")
+            and not self.journal.fault.latched()
             and g.controls.ready
             and g.controls.desired() == 0
             and self.report_hold_authorized()
@@ -967,7 +967,7 @@ class ManagedCharging:
             and control.get("owner") in ("local", "shared")
             and control.get("inhibit") is False
             and j.phase.read().active
-            and not j.get("managed_control_fault")
+            and not j.fault.latched()
             and not c.stopping
         )
 

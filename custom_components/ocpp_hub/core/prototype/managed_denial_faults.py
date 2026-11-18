@@ -92,7 +92,7 @@ def denial_source_fault(j: Journal, fault: dict[str, Any]) -> dict[str, Any] | N
 
 # Repeated failure supersedes permission to retry while retaining the original association of unresolved denials.
 def retained_denial_fault(j: Journal, proof: dict[str, Any]) -> dict[str, Any] | None:
-    current = j.get("managed_control_fault", {})
+    current = j.fault.read({})
     entry = j.get(PROOFS, {}).get(fingerprint(proof.get("attestation")))
     if (
         not entry
@@ -103,6 +103,7 @@ def retained_denial_fault(j: Journal, proof: dict[str, Any]) -> dict[str, Any] |
         or not proof_headers_match(proof, fingerprint(proof.get("attestation")))
     ):
         return None
+    source: dict[str, Any] | None
     if (
         proof["kind"] == COMBINED
         and current.get("classification") == GENERIC

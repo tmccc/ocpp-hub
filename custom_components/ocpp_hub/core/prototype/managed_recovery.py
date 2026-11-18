@@ -22,10 +22,10 @@ def local_recovery_binding(gateway: Gateway, spec_digest: str) -> str:
         or intent.get("mode") != "paused"
         or type(intent.get("revision")) is not int
         or not 0 <= intent["revision"] < 2**53
-        or journal.get("managed_control_fault")
+        or journal.fault.latched()
         or journal.get("trial_preservation_fault")
         or journal.get("trial_inventory_fault")
-        or journal.get("managed_current_change", {}).get("state") in ("pending", "uncertain", "interrupted")
+        or journal.current_change.read().state in ("pending", "uncertain", "interrupted")
         or journal.get("managed_test_charge", {}).get("state")
         in ("armed", "starting", "awaiting_power", "charging", "running", "stopping")
         or journal.db.execute(
@@ -44,7 +44,7 @@ def local_recovery_binding(gateway: Gateway, spec_digest: str) -> str:
             "intent": intent,
             "mode": journal.get("managed_mode"),
             "current_capability": journal.get("managed_current_capability"),
-            "current_change": journal.get("managed_current_change"),
+            "current_change": journal.current_change.stored(),
             "test": journal.get("managed_test_charge"),
             "temporary_schedule": {},
         }

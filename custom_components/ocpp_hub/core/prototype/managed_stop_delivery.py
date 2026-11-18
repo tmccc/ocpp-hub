@@ -81,7 +81,7 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
                 entry.get("completed") is None
                 and not entry.get("superseded")
                 and proof["kind"] in (*KINDS, "start-delivery", COMBINED_KIND)
-                and j.get("managed_control_fault") == proof["installed_fault"]
+                and j.fault.read() == proof["installed_fault"]
                 and (
                     proof["attestation"]["delivery_token"] == item.token
                     or combined_stop_matches(proof, identity)
@@ -100,8 +100,7 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
                     **entry,
                     "superseded": {"reply_digest": rejection["reply_digest"], "at_epoch": time.time()},
                 }
-                j.put(
-                    "managed_control_fault",
+                j.fault.replace(
                     retained_fault
                     or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
                 )
@@ -121,7 +120,7 @@ def approved_stop_metadata(j: Journal, item: Delivery, response: dict[str, Any])
             entry.get("completed") is not None
             or entry.get("superseded")
             or proof["kind"] not in KINDS
-            or j.get("managed_control_fault") != proof["installed_fault"]
+            or j.fault.read() != proof["installed_fault"]
         ):
             continue
         evidence = proof["attestation"]
@@ -183,7 +182,7 @@ def record_stop_ack(j: Journal, item: Delivery, response: dict[str, Any]) -> Non
             entry.get("completed") is not None
             or entry.get("superseded")
             or proof["kind"] not in KINDS
-            or j.get("managed_control_fault") != proof["installed_fault"]
+            or j.fault.read() != proof["installed_fault"]
             or not all(proof["attestation"].get(name) == value for name, value in identity.items())
         ):
             continue
@@ -196,7 +195,7 @@ def record_stop_ack(j: Journal, item: Delivery, response: dict[str, Any]) -> Non
     if changed:
         j.put(PROOFS, records)
     else:
-        fault = j.get("managed_control_fault", {})
+        fault = j.fault.read({})
         prior = j.get(WIRE_ACK, {})
         if fault.get("classification") == "owner_control_or_delivery_uncertain" and prior.get("fault") != fault:
             j.put(

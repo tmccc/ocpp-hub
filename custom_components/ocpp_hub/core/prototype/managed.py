@@ -49,6 +49,7 @@ from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Pr
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
+from .start_settlement import RetirementCandidate
 from .store import RecoveryRequiredError, encoded, fingerprint
 from .supervision import ControlFacts, HealthVerdict, Observation, PollStatus, assess
 from .trial_evidence import Resource, profile_projection
@@ -138,7 +139,7 @@ class ManagedController:
             raise RecoveryRequiredError("return awaits timed test settlement")
         if action == "app_control" and self.current.pending():
             raise RecoveryRequiredError("return awaits the current-setting outcome")
-        if action == "app_control" and self.session.journal.get("managed_control_fault"):
+        if action == "app_control" and self.session.journal.fault.latched():
             raise RecoveryRequiredError("a latched fault requires independent operator reconciliation")
         if action == "app_control" and self.requests.intent().mode != "paused":
             raise RecoveryRequiredError("return requires a current paused intent")
@@ -198,7 +199,7 @@ class ManagedController:
         def current() -> bool:
             return (
                 not self.stopping
-                and not j.get("managed_control_fault")
+                and not j.fault.latched()
                 and self.charging.lease is None
                 and not g.controls._operations
                 and not g.charger._pending
@@ -408,7 +409,7 @@ class ManagedController:
                         complete_record(self, record)
                     if internal:
                         g.controls._complete(j.get("control")["ticket"], uncertain=False)
-                if any(record.key == "managed_test_charge" for record in records):
+                if any(isinstance(record, RetirementCandidate) for record in records):
                     j.starts.set_lease(None)
                     self.charging.changed.set()
         if self.current.failed_idle_hold():
@@ -475,7 +476,7 @@ class ManagedController:
     # Reuse only the existing owned zero profile; a fault never creates Stop, cleanup or positive authority.
     async def hold_fault(self) -> None:
         g, j = self.session.gateway, self.session.journal
-        fault, control = j.get("managed_control_fault"), j.get("control", {})
+        fault, control = j.fault.read(), j.get("control", {})
         epoch, boot, revision = g._charger_epoch, g.boot_observation, g.controls._revision
         binding, handover = j.get("trial_binding", {}), j.get("native_bounded_handover", {})
         station = j.db.execute(
@@ -502,7 +503,7 @@ class ManagedController:
             if (
                 self.stopping
                 or not fault
-                or j.get("managed_control_fault") != fault
+                or j.fault.read() != fault
                 or j.get("control", {}) != control
                 or not ControlState(control).explicit_local_hold
                 or g.controls.desired() != 0
@@ -544,7 +545,7 @@ class ManagedController:
     # Choose the domain's current source proof once, identically at preflight and the final native send gate.
     def continuation_decision(self, native: HandoverEvidence, local: int) -> GateDecision:
         j = self.session.journal
-        if j.get("managed_current_change", {}).get("state") == "recovering":
+        if j.current_change.read().recovering:
             return current_session_decision(self.session.gateway, native, local)
         elif self.ordinary.active():
             return self.ordinary.session_decision(native, local)
@@ -624,7 +625,7 @@ class ManagedController:
             return "installation is not operating"
         if j.get("native_bounded_handover", {}).get("stage") != "admitted":
             return "native handover is not admitted"
-        if facts.fault_latched():
+        if j.fault.latched():
             return "managed fault is latched"
         if not facts.boot_current():
             return "current Boot is unconfirmed"
@@ -793,7 +794,7 @@ class ManagedController:
             except UnavailableError:
                 pass  # Retain the proved strict refusal while its atomic diagnostic latch awaits storage.
             return PollStatus("attention", classification)
-        if j.get("managed_control_fault"):
+        if j.fault.latched():
             await self.hold_fault()
             if (
                 self.requests.pending_pause()
@@ -807,9 +808,9 @@ class ManagedController:
                 await reconcile_owner_release(self)
             except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
                 pass  # The exact fault remains latched until a new Pause and every independent zero proof agree.
-            if not j.get("managed_control_fault"):
+            if not j.fault.latched():
                 return PollStatus("reconciling")
-            return PollStatus("attention", j.get("managed_control_fault")["classification"])
+            return PollStatus("attention", j.fault.classification())
         return None
 
     # Native observation, recovery and diagnostic escalation retain their original await and effect order.
@@ -819,7 +820,7 @@ class ManagedController:
             return PollStatus("starting")
         if self.requests.intent().mode == "paused" and (self.pause_task is None or self.pause_task.done()):
             await self.ensure_pause_zero()
-        current_hold = j.get("managed_current_change", {}).get("state") == "recovering"
+        current_hold = j.current_change.read().recovering
         if (
             not g.controls.ready
             and (self.released_epoch != g._charger_epoch)
@@ -920,7 +921,7 @@ class ManagedController:
             self.current.applying()
             and not s.runtime.status.delivery_blocked
             and not j.get("uncertain_vendor_command")
-            and not j.get("managed_control_fault")
+            and not j.fault.latched()
             and not j.get("trial_preservation_fault")
             and not j.get("trial_inventory_fault")
             and not control.get("start_pending")
@@ -941,7 +942,7 @@ class ManagedController:
             facts = replace(facts, vendor_uncertain=bool(j.get("uncertain_vendor_command")))
         if facts.requires_fault and not self.stopping:
             self.fault("owner_control_or_delivery_uncertain")
-        faulted = facts.has_authority and bool(j.get("managed_control_fault"))
+        faulted = facts.has_authority and j.fault.latched()
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )

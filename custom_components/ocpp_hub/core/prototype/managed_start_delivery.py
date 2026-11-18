@@ -31,12 +31,10 @@ KIND = "start-delivery"
 def latch_start_delivery_fault(j: Journal) -> None:
     if not j.db.in_transaction:
         raise RecoveryRequiredError("Start delivery fault must share its quarantine transaction")
-    if j.get("managed_mode") is not None and not j.get("managed_control_fault"):
+    if j.get("managed_mode") is not None and not j.fault.latched():
         control = j.get("control", {})
         j.control.hold(control)
-        j.put(
-            "managed_control_fault", {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()}
-        )
+        j.fault.replace({"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()})
 
 
 # An interrupted approved retry needs new exact evidence; its old retry permission cannot block all later tooling.
@@ -56,7 +54,7 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
             and entry.get("completed") is None
             and not entry.get("superseded")
             and proof.get("start_wire_ack") is None
-            and j.get("managed_control_fault") == proof["installed_fault"]
+            and j.fault.read() == proof["installed_fault"]
             and evidence["delivery_token"] == item.token
             and evidence["local_transaction_id"] == item.transaction
             and evidence["payload_digest"] == fingerprint(item.payload)
@@ -69,8 +67,7 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
             changed = True
     if changed:
         j.put(PROOFS, records)
-        j.put(
-            "managed_control_fault",
+        j.fault.replace(
             retained_fault or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
         )
 
@@ -140,7 +137,7 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
                     proof["kind"] == KIND
                     and entry.get("completed") is None
                     and not entry.get("superseded")
-                    and j.get("managed_control_fault") == proof["installed_fault"]
+                    and j.fault.read() == proof["installed_fault"]
                     and proof["attestation"]["delivery_token"] == item.token
                 ):
                     retained_fault = retained_denial_fault(j, proof) or retained_fault
@@ -148,8 +145,7 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
                     changed = True
             if changed:
                 j.put(PROOFS, proofs)
-                j.put(
-                    "managed_control_fault",
+                j.fault.replace(
                     retained_fault
                     or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
                 )
@@ -162,15 +158,14 @@ def record_start_denial(j: Journal, item: Delivery, response: dict[str, Any]) ->
     if not j.db.in_transaction:
         raise RecoveryRequiredError("Start denial must share its mapping transaction")
     records = j.get(DENIALS, {})
-    fault = j.get("managed_control_fault")
-    created_fault = fault is None
-    if created_fault:
+    fault = j.fault.read()
+    if fault is None:
         fault = {
             "classification": "owner_control_or_delivery_uncertain",
             "at_epoch": time.time(),
             "denied_start": item.token,
         }
-        j.put("managed_control_fault", fault)
+        j.fault.replace(fault)
     j.put(
         DENIALS,
         {
@@ -299,7 +294,7 @@ def record_start_wire_ack(j: Journal, item: Delivery, response: dict[str, Any]) 
             proof["kind"] != KIND
             or entry.get("completed") is not None
             or entry.get("superseded")
-            or j.get("managed_control_fault") != proof["installed_fault"]
+            or j.fault.read() != proof["installed_fault"]
             or proof["attestation"]["local_transaction_id"] != item.transaction
         ):
             continue

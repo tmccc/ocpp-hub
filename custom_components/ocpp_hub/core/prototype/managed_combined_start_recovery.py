@@ -130,7 +130,7 @@ def record_combined_stop_ack(j: Journal, item: Delivery, response: dict[str, Any
             proof["kind"] != KIND
             or entry.get("completed") is not None
             or entry.get("superseded")
-            or j.get("managed_control_fault") != proof["installed_fault"]
+            or j.fault.read() != proof["installed_fault"]
             or not combined_stop_matches(proof, identity)
         ):
             continue

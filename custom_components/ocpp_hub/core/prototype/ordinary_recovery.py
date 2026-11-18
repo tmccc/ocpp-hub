@@ -70,13 +70,13 @@ class OrdinaryRecovery:
         c, j = self.c, self.c.session.journal
         return (
             not c.stopping
-            and (not j.get("managed_control_fault"))
+            and (not j.fault.read())
             and (j.phase.read().operating)
             and (c.requests.intent().mode == "app")
             and (not c.current.pending())
             and (c.charging.lease is None)
             and (c.charging.state().get("state") in (None, "completed") or self.verified_normal())
-            and (j.get("managed_current_change", {}).get("state") not in ("interrupted", "uncertain"))
+            and (j.current_change.read().state not in ("interrupted", "uncertain"))
         )
 
     # A newer explicit Pause or control revision immediately invalidates the saved positive recovery authority.

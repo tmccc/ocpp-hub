@@ -64,7 +64,7 @@ def protocol_snapshot(c: ManagedController) -> dict[str, Any]:
 # Exact current and verified ancestor markers matter; unrelated old audit rows cannot explain today's fault.
 def fault_summary(c: ManagedController) -> tuple[dict[str, Any] | None, list[str], str]:
     journal = c.session.journal
-    fault = journal.get("managed_control_fault")
+    fault = journal.fault.read()
     if not fault:
         return None, [], "not_assessed"
     sources = repair_sources(journal, fault)

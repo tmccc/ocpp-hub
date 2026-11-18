@@ -103,7 +103,7 @@ class NativeRepairAudits:
     # A durable fence precedes the audit; a failed BEGIN or COMMIT therefore prevents the read entirely.
     def begin(self, authority: str, sequence: int, epoch: int, boot: str | None, revision: int) -> RepairAttempt | None:
         self.flush()
-        fault = self.journal.get("managed_control_fault", {})
+        fault = self.journal.fault.read({})
         if not fault or not self.eligible(fault):
             return None
         if audit_pending(self.journal, fault):
@@ -120,7 +120,7 @@ class NativeRepairAudits:
             revision,
         )
         with self.journal.atomic():
-            if self.journal.get("managed_control_fault") != fault or audit_pending(self.journal, fault):
+            if self.journal.fault.read() != fault or audit_pending(self.journal, fault):
                 raise RecoveryRequiredError("native repair fault changed before its independent audit")
             self.journal.put(AUDITS, {**self.journal.get(AUDITS, {}), fingerprint(fault): attempt.value()})
         self.active = attempt
@@ -160,7 +160,7 @@ class NativeRepairAudits:
                     },
                 )
                 acknowledgement = journal.get(ACK)
-                if journal.get("managed_control_fault") == fault and (
+                if journal.fault.read() == fault and (
                     isinstance(acknowledgement, dict) and acknowledgement.get("fault") == fault
                 ):
                     journal.db.execute("DELETE FROM meta WHERE key=?", (ACK,))

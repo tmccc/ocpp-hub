@@ -214,9 +214,7 @@ class TrialSession:
     async def _before_ceiling(self) -> None:
         if self._introduction_refusal is not None:
             self._persist_introduction_refusal()
-        if self._introduction_refused_epoch == self.gateway._charger_epoch and self.journal.get(
-            "managed_control_fault"
-        ):
+        if self._introduction_refused_epoch == self.gateway._charger_epoch and self.journal.fault.latched():
             raise UnavailableError("native bounded introduction remains terminally refused for this connection")
         try:
             if self.connected_cleanup_only:

@@ -256,7 +256,7 @@ class NativeBoundedHandover:
                 raise AuditSupersededError("native availability result was superseded") from error
             if as_result:
                 return Pending(Prerequisite.NATIVE, "recovery awaits fresh complete native evidence", error)
-            if self.gateway.journal.get("managed_current_change", {}).get("state") == "recovering":
+            if self.gateway.journal.current_change.read().recovering:
                 raise UnavailableError("current selection hold awaits fresh native evidence") from error
             ordinary = self.gateway.journal.get("managed_ordinary_recovery", {})
             intent = self.gateway.journal.get("managed_control_intent", {})
@@ -476,7 +476,7 @@ class NativeBoundedHandover:
                 # This prefix owns only metadata and restrictive zero; later Stop-capable work is not replayed.
                 raise IntroductionDeferredError("introduction awaits required journal storage") from error
             if binding is not None and native.physical.transaction_open:
-                if journal.get("managed_current_change", {}).get("state") == "recovering":
+                if journal.current_change.read().recovering:
                     pass  # This operation owns only zero; fresh supervision must identify the independent session.
                 elif (
                     journal.get("managed_mode")
@@ -517,7 +517,7 @@ class NativeBoundedHandover:
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
             or j.get("trial_binding") != binding
             or j.get("managed_control_intent", {}).get("mode") != "paused"
-            or j.get("managed_control_fault")
+            or j.fault.latched()
             or not g.current_boot_seen(epoch)
             or fingerprint(j.get("boot")) != self.spec.boot_digest
             or g.charger.sender is None
@@ -558,7 +558,7 @@ class NativeBoundedHandover:
             j = self.gateway.journal
             control = j.get("control", {})
             if (
-                j.get("managed_current_change", {}).get("state") == "recovering"
+                j.current_change.read().recovering
                 and recorded_station_profile(j, self.spec.digest, self.spec.boot_digest)
                 and control.get("inhibit")
             ):
@@ -699,7 +699,7 @@ class NativeBoundedHandover:
         zero = action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0
         if zero:
             return None  # Existing ledger guards still forbid recreating a station profile after verified absence.
-        selecting = self.gateway.journal.get("managed_current_change", {}).get("state") == "pending"
+        selecting = self.gateway.journal.current_change.read().selecting
         # Managed release uses the common typed prerequisite path, irrespective of its source or call location.
         if self.book.before_positive_release is not None:
             observed = await self.read_result(
@@ -713,7 +713,7 @@ class NativeBoundedHandover:
                 closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
             )
         self.require_selected(native)
-        change = self.gateway.journal.get("managed_current_change", {})
+        change = self.gateway.journal.current_change.read().value
         if action == "SetChargingProfile" and change.get("state") == "recovering":
             local = self.gateway.journal.active()
             if local is not None:

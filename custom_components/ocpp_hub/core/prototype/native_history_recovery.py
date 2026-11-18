@@ -73,7 +73,7 @@ def acknowledge_start_attempts(
 def _reconcile(
     journal: Journal, book: ResourceBook, spec: NativeBoundedSpec, native: HandoverEvidence, *, attempts: bool
 ) -> dict[str, Any]:
-    fault, failure = journal.get("managed_control_fault", {}), journal.get("managed_native_failure", {})
+    fault, failure = journal.fault.read({}), journal.get("managed_native_failure", {})
     policy = history_policy(journal, spec.digest)
     detail = (
         "complete connected-handover native evidence is required"
@@ -138,7 +138,7 @@ def _reconcile(
                 or journal.get("native_start_attempt_recovery") is not None
                 or journal.get("vendor_start_grant")
                 or journal.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
-                or journal.get("managed_current_change", {}).get("state") not in (None, "completed")
+                or journal.current_change.read().state not in (None, "completed")
                 or journal.get("managed_test_charge", {}).get("state") not in (None, "completed")
                 or not isinstance(intent, dict)
                 or set(intent) != {"mode", "revision"}
@@ -195,7 +195,7 @@ def _reconcile(
                     "charging_started": False,
                 },
             )
-        journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
+        journal.fault.clear()
         journal.phase.recover()
         journal.control.hold(control)
     return {**summary, "fault_cleared": True, "charging_started": False}

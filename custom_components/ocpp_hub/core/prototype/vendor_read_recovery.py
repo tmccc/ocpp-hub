@@ -26,11 +26,11 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
             return False
         control = journal.get("control", {})
         intent = journal.get("managed_control_intent", {})
-        fault = journal.get("managed_control_fault")
+        fault = journal.fault.read()
         mode = journal.get("managed_mode", {})
         local_start = journal.get("local_start_receipt", {})
         charge = journal.get("managed_test_charge", {})
-        current = journal.get("managed_current_change", {})
+        current = journal.current_change.read().value
         if (
             not all(isinstance(value, dict) for value in (control, intent, mode, local_start, charge, current))
             or mode.get("mode") != "app_schedule"
@@ -76,7 +76,7 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
         journal.put("vendor_read_failure_recovery", migration)
         journal.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
         if fault is not None and fault.get("classification") == "owner_control_or_delivery_uncertain":
-            journal.db.execute("DELETE FROM meta WHERE key='managed_control_fault'")
+            journal.fault.clear()
         write_intent(journal, ControlIntent(intent["mode"], intent["revision"]), "paused", coalesce=True)
         journal.phase.restrict(control)
         return True

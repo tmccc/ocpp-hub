@@ -48,12 +48,12 @@ async def prepare_current_capability(
             or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
             or journal.get("managed_control_intent", {}).get("mode") != "paused"
             or not journal.phase.read().operating
-            or journal.get("managed_control_fault")
+            or journal.fault.latched()
             or not control.get("inhibit")
             or control.get("owner") != "local"
             or control.get("start_pending")
             or control.get("uncertain")
-            or journal.get("managed_current_change", {}).get("state") in ("pending", "uncertain", "interrupted")
+            or journal.current_change.read().state in ("pending", "uncertain", "interrupted")
             or journal.get("managed_test_charge", {}).get("state")
             in ("armed", "starting", "awaiting_power", "charging", "running", "stopping")
             or journal.db.execute(

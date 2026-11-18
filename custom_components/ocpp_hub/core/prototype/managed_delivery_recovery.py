@@ -138,7 +138,7 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
             "SELECT 1 FROM managed_requests WHERE action!='pause' "
             "AND state IN ('accepted','running','uncertain') LIMIT 1"
         ).fetchone()
-        or j.get("managed_current_change", {}).get("state") not in (None, "completed", "cancelled")
+        or not j.current_change.read().settled_or_missing
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
         or j.get("managed_test_charge", {}).get("state") not in (None, "completed")
         and not closed_normal_delivery(j)
@@ -156,7 +156,7 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
 # Inspection reveals opaque journal correlation/digests, never credentials, raw tags or private native bodies.
 def delivery_candidate(j: Journal, book: ResourceBook, spec: NativeBoundedSpec, n: HandoverEvidence) -> dict[str, Any]:
     require_delivery_zero(j, book, spec, n)
-    fault, head = j.get("managed_control_fault", {}), j.next_delivery()
+    fault, head = j.fault.read({}), j.next_delivery()
     if (
         fault.get("classification") != FAULT
         or head is None
@@ -221,7 +221,7 @@ def reconcile_delivery_start(
     stop = j.db.execute(
         "SELECT token FROM outbox WHERE local=? AND action='StopTransaction'", (evidence.local,)
     ).fetchone()
-    anchor, fault = delivery_anchor(j, spec), j.get("managed_control_fault")
+    anchor, fault = delivery_anchor(j, spec), j.fault.read()
     normal = j.get("managed_test_charge") if closed_normal_delivery(j) else None
     proof = {
         "version": 1,
@@ -241,7 +241,7 @@ def reconcile_delivery_start(
 
     # This callback runs inside acknowledge's transaction after mapping and Start removal, with no await.
     def recorded() -> None:
-        if delivery_anchor(j, spec) != anchor or j.get("managed_control_fault") != fault or j.get(KEY, {}) != records:
+        if delivery_anchor(j, spec) != anchor or j.fault.read() != fault or j.get(KEY, {}) != records:
             raise RecoveryRequiredError("delivery reconciliation authority changed")
         if not matching_delivery_row(j, proof):
             raise RecoveryRequiredError("delivery reconciliation lifecycle changed")

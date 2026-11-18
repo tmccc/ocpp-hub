@@ -72,6 +72,7 @@ class Journal:
                 raise RecoveryRequiredError("journal already has an active owner") from None
             from .control_state import ControlAuthority
             from .installation_lifecycle import InstallationLifecycle
+            from .managed_records import CurrentChangeJournal, ManagedFaultJournal
             from .retired_schedules import schedule_history
             from .start_lifecycle import StartLifecycle
 
@@ -85,6 +86,8 @@ class Journal:
             self.control = ControlAuthority(self)
             self.phase = InstallationLifecycle(self)
             self.starts = StartLifecycle(self)
+            self.current_change = CurrentChangeJournal(self)
+            self.fault = ManagedFaultJournal(self)
             self._initialize(path, identity)
             cleanup.pop_all()
 

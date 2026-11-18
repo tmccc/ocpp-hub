@@ -41,7 +41,3 @@ class ManagedFacts:
         return not self.session.journal.db.execute(
             "SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1"
         ).fetchone()
-
-    # A stored fault stays active until its recovery owner clears it.
-    def fault_latched(self) -> bool:
-        return bool(self.session.journal.get("managed_control_fault"))

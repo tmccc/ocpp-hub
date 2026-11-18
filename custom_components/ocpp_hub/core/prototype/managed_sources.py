@@ -17,7 +17,7 @@ def recorded_station_profile(j: Journal, spec_digest: str, boot_digest: str) -> 
         and j.get("native_bounded_handover", {}).get("stage") == "admitted"
         and row is not None
         and row["state"] != "absent_verified"
-        and not j.get("managed_control_fault")
+        and not j.fault.latched()
         and not j.get("trial_inventory_fault")
         and not j.get("trial_preservation_fault")
     )
