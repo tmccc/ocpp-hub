@@ -67,6 +67,11 @@ def emitted_states():
         for node in ast.walk(producer_tree(CORE / "supervision.py"))
         if isinstance(node, ast.FunctionDef) and node.name == "assess"
     )
+    methods.extend(
+        node
+        for node in producer_tree(CORE / "managed_view.py").body
+        if isinstance(node, ast.FunctionDef) and node.name in ("publish_poll", "refresh_for_read")
+    )
     methods.append(producer_tree(ROOT / "tools/managed_proxy.py"))
     values = set()
     for method in methods:
@@ -214,8 +219,8 @@ def client_projection():
 # Why: outage history must not disappear at the producer/consumer vocabulary boundary.
 @pytest.mark.parametrize("state", emitted_states())
 def test_cloud_wait_timeline_survives_both_projections(tmp_path, state):
-    value = Reporting(tmp_path).update({"state": state, "checked_at": 10000, "diagnostics": {"available": True}})
-    row = value["diagnostics"]["timeline"][0]
+    details = Reporting(tmp_path).observe({"state": state, "checked_at": 10000, "diagnostics": {"available": True}})
+    row = details.timeline[0]
     assert row["state"] == state
     assert client_projection().transition(row)["state"] == state
 
@@ -224,7 +229,7 @@ def test_cloud_wait_timeline_survives_both_projections(tmp_path, state):
 # Why: checking a handwritten allowlist cannot notice a new producer value dropped by both consumers.
 @pytest.mark.parametrize("phase", emitted_phases())
 def test_emitted_phase_survives_both_projections(tmp_path, phase):
-    value = Reporting(tmp_path).update(
+    details = Reporting(tmp_path).observe(
         {
             "state": "stopping",
             "phase": phase,
@@ -232,7 +237,7 @@ def test_emitted_phase_survives_both_projections(tmp_path, phase):
             "diagnostics": {"available": True},
         }
     )
-    row = value["diagnostics"]["timeline"][0]
+    row = details.timeline[0]
     assert row["phase"] == phase and client_projection().transition(row)["phase"] == phase
 
 

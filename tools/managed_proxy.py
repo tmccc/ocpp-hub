@@ -22,8 +22,7 @@ from tools.trial_proxy import load_core  # noqa: E402
 load_core()
 from ocpp_hub_core.prototype.managed import ManagedController  # noqa: E402
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings  # noqa: E402
-from ocpp_hub_core.prototype.managed_diagnostics import snapshot as diagnostic_snapshot  # noqa: E402
-from ocpp_hub_core.prototype.managed_view import health_snapshot  # noqa: E402
+from ocpp_hub_core.prototype.managed_view import health_snapshot, publish_poll  # noqa: E402
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
@@ -140,14 +139,11 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
         notify("READY=1\nSTATUS=Waiting for verified charger and owner control")
         while not stopped.is_set():
             status = await controller.tick()
-            remaining = expires - time.time()
-            status.update(pid=os.getpid(), started_at=started, certificate_remaining_seconds=remaining, running=True)
-            if remaining <= 1800:
-                status.update(state="degraded", fault="listener_certificate_expiring")
-            status["diagnostics"] = diagnostic_snapshot(controller, status)
-            published = reporting.update(status)
+            published = publish_poll(
+                controller, status, pid=os.getpid(), started=started, expires=expires, observe=reporting.observe
+            )
             if reporting.write(published, status_path, events_path, save_private, event):
-                notify("STATUS=App/schedule control: " + str(status.get("state")))
+                notify("STATUS=App/schedule control: " + str(published.get("state")))
             try:
                 await asyncio.wait_for(stopped.wait(), 5)
             except TimeoutError:

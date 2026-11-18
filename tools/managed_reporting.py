@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ocpp_hub_core.prototype.managed_diagnostics import FAULTS
+from ocpp_hub_core.prototype.managed_view import ReportDetails
 from ocpp_hub_core.prototype.security import SecurityError
 
 
@@ -40,7 +41,7 @@ class Reporting:
         self.output_errors = 0
 
     # Ages and ordinary protocol counters do not create a repeated transition every five-second poll.
-    def update(self, status: dict[str, Any]) -> dict[str, Any]:
+    def observe(self, status: dict[str, Any]) -> ReportDetails:
         diagnostic = status["diagnostics"]
         state, fault, phase = status.get("state"), status.get("fault"), status.get("phase")
         transition = {
@@ -94,16 +95,7 @@ class Reporting:
         if signature != self.previous:
             self.timeline.append({"at_epoch": status.get("checked_at"), **transition})
             self.previous = signature
-        return {
-            **status,
-            "software": dict(self.software),
-            "diagnostics": {
-                **diagnostic,
-                "timeline": list(self.timeline),
-                "timeline_scope": "current_process",
-                "reporting_errors": self.output_errors,
-            },
-        }
+        return ReportDetails(dict(self.software), list(self.timeline), self.output_errors)
 
     # A failed optional file/stdout write cannot escape into required supervision or settle a command as successful.
     def write(

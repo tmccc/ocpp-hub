@@ -20,7 +20,7 @@ from websockets.http11 import Request, Response
 
 from .ics import unique_object
 from .managed import ManagedController
-from .managed_view import health_snapshot, session_history
+from .managed_view import refresh_for_read, session_history
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import TRANSPORT_LOG, SecurityError
@@ -134,56 +134,12 @@ class ManagementServer:
             elif command == "history":
                 result = {"sessions": session_history(self.controller.session.journal)}
             elif command == "status":
-                result = dict(self.status())
-                intent = self.controller.requests.intent()
-                if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
-                    pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
-                    result.update(
-                        state="pausing" if intent.mode == "paused" and not pending else "reconciling",
-                        local_hold_verified=False,
-                        owner_control_enabled=False,
-                    )
-                result.update(desired_control=intent.mode, control_revision=intent.revision)
-                result["api_version"] = 1
-                result = health_snapshot(result)
-                result["can_pause"] = not self.controller.stopping
-                result["can_start_test"] = result["healthy"] and self.controller.charging.available(
-                    self.controller.latest_native
-                )
-                result["can_start"] = result["local_healthy"] and self.controller.charging.available(
-                    self.controller.latest_native, normal=True
-                )
-                result["requested_current_a"] = self.controller.current.selected()
-                result["start_authorization"] = self.controller.charging.authorization_status()
-                result["can_set_current"] = result["local_healthy"] and self.controller.current.available(
-                    self.controller.latest_native
-                )
-                result["can_return"] = self._return_refusal(intent.mode, result) is None
-                result["sessions"] = session_history(self.controller.session.journal)
+                result = refresh_for_read(self.controller, self.status())
             else:
                 raise SecurityError("management read is not supported")
         except sqlite3.Error:
             raise UnavailableError("management journal read is temporarily unavailable") from None
         return {"id": identifier, "ok": True, "result": result}
-
-    # This status hint uses published evidence. Return execution rechecks its own authority and fresh zero.
-    def _return_refusal(self, mode: str, status: dict[str, Any]) -> str | None:
-        c = self.controller
-        if mode != "paused":
-            return "pause_not_requested"
-        if not status["healthy"]:
-            return "service_unhealthy"
-        if status.get("local_hold_verified") is not True:
-            return "local_hold_unverified"
-        if c.requests.return_in_progress():
-            return "return_pending"
-        if c.current.pending():
-            return "current_update_pending"
-        if c.charging.return_blocked():
-            return "managed_start_active"
-        if not c.requests.has_capacity():
-            return "request_capacity_exhausted"
-        return None
 
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:

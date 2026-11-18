@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .store import Journal
 from .supervision import HealthVerdict, PollStatus
 
@@ -267,3 +269,88 @@ def observed_status(
         "charger_history_complete": history.complete,
         "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
     }
+
+
+@dataclass(frozen=True)
+class ReportDetails:
+    """Process-local software identity, transition history and optional output failures."""
+
+    software: dict[str, Any]
+    timeline: list[dict[str, Any]]
+    output_errors: int
+
+
+# Add the reporting fields in one place for the file and its cached socket projection.
+def with_reporting(status: dict[str, Any], details: ReportDetails) -> dict[str, Any]:
+    return {
+        **status,
+        "software": details.software,
+        "diagnostics": {
+            **status["diagnostics"],
+            "timeline": details.timeline,
+            "timeline_scope": "current_process",
+            "reporting_errors": details.output_errors,
+        },
+    }
+
+
+# Finish a poll with process metadata and optional evidence, then record the resulting transition.
+def publish_poll(
+    c: ManagedController,
+    poll: dict[str, Any],
+    *,
+    pid: int,
+    started: float,
+    expires: float,
+    observe: Callable[[dict[str, Any]], ReportDetails],
+) -> dict[str, Any]:
+    remaining = expires - time.time()
+    result = dict(poll, pid=pid, started_at=started, certificate_remaining_seconds=remaining, running=True)
+    if remaining <= 1800:
+        result.update(state="degraded", fault="listener_certificate_expiring")
+    result["diagnostics"] = diagnostic_snapshot(c, result)
+    return with_reporting(result, observe(result))
+
+
+# This status hint uses published evidence. Return execution rechecks its own authority and fresh zero.
+def _return_refusal(c: ManagedController, mode: str, status: dict[str, Any]) -> str | None:
+    if mode != "paused":
+        return "pause_not_requested"
+    if not status["healthy"]:
+        return "service_unhealthy"
+    if status.get("local_hold_verified") is not True:
+        return "local_hold_unverified"
+    if c.requests.return_in_progress():
+        return "return_pending"
+    if c.current.pending():
+        return "current_update_pending"
+    if c.charging.return_blocked():
+        return "managed_start_active"
+    if not c.requests.has_capacity():
+        return "request_capacity_exhausted"
+    return None
+
+
+# Apply newer intent and refresh live availability without promoting stale poll evidence to current authority.
+def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[str, Any]:
+    result = dict(published)
+    intent = c.requests.intent()
+    if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
+        pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
+        result.update(
+            state="pausing" if intent.mode == "paused" and not pending else "reconciling",
+            local_hold_verified=False,
+            owner_control_enabled=False,
+        )
+    result.update(desired_control=intent.mode, control_revision=intent.revision)
+    result["api_version"] = 1
+    result = health_snapshot(result)
+    result["can_pause"] = not c.stopping
+    result["can_start_test"] = result["healthy"] and c.charging.available(c.latest_native)
+    result["can_start"] = result["local_healthy"] and c.charging.available(c.latest_native, normal=True)
+    result["requested_current_a"] = c.current.selected()
+    result["start_authorization"] = c.charging.authorization_status()
+    result["can_set_current"] = result["local_healthy"] and c.current.available(c.latest_native)
+    result["can_return"] = _return_refusal(c, intent.mode, result) is None
+    result["sessions"] = session_history(c.session.journal)
+    return result

@@ -1,6 +1,5 @@
 """Diagnostic projections inspect real retained state without acquiring control or manufacturing confirmation."""
 
-import copy
 import json
 import sqlite3
 import uuid
@@ -8,7 +7,7 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed_diagnostics import snapshot
 from ocpp_hub_core.prototype.managed_native_repair import AUDITS, REVOCATIONS, NativeRepairAudits
-from ocpp_hub_core.prototype.managed_view import health_snapshot
+from ocpp_hub_core.prototype.managed_view import health_snapshot, with_reporting
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.store import fingerprint
 
@@ -182,14 +181,16 @@ def test_reporting_timeline_is_bounded_and_keeps_phase_changes(tmp_path):
         "checked_at": 10000,
         "diagnostics": {"available": True, "original_fault": original, "blockers": ["fault_latched"]},
     }
-    first = reporter.update(copy.deepcopy(status))
-    reporter.update(copy.deepcopy(status) | {"checked_at": 10005})
+    first = with_reporting(status, reporter.observe(status))
+    reporter.observe(status | {"checked_at": 10005})
     assert len(reporter.timeline) == 1
-    changed = reporter.update(copy.deepcopy(status) | {"phase": "recovering", "checked_at": 10010})
+    status = status | {"phase": "recovering", "checked_at": 10010}
+    changed = with_reporting(status, reporter.observe(status))
     assert [row["phase"] for row in changed["diagnostics"]["timeline"]] == ["blocked", "recovering"]
     assert first["diagnostics"]["timeline"][0]["phase"] == "blocked"
     for revision in range(30):
-        changed = reporter.update(copy.deepcopy(status) | {"control_revision": revision})
+        status = status | {"control_revision": revision}
+        changed = with_reporting(status, reporter.observe(status))
     assert len(changed["diagnostics"]["timeline"]) == 20
     assert changed["diagnostics"]["original_fault"] == original
     assert changed["diagnostics"]["timeline_scope"] == "current_process"
@@ -204,7 +205,8 @@ def test_reporting_io_failure_is_counted_without_escaping_and_can_recover(tmp_pa
     status_path, event_path = tmp_path / "status.json", tmp_path / "events.jsonl"
     blocked = status_path if sink == "status" else event_path
     blocked.mkdir()
-    value = reporter.update({"state": "healthy", "checked_at": 10000, "diagnostics": {"available": True}})
+    status = {"state": "healthy", "checked_at": 10000, "diagnostics": {"available": True}}
+    value = with_reporting(status, reporter.observe(status))
     reporter.write(value, status_path, event_path, managed_proxy.save_private, managed_proxy.event)
     assert value["diagnostics"]["reporting_errors"] == 1
     blocked.rmdir()
