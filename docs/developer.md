@@ -159,6 +159,16 @@ for a later send; exact native/Boot/ticket checks remain at the actual effect an
 
 `ManagedCharging` and `ChargeLease` in `managed_charging.py` own normal charging and bounded local/cloud tests.
 The historical `managed_test_charge` journal key and public test command/status names remain unchanged.
+Normal Start may ask the registered cloud to renew a configured tag whose stored Accepted reply has aged out.
+`_renew_start_tag()` pins the lease, controller authority and exact stored authorization through the matched reply;
+the gateway also pins its vendor connection. It runs before zero preparation or any charger effect. Explicit
+denials remain denials, offline expiry stays enforced, and timed test admission does not gain this exception.
+`start_authorization` is a diagnostic summary, never permission to send.
+
+In the separate older integration, `PlanStore` retains a failed secondary planning-profile synchronization code.
+The app-plan sensor exposes `profile_sync_pending` and `profile_sync_error` separately from the accepted native
+planning flag. A successful explicit reapply clears the error; no background retry task is introduced. Session
+history loading validates both the outer object and the sessions list before processing individual records.
 
 `Journal.phase` in `installation_lifecycle.py` is the sole installation phase/introduction-flag writer. Its small
 `InstallationState` names shared read predicates; every `read()` samples only the phase, and the separate

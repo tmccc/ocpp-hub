@@ -823,9 +823,11 @@ static authorization gates. Scoped cloud-outage admission is described below; Re
 cloud reconciliation. A Start payload cannot select its own current/tag/duration; current selection is a separate
 idle-only command. The raw generic Start path remains unavailable. Existing timed tests remain.
 
-If every configured local tag has an expired cloud approval, HA/local Start is unavailable even when the cloud
-is connected. There is no management command to renew those approvals; supported charger/vendor traffic must
-obtain fresh approval for a matching local tag. Approval for a different tag does not enable local Start.
+If all configured local tags lack current approval, the control-mode diagnostic explains why. Normal Start can
+renew a previously Accepted approval that has aged out by requesting fresh `Authorize` from the connected cloud.
+It sends no charger command until a matching current Accepted reply arrives under the same control authority.
+A timeout, refusal, changed Boot or newer Pause prevents Start. Explicit cached denials are not renewed this way;
+offline Start still requires an unexpired approval. Approval for a different tag does not enable local Start.
 
 Return restores the selected ceiling and app/schedule authority. It sends no Start and does not replay a missed
 daily start. When returning during an already open native daily window, check the actual session and measured
@@ -1496,6 +1498,10 @@ plan:
 - When the app changes the planning, the hub takes it over, writes it to the charger and tells the app it worked.
 - When you switch the planning off in the app, the hub removes its profile so the charger charges freely, and keeps the
   windows for later. Switching it on writes them again.
+
+The app-plan sensor's `profile_sync_pending` and `profile_sync_error` attributes report a failed secondary hub
+profile write separately from the charger's accepted native planning switch. Reapply the plan or switch after
+the connection or refusal is resolved; a successful write clears the error.
 
 The app talks to the charger through its own binary protocol inside OCPP `DataTransfer`. The hub decodes the planning
 part of it; the layout was worked out from captured traffic and is documented in

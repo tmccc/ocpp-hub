@@ -98,18 +98,17 @@ changes rather than a cumulative total. Further simplification remains open.
 
 ## Follow-ups from the fresh bug review — 18 November 2026
 
-- [ ] Retry and diagnose SQLite failures after the first introduction read but before the audit marker is published.
-  Such a failure can retire the Boot probe and strand the same connection after storage heals. Add a real
-  post-read write-failure witness; retain the distinction from later failures that paused foreground proof can repair.
-- [ ] Explain expired local-tag approvals in Start diagnostics and assess an explicit online renewal path. The
-  existing refusal is documented policy; ignoring expiry is not a fix. The README now states the owner-visible
-  limitation and distinguishes Return from an actual Start inside an already open daily window.
-- [ ] In the separate older integration, expose or retry failed secondary hub-profile synchronisation after a
-  genuinely accepted native planning switch; do not revert the accepted native flag. Guard malformed session-history
-  container shapes before iterating them. Neither issue was found on the active iCS path.
-- [ ] Select tagged release notes by the requested version instead of the first changelog heading, which is
-  `Unreleased`. Preserve version-component boundaries when checking equality; removing dots can equate different
-  versions. These findings concern release tooling, not the deployed charger session.
+- [x] Retry replay-safe post-read introduction metadata and zero preparation after SQLite failure. Diagnose later
+  storage failures without replaying Stop-capable work; cover the retry with real post-read SQLite write failures.
+- [x] Explain local-tag approval readiness and let normal Start request actual fresh cloud approval for an aged
+  Accepted tag before charger effects. Preserve cached denials, offline expiry and newer authority guards.
+- [x] In the separate older integration, expose persistent failed secondary profile synchronization independently
+  of the accepted native planning flag; clear it after successful explicit reapply. Guard malformed session-history
+  containers while retaining valid sibling records.
+- [x] Select release notes by the requested numeric version and fail on missing or empty notes. Compare versions
+  without collapsing dotted components. These tooling fixes do not change a charger session.
+- [ ] Complete Claude's scoped fix review, all four full 20-worker suites and deployment of this batch. Focused
+  regressions are development evidence; the currently deployed implementation remains `de2d74b` above.
 
 ## iCS implementation history — 15–17 November 2026
 

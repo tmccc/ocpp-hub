@@ -196,8 +196,12 @@ RISKS = (
         "BOOT-RETRY",
         "A real failed native observation grants no positive introduction authority.",
         "Actual HTTP restoration and full zero introduction recover without another Start.",
-        ("tests/test_managed_introduction_retry.py", "tests/test_introduction_storage_retry.py"),
-        "503 and initial-read SQL retry; later Stop-capable work and unknown audit fences retain proof requirements.",
+        (
+            "tests/test_managed_introduction_retry.py",
+            "tests/test_introduction_storage_retry.py",
+            "tests/test_introduction_write_retry.py",
+        ),
+        "503 and initial/post-read SQL retry; terminal SQL is diagnosed without replaying effect-capable work.",
     ),
     Risk(
         "PAUSE-PRECEDENCE",

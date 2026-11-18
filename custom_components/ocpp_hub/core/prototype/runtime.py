@@ -238,7 +238,8 @@ class ConnectionRuntime:
             self.gateway._require_epoch("charger", epoch)
             if self.ceiling_enabled():
                 await self._confirm_introduced_ceiling(epoch)
-        except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError) as error:
+        except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError, sqlite3.Error) as error:
+            # Later introduction may own Stop; record its storage failure without replaying that work.
             self.status.last_failure = "BootOrCeilingUnavailable"
             self.status.charger_fault.record(error, "boot_or_ceiling", self.gateway.charger.diagnostics.action)
 

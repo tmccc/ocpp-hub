@@ -234,6 +234,7 @@ def observed_status(
     history = summarize_charger_history(native.history)
     return {
         **base,
+        "start_authorization": c.charging.authorization_status(),
         "local_healthy": verdict.local_healthy,
         "checked_at": time.time(),
         "phase": j.phase.read().value,

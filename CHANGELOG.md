@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Retry replay-safe introduction metadata and zero preparation after SQLite failure; diagnose later storage
+  failures without replaying Stop-capable work.
+- Let normal managed Start request fresh cloud approval for an aged Accepted local tag before any charger effect.
+  Preserve explicit denials, offline expiry, one-shot authority and newer Pause/Boot guards; explain approval
+  readiness in the existing HA control-mode diagnostic.
+- Expose persistent `profile_sync_pending` and `profile_sync_error` attributes in the older integration when its
+  secondary hub profile fails after an accepted native planning switch. A successful explicit reapply clears them.
+  Skip malformed session-history containers while retaining valid records.
+- Select release notes from the requested numeric changelog heading and fail on missing or empty notes. Preserve
+  version-component boundaries when comparing versions, including equivalent prerelease spellings.
+
 - Give installation phases and the introduction flag one journal owner. Name the shared phase predicates and
   compound transitions while preserving stored values, lazy reads, write order and caller-owned transactions.
   Keep phase-only recovery distinct from physical holds and the two existing fault-blocking policies.

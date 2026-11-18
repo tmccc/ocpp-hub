@@ -193,7 +193,24 @@ class ManagedCharging:
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             return
 
-    # Admission is conservative; the worker independently rechecks physical zero before Start.
+    # Explain authorization separately from physical health, without granting permission from a public snapshot.
+    def authorization_status(self) -> str:
+        g = self.controller.session.gateway
+        if not self.journal.phase.read().legacy_active or self.journal.phase.starting:
+            return "not_ready"
+        if any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
+            return "ready"
+        if any(g.local_start_expired(tag) for tag in g.policy.allowed_tags):
+            return (
+                "renewal_required"
+                if self.controller.session.runtime.status.vendor_connected
+                and g.vendor.sender is not None
+                and g.vendor_registration == "Accepted"
+                else "expired_cloud_unavailable"
+            )
+        return "denied" if g.policy.allowed_tags else "no_approved_tag"
+
+    # Admission may offer a normal online renewal; the worker still needs actual approval and fresh physical zero.
     def available(self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False) -> bool:
         c, j = self.controller, self.journal
         g = c.session.gateway
@@ -207,7 +224,12 @@ class ManagedCharging:
             and (normal or c.current.selected() == 6)
             and not c.current.pending()
             and not g.policy.allow_local_start
-            and (not local or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags))
+            and (
+                not local
+                or any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags)
+                or normal
+                and self.authorization_status() == "renewal_required"
+            )
             and not j.get("control", {}).get("uncertain")
             and not j.get("control", {}).get("start_pending")
             and j.active() is None
@@ -244,7 +266,11 @@ class ManagedCharging:
             or not 0 <= time.time() - native.physical.observed_at <= 15
             or not self.available(native, local=action in ("start", "start_test"), normal=action == "start")
         ):
-            raise RecoveryRequiredError("test requires current shared six-ampere authority and no pending work")
+            raise RecoveryRequiredError(
+                "Start requires fresh idle authority, current approval or online renewal, and no pending work"
+                if action == "start"
+                else "test requires current shared six-ampere authority and no pending work"
+            )
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"
         lease = ChargeLease(
@@ -306,12 +332,39 @@ class ManagedCharging:
         ):
             raise DeniedError("managed test Start permission expired or was superseded")
 
+    # A normal Start can request one fresh cloud decision before any charger effect, under exact current authority.
+    async def _renew_start_tag(self, lease: ChargeLease) -> str | None:
+        c, g = self.controller, self.controller.session.gateway
+        if any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
+            return None
+        if self.authorization_status() != "renewal_required":
+            raise DeniedError("a current local Start approval is unavailable")
+        tag = next(tag for tag in sorted(g.policy.allowed_tags) if g.local_start_expired(tag))
+        authority, stored = c.authority(), g.auth_info.stored(tag)
+        if authority is None:
+            raise DeniedError("Start approval renewal requires current connection authority")
+
+        # A newer owner operation, Boot metadata or tag decision must win over this pending cloud reply.
+        def guard() -> None:
+            self.guard(lease)
+            if c.authority() != authority or g.auth_info.stored(tag) != stored:
+                raise DeniedError("Start approval renewal was superseded")
+
+        guard()
+        await g._cloud_authorize(tag, guard=guard)
+        self.guard(lease)
+        if c.authority() != authority or not g._local_start_allowed(tag):
+            raise DeniedError("the manufacturer did not provide a current local Start approval")
+        return tag
+
     # The service owns the worker after client disappearance; failures revoke only this Start's authority.
     async def _start(self, lease: ChargeLease) -> None:
         c, j = self.controller, self.journal
         previous_current = current_candidate(c) if lease.normal else None
         effects = False
         try:
+            self.guard(lease)
+            renewed_tag = await self._renew_start_tag(lease) if lease.normal else None
             self.guard(lease)
             initial = await c.settled_native()
             c.native.require(initial, closed=True)
@@ -355,7 +408,9 @@ class ManagedCharging:
             )
             if not tags:
                 raise DeniedError("no current approved local tag is available for this test")
-            tag = tags[0]
+            tag = renewed_tag if renewed_tag is not None else tags[0]
+            if not c.session.gateway._local_start_allowed(tag):
+                raise DeniedError("the selected local Start approval was superseded")
 
             # Commit the attempt marker with LocalControl's receipt, never before its owned task first executes.
             def prepared() -> None:

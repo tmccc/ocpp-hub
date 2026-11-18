@@ -269,6 +269,8 @@ class AppPlanSensor(OcppHubEntity, SensorEntity):
         """The windows with the day, the start and the end; a window that ends before it starts runs overnight."""
         return {
             "planning": "on" if self._runtime.plans.planning_on(self._cp_id) else "off",
+            "profile_sync_pending": self._runtime.plans.profile_sync_error(self._cp_id) is not None,
+            "profile_sync_error": self._runtime.plans.profile_sync_error(self._cp_id),
             "windows": [
                 {"day": self._DAYS[day - 1], "from": _clock_text(start), "to": _clock_text(end)}
                 for day, start, end in self._windows() or ()

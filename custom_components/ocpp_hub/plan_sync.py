@@ -8,6 +8,7 @@ the plan is kept only when that worked. The app is answered from the plan when i
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Mapping
 
 from homeassistant.core import HomeAssistant
@@ -48,7 +49,7 @@ class PlanSync:
         self._central: CentralSystem | None = None
         # How many profile writes the plan has seen per charger, and the chargers the plan is writing to right now.
         self._seen: dict[str, int] = {}
-        self._writing: set[str] = set()
+        self._writing: Counter[str] = Counter()
 
     # Give the plan the central system it writes through; it is made after the mirror that needs the plan.
     def bind(self, central: CentralSystem) -> None:
@@ -76,25 +77,38 @@ class PlanSync:
     def planning_on(self, cp_id: str) -> bool:
         return self._store.planning_on(cp_id)
 
+    # Expose a failed secondary profile separately from the charger's genuinely accepted native switch.
+    def profile_sync_error(self, cp_id: str) -> str | None:
+        return self._store.profile_sync_error(cp_id)
+
     # The app switched its planning on or off. The plan is kept either way; off clears the hub's profile so the charger
     # is no longer held outside the windows, on writes the profile of the plan again.
     async def planning_switched(self, cp_id: str, on: bool) -> None:
         self._store.set_planning(cp_id, on)
         windows = self._store.get(cp_id)
+        error_code = None
         if windows:
             try:
                 await self._apply(cp_id, windows, on)
             except (ControlError, SchedulePlanError) as error:
+                error_code = error.code if isinstance(error, ControlError) else "invalid_schedule"
                 _LOGGER.warning(
                     "[plan] Switching the planning %s for %s failed: %s", "on" if on else "off", cp_id, error
                 )
+        current = self._store.get(cp_id)
+        # A failed clear still matters to a replacement plan; only an exact matching success can clear an error.
+        if self._store.planning_on(cp_id) == on and (current == windows or error_code is not None and current):
+            self._store.set_profile_sync_error(cp_id, error_code)
         async_dispatcher_send(self._hass, plan_signal(self._entry_id, cp_id))
 
     # Set the plan: turn the windows into one recurring profile and write it, then keep the plan. An empty plan clears
     # the hub's profile instead, because a profile of nothing but the outside limit would hold the charger at that limit
     # all week. Raises ControlError or SchedulePlanError when it cannot be written, and keeps the old plan then.
     async def set_plan(self, cp_id: str, windows: list[PlanWindow]) -> None:
-        await self._apply(cp_id, windows, self.planning_on(cp_id))
+        on = self.planning_on(cp_id)
+        await self._apply(cp_id, windows, on)
+        if self.planning_on(cp_id) == on:
+            self._store.set_profile_sync_error(cp_id, None)
         self._keep(cp_id, windows)
 
     # Write the plan to the charger as a profile, or clear the profile when the planning is off, while the snapshot
@@ -103,11 +117,13 @@ class PlanSync:
         control = self._central.control(cp_id) if self._central is not None else None
         if control is None:
             raise ControlError("not_connected", "the charger is not connected")
-        self._writing.add(cp_id)
+        self._writing[cp_id] += 1
         try:
             await self._write(control, windows if on else [])
         finally:
-            self._writing.discard(cp_id)
+            self._writing[cp_id] -= 1
+            if not self._writing[cp_id]:
+                del self._writing[cp_id]
             session = self._central.session(cp_id) if self._central is not None else None
             if session is not None:
                 self._seen[cp_id] = session.snapshot.profile_writes
@@ -145,5 +161,7 @@ class PlanSync:
 
     # Keep a plan and tell the entities that show it.
     def _keep(self, cp_id: str, windows: list[PlanWindow]) -> None:
+        if not windows:
+            self._store.set_profile_sync_error(cp_id, None)
         self._store.set(cp_id, windows)
         async_dispatcher_send(self._hass, plan_signal(self._entry_id, cp_id))

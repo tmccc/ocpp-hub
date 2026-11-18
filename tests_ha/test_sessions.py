@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -15,6 +16,45 @@ from tests_ha.conftest import state_of, wait_for
 
 CURRENT_SESSION = "sensor.ocpp_hub_test0001_current_session"
 LAST_SESSION = "sensor.ocpp_hub_test0001_last_session"
+
+
+# Intent: malformed history containers cannot abort actual integration setup or the next reload.
+# Why: the container was accessed outside record handling, so valid HA storage envelopes could brick setup.
+@pytest.mark.parametrize("stored", [["invalid"], {"sessions": None}, {"sessions": 1}, {"sessions": "invalid"}])
+async def test_malformed_history_container_does_not_abort_setup(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    setup_hub: Callable[..., Awaitable[MockConfigEntry]],
+    stored: object,
+) -> None:
+    hass_storage["ocpp_hub.sessions"] = {"version": 1, "minor_version": 1, "key": "ocpp_hub.sessions", "data": stored}
+    entry = await setup_hub()
+    assert entry.state.name == "LOADED" and entry.runtime_data.sessions.count() == 0
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state.name == "LOADED" and entry.runtime_data.sessions.count() == 0
+
+
+# Intent: a damaged history record is skipped while the valid sibling survives actual setup and reload.
+# Why: guarding the container must retain the existing promise to preserve readable history.
+async def test_malformed_history_records_keep_valid_siblings(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    setup_hub: Callable[..., Awaitable[MockConfigEntry]],
+) -> None:
+    started = datetime(2026, 11, 17, tzinfo=UTC)
+    valid = ChargeSession("TEST0001", 1, 321, None, started, started + timedelta(hours=1), energy_wh=1000)
+    hass_storage["ocpp_hub.sessions"] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": "ocpp_hub.sessions",
+        "data": {"sessions": [None, {}, valid.to_dict()]},
+    }
+    entry = await setup_hub()
+    assert entry.runtime_data.sessions.newest_first() == [valid]
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.sessions.newest_first() == [valid]
 
 
 # A MeterValues payload with the energy register in Wh and the power in W.

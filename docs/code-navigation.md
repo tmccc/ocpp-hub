@@ -148,6 +148,9 @@ daily timetable and owned station receipt before retiring a fault. Start with
 `test_managed_settlement_regressions.py` for real-peer recovery and storage-failure cases. `test_runtime_boot_retry.py`
 covers repeated read-only probes; `test_managed_cached_authorization.py` and
 `test_managed_cloud_pending_return.py` cover cloud decisions, retained permissions and timed-test Return settlement.
+`test_managed_start_authorization.py` covers guarded normal-Start renewal of aged Accepted tags through actual
+upstream TLS replies, refusals and superseding authority. The existing HA control-mode diagnostic explains
+authorization readiness without changing physical health.
 
 For introduction, follow `TrialSession._before_ceiling()`, `NativeBoundedHandover.introduce()` and the runtime's
 typed deferred retry loop. `audited_epoch` records completed admission auditing; `introduced_epoch` and
@@ -159,6 +162,8 @@ not prove zero or publish shared authority. `managed_faults.py` shares the stric
 supervision.
 `test_introduction_readiness_retry.py` separates pending prerequisites from simultaneous content contradictions;
 `test_introduction_completion.py` covers foreground zero, a newer Pause and the retry-sleep gap at 6 A and 32 A.
+`test_introduction_write_retry.py` injects real post-read SQLite write failures into the replay-safe prefix;
+later Stop-capable work stays outside that retry boundary.
 For command timing, follow `Peer._validate()` through its priority gate and then the independent send/reply deadline;
 `test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch.
 

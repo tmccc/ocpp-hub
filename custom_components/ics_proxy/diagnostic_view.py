@@ -31,6 +31,12 @@ REASONS = {
     "certificate_validity_insufficient": "The loaded listener certificate has insufficient remaining validity.",
     "local_health_unverified": "The local service has not passed every required health check.",
 }
+START_AUTHORIZATION = {
+    "renewal_required": "Start will request fresh approval from the manufacturer cloud before charging.",
+    "expired_cloud_unavailable": "Local Start needs fresh approval, but the manufacturer cloud is unavailable.",
+    "denied": "The manufacturer has not approved a configured local Start tag.",
+    "no_approved_tag": "No local Start tag is configured.",
+}
 FAULTS = {
     "owner_release_unconfirmed": "Returning app/schedule control was not confirmed.",
     "native_authority_or_preservation_failed": "Charger authority or preservation verification failed.",
@@ -299,12 +305,17 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
         return FAULTS[fault]
     if detail["current_fault"]:
         return FAULTS[detail["current_fault"]]
+    authorization = label(data.get("start_authorization"), START_AUTHORIZATION)
+    if authorization == "expired_cloud_unavailable" and native_fresh and set(blockers) == {"cloud_disconnected"}:
+        return START_AUTHORIZATION[authorization]
     if blockers:
         return REASONS[blockers[0]]
-    if detail["pending_command_count"]:
-        return "A recorded command is still awaiting its confirmed outcome."
     if not native_fresh:
         return REASONS["native_stale"]
+    if authorization is not None:
+        return START_AUTHORIZATION[authorization]
+    if detail["pending_command_count"]:
+        return "A recorded command is still awaiting its confirmed outcome."
     return (
         "No problem reported in the latest verified status."
         if data.get("healthy") is True

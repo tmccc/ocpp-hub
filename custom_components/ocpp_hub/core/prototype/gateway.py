@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
-from .auth_info import InfoBook, validate_info
+from .auth_info import InfoBook, expiry, validate_info
 from .authorisation import VendorAuthorisation
 from .connection_scope import control_scope_matches, current_control_scope
 from .delivery_reply import DeliveryReply
@@ -553,6 +554,15 @@ class Gateway:
             return False
         info = self.auth_info.get(tag)
         return info is None or info["status"] == "Accepted"
+
+    # Only a locally aged Accepted decision is renewable by owner Start; explicit cloud denials remain binding.
+    def local_start_expired(self, tag: str) -> bool:
+        if not self._local_tag(tag) or not self.journal.phase.read().legacy_active or self.journal.phase.starting:
+            return False
+        info = self.auth_info.stored(tag)
+        return bool(
+            info and info["status"] == "Accepted" and "expiryDate" in info and expiry(info["expiryDate"]) <= time.time()
+        )
 
     # Owner-approved local permissions have explicit local expiry, distinct from actual cloud metadata.
     def _tag_info(self, tag: str) -> dict[str, Any]:

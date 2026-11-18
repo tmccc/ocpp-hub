@@ -55,6 +55,44 @@ def detail():
     }
 
 
+# Intent: local Start approval explanations remain separate from health and never render arbitrary peer text.
+# Why: an expired approval used to leave Start unavailable without telling the owner how the online path differs.
+@pytest.mark.parametrize(
+    "authorization,expected",
+    [
+        ("renewal_required", "request fresh approval"),
+        ("expired_cloud_unavailable", "needs fresh approval"),
+        ("denied", "has not approved"),
+        ("no_approved_tag", "No local Start tag"),
+    ],
+)
+async def test_start_authorization_explanation_is_allowlisted(actual_hass, authorization, expected):
+    from custom_components.ics_proxy.diagnostic_view import explanation
+
+    data = {"healthy": True, "diagnostics": detail(), "start_authorization": authorization}
+    assert expected in explanation(data, fresh=True, native_fresh=True)
+    data["start_authorization"] = PRIVATE
+    assert PRIVATE not in explanation(data, fresh=True, native_fresh=True)
+    data["start_authorization"] = authorization
+    assert "stale" in explanation(data, fresh=False, native_fresh=True)
+    assert "reading is stale" in explanation(data, fresh=True, native_fresh=False)
+    if authorization == "expired_cloud_unavailable":
+        data["health_blockers"] = ["cloud_disconnected"]
+        assert expected in explanation(data, fresh=True, native_fresh=True)
+
+
+# Intent: the real HA control-mode entity explains an expired approval without making the service unhealthy.
+# Why: a core-only status field would still leave the owner-facing diagnostic surface silent.
+async def test_actual_control_mode_sensor_explains_start_renewal(actual_hass, peer):
+    peer["state"]["diagnostics"] = detail()
+    peer["state"]["start_authorization"] = "renewal_required"
+    entry = await setup(actual_hass, peer)
+    entity = actual_hass.states.get("sensor.ics_proxy_control_mode")
+    assert entity is not None
+    assert "request fresh approval" in entity.attributes["diagnostic_summary"]
+    assert entry.runtime_data.data["healthy"] is True
+
+
 # Intent: English explanations distinguish unknown/strict outcomes, storage waits, measurement faults and Pause.
 # Why: a fault label must not suggest ordinary Pause/Return can waive an interrupted or strict recovery audit.
 @pytest.mark.parametrize(

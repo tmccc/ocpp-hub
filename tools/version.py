@@ -5,7 +5,7 @@ The version lives in three places:
 
 - ``pyproject.toml`` (PEP 440: ``1.8.0rc2``)
 - ``custom_components/ocpp_hub/manifest.json`` (display: ``1.8.0-rc2``)
-- the top ``## <version>`` heading in ``CHANGELOG.md``
+- a matching numeric ``## <version>`` heading in ``CHANGELOG.md``
 
 ``bump`` converts the input ``X.Y.Z-rcN`` form to the PEP 440 ``X.Y.ZrcN``
 for ``pyproject.toml`` and keeps the display form (hyphen) elsewhere::
@@ -40,7 +40,7 @@ _PRE_RELEASE = r"(rc|alpha|beta|a|b|post|dev)"
 # 1.8.0-rc2 and 1.8.0rc2 name the same release.
 def canonical(version: str) -> str:
     """Normalize ``1.8.0-rc2`` / ``1.8.0rc2`` / ``1.8.0`` for comparison."""
-    return re.sub(r"[^0-9a-z]", "", version.strip().lower())
+    return pyproject_version(version.strip().lower())
 
 
 # Convert a display version to PEP 440 form.

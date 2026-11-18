@@ -141,6 +141,95 @@ async def test_the_planning_switch_clears_and_restores_the_profile(
     assert hass.states.get(PLAN).attributes["planning"] == "on"
 
 
+# Intent: rejected secondary profile writes retain the accepted native switch and expose persistent pending sync.
+# Why: an app's genuine native acknowledgement must not hide a failed hub restriction or be reverted as a fake fix.
+@pytest.mark.parametrize("on", [False, True])
+async def test_failed_planning_profile_sync_is_visible_until_success(
+    hass: HomeAssistant, setup_hub: Callable[..., Awaitable[MockConfigEntry]], connect_charger: Any, on: bool
+) -> None:
+    charger, entry = await _booted(hass, setup_hub, connect_charger)
+    await _call(hass, charger, {"windows": [MONDAY_NOON]})
+    plans = entry.runtime_data.plans
+    if on:
+        off = asyncio.create_task(plans.planning_switched("TEST0001", False))
+        await charger.answer(await charger.next_hub_call(), {"status": "Accepted"})
+        await off
+    switch = asyncio.create_task(plans.planning_switched("TEST0001", on))
+    for _ in range(2 if on else 1):
+        request = await charger.next_hub_call()
+        assert request[2] == ("SetChargingProfile" if on else "ClearChargingProfile")
+        await charger.answer(request, {"status": "Rejected"})
+    await switch
+    await wait_for(hass, lambda: hass.states.get(PLAN).attributes.get("profile_sync_pending") is True, "sync not shown")
+    assert plans.planning_on("TEST0001") is on and plans.plan("TEST0001") == [PlanWindow(1, 43200, 50400)]
+    assert hass.states.get(PLAN).attributes["profile_sync_error"] == "rejected"
+
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    plans = entry.runtime_data.plans
+    assert plans.planning_on("TEST0001") is on and plans.profile_sync_error("TEST0001") == "rejected"
+    charger = await connect_charger(entry)
+    await charger.boot()
+    await wait_for(hass, lambda: hass.states.get(PLAN).attributes.get("profile_sync_pending") is True, "pending lost")
+    retry = asyncio.create_task(plans.planning_switched("TEST0001", on))
+    await charger.answer(await charger.next_hub_call(), {"status": "Accepted"})
+    await retry
+    await wait_for(
+        hass, lambda: hass.states.get(PLAN).attributes.get("profile_sync_pending") is False, "sync not cleared"
+    )
+    assert plans.planning_on("TEST0001") is on and plans.profile_sync_error("TEST0001") is None
+
+
+# Intent: an older failed profile clear cannot mark a newer accepted native switch as failed.
+# Why: the app may switch again while a secondary profile reply is still pending.
+async def test_old_profile_failure_does_not_overwrite_newer_switch(
+    hass: HomeAssistant, setup_hub: Callable[..., Awaitable[MockConfigEntry]], connect_charger: Any
+) -> None:
+    charger, entry = await _booted(hass, setup_hub, connect_charger)
+    await _call(hass, charger, {"windows": [MONDAY_NOON]})
+    plans = entry.runtime_data.plans
+    off = asyncio.create_task(plans.planning_switched("TEST0001", False))
+    clearing = await charger.next_hub_call()
+    on = asyncio.create_task(plans.planning_switched("TEST0001", True))
+    await wait_for(hass, lambda: plans.planning_on("TEST0001"), "new switch not accepted")
+    await charger.answer(clearing, {"status": "Rejected"})
+    await off
+    assert plans.profile_sync_error("TEST0001") is None and plans.planning_on("TEST0001")
+    restoring = await charger.next_hub_call()
+    assert restoring[2] == "SetChargingProfile"
+    await charger.answer(restoring, {"status": "Accepted"})
+    await on
+    assert plans.profile_sync_error("TEST0001") is None
+    assert plans.plan("TEST0001") == [PlanWindow(1, 43200, 50400)]
+
+
+# Intent: a failed native-off profile clear remains visible when an earlier HA write replaced the plan meanwhile.
+# Why: changed windows do not remove the need to clear a still-installed hub profile while native planning is off.
+async def test_failed_switch_sync_remains_visible_after_plan_replacement(
+    hass: HomeAssistant, setup_hub: Callable[..., Awaitable[MockConfigEntry]], connect_charger: Any
+) -> None:
+    charger, entry = await _booted(hass, setup_hub, connect_charger)
+    await _call(hass, charger, {"windows": [MONDAY_NOON]})
+    plans = entry.runtime_data.plans
+    replacement = asyncio.create_task(
+        hass.services.async_call(DOMAIN, "set_plan", {"windows": [TUESDAY_AFTERNOON]}, blocking=True)
+    )
+    writing = await charger.next_hub_call()
+    off = asyncio.create_task(plans.planning_switched("TEST0001", False))
+    await wait_for(hass, lambda: not plans.planning_on("TEST0001"), "native off not retained")
+    await charger.answer(writing, {"status": "Accepted"})
+    await replacement
+    clearing = await charger.next_hub_call()
+    await charger.answer(clearing, {"status": "Rejected"})
+    await off
+    assert plans.plan("TEST0001") == [PlanWindow(2, 46800, 61200)] and not plans.planning_on("TEST0001")
+    assert plans.profile_sync_error("TEST0001") == "rejected"
+    assert hass.states.get(PLAN).attributes["profile_sync_pending"] is True
+    await _call(hass, charger, {"windows": [TUESDAY_AFTERNOON]})
+    assert plans.profile_sync_error("TEST0001") is None
+    assert hass.states.get(PLAN).attributes["profile_sync_pending"] is False
+
+
 # Intent: the plan shows as a calendar: a Monday window gives an event on that Monday, an overnight window runs into the
 # next day, and a switched-off window gives none.
 # Why: the calendar is the way to see the plan in Home Assistant, and it is built from the same plan as the sensor.

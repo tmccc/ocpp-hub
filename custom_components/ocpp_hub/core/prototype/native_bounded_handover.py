@@ -402,66 +402,79 @@ class NativeBoundedHandover:
             ) as error:
                 # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
                 raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
-            gateway._require_epoch("charger", epoch)
-            if binding is None:
-                if (
-                    not journal.phase.read().active
-                    or journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone()
-                ):
-                    raise RecoveryRequiredError("initial native bounded introduction cannot adopt existing resources")
-                if native.physical.history is None:
-                    raise SecurityError("actual Boot introduction requires complete current history")
-                verify_initial_history(journal, native.physical.history, journal.identity, self.spec.hardware_identity)
-                journal.put(
-                    "trial_binding",
-                    {
-                        "configuration_digest": self.binding_digest(native),
-                        "station": self.choice.value(),
-                        "boot_digest": self.spec.boot_digest,
-                    },
-                )
-            elif binding != {
-                "configuration_digest": self.binding_digest(native),
-                "station": self.choice.value(),
-                "boot_digest": self.spec.boot_digest,
-            }:
-                raise SecurityError("native bounded introduction binding changed")
             try:
+                gateway._require_epoch("charger", epoch)
                 if binding is None:
-                    self.require_known_session(native)
-                else:
-                    self.require_recovery_session(native)
-            except NativeSessionPendingError as error:
-                raise IntroductionDeferredError("introduction awaits native lifecycle reconciliation") from error
-            self.book.owned_present(native.physical)
-            if binding is not None or journal.get("control", {}).get("uncertain"):
-                control = journal.get("control", {})
-                journal.control.hold(control)
-                if first_zero:
-                    # Stay in initial admission until its first zero succeeds, including a genuinely unapplied refusal.
-                    ticket = journal.get("control", {}).get("ticket")
-                    intent = journal.get("managed_control_intent", {})
-                    try:
-                        await gateway.controls.ensure_ceiling()
-                    except (UnavailableError, TimeoutError) as error:
-                        # Only this zero may have been sent; reread the binding and owned receipt before retrying.
-                        raise IntroductionDeferredError("initial introduction awaits its restrictive zero") from error
-                    except DeniedError as error:
-                        latest, control = journal.get("managed_control_intent", {}), journal.get("control", {})
-                        if (
-                            latest.get("mode") != "paused"
-                            or latest.get("revision", 0) <= intent.get("revision", 0)
-                            or control.get("ticket") == ticket
-                            or not ControlState(control).explicit_local_hold
-                            or gateway.controls.desired() != 0
-                        ):
-                            raise
-                        raise IntroductionDeferredError("initial zero was superseded by a newer owner Pause") from error
-                    gateway._require_epoch("charger", epoch)
-                journal.phase.recover()
-            self.audited_epoch = epoch
-            verified_revision = gateway.controls._revision
-            journal.phase.introduced()
+                    if (
+                        not journal.phase.read().active
+                        or journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone()
+                    ):
+                        raise RecoveryRequiredError(
+                            "initial native bounded introduction cannot adopt existing resources"
+                        )
+                    if native.physical.history is None:
+                        raise SecurityError("actual Boot introduction requires complete current history")
+                    verify_initial_history(
+                        journal, native.physical.history, journal.identity, self.spec.hardware_identity
+                    )
+                    journal.put(
+                        "trial_binding",
+                        {
+                            "configuration_digest": self.binding_digest(native),
+                            "station": self.choice.value(),
+                            "boot_digest": self.spec.boot_digest,
+                        },
+                    )
+                elif binding != {
+                    "configuration_digest": self.binding_digest(native),
+                    "station": self.choice.value(),
+                    "boot_digest": self.spec.boot_digest,
+                }:
+                    raise SecurityError("native bounded introduction binding changed")
+                try:
+                    if binding is None:
+                        self.require_known_session(native)
+                    else:
+                        self.require_recovery_session(native)
+                except NativeSessionPendingError as error:
+                    raise IntroductionDeferredError("introduction awaits native lifecycle reconciliation") from error
+                self.book.owned_present(native.physical)
+                if binding is not None or journal.get("control", {}).get("uncertain"):
+                    control = journal.get("control", {})
+                    journal.control.hold(control)
+                    if first_zero:
+                        # Stay in initial admission until its first zero succeeds,
+                        # including a genuinely unapplied refusal.
+                        ticket = journal.get("control", {}).get("ticket")
+                        intent = journal.get("managed_control_intent", {})
+                        try:
+                            await gateway.controls.ensure_ceiling()
+                        except (UnavailableError, TimeoutError) as error:
+                            # Only this zero may have been sent; reread the binding and owned receipt before retrying.
+                            raise IntroductionDeferredError(
+                                "initial introduction awaits its restrictive zero"
+                            ) from error
+                        except DeniedError as error:
+                            latest, control = journal.get("managed_control_intent", {}), journal.get("control", {})
+                            if (
+                                latest.get("mode") != "paused"
+                                or latest.get("revision", 0) <= intent.get("revision", 0)
+                                or control.get("ticket") == ticket
+                                or not ControlState(control).explicit_local_hold
+                                or gateway.controls.desired() != 0
+                            ):
+                                raise
+                            raise IntroductionDeferredError(
+                                "initial zero was superseded by a newer owner Pause"
+                            ) from error
+                        gateway._require_epoch("charger", epoch)
+                    journal.phase.recover()
+                self.audited_epoch = epoch
+                verified_revision = gateway.controls._revision
+                journal.phase.introduced()
+            except sqlite3.Error as error:
+                # This prefix owns only metadata and restrictive zero; later Stop-capable work is not replayed.
+                raise IntroductionDeferredError("introduction awaits required journal storage") from error
             if binding is not None and native.physical.transaction_open:
                 if journal.get("managed_current_change", {}).get("state") == "recovering":
                     pass  # This operation owns only zero; fresh supervision must identify the independent session.

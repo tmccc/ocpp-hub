@@ -31,9 +31,10 @@ class SessionStore:
     # Read the saved history. A record that cannot be read is skipped with a warning, so one damaged entry does not
     # cost the owner the rest of the history.
     async def async_load(self) -> None:
-        stored = await self._store.async_load() or {}
+        stored = await self._store.async_load()
+        records = stored.get("sessions") if isinstance(stored, dict) else None
         loaded: list[ChargeSession] = []
-        for record in stored.get("sessions", []):
+        for record in records if isinstance(records, list) else []:
             try:
                 loaded.append(ChargeSession.from_dict(record))
             except KeyError, TypeError, ValueError:
@@ -113,6 +114,7 @@ class PlanStore:
         self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, PLAN_STORAGE_KEY)
         self._plans: dict[str, list[PlanWindow]] = {}
         self._planning: dict[str, bool] = {}
+        self._profile_sync_errors: dict[str, str] = {}
 
     # Read the saved plans. A record that cannot be read is skipped with a warning.
     async def async_load(self) -> None:
@@ -127,6 +129,24 @@ class PlanStore:
                 _LOGGER.warning("Skipping an unreadable plan in storage")
         switches = stored.get("planning") if isinstance(stored, dict) else None
         self._planning = {cp: bool(on) for cp, on in switches.items()} if isinstance(switches, dict) else {}
+        errors = stored.get("profile_sync_errors") if isinstance(stored, dict) else None
+        self._profile_sync_errors = (
+            {cp: error for cp, error in errors.items() if isinstance(cp, str) and isinstance(error, str)}
+            if isinstance(errors, dict)
+            else {}
+        )
+
+    # A genuine native planning flag is separate from the result of the hub's secondary profile write.
+    def profile_sync_error(self, cp_id: str) -> str | None:
+        return self._profile_sync_errors.get(cp_id)
+
+    # Retain a failed synchronization through reload; only a matching success or retired plan clears it.
+    def set_profile_sync_error(self, cp_id: str, error: str | None) -> None:
+        if error is None:
+            self._profile_sync_errors.pop(cp_id, None)
+        else:
+            self._profile_sync_errors[cp_id] = error
+        self._store.async_delay_save(self._data, SAVE_DELAY_S)
 
     # The plan of a charger, or None when the hub has none yet.
     def get(self, cp_id: str) -> list[PlanWindow] | None:
@@ -157,4 +177,5 @@ class PlanStore:
                 cp: [[w.weekday, w.start_s, w.end_s, w.enabled] for w in windows] for cp, windows in self._plans.items()
             },
             "planning": dict(self._planning),
+            "profile_sync_errors": dict(self._profile_sync_errors),
         }

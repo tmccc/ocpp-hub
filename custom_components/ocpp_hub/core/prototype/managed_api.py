@@ -154,6 +154,7 @@ class ManagementServer:
                     self.controller.latest_native, normal=True
                 )
                 result["requested_current_a"] = self.controller.current.selected()
+                result["start_authorization"] = self.controller.charging.authorization_status()
                 result["can_set_current"] = result["local_healthy"] and self.controller.current.available(
                     self.controller.latest_native
                 )
