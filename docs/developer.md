@@ -64,6 +64,13 @@ with one case of lookahead so pytest can keep its session fixtures. Each contain
 port range and scratch directory for the entire session. The dispatch log and worker evidence must agree on every
 grant, start and completion. An interrupted grant stays recorded and is never retried within the attempt.
 
+Each engine execution worker mounts a private 128 MiB tmpfs for the Start recovery matrix. That matrix creates
+each case's configuration and SQLite journal there, including the journal reopened after simulated replacement.
+The default Python and pytest scratch paths, disk-specific tests, shared fixtures and qualification logs are
+disk-backed. The auditor checks each case against the canonical Start recovery IDs and verifies the worker
+mounts and the actual Start journals. Failed cases copy their RAM files to the worker's disk when pytest can
+report the failure. Abrupt container removal can discard in-flight RAM files while retaining disk-backed logs.
+
 For an existing provisioned Linux worker, the invocation has this form; all capitalized paths/IDs are operator inputs:
 
 ```bash

@@ -110,6 +110,26 @@ def test_worker_builder_uses_shared_mount_guard(tmp_path, monkeypatch):
         parallel_worker.container_command(config, batch / "3", 0, "unused", {})
 
 
+# Intent: collections and HA workers use the disk bind, and only engine execution has a private child tmpfs.
+# Why: mounting RAM over a whole worker directory would move persistence tests and raw evidence off disk.
+def test_worker_builder_mounts_ram_only_for_engine_execution(tmp_path, monkeypatch):
+    batch = tmp_path / "batch"
+    engine = batch / "0"
+    engine.mkdir(parents=True)
+    monkeypatch.setattr(parallel_worker, "ROOT", batch)
+    monkeypatch.setattr(parallel_worker, "SOURCE", batch / "source")
+    config = configuration(tmp_path) | {"suite": "engine-model"}
+    assert "--tmpfs" not in parallel_worker.container_command(config, batch / "collection", 0, "collect", {})
+    argv = parallel_worker.container_command(config, engine, 0, "engine", {}, True)
+    mount = argv[argv.index("--tmpfs") + 1]
+    assert mount.startswith(f"{engine / 'start-recovery-ram'}:rw,noexec,nosuid,nodev,size=128m,mode=0700,")
+    assert f"type=bind,src={engine},dst={engine}" in argv
+    config["suite"] = "ha-proxy"
+    assert "--tmpfs" not in parallel_worker.container_command(config, engine, 0, "ha", {})
+    with pytest.raises(ValueError, match="tmpfs destination"):
+        parallel_worker.container_command(config, engine, 0, "ha", {}, True)
+
+
 # Intent: fresh audit replay rejects the same unsafe raw configuration before touching runtime or starting a container.
 # Why: independently recollecting through an identical source overlay would otherwise agree with the incomplete run.
 def test_fresh_replay_uses_shared_mount_guard(tmp_path, monkeypatch):

@@ -5,7 +5,9 @@ import importlib.metadata
 import json
 import os
 import runpy
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -15,11 +17,13 @@ RAW_ITEMS = []
 DESELECTED = []
 COLLECTION_ERRORS = []
 EFFECTIVE_SETTINGS = None
+SCRATCH_ROOTS = None
 
 
 # Only the supervisor opts its execution workers into dispatch. Collectors and static CI retain the normal loop.
 def pytest_addoption(parser):
     parser.addoption("--qualification-work-queue", action="store_true")
+    parser.addoption("--qualification-start-recovery-ram", action="store_true")
 
 
 # Resolve the reviewed helper by source path, independent of installed tools packages or copied plugin locations.
@@ -84,7 +88,31 @@ def namespace_counters():
 
 # Record the isolated namespace before the first fixture starts.
 def pytest_sessionstart(session):
-    emit({"event": "worker_namespace", "runtime": runtime_identity(), **namespace_counters()})
+    global SCRATCH_ROOTS
+    SCRATCH_ROOTS = None
+    config = session.config
+    if config.getoption("qualification_start_recovery_ram"):
+        from tools.qualification_scratch import RAM_DIRECTORY, worker_scratch
+
+        disk = Path(os.environ["TMPDIR"]).resolve(strict=True)
+        if (
+            config.option.collectonly
+            or not config.getoption("--qualification-work-queue")
+            or Path(tempfile.gettempdir()).resolve() != disk
+            or config.option.basetemp is None
+            or Path(config.option.basetemp).resolve() != disk / "tmp"
+            or Path(os.environ["SCENARIO_RESULTS"]).resolve().parent != disk
+        ):
+            raise pytest.UsageError("mixed scratch requires the engine worker's ordinary disk temp and evidence paths")
+        SCRATCH_ROOTS = worker_scratch(disk, disk / RAM_DIRECTORY)
+    emit(
+        {
+            "event": "worker_namespace",
+            "runtime": runtime_identity(),
+            "scratch_roots": SCRATCH_ROOTS,
+            **namespace_counters(),
+        }
+    )
 
 
 # Machine-readable collection prevents text formatting or root-prefix parsing from silently omitting cases.
@@ -167,6 +195,7 @@ def pytest_runtest_logreport(report):
             "outcome": report.outcome,
             "duration_s": report.duration,
             "properties": dict(report.user_properties),
+            "scratch": getattr(report, "qualification_scratch", None),
             "failure": report.longreprtext if report.failed else None,
         }
     )
@@ -179,11 +208,35 @@ def pytest_sessionfinish(session, exitstatus):
     emit({"event": "session_finish", "exitstatus": int(exitstatus), "runtime": runtime_identity()})
 
 
+# Capture the actual temp fixture before the body and the Start journal before cleanup.
+def observe_case_scratch(item, report):
+    from tools.qualification_scratch import path_evidence
+
+    tmp = item.funcargs.get("tmp_path")
+    path = tmp.resolve() if isinstance(tmp, Path) else None
+    ram = Path(SCRATCH_ROOTS["ram"]["path"])
+    if report.when == "setup" and report.passed and path is not None:
+        report.qualification_scratch = path_evidence(path)
+    if path is None or not path.is_relative_to(ram):
+        return
+    if report.when == "call" and report.passed and (path / "state.db").is_file():
+        report.qualification_scratch = path_evidence(path / "state.db")
+    if report.failed and path.is_dir():
+        destination = Path(SCRATCH_ROOTS["disk"]["path"]) / "start-recovery-failures" / path.name
+        try:
+            destination.parent.mkdir(exist_ok=True)
+            shutil.copytree(path, destination, symlinks=True)
+        except OSError as error:
+            emit({"event": "scratch_backup_failed", "id": item.nodeid, "detail": str(error)[:1000]})
+
+
 # Preserve exceptions hidden by transport classification without changing the actual test result.
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    if SCRATCH_ROOTS is not None:
+        observe_case_scratch(item, report)
     if call.excinfo is not None and report.failed:
         current = call.excinfo.value
         chain = []
