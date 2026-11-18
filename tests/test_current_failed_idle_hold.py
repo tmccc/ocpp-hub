@@ -13,7 +13,7 @@ from tests.tls_support import tls as tls
 
 
 # Intent: only the exact failed current generation can settle physical uncertainty after native HTTP recovers.
-# Why: an automatic zero hold must recover without retiring an unknown current outcome or borrowing a later Pause.
+# Why: only fresh exact proof can retire the request while keeping its original failure.
 async def test_failed_idle_hold_binds_request_cause_boot_and_existing_control(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -93,12 +93,13 @@ async def test_failed_idle_hold_binds_request_cause_boot_and_existing_control(
         j.db.execute("UPDATE managed_requests SET result=? WHERE id=?", (json.dumps(result["result"]), identifier))
         assert c.current.failed_idle_hold()
 
-        # Fresh supervision alone confirms zero, preserving both the unknown update and the previous selection.
+        # Fresh supervision confirms zero and retires the exact request without changing its original failure.
         b.rig.peer.unavailable = False
         healed = await healthy(c)
         assert healed["desired_control"] == "paused" and healed["local_hold_verified"]
         assert healed["control_revision"] == revision + 2 and healed["station_ceiling_a"] == 0
-        assert j.get("control")["uncertain"] is False and c.requests.receipt(identifier) == result
+        assert j.get("control")["uncertain"] is False
+        assert c.requests.receipt(identifier) == {**result, "state": "failed"}
         assert c.current.selected() == 6 and b.rig.bench.firmware.effective_limit() == 0
         assert b.rig.bench.received_limits == before_limits and not starts(b.rig)
         assert all(

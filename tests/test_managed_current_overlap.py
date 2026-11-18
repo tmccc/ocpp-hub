@@ -226,10 +226,11 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
                 assert b.c.requests.receipt(identifier) == before and b.device.effective_limit() == 0
                 await b.close_transaction(local)
                 assert (await healthy(b.c))["local_hold_verified"]
+                settled = {**before, "state": "failed"}
+                assert b.c.requests.receipt(identifier) == settled
                 b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
                 assert (await healthy(b.c))["owner_control_enabled"]
-                assert b.c.requests.receipt(identifier)["state"] == "failed"
-                assert b.c.requests.receipt(identifier)["result"]["classification"] == "superseded_by_verified_return"
+                assert b.c.requests.receipt(identifier) == settled
                 return
             if failure == "unknown-source":
                 intent, wire = b.c.requests.intent(), len(b.rig.bench.device_calls)

@@ -107,17 +107,17 @@ async def test_pending_paused_selection_restarts_at_previous_current(
                 await introduced(b.rig, replacement, charger, "paused-selection-replacement")
                 status = await healthy(recovered)
                 assert status["local_hold_verified"] and recovered.current.selected() == previous
-                assert recovered.requests.receipt(request)["state"] == "uncertain"
+                settled = recovered.requests.receipt(request)
+                assert settled["state"] == "failed"
+                assert settled["result"] == {"classification": "process_replaced"}
                 assert b.rig.bench.firmware.effective_limit() == 0 and not starts(b.rig)
                 returning = uuid.uuid4().hex
                 recovered.command(returning, "app_control", recovered.requests.intent().revision)
                 assert (await healthy(recovered))["owner_control_enabled"]
                 assert recovered.requests.receipt(returning)["state"] == "completed"
                 assert recovered.current.selected() == b.rig.bench.firmware.effective_limit() == previous
-                # Verified Return retires the abandoned target; it must not leave an orphan recovery blocker.
-                receipt = recovered.requests.receipt(request)
-                assert receipt["state"] == "failed"
-                assert receipt["result"] == {"classification": "superseded_by_verified_return", "current_a": previous}
+                # Return keeps the settled receipt and releases only the previously selected current.
+                assert recovered.requests.receipt(request) == settled
                 assert replacement.journal.get("managed_current_change")["state"] == "cancelled"
                 assert not starts(b.rig)
         finally:
