@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
 from .store import Journal, fingerprint
 
 if TYPE_CHECKING:
-    from .gateway import Gateway
+    from .gateway import Gateway, NativeStartReport
+    from .managed_charging import ManagedCharging
     from .trial_handover_evidence import HandoverEvidence
 
 
@@ -26,10 +27,11 @@ class ManagedStartBinding:
     """Keep the acknowledged command pending until the two independent session reports agree."""
 
     # Store only tag digests for the verified original timetable; its identity already binds the installation.
-    def __init__(self, gateway: Gateway, original: str) -> None:
+    def __init__(self, gateway: Gateway, original: str, charging: ManagedCharging) -> None:
         self.gateway = gateway
         self.journal = gateway.journal
         self.original = original
+        self.charging = charging
 
     # Preserve the exact pending requests at allocation, before a later acknowledgement, Pause, or restart.
     def defer(self, local: int, tag: str) -> bool:
@@ -97,8 +99,7 @@ class ManagedStartBinding:
         with j.atomic():
             if pending["owner"] and local_start_receipt(j).get("ticket") == pending["ticket"]:
                 self.gateway.controls.bind_start(tag, local)
-                if self.gateway.start_observer is not None:
-                    self.gateway.start_observer(local, start)
+                self.charging.started(local, start)
             elif pending["vendor"] is not None and j.get("vendor_start_grant", {}).get("token") == pending["vendor"]:
                 self.gateway.authorisation.consume(tag, local)
                 grant = j.get("vendor_start_grant", {})
@@ -150,3 +151,32 @@ class ManagedStartBinding:
                 "native_source": {"marker": n.session_plan_id, "start": fingerprint(start), "schedule": self.original},
             },
         )
+
+
+class ManagedStartReports:
+    """Wire the reported Start flow to the managed charging and source owners."""
+
+    # Integrate both owners when the controller is fully constructed.
+    def __init__(self, charging: ManagedCharging, binding: ManagedStartBinding) -> None:
+        self.charging = charging
+        self.binding = binding
+
+    # A protected owner Start may first need a zero hold.
+    async def prepare_hold(self, payload: dict[str, Any]) -> None:
+        await self.charging.prepare_owner_report(payload)
+
+    # Use the independently observed native occurrence and schedule.
+    async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None:
+        return await self.charging.prepare_native_report(payload)
+
+    # A held report is allowed only for the existing operation.
+    def permits_held(self, tag: str) -> bool:
+        return self.charging.can_record_owner(tag)
+
+    # Keep the command pending while its source is still ambiguous.
+    def defer_binding(self, local: int, tag: str) -> bool:
+        return self.binding.defer(local, tag)
+
+    # Publish the recorded Start to the active charging operation.
+    def recorded(self, local: int, payload: dict[str, Any]) -> None:
+        self.charging.started(local, payload)

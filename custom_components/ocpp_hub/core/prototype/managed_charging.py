@@ -94,12 +94,8 @@ class ManagedCharging:
                 claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.retire_refused_unsent()
-        controller.session.gateway.start_observer = self.started
         controller.native.observation_listener = self.record_source
         controller.native.positive_guard = self.positive_decision
-        controller.session.gateway.prepare_report_hold = self.prepare_owner_report
-        controller.session.gateway.held_start_report = self.can_record_owner
-        controller.session.gateway.native_start_report = self.prepare_native_report
 
     # Keep one journal owner and the same durable management receipt table as Pause/Return.
     @property

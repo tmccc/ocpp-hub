@@ -32,7 +32,7 @@ from .managed_settlement import (
     require_settled_debt,
 )
 from .managed_sources import awaiting_owner_start, recorded_station_profile
-from .managed_start_binding import ManagedStartBinding
+from .managed_start_binding import ManagedStartBinding, ManagedStartReports
 from .managed_view import observed_status, poll_base, poll_status
 from .native_bounded import readiness_decision
 from .native_bounded_handover import AuditSupersededError
@@ -103,8 +103,8 @@ class ManagedController:
         self.native.positive_guard = self.positive_decision
         self.native.continuation_guard = self.continuation_decision
         self.native.recovery_zero_only = self.charging.scoped_normal_stop
-        binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest)
-        session.gateway.defer_command_binding = binding.defer
+        binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest, self.charging)
+        session.gateway.start_reports = ManagedStartReports(self.charging, binding)
         self.native.command_source_observer = binding.observe
         self.native.repair_audits = NativeRepairAudits(
             session.journal, lambda fault: release_evidence(self, fault) is not None

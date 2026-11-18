@@ -11,10 +11,10 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from ..frames import Frame, build_call_error, build_call_result, parse_frame
 from .auth_info import InfoBook, expiry, validate_info
@@ -97,6 +97,25 @@ class NativeStartReport:
     record: Callable[[int], None] = field(compare=False)
 
 
+class StartReports(Protocol):
+    """Managed hooks for this one charger lifecycle report, in gateway dispatch order."""
+
+    # Establish any required owner hold before the gateway pins its ticket.
+    async def prepare_hold(self, payload: dict[str, Any]) -> None: ...
+
+    # Identify a delayed native or owner report using fresh independent evidence.
+    async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None: ...
+
+    # Permit a proved owner report under a hold without authorizing any new Start.
+    def permits_held(self, tag: str) -> bool: ...
+
+    # Reserve a possible command binding until the actual native source is known.
+    def defer_binding(self, local: int, tag: str) -> bool: ...
+
+    # Record the observed Start inside its journal transaction.
+    def recorded(self, local: int, payload: dict[str, Any]) -> None: ...
+
+
 @dataclass(frozen=True)
 class VendorProfileWrite:
     """The exact translated profile awaiting a real acceptance, including a new alias reservation."""
@@ -121,11 +140,7 @@ class Gateway:
         self.controls = LocalControl(journal, self.charger, self.policy, lambda: self._charger_epoch)
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
-        self.prepare_report_hold: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-        self.held_start_report: Callable[[str], bool] | None = None
-        self.native_start_report: Callable[[dict[str, Any]], Awaitable[NativeStartReport | None]] | None = None
-        self.defer_command_binding: Callable[[int, str], bool] | None = None
-        self.start_observer: Callable[[int, dict[str, Any]], None] | None = None
+        self.start_reports: StartReports | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
@@ -339,56 +354,17 @@ class Gateway:
                             else {"status": "Invalid"}
                         )
                     return build_call_result(token, {"idTagInfo": info})
-                if action == "StartTransaction" and self.prepare_report_hold and not self.journal.known_start(payload):
-                    await self.prepare_report_hold(payload)
-                    self._require_epoch("charger", epoch)
-                ticket = self.journal.get("control", {}).get("ticket")
-                if action == "StartTransaction" and self.policy.strict_cloud_authorization:
-                    try:
-                        await self._renew_direct_start(payload, epoch)
-                    except DeniedError, UnavailableError:
-                        if not self.journal.known_start(payload):
-                            raise
-                    self._require_epoch("charger", epoch)
-                if action in ("Authorize", "StartTransaction") and self._tag_allowed(payload.get("idTag")):
-                    await self.controls.ensure_ceiling()
-                    self._require_epoch("charger", epoch)
-                if (
-                    action == "StartTransaction"
-                    and self.journal.get("control", {}).get("ticket") != ticket
-                    and not self.journal.known_start(payload)
-                ):
-                    raise DeniedError("a newer owner operation superseded the start")
-                native_report = None
-                if (
-                    action == "StartTransaction"
-                    and self.native_start_report is not None
-                    and not self.journal.known_start(payload)
-                ):
-                    native_report = await self.native_start_report(payload)
-                    tag = payload.get("idTag")
-                    if (
-                        native_report is not None
-                        and self.policy.strict_cloud_authorization
-                        and isinstance(tag, str)
-                        and self._tag_info(tag)["status"] != "Accepted"
-                        and self.auth_info.accepted_for_delayed_report(
-                            tag, timestamp(payload["timestamp"]).timestamp(), payload["timestamp"]
-                        )
-                        is None
-                    ):
-                        await self._renew_direct_start(payload, epoch, held_native=True)
-                        refreshed = await self.native_start_report(payload)
-                        if refreshed is None or refreshed != native_report:
-                            raise DeniedError("the native occurrence changed during cloud authorization")
-                        native_report = refreshed
-                    self._require_epoch("charger", epoch)
-                    if self.journal.get("control", {}).get("ticket") != ticket:
-                        raise DeniedError("a newer owner operation superseded the reported start")
                 receipt = f"{epoch}:{token}"
-                text = build_call_result(
-                    token, self._local_answer(receipt, action, payload, native_report=native_report)
-                )
+                if action == "StartTransaction":
+                    response = await self._reported_start(receipt, payload, epoch)
+                else:
+                    # A failed journal read makes even a non-Start local reply unavailable.
+                    self.journal.get("control", {}).get("ticket")
+                    if action == "Authorize" and self._tag_allowed(payload.get("idTag")):
+                        await self.controls.ensure_ceiling()
+                        self._require_epoch("charger", epoch)
+                    response = self._local_answer(receipt, action, payload)
+                text = build_call_result(token, response)
         except DeniedError, ConflictError:
             text = build_call_error(
                 token, "PropertyConstraintViolation", "request conflicts with local policy or state"
@@ -402,10 +378,91 @@ class Gateway:
             text = build_call_error(token, "InternalError", "outcome unavailable; success was not confirmed")
         return text
 
-    # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
-    def _local_answer(
-        self, token: str, action: str, payload: dict[str, Any], *, native_report: NativeStartReport | None = None
+    # Hold, authorize and fence a reported Start before committing its real lifecycle.
+    async def _reported_start(self, receipt: str, payload: dict[str, Any], epoch: int) -> dict[str, Any]:
+        if self.start_reports is not None and not self.journal.known_start(payload):
+            await self.start_reports.prepare_hold(payload)
+            self._require_epoch("charger", epoch)
+        ticket = self.journal.get("control", {}).get("ticket")
+        if self.policy.strict_cloud_authorization:
+            try:
+                await self._renew_direct_start(payload, epoch)
+            except DeniedError, UnavailableError:
+                if not self.journal.known_start(payload):
+                    raise
+            self._require_epoch("charger", epoch)
+        if self._tag_allowed(payload.get("idTag")):
+            await self.controls.ensure_ceiling()
+            self._require_epoch("charger", epoch)
+        if self.journal.get("control", {}).get("ticket") != ticket and not self.journal.known_start(payload):
+            raise DeniedError("a newer owner operation superseded the start")
+        native_report = None
+        if self.start_reports is not None and not self.journal.known_start(payload):
+            native_report = await self.start_reports.identify(payload)
+            tag = payload.get("idTag")
+            if (
+                native_report is not None
+                and self.policy.strict_cloud_authorization
+                and isinstance(tag, str)
+                and self._tag_info(tag)["status"] != "Accepted"
+                and self.auth_info.accepted_for_delayed_report(
+                    tag, timestamp(payload["timestamp"]).timestamp(), payload["timestamp"]
+                )
+                is None
+            ):
+                await self._renew_direct_start(payload, epoch, held_native=True)
+                refreshed = await self.start_reports.identify(payload)
+                if refreshed is None or refreshed != native_report:
+                    raise DeniedError("the native occurrence changed during cloud authorization")
+                native_report = refreshed
+            self._require_epoch("charger", epoch)
+            if self.journal.get("control", {}).get("ticket") != ticket:
+                raise DeniedError("a newer owner operation superseded the reported start")
+        return self._record_start(receipt, payload, native_report)
+
+    # Validate the report and commit its command/native binding with the new transaction.
+    def _record_start(
+        self, token: str, payload: dict[str, Any], native_report: NativeStartReport | None
     ) -> dict[str, Any]:
+        integer(payload.get("connectorId"), 1, 1)
+        number(payload.get("meterStart"), 1e12)
+        occurred = timestamp(payload.get("timestamp"))
+        tag = payload.get("idTag")
+        if not isinstance(tag, str):
+            raise DeniedError("a reported start requires a tag")
+        known = self.journal.known_start(payload)
+        historical = None
+        if (
+            not known
+            and self.policy.strict_cloud_authorization
+            and (native_report is not None or self.start_reports is not None and self.start_reports.permits_held(tag))
+        ):
+            historical = self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp(), payload["timestamp"])
+        if not known and not self._tag_allowed(
+            tag, lifecycle=True, historical=historical is not None, native_report=native_report is not None
+        ):
+            raise DeniedError("tag is not approved for local authorization")
+
+        # Permission binding and the pending flag belong to the very same commit as the new Start fact.
+        def accepted(local: int) -> None:
+            if native_report is not None:
+                native_report.record(local)
+            elif self.start_reports is None or not self.start_reports.defer_binding(local, payload["idTag"]):
+                self.authorisation.consume(payload["idTag"], local)
+                self.controls.bind_start(payload["idTag"], local)
+            if self.start_reports is not None:
+                self.start_reports.recorded(local, payload)
+
+        info = historical or (self._tag_info(tag) if self.policy.strict_cloud_authorization and not known else None)
+        if info is not None:
+            if info["status"] != "Accepted":
+                raise DeniedError("authorization changed before accepting the new session")
+            if historical is None and not self._local_tag(tag):
+                self.auth_info.require_dynamic(info)
+        return self.journal.start(token, payload, accepted, info)
+
+    # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
+    def _local_answer(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "BootNotification":
             previous_boot = self.journal.get("boot")
             if previous_boot is not None and previous_boot != payload:
@@ -432,43 +489,6 @@ class Gateway:
             tag = payload.get("idTag")
             allowed = self._tag_allowed(tag)
             return {"idTagInfo": {"status": "Accepted" if allowed else "Invalid"}}
-        if action == "StartTransaction":
-            integer(payload.get("connectorId"), 1, 1)
-            number(payload.get("meterStart"), 1e12)
-            occurred = timestamp(payload.get("timestamp"))
-            tag = payload.get("idTag")
-            if not isinstance(tag, str):
-                raise DeniedError("a reported start requires a tag")
-            known = self.journal.known_start(payload)
-            historical = None
-            if (
-                not known
-                and self.policy.strict_cloud_authorization
-                and (native_report is not None or self.held_start_report is not None and self.held_start_report(tag))
-            ):
-                historical = self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp(), payload["timestamp"])
-            if not known and not self._tag_allowed(
-                tag, lifecycle=True, historical=historical is not None, native_report=native_report is not None
-            ):
-                raise DeniedError("tag is not approved for local authorization")
-
-            # Permission binding and the pending flag belong to the very same commit as the new Start fact.
-            def accepted(local: int) -> None:
-                if native_report is not None:
-                    native_report.record(local)
-                elif self.defer_command_binding is None or not self.defer_command_binding(local, payload["idTag"]):
-                    self.authorisation.consume(payload["idTag"], local)
-                    self.controls.bind_start(payload["idTag"], local)
-                if self.start_observer is not None:
-                    self.start_observer(local, payload)
-
-            info = historical or (self._tag_info(tag) if self.policy.strict_cloud_authorization and not known else None)
-            if info is not None:
-                if info["status"] != "Accepted":
-                    raise DeniedError("authorization changed before accepting the new session")
-                if historical is None and not self._local_tag(tag):
-                    self.auth_info.require_dynamic(info)
-            return self.journal.start(token, payload, accepted, info)
         if action == "StopTransaction":
             integer(payload.get("transactionId"))
             number(payload.get("meterStop"), 1e12)
@@ -516,7 +536,7 @@ class Gateway:
         held_report = (
             lifecycle
             and inhibited
-            and (native_report or self.held_start_report is not None and self.held_start_report(tag))
+            and (native_report or self.start_reports is not None and self.start_reports.permits_held(tag))
         )
         if (
             inhibited
