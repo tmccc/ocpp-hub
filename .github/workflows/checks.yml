@@ -42,6 +42,9 @@ jobs:
         run: mypy --strict --follow-imports=skip custom_components/ocpp_hub/core custom_components/ics_proxy/api.py
 
       - name: Test
+        env:
+          # Hosted jobs have separate runners. Use the same non-ephemeral listener pool as qualification.
+          MODEL_WORKER_INDEX: "0"
         run: |
           mkdir -p "${RUNNER_TEMP}/engine"
           TMPDIR="${RUNNER_TEMP}/engine" python tools/qualification_collection.py --source "$PWD" --suite engine-model --output "${RUNNER_TEMP}/engine/complete-collection.json"

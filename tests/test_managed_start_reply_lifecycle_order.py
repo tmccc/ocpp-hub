@@ -17,6 +17,7 @@ from tests.managed_rig import healthy, starts
 from tests.management_peer import TOKEN, call
 from tests.native_fault_support import coroutine_locals
 from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_managed_normal_start import natural_stop
 from tests.tls_support import tls as tls
 
@@ -135,7 +136,8 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
                 rig.bench.cp, rig.bench.connection = "C", "Charging"
                 rig.bench.firmware.fire_plan(9)
                 assert (await healthy(c))["current_a"] == 6
-                assert j.active() == local and j.vendor_id(local) is not None
+                assert j.active() == local
+                await until(lambda: j.vendor_id(local) is not None)
                 assert c.requests.receipt(identifier)["state"] == "completed"
                 c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
                 await c.pause_task
