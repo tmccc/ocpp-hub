@@ -95,10 +95,11 @@ must all pass the auditor. The source-pinned registry declares33,194 raw/9,202 r
 584 raw/360 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
 source, including HA families, then verifies exact input/event/recovery evidence. See the
 [recovery coverage matrix](recovery-coverage.md) for scopes, focused-only risks and limits.
-CI derives the exact model collection from that registry across20 independent runner jobs and includes all HA suites.
-The model shard collector retains the complete `tests_model` root and adds exact registered engine test functions
-from other roots. Its structural regression checks the real collection against the canonical manifest, including
-process-death families, while excluding ordinary named tests from the model-only CI partition.
+Hosted CI collects the complete engine suite once and distributes that shared plan across 20 independent runners.
+The plan includes ordinary engine tests, the full `tests_model` root and registered model cases under `tests/`.
+Each job verifies its exact assignment and all reported phases against the plan. Model cases also retain their
+input, event and recovery checks against the registry. The aggregate check requires all engine, static and HA
+jobs to pass.
 
 Large targeted socket-test batches also need separate offline network environments. The Python loopback guard alone
 shares the host's connection tables; sustained parallel HTTP traffic has exhausted that table and caused unrelated
@@ -137,8 +138,8 @@ checked before collection. SSH and collection have bounded timeouts and no cache
 `parallel_qualify.py` forwards its explicitly chosen worker settings to its immediate audit. Later validator,
 coverage-matrix and deployment-gate invocations must pass their intended trusted executor map themselves.
 The supported `deploy_ha.py --collection-executors` option forwards the same caller-selected map to its validation gate.
-CI performs the same controlled discovery before its ordinary and HA jobs; this does not replace the separate
-four-suite twenty-worker qualification.
+CI uses the same controlled discovery for its engine plan and HA jobs. The four-suite twenty-worker
+qualification supplies the separate release evidence.
 
 ## Rules for code
 

@@ -13,7 +13,7 @@ env:
   PYTEST_PLUGINS: ""
 
 jobs:
-  checks:
+  static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -41,15 +41,6 @@ jobs:
       - name: Type check
         run: mypy --strict --follow-imports=skip custom_components/ocpp_hub/core custom_components/ics_proxy/api.py
 
-      - name: Test
-        env:
-          # Hosted jobs have separate runners. Use the same non-ephemeral listener pool as qualification.
-          MODEL_WORKER_INDEX: "0"
-        run: |
-          mkdir -p "${RUNNER_TEMP}/engine"
-          TMPDIR="${RUNNER_TEMP}/engine" python tools/qualification_collection.py --source "$PWD" --suite engine-model --output "${RUNNER_TEMP}/engine/complete-collection.json"
-          TMPDIR="${RUNNER_TEMP}/engine" python tools/offline_validate.py tests/ --junitxml=pytest-report.xml
-
       - name: Compile
         run: python3 -m compileall -f custom_components/
 
@@ -61,6 +52,18 @@ jobs:
             base=$(git rev-parse --verify -q HEAD^ || git hash-object -t tree /dev/null)
             git diff --check "$base" HEAD
           fi
+
+      - name: Collect the complete engine suite
+        run: |
+          mkdir -p "${RUNNER_TEMP}/engine-plan"
+          TMPDIR="${RUNNER_TEMP}/engine-plan" python tools/qualification_collection.py \
+            --source "$PWD" --suite engine-model --output "${RUNNER_TEMP}/engine-plan/collection.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engine-plan
+          path: ${{ runner.temp }}/engine-plan/collection.json
+          if-no-files-found: error
+          overwrite: true
 
   # The Home Assistant layer (config flow, setup, entities, diagnostics) against the real Home Assistant test harness.
   # The version of the plugin pins the Home Assistant version it tests against; keep it equal to the owner's server.
@@ -97,7 +100,8 @@ jobs:
           TMPDIR="${RUNNER_TEMP}/ha" python tools/qualification_collection.py --source "$PWD" --suite "${{ matrix.collection_suite }}" --output "${RUNNER_TEMP}/ha/complete-collection.json"
           TMPDIR="${RUNNER_TEMP}/ha" python tools/offline_ha_validate.py ${{ matrix.arguments }}
 
-  model:
+  engine:
+    needs: static
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -110,11 +114,33 @@ jobs:
           python-version: "3.14"
       - name: Install dependencies
         run: pip install -r requirements-offline.txt
-      - name: Run complete model shard
-        run: python tools/run_model_shard.py --shard ${{ matrix.shard }} --output "${RUNNER_TEMP}/model"
-      - name: Preserve model evidence
+      - uses: actions/download-artifact@v8
+        with:
+          name: engine-plan
+          path: ${{ runner.temp }}/engine-plan
+      - name: Run assigned engine and model cases
+        run: |
+          python tools/run_model_shard.py --shard ${{ matrix.shard }} --output "${RUNNER_TEMP}/engine" \
+            --engine-collection "${RUNNER_TEMP}/engine-plan/collection.json"
+      - name: Preserve shard evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: model-${{ matrix.shard }}
-          path: ${{ runner.temp }}/model
+          name: engine-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/engine
+          if-no-files-found: error
+
+  checks:
+    if: ${{ always() }}
+    needs: [static, engine, ha-layer]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all checks to pass
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          ENGINE_RESULT: ${{ needs.engine.result }}
+          HA_RESULT: ${{ needs.ha-layer.result }}
+        run: |
+          test "$STATIC_RESULT" = success
+          test "$ENGINE_RESULT" = success
+          test "$HA_RESULT" = success
