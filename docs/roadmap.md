@@ -8,22 +8,31 @@ The repository has two deployment domains: the standalone iCS proxy with its thi
 older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
 Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
-## Current iCS implementation — 17 November 2026
+## Current iCS implementation — 18 November 2026
 
 - [x] Version 0.2.3 implements shared recovery coordination, explicit permission/result/effect contracts, atomic
   Start/Return authority publication and owned shutdown. Reconnect completion remains separate from admission
-  auditing and verified zero. The README, navigation guide and recovery coverage describe these boundaries and
-  their regressions. Backend implementation `0020bbd`, including the simplifications below, is deployed and
-  independently verified. The unchanged HA client remains at implementation `8013d2f`; its files and running
-  process were retained without installation or restart.
+  auditing and verified zero. Backend implementation `de2d74b`, including the simplifications below and the
+  installation lifecycle owner, is committed, pushed, deployed and independently verified. The unchanged HA client
+  remains at implementation `8013d2f`; its files and running process were retained without installation or restart.
   Settings, history, the dashboard, 16 entities and all 25 automation states (including five disabled) are preserved.
-  The final checks confirm healthy local and cloud connections, paused zero at control revision 59, and the
-  32 A selection and native configuration retained. The session is closed; no delivery or mutation debt remains.
-  Home Assistant remains on core 2026.11.1. No new live charging trial was performed.
-- [x] Implementation `0020bbd` passed all four complete suites with 20 workers each: 12,866 engine/model tests,
-  613 HA 2026.11.0 client tests, 613 HA 2026.10.4 client tests and 48 older-integration tests. The normal evidence gate
-  with fresh collection and the independent evidence audit passed. Documentation-only follow-ups do not change
-  that tested implementation.
+  Deployment checks preserved healthy paused zero at control revision 59, the selected/native 32 A ceiling,
+  original schedule/configuration and a closed session with no delivery or mutation debt. Home Assistant remains
+  on core 2026.11.1. The backend was activated once. A transient outbox snapshot interrupted one schema check;
+  its failure is retained alongside two subsequent unchanged strict passes and the completed independent audit.
+- [x] Implementation `de2d74b` passed all four complete suites with 20 workers each: 12,946 engine/model tests,
+  613 HA 2026.11.0 client tests, 613 HA 2026.10.4 client tests and 48 older-integration tests, 14,220 tests total.
+  The normal validator and independent evidence audit passed. Documentation-only follow-ups do not change
+  that tested and deployed implementation.
+- [x] After deployment, a separately authorised Return restored app/schedule control at revision 60 and the
+  verified 32 A ceiling. Subsequent ordinary charging was observed at 3.5 kW and 14.2 A; no Start command was sent
+  by the deployment work. A separately authorised 06:00 Europe/London Stop for 18 November is armed in a persistent
+  external timer. Its physical completion is not yet verified.
+- [x] Claude cleared its context and reviewed the exact deployed source, all code/tests and normal documentation.
+  The independent visible-read audit accounts for all 520 normal text files and four limited recorded-data views
+  with their complete consumers. Full raw capture bodies and six branding PNGs were not visually reviewed.
+  Findings are static, not runtime reproductions: one iCS retry defect, an authorisation renewal/diagnostic gap,
+  two legacy-integration issues and two release-tooling weaknesses. Open corrections are recorded below.
 
 ## Architectural simplification — 17 November 2026
 
@@ -77,14 +86,30 @@ changes rather than a cumulative total. Further simplification remains open.
   ordering. Remove three unused exception adapters; retain all charging features and persisted formats. The gain is
   consistent authority vocabulary rather than another large line-count reduction.
 
-## Local lifecycle refactor — 17 November 2026
+## Installation lifecycle refactor — 18 November 2026
 
-- [~] Give installation phase and introduction-flag writes one owner, `Journal.phase`, with named transitions
+- [x] Give installation phase and introduction-flag writes one owner, `Journal.phase`, with named transitions
   and shared phase predicates. Preserve raw stored values, lazy reads, separate fault policies, physical-control
   preimages and original transaction/write order. Focused verification passes 341 unique cases, including 80 new
   lifecycle cases, diagnostic contracts and two actual SIGKILL boundaries. All 17 generated owner mutants are
   caught; static checks and Claude's independent runtime review pass. Runtime grows by 115 physical lines to
-  centralise ownership. Full qualification and deployment remain separate; the deployed backend is still `0020bbd`.
+  centralise ownership. The exact implementation is included in the full qualification and verified `de2d74b`
+  deployment above.
+
+## Follow-ups from the fresh bug review — 18 November 2026
+
+- [ ] Retry and diagnose SQLite failures after the first introduction read but before the audit marker is published.
+  Such a failure can retire the Boot probe and strand the same connection after storage heals. Add a real
+  post-read write-failure witness; retain the distinction from later failures that paused foreground proof can repair.
+- [ ] Explain expired local-tag approvals in Start diagnostics and assess an explicit online renewal path. The
+  existing refusal is documented policy; ignoring expiry is not a fix. The README now states the owner-visible
+  limitation and distinguishes Return from an actual Start inside an already open daily window.
+- [ ] In the separate older integration, expose or retry failed secondary hub-profile synchronisation after a
+  genuinely accepted native planning switch; do not revert the accepted native flag. Guard malformed session-history
+  container shapes before iterating them. Neither issue was found on the active iCS path.
+- [ ] Select tagged release notes by the requested version instead of the first changelog heading, which is
+  `Unreleased`. Preserve version-component boundaries when checking equality; removing dots can equate different
+  versions. These findings concern release tooling, not the deployed charger session.
 
 ## iCS implementation history — 15–17 November 2026
 
@@ -110,9 +135,10 @@ changes rather than a cumulative total. Further simplification remains open.
   one HA test body; this is composed evidence, not a new four-suite same-commit qualification.
 - [x] This installation's 32 A commissioning handover is closed. Managed Start/Pause/Return and idle-only current
   selection are implemented. The earlier trial notes do not redefine today's supported control path.
-- [ ] Resolve the vendor cloud connection failure first observed on 14 November. As of the 15 November investigation,
-  local control remained healthy at paused zero while cloud openings were refused on both configured server nodes,
-  including through a different public IP. No internal vendor cause or wider outage was established.
+- [ ] Identify the cause of the vendor cloud connection failure first observed on 14 November. Live connections
+  are healthy again in the 18 November deployment checks. In the 15 November investigation, local control remained
+  healthy at paused zero while cloud openings were refused on both configured server nodes, including through a
+  different public IP. No internal vendor cause or wider outage was established.
 
 The dated entries below retain historical observations and physical limits. The Raedian-specific open items remain
 separate from the delivered iCS installation.

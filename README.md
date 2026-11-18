@@ -823,6 +823,14 @@ static authorization gates. Scoped cloud-outage admission is described below; Re
 cloud reconciliation. A Start payload cannot select its own current/tag/duration; current selection is a separate
 idle-only command. The raw generic Start path remains unavailable. Existing timed tests remain.
 
+If every configured local tag has an expired cloud approval, HA/local Start is unavailable even when the cloud
+is connected. There is no management command to renew those approvals; supported charger/vendor traffic must
+obtain fresh approval for a matching local tag. Approval for a different tag does not enable local Start.
+
+Return restores the selected ceiling and app/schedule authority. It sends no Start and does not replay a missed
+daily start. When returning during an already open native daily window, check the actual session and measured
+power; restoring authority alone does not prove that the firmware has resumed charging.
+
 If Return interrupts a normal Start, zero is reasserted while the original accepted Start remains pending until
 its real lifecycle is known. Return cannot complete from zero power alone. An immediate transaction report after
 the Start acknowledgement is rechecked against the control state after that handoff; a later Pause still wins.
