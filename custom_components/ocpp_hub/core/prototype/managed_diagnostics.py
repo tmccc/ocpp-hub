@@ -114,13 +114,15 @@ def fault_summary(c: ManagedController) -> tuple[dict[str, Any] | None, list[str
 # Receipt states remain durable facts; neither a completed worker nor an old accepted time proves physical success.
 def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, Any]], int]:
     journal = c.session.journal
-    count = journal.db.execute(
-        "SELECT COUNT(*) FROM managed_requests WHERE state IN ('accepted','running','uncertain')"
-    ).fetchone()[0]
-    rows = journal.db.execute(
-        "SELECT action,state,result FROM managed_requests WHERE state IN ('accepted','running','uncertain') "
-        "ORDER BY rowid DESC LIMIT 5"
-    ).fetchall()
+    intent = c.requests.intent()
+    # Once a newer app intent won, old uncertain Returns are receipt history rather than pending work.
+    cutoff = (intent.revision if intent.mode == "app" else 0,)
+    where = (
+        " FROM managed_requests WHERE state IN ('accepted','running','uncertain') "
+        "AND NOT (action='app_control' AND state='uncertain' AND revision<?)"
+    )
+    count = journal.db.execute("SELECT COUNT(*)" + where, cutoff).fetchone()[0]
+    rows = journal.db.execute("SELECT action,state,result" + where + " ORDER BY rowid DESC LIMIT 5", cutoff).fetchall()
     commands = []
     for row in rows:
         result = json.loads(row["result"])

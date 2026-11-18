@@ -82,7 +82,7 @@ def release_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, A
     failure = c.session.journal.get("managed_native_failure", {})
     at, observed = fault.get("at_epoch"), failure.get("at_epoch")
     eligible = (
-        failure.get("type") in ("NativeTransportUnavailableError", "StaleEvidenceError")
+        failure.get("type") in ("NativeTransportUnavailableError", "StaleEvidenceError", "NativeReadinessError")
         and isinstance(at, (int, float))
         and not isinstance(at, bool)
         and isinstance(observed, (int, float))

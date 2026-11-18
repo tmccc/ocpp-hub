@@ -7,6 +7,7 @@ import uuid
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_debt_recovery import debt_snapshot
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, reconcile_owner_release
 from ocpp_hub_core.prototype.managed_settlement import current_candidate, internal_pause_matches, require_record
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, encoded
@@ -282,7 +283,7 @@ async def test_failed_current_record_retires_after_verified_pause(tmp_path, tls,
             assert (await settled_without_another_command(c))["local_hold_verified"]
             assert j.get("managed_current_change")["id"] == identifier
             assert j.get("managed_current_change")["state"] == "cancelled"
-            assert c.requests.receipt(identifier) == historical
+            assert c.requests.receipt(identifier) == {**historical, "state": "failed"}
             assert c.current.selected() == 6 and b.rig.bench.firmware.effective_limit() == 0
             assert not starts(b.rig)
             assert all(
@@ -291,6 +292,15 @@ async def test_failed_current_record_retires_after_verified_pause(tmp_path, tls,
         finally:
             j.db.execute("DROP TRIGGER review_worker_boundary")
             j.db.execute("DROP TRIGGER review_cleanup_unavailable")
+        successor = uuid.uuid4().hex
+        c.command(successor, "set_current", c.requests.intent().revision, current_a=12)
+        await c.current.settle()
+        assert (await healthy(c))["local_hold_verified"]
+        assert j.current_change.read().value["id"] == successor
+        assert c.requests.receipt(successor)["state"] == "completed"
+        assert c.requests.receipt(identifier) == {**historical, "state": "failed"}
+        assert debt_snapshot(j, c.native.spec, "stop-delivery")["requests"] == []
+        assert b.rig.bench.firmware.effective_limit() == 0
 
 
 # Intent: an exact internal Pause claim converges when HTTP heals even if its one immediate follow-up read failed.
@@ -427,4 +437,4 @@ async def test_terminal_current_snapshot_is_revoked_during_native_read(
                 j.db.execute("UPDATE managed_requests SET revision=? WHERE id=?", (revision, identifier))
         assert (await healthy(c))["local_hold_verified"]
         assert j.get("managed_current_change")["state"] == "cancelled"
-        assert c.requests.receipt(identifier) == historical
+        assert c.requests.receipt(identifier) == {**historical, "state": "failed"}

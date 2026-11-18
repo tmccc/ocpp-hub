@@ -168,8 +168,21 @@ def _plan_start(payload: dict[str, Any], policy: ControlPolicy) -> Forward | Ref
     return Forward("RemoteStartTransaction", payload)
 
 
-# Clearing profiles is passed on, except for the hub's own id, which only the hub removes. A clear without an id would
-# also remove the hub's profile; the caller lets the snapshot forget the hub's limit when that is accepted.
+# An accepted clear matches a specific ID or all of its supplied filters. Missing profile facts cannot prove a match.
+def clears_profile(
+    payload: dict[str, Any],
+    profile_id: int | None,
+    purpose: str | None,
+    connector_id: int | None,
+    stack_level: int | None,
+) -> bool:
+    if "id" in payload:
+        return bool(payload["id"] == profile_id)
+    scope = (("connectorId", connector_id), ("chargingProfilePurpose", purpose), ("stackLevel", stack_level))
+    return all(key not in payload or value is not None and payload[key] == value for key, value in scope)
+
+
+# Forward clears except a direct request for the hub's reserved profile ID.
 def _plan_clear(payload: dict[str, Any]) -> Forward | Refuse:
     if "id" in payload and not is_integer(payload["id"]):
         return Refuse({"status": "Unknown"}, "the profile id is not a number")

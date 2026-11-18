@@ -25,6 +25,7 @@ Version comparison preserves dotted components and normalizes the documented pre
 release job uses `python -m tools.release_notes "$GITHUB_REF_NAME" --output /tmp/release_notes.md` to select that
 exact numeric heading, skipping `Unreleased`. Missing or empty notes fail the release instead of selecting another
 section. Nested headings inside the selected notes are preserved.
+Before building the archive, CI also checks that the tag matches the version in the packaged manifests.
 
 Pre-releases use `X.Y.Z-rcN` (HACS shows it as a pre-release).
 
@@ -73,6 +74,10 @@ OCPP_QUALIFICATION_REPORT="$QUALIFICATION_BUNDLE" python tools/deploy_ha.py \
 The helper runs the validation gate, creates an external backup, installs and verifies files. Without the explicit
 domain it selects the older `ocpp_hub` integration. It does not deploy the standalone service. When separately
 authorized, `--restart --yes --ha-api-config "$HA_API_CONFIG"` performs the configuration check and HA restart.
+Docker verifies the selected Core process through its local API and waits for a new process to report running.
+For the legacy SSH restart, the API hostname must match the SSH target. Use `ssh_host` in the private API
+configuration for an explicit SSH alias. Verification uses the configured Uptime timestamp entity, which
+defaults to `sensor.uptime` and can be set via `uptime_entity`.
 `--skip-checks` is an exceptional explicit override after a reviewed replacement gate, not the normal workflow.
 
 Verify installed software identity, fresh local/native and HA state, preserved records and the requested mode.

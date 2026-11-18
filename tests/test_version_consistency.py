@@ -23,6 +23,17 @@ def test_version_is_in_sync() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+# Intent: the publishing gate accepts the current release tag and refuses a different version.
+# Why: a historical changelog heading must not let a new archive publish under its old tag.
+def test_release_tag_must_match_the_checked_out_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(version, "read_pyproject", lambda: "1.10.0rc2")
+    monkeypatch.setattr(version, "read_manifest", lambda path: "1.10.0-rc2")
+    monkeypatch.setattr(version, "read_changelog_headings", lambda: ["Unreleased", "1.10.0-rc2", "1.9.0"])
+
+    assert version.main(["version.py", "check", "v1.10.0-rc2"]) == 0
+    assert version.main(["version.py", "check", "v1.9.0"]) == 1
+
+
 # Intent: distinct numeric version components must cause actual release-version drift to fail.
 # Why: stripping dots made two different releases compare equal and let CI miss a mismatch.
 @pytest.mark.parametrize("package,manifest", [("0.2.3", "0.23"), ("1.10.0", "11.0.0")])

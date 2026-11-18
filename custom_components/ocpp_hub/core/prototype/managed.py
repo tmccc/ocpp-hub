@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
-from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
+from .connection_scope import control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
 from .local_control import local_start_receipt
 from .managed_charging import ManagedCharging
@@ -34,7 +34,7 @@ from .managed_settlement import (
 from .managed_sources import awaiting_owner_start, recorded_station_profile
 from .managed_start_binding import ManagedStartBinding, ManagedStartReports
 from .managed_view import observed_status, poll_base, poll_status
-from .native_bounded import readiness_decision
+from .native_bounded import NativeReadinessError, readiness_decision
 from .native_bounded_handover import AuditSupersededError
 from .native_faults import (
     MEASURED_FAULT,
@@ -94,7 +94,7 @@ class ManagedController:
         self.requests = ManagedRequests(session.journal)
         self.pause_task: asyncio.Task[Any] | None = None
         self.latest_native: HandoverEvidence | None = None
-        self.status_scope: ControlScope | None = None
+        self.status_authority: AuthorityStamp | None = None
         self.status_vendor_epoch: int | None = None
 
         self.current = ManagedCurrentLimits(self)
@@ -316,7 +316,8 @@ class ManagedController:
                     j.put("managed_owner_stop", intent.pause_claim(stop_ticket))
 
             try:
-                native = await self.native.read()
+                # Closing the exact locally known session may proceed even after cable removal.
+                native = await self.native.read(closing_local=local)
             except _NativeMeasurementError as candidate:
                 if (
                     candidate.authority != self.native.authority()
@@ -381,7 +382,8 @@ class ManagedController:
     async def maintain_pause(self) -> HandoverEvidence:
         if self.pause_task is not None and not self.pause_task.done():
             await asyncio.shield(self.pause_task)
-        native = await self.native.read()
+        # A still-open unplugged session must reach the guarded Stop retry below.
+        native = await self.native.read(closing_local=self.session.journal.active())
         self.native.require_known_session(native)
         if (
             native.physical.transaction_open
@@ -443,7 +445,11 @@ class ManagedController:
         pause_revision = self.requests.intent().revision
         if receipt.get("pause_revision") == pause_revision and receipt.get("verified_pause_revision") != pause_revision:
             j.starts.pause_verified(receipt, pause_revision)
-        self.requests.confirm_pauses()
+        try:
+            self.requests.confirm_pauses()
+        except sqlite3.Error as error:
+            # Only receipt publication failed. The next poll can verify zero without repeating Stop.
+            raise RecoveryRequiredError("verified Pause awaits receipt publication") from error
         return native
 
     # Offline replacement retires prior app authority before any recovery wait and never auto-Returns on reconnection.
@@ -717,6 +723,19 @@ class ManagedController:
             native = candidate.native
             measured = self.native._selected_measurements(native, candidate.measured)
             authority, sequence = candidate.authority, candidate.sequence
+        except NativeReadinessError as error:
+            physical = error.native.physical
+            if not error.unplugged_at_zero or (
+                physical.native_transaction_id != self.session.journal.active()
+                and not self.ordinary.closure_gap(error.native)
+            ):
+                raise
+            self.latest_native = None
+            self.failures = 0
+            self.strict_failure_seen = False
+            if self.ordinary.ordinary():
+                await self.ordinary.hold("unplugged_session_pending")
+            raise RecoveryRequiredError("unplugged session awaits exact lifecycle closure") from error
         async with asyncio.timeout(15):
             if self.session._resource_mutation_inflight():
                 raise UnavailableError("managed native observation crossed a resource mutation")

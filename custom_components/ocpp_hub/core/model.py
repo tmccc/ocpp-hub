@@ -106,6 +106,8 @@ class ChargerSnapshot:
     vendor_limit_a: float | None = None
     vendor_profile_id: int | None = None
     vendor_purpose: str | None = None
+    vendor_profile_connector_id: int | None = None
+    vendor_profile_stack_level: int | None = None
     # What the charger itself says is in effect right now, from GetCompositeSchedule; None when it cannot say.
     composite_limit_a: float | None = None
     # The limits the charger says apply over the next 24 hours, as (seconds after schedule_start, amperes), and when
@@ -215,11 +217,13 @@ class LimitMemory:
     # Set on a side that was read from storage and not yet confirmed by the charger; never stored itself.
     hub_restored: bool = False
     vendor_restored: bool = False
+    vendor_profile_connector_id: int | None = None
+    vendor_profile_stack_level: int | None = None
 
     @property
     def empty(self) -> bool:
         """True when there is nothing to remember."""
-        return self.hub_a is None and self.vendor_a is None
+        return self.hub_a is None and self.hub_purpose is None and self.vendor_a is None
 
     # The memory as plain JSON values.
     def to_dict(self) -> dict[str, object]:
@@ -229,6 +233,8 @@ class LimitMemory:
             "vendor_a": self.vendor_a,
             "vendor_profile_id": self.vendor_profile_id,
             "vendor_purpose": self.vendor_purpose,
+            "vendor_profile_connector_id": self.vendor_profile_connector_id,
+            "vendor_profile_stack_level": self.vendor_profile_stack_level,
         }
 
     # Rebuild the memory from what to_dict wrote; a record with the wrong types raises, so the caller can skip it.
@@ -250,10 +256,13 @@ class LimitMemory:
             raise TypeError("a limit record must be an object")
 
         profile_id = data.get("vendor_profile_id")
+        connector_id, stack_level = data.get("vendor_profile_connector_id"), data.get("vendor_profile_stack_level")
         return cls(
             hub_a=number("hub_a"),
             hub_purpose=data.get("hub_purpose"),
             vendor_a=number("vendor_a"),
             vendor_profile_id=int(profile_id) if profile_id is not None else None,
             vendor_purpose=data.get("vendor_purpose"),
+            vendor_profile_connector_id=connector_id if type(connector_id) is int else None,
+            vendor_profile_stack_level=stack_level if type(stack_level) is int else None,
         )

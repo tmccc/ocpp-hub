@@ -228,7 +228,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OcppHubConfigEntry) -> b
     mirror = VendorMirror(settings, policy=policy, plan_handler=plans) if settings is not None else None
     if mirror is not None:
         await mirror.start()
-    central = CentralSystem([], policy=policy)
+    central = CentralSystem([], policy=policy, allocate_transaction_id=sessions.async_next_transaction_id)
     central.restore_limits(stored_limits)
     plans.bind(central)
     listener = HubListener(

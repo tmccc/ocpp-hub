@@ -20,6 +20,7 @@ from .notification import notice_for
 
 DOMAIN = "ics_proxy"
 LOGGER = logging.getLogger(__name__)
+AGE_FIELDS = ("status_age_seconds", "native_age_seconds")
 
 
 # Bound before any float arithmetic: JSON integers can exceed the representable range without exceeding message size.
@@ -67,14 +68,14 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Health cannot outlive either the independent native reading or the service report which verified it.
     @property
     def fresh_healthy(self) -> bool:
-        ages = [self.age("status_age_seconds"), self.age("native_age_seconds")]
+        ages = [self.age(key) for key in AGE_FIELDS]
         return (self.data or {}).get("healthy") is True and all(a is not None and 0 <= a <= 15 for a in ages)
 
     # Explicit local health can retain safe native control during a manufacturer-cloud outage.
     @property
     def fresh_local_healthy(self) -> bool:
         data = self.data or {}
-        ages = [self.age("status_age_seconds"), self.age("native_age_seconds")]
+        ages = [self.age(key) for key in AGE_FIELDS]
         return (
             data.get("running") is True
             and data.get("local_healthy", data.get("healthy")) is True
@@ -88,10 +89,18 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.cancel_timer()
             self.cancel_timer = None
 
+    # Schedule the next boundary of this snapshot. Service-only entities can outlive the native readings.
+    @callback
+    def schedule_expiry(self, remaining: list[float]) -> None:
+        until_expiry = min((age for age in remaining if age >= 0), default=None)
+        if until_expiry is not None:
+            self.cancel_timer = async_call_later(self.hass, max(0.1, until_expiry) + 0.05, self.expire)
+
     # Entity invalidation runs on time without performing another request or issuing a charger command.
     @callback
     def expire(self, now: Any) -> None:
         self.cancel_timer = None
+        self.schedule_expiry([15 - age for key in AGE_FIELDS if (age := self.age(key)) is not None])
         self.update_notification(self.fresh_healthy)
         self.async_update_listeners()
 
@@ -124,15 +133,14 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed("The charger proxy status belongs to an inactive entry")
         self.received_at = time.monotonic()
         transit = max(0, self.received_at - started)
-        for key in ("status_age_seconds", "native_age_seconds"):
+        for key in AGE_FIELDS:
             age = value.get(key)
             if usable_age(age):
                 value[key] = age + transit
         self.cancel_expiry()
-        ages = [value.get(key) for key in ("status_age_seconds", "native_age_seconds")]
+        ages = [value.get(key) for key in AGE_FIELDS]
         remaining = [15 - age for age in ages if usable_age(age)]
-        if remaining:
-            self.cancel_timer = async_call_later(self.hass, max(0.1, min(remaining)) + 0.05, self.expire)
+        self.schedule_expiry(remaining)
         self.update_notification(
             value.get("healthy") is True
             and len(remaining) == 2

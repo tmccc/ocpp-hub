@@ -53,7 +53,9 @@ class CloudReplyPeer:
         frame = decode(raw)
         if frame[0] == 3 and self.actions.get(frame[1]) == "StopTransaction":
             gate = getattr(self.bench, "stop_gate", None)
-            if gate is not None:
+            if gate is not None and not gate.is_set():
+                waits = getattr(self.bench, "held_stop_replies", [])
+                self.bench.held_stop_replies = [*waits, frame[1]]
                 await gate.wait()
             info = getattr(self.bench, "stop_info", None)
             if getattr(self.bench, "stop_error", False):

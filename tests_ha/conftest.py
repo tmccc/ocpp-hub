@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -63,7 +64,11 @@ def state_of(hass: HomeAssistant, entity_id: str) -> str | None:
 # Intent: factory fixture that sets up an OCPP Hub entry on a free port and unloads it at the end of the test.
 # Why: a test that leaves the server running would fail the plugin's check for lingering tasks.
 @pytest.fixture
-async def setup_hub(hass: HomeAssistant) -> AsyncIterator[Callable[..., Awaitable[MockConfigEntry]]]:
+async def setup_hub(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Callable[..., Awaitable[MockConfigEntry]]]:
+    # Transaction ID reservations use real disk storage and must survive reload within this test.
+    monkeypatch.setattr(hass.config, "config_dir", str(tmp_path))
     entries: list[MockConfigEntry] = []
 
     # Intent: add and set up one entry with the given options.

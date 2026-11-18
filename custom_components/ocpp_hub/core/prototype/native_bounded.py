@@ -172,6 +172,24 @@ def require_native(
 class NativeReadinessError(SecurityError):
     """Strict native comparisons passed, but a closed zero-output prerequisite is not yet satisfied."""
 
+    # Retain the audited observation so the caller can distinguish known pending closure.
+    def __init__(self, detail: str, native: HandoverEvidence) -> None:
+        super().__init__(detail)
+        self.native = native
+
+    # A still-open unplugged session can wait only with no offered or measured output.
+    @property
+    def unplugged_at_zero(self) -> bool:
+        physical = self.native.physical
+        return (
+            physical.cp == "A"
+            and physical.connection == "Unplug"
+            and physical.transaction_open
+            and physical.native_transaction_id is not None
+            and self.native.output_limit_a == 0
+            and all(value == 0 for value in self.native.currents_a + self.native.powers_w)
+        )
+
 
 # Closed/zero is an operation prerequisite, not proof of a new immutable native contradiction.
 def _require_ready(
@@ -179,7 +197,7 @@ def _require_ready(
 ) -> None:
     decision = readiness_decision(native, closed, allow_unplugged, closing_local)
     if isinstance(decision, Pending):
-        raise NativeReadinessError(decision.detail)
+        raise NativeReadinessError(decision.detail, native)
 
 
 # A valid native observation may still await closure/zero; immutable content inspection remains a separate check.

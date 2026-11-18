@@ -359,7 +359,7 @@ class ManagedCurrentLimits:
             return "current_selection_not_commissioned"
         if c.stopping:
             return "service_stopping"
-        if self.pending():
+        if j.current_change.read().unresolved:
             return "current_update_pending"
         if j.fault.latched():
             return "fault_latched"

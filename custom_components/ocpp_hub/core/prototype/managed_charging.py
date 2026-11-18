@@ -42,6 +42,14 @@ STARTUP_BUDGET = 60
 ACTIVE = frozenset({"armed", "starting", "awaiting_power", "charging", "running", "stopping"})
 
 
+@dataclass(frozen=True)
+class TestFlow:
+    """The first verified power sample fixes the nominal Stop time even if publication must retry."""
+
+    observed_at: float
+    deadline: float
+
+
 @dataclass
 class ChargeLease:
     """A live request belongs to one actual introduction, revision, Stop generation and monotonic budget."""
@@ -64,6 +72,7 @@ class ChargeLease:
     initial_zero_boot: str | None = None
     initial_zero_stop_epoch: int | None = None
     start_scope: CloudAttemptScope | None = None
+    first_flow: TestFlow | None = None
 
 
 class ManagedCharging:
@@ -912,22 +921,29 @@ class ManagedCharging:
                 and (cloud or not state.get("start_rpc_accepted") or local.get("local") != self.journal.active())
             ) or (lease.source == "cloud" and not cloud):
                 return
-            lease.deadline = min(
-                lease.hard_deadline, time.monotonic() + DURATION + (15 if lease.source == "cloud" else 0)
-            )
-            self.journal.starts.project_test(
-                {
-                    **state,
-                    "state": "charging",
-                    "flow_started_at": time.time(),
-                    "stop_deadline_epoch": time.time() + DURATION,
-                    "local_transaction": self.journal.active(),
-                    "start_source_verified": True,
-                },
-            )
-            c.requests.finish(
-                lease.identifier, "completed", {"positive_power_verified": True, "duration_seconds": DURATION}
-            )
+            if lease.first_flow is None:
+                lease.first_flow = TestFlow(time.time(), time.monotonic() + DURATION)
+            flow = lease.first_flow
+            try:
+                with self.journal.atomic():
+                    self.journal.starts.project_test(
+                        {
+                            **state,
+                            "state": "charging",
+                            "flow_started_at": flow.observed_at,
+                            "stop_deadline_epoch": flow.observed_at + DURATION,
+                            "local_transaction": self.journal.active(),
+                            "start_source_verified": True,
+                        }
+                    )
+                    c.requests.finish(
+                        lease.identifier, "completed", {"positive_power_verified": True, "duration_seconds": DURATION}
+                    )
+            except sqlite3.Error as error:
+                if self.journal.db.in_transaction:
+                    raise
+                raise RecoveryRequiredError("verified test flow awaits receipt publication") from error
+            lease.deadline = min(lease.hard_deadline, flow.deadline + (15 if lease.source == "cloud" else 0))
             self.changed.set()
 
     # A failed normal Start can reclaim only zero from its own unchanged ticket beneath the original owner Pause.
@@ -1024,14 +1040,17 @@ class ManagedCharging:
         state = self.state()
         if state.get("kind") == "normal":
             return None
-        grace = 15 if state.get("source") == "cloud" and state.get("state") == "charging" else 0
+        remaining = 0.0
+        if self.lease is not None:
+            deadline = self.lease.deadline
+            if state.get("state") == "charging" and self.lease.first_flow is not None:
+                deadline = min(deadline, self.lease.first_flow.deadline)
+            remaining = deadline - time.monotonic()
         return {
             "source": state.get("source"),
             "state": state.get("state"),
             "duration_seconds": DURATION,
-            "seconds_remaining": min(DURATION, max(0, round(self.lease.deadline - time.monotonic() - grace)))
-            if self.lease
-            else 0,
+            "seconds_remaining": min(DURATION, max(0, round(remaining))),
         }
 
     # Ordinary sessions separate measured charging from known transaction existence, without a countdown.

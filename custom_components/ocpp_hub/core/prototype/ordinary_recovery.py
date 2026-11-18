@@ -12,6 +12,7 @@ from .gateway import NativeStartReport
 from .local_control import local_start_receipt
 from .managed_sources import recorded_station_profile
 from .managed_start_binding import known_plan_source
+from .native_bounded import NativeReadinessError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .store import RecoveryRequiredError, fingerprint
@@ -471,11 +472,17 @@ class OrdinaryRecovery:
     async def recover(self) -> Pending | None:
         c, j = self.c, self.c.session.journal
         await self.hold("restricted_introduction")
-        native = await c.native.read_result()
+        try:
+            native = await c.native.read_result()
+        except NativeReadinessError as error:
+            if not error.unplugged_at_zero or not self.closure_gap(error.native):
+                raise
+            return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
         if isinstance(native, Pending):
             return native
         local = j.active()
-        if self.closure_gap(native):
+        unplugged_hold = j.get(KEY, {}).get("reason") == "unplugged_session_pending"
+        if self.closure_gap(native) or (unplugged_hold and native.physical.transaction_open):
             return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
         decision = self.zero_introduction_decision(native, local)
         if isinstance(decision, Pending):

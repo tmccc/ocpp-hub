@@ -153,8 +153,9 @@ class NativeBoundedHandover:
         *,
         owned: bool = False,
         initial: bool = False,
+        closing_local: int | None = None,
     ) -> HandoverEvidence:
-        result = await self._read(route, closed, owned=owned, initial=initial)
+        result = await self._read(route, closed, owned=owned, initial=initial, closing_local=closing_local)
         if isinstance(result, Pending):
             raise AssertionError("legacy native read returned a managed prerequisite")
         return result
@@ -172,6 +173,7 @@ class NativeBoundedHandover:
         owned: bool = False,
         initial: bool = False,
         as_result: bool = False,
+        closing_local: int | None = None,
     ) -> HandoverEvidence | Pending:
         self.read_sequence += 1
         sequence, before = self.read_sequence, self.authority()
@@ -231,7 +233,7 @@ class NativeBoundedHandover:
                 self.ordinary_source_observer(native)
             if measured.exceeded:
                 raise _NativeMeasurementError(native, measured, self.authority(), sequence)
-            _require_ready(native, False, self.allow_unplugged, None)
+            _require_ready(native, False, self.allow_unplugged, closing_local)
         except NativeContentError as error:
             invalidate()
             # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
@@ -263,11 +265,19 @@ class NativeBoundedHandover:
             if ordinary.get("state") == "holding" and intent == {"mode": "app", "revision": ordinary.get("revision")}:
                 raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
             raise
-        except SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError:
+        except (SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
             invalidate()
             applicable = current()
             if repair is not None:
                 repair.finish(attempt, "readiness" if applicable else "superseded")
+            if (
+                applicable
+                and as_result
+                and isinstance(error, NativeReadinessError)
+                and error.unplugged_at_zero
+                and error.native.physical.native_transaction_id == gateway.journal.active()
+            ):
+                return Pending(Prerequisite.LIFECYCLE, str(error), error)
             raise
         except sqlite3.Error as error:
             invalidate()

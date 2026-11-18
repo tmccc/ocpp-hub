@@ -6,6 +6,7 @@ import uuid
 from dataclasses import replace
 
 import pytest
+from ocpp_hub_core.prototype.managed_diagnostics import snapshot
 from ocpp_hub_core.prototype.native_bounded_handover import NativeBoundedHandover
 from ocpp_hub_core.prototype.recovery_contracts import Prerequisite, RestoreState
 from ocpp_hub_core.prototype.recovery_coordinator import RecoveryCoordinator
@@ -70,6 +71,8 @@ async def new_return_after_preflight_recovery(test, identifier, original, intent
     assert accepted["id"] == fresh and accepted["state"] == "accepted"
     await completed_control(test, fresh, mode="app", revision=intent.revision + 1, ceiling=c.current.selected())
     assert c.requests.receipt(identifier) == original and not starts(test.rig)
+    status = await healthy(c)
+    assert snapshot(c, status)["pending_command_count"] == 0
     return fresh, copy.deepcopy(c.requests.receipt(fresh))
 
 

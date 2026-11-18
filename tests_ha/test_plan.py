@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -11,8 +12,10 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.ocpp_hub.const import DOMAIN
+from custom_components.ocpp_hub.const import CONF_VENDOR_COMMANDS, CONF_VENDOR_URL, DOMAIN
+from custom_components.ocpp_hub.core import raedian
 from custom_components.ocpp_hub.core.raedian import PlanWindow
+from tests.fake_vendor import FakeVendor
 from tests_ha.conftest import state_of, wait_for
 
 PLAN = "sensor.ocpp_hub_test0001_app_plan"
@@ -38,6 +41,51 @@ async def _call(hass: HomeAssistant, charger: Any, data: dict[str, Any], status:
     await charger.answer(request, {"status": status})
     await call
     return request
+
+
+# Intent: an accepted native planning switch completes its secondary profile change after a vendor reconnect.
+# Why: the charger's acknowledgement survives the vendor socket and HA must reflect the actual installed profile.
+async def test_accepted_planning_switch_survives_vendor_disconnect(hass, setup_hub, connect_charger):
+    vendor = FakeVendor()
+    await vendor.start()
+    try:
+        entry = await setup_hub({CONF_VENDOR_URL: vendor.url, CONF_VENDOR_COMMANDS: "forward"})
+        charger = await connect_charger(entry)
+        await charger.boot()
+        await wait_for(hass, lambda: vendor.calls_of("BootNotification"), "the boot did not reach the vendor")
+        await _call(hass, charger, {"windows": [MONDAY_NOON]})
+        session = entry.runtime_data.central.session("TEST0001")
+        assert session.snapshot.limit_purpose == "ChargePointMaxProfile"
+        data = raedian.build_frame(
+            raedian.HEAD_CLOUD,
+            raedian.COMMAND_PLANNING_SWITCH,
+            bytes.fromhex("0123456789abcdbe"),
+            bytes([raedian.PLANNING_OFF]),
+        )
+        payload = {
+            "vendorId": "READIAN",
+            "messageId": "RemoteConfiguration",
+            "data": json.dumps({"instructType": "b3", "originalData": data}),
+        }
+        switch = asyncio.create_task(vendor.command("DataTransfer", payload))
+        native_switch = await charger.next_hub_call()
+        prior_connections = vendor.connection_count
+        await vendor.stop()
+        switch.cancel()
+        await asyncio.gather(switch, return_exceptions=True)
+        await vendor.start()
+        await wait_for(hass, lambda: vendor.connection_count > prior_connections, "vendor did not reconnect")
+        assert session.snapshot.limit_purpose == "ChargePointMaxProfile"
+        await charger.answer(native_switch, {"status": "Accepted"})
+        clear = await charger.next_hub_call()
+        assert clear[2] == "ClearChargingProfile"
+        await charger.answer(clear, {"status": "Accepted"})
+        await wait_for(hass, lambda: session.snapshot.limit_purpose is None, "accepted profile clear was lost")
+        assert entry.runtime_data.plans.plan("TEST0001") == [PlanWindow(1, 43200, 50400)]
+        assert not entry.runtime_data.plans.planning_on("TEST0001")
+        assert entry.runtime_data.plans.profile_sync_error("TEST0001") is None
+    finally:
+        await vendor.stop()
 
 
 # Intent: setting a plan writes one weekly profile to the charger with the limit inside the windows from the ceiling and

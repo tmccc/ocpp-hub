@@ -11,6 +11,7 @@ The version lives in four files:
 for ``pyproject.toml`` and keeps the display form (hyphen) elsewhere::
 
     python tools/version.py check
+    python tools/version.py check v1.8.0-rc2
     python tools/version.py bump 1.8.0
     python tools/version.py bump 1.8.0-rc3  # pyproject gets 1.8.0rc3
 
@@ -70,9 +71,9 @@ def read_changelog_headings() -> list[str]:
     return re.findall(r"^##\s+(\S+)", CHANGELOG.read_text(), re.MULTILINE)
 
 
-# Compare the package with both manifests and the newest numeric changelog heading.
+# Compare the package with both manifests, the newest numeric changelog heading, and the tag when publishing.
 # CI must fail when they disagree.
-def check() -> int:
+def check(tag: str | None = None) -> int:
     pyproject = read_pyproject()
     problems: list[str] = []
     for path in MANIFESTS:
@@ -82,6 +83,8 @@ def check() -> int:
     latest = next((heading for heading in read_changelog_headings() if re.match(r"\d", heading)), "")
     if canonical(latest) != canonical(pyproject):
         problems.append(f"CHANGELOG.md latest numeric heading is {latest or 'missing'}, expected {pyproject}")
+    if tag is not None and (not tag.startswith("v") or canonical(tag[1:]) != canonical(pyproject)):
+        problems.append(f"release tag ({tag}) differs from the checked-out version ({pyproject})")
     if problems:
         for problem in problems:
             print(f"VERSION MISMATCH: {problem}", file=sys.stderr)
@@ -117,11 +120,11 @@ def bump(new: str) -> int:
 # Dispatch the check and bump commands.
 # One entry point serves CI and the release steps.
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("check", "bump"):
+    if len(argv) not in (2, 3) or argv[1] not in ("check", "bump"):
         print(__doc__, file=sys.stderr)
         return 2
     if argv[1] == "check":
-        return check()
+        return check(argv[2] if len(argv) == 3 else None)
     if len(argv) < 3:
         print("usage: python tools/version.py bump X.Y.Z", file=sys.stderr)
         return 2

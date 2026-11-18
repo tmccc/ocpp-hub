@@ -1,6 +1,7 @@
 """Actual HA keeps snapshot transit, reload recovery and incomplete history honest."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from homeassistant.components import persistent_notification
@@ -14,6 +15,52 @@ from tests import conftest as _engine  # noqa: F401 - register the standalone en
 from tests.tls_support import tls as tls
 from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_client import setup
+
+
+# Intent: expire native and service-only entities at their own boundaries while the next status is held.
+# Why: aging one half of a snapshot must not leave the other half visible indefinitely during a slow poll.
+async def test_app_connection_expires_after_native_reading_during_held_poll(actual_hass, peer, monkeypatch):
+    from custom_components.ics_proxy import coordinator
+
+    clock = SimpleNamespace(now=1000.0)
+    scheduled = []
+    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.now))
+
+    # Drive the real coordinator expiry callbacks without making the peer wait for wall-clock seconds.
+    def later(hass, delay, action):
+        event = (clock.now + delay, action)
+        scheduled.append(event)
+        return lambda: scheduled.remove(event)
+
+    monkeypatch.setattr(coordinator, "async_call_later", later)
+    peer["state"].update(native_age_seconds=12, status_age_seconds=10)
+    entry = await setup(actual_hass, peer)
+    power = "sensor.ics_proxy_power"
+    app = "binary_sensor.ics_proxy_cloud_connected"
+    assert actual_hass.states.get(app).state == "on"
+    held, release = asyncio.Event(), asyncio.Event()
+
+    # Hold the transport reply so only the original snapshot's timers can publish new entity states.
+    async def hold(command, request, result):
+        if command == "status":
+            held.set()
+            await release.wait()
+
+    peer["response_gate"] = hold
+    poll = asyncio.create_task(entry.runtime_data.async_refresh())
+    try:
+        await asyncio.wait_for(held.wait(), 3)
+        clock.now, expire = scheduled.pop(0)
+        expire(None)
+        assert actual_hass.states.get(power).state == "unavailable"
+        assert actual_hass.states.get(app).state == "on"
+        clock.now, expire = scheduled.pop(0)
+        expire(None)
+        assert actual_hass.states.get(app).state == "unavailable"
+        assert not scheduled and not poll.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(poll, 3)
 
 
 # Intent: response transit consumes native freshness immediately and in the timer between polls.

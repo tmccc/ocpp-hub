@@ -687,8 +687,8 @@ An accepted current update owns its pending native verification. Unfinished phys
 publishes fresh, nonhealthy status with unknown native measurements; cached readings never become a new zero proof.
 A diagnostic-only storage failure cannot delay restrictive cleanup, request settlement or later native supervision.
 If an idle current update fails and its first zero-hold verification loses native HTTP, supervision can verify that
-same hold when HTTP recovers. The failed current receipt stays uncertain until a separate owner Pause/Return;
-verification neither sends Stop nor restores a positive ceiling.
+same hold when HTTP recovers. Exact closed-zero proof retires the interrupted current request as failed, keeping
+its original reason and both current values. This verification leaves the station at zero until a separate Return.
 Failed app current updates retain the previous verified selection and require independent confirmation of their hold.
 The failed target remains in its receipt for diagnosis. An older journal fault from the current/health collision
 requires a new explicit Pause, its exact failed-request diagnostic and full closed-zero/settled-journal proof.
@@ -1274,7 +1274,10 @@ write-mode enum and is not evidence of actual metadata replies in those modes.
 
 All observed proprietary write replies are exactly `{"status":"Accepted","data":""}`. Plans use wire amperes such as `32.0`;
 retained native fields encode tenths of an ampere. Scaling is applied only where actual evidence establishes it.
-The app's fresh RemoteStart uses a new tag, and its current slider installs a new transaction-specific profile.
+The app sometimes uses a new RemoteStart tag and sometimes reuses its recurring plan's tag. The captures contain
+both cases, but they do not retain the native session's `_setPlanId`. Same-tag command attribution waits for a
+distinct native plan marker before treating the session as command-started.
+The app's current slider installs a new transaction-specific profile.
 A previous session's 6 A TxProfile did not constrain the next session; the app had to apply a new 6 A profile.
 A paused car still produced Authorize/StartTransaction, so a transaction alone does not prove power is flowing.
 

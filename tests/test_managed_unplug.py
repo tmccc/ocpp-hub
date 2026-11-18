@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import copy
 import ssl
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.recovery_contracts import Pending, Prerequisite
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.trial_handover_evidence import HandoverEvidence
 from ocpp_hub_core.prototype.trial_session import TrialSession
 
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.test_native_bounded import IDENTITY, native, spec
 from tests.tls_support import tls as tls
 
@@ -105,6 +110,56 @@ async def test_managed_unplug_and_replug_remain_healthy_without_control_commands
             assert session.journal.get("managed_control_fault") is None
             assert rig.bench.received_limits == old_limits and not starts(rig)
             assert rig.bench.history == old_history and session.journal.active() is None
+
+
+# Intent: hold zero for an unplugged session until the charger closes it, with or without explicit Pause.
+# Why: unresolved closure is a lifecycle prerequisite and must not latch an authority fault.
+@pytest.mark.parametrize("owner_pause", [False, True])
+async def test_unplugged_open_session_waits_then_owner_pause_closes_it(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_pause: bool,
+) -> None:
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, rig = test.controller, test.rig
+        local = await positive_flow(test, "daily")
+        assert (await healthy(c))["charging_session_open"]
+        assert rig.bench.firmware.effective_limit() == 6
+        intent = c.requests.intent()
+        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        rig.peer.paused, rig.peer.permission_enabled = True, False
+        for _ in range(4):
+            status = await c.tick()
+            assert status["state"] == "reconciling" and not status["owner_control_enabled"]
+            assert rig.bench.firmware.effective_limit() == 0
+        assert c.requests.intent() == intent and c.session.journal.active() == local
+        assert not rig.bench.remote_stop.is_set()
+        assert c.session.journal.fault.read({}) == {}
+        pending = await c.native.read_result()
+        assert isinstance(pending, Pending) and pending.reason is Prerequisite.LIFECYCLE
+        if owner_pause:
+            c.command(uuid.uuid4().hex, "pause", intent.revision)
+            assert (await actual_stop(test, local))["local_hold_verified"]
+        else:
+            rig.bench.cp, rig.bench.connection = "B", "Plug"
+            assert (await c.tick())["state"] == "reconciling"
+            assert rig.bench.firmware.effective_limit() == 0
+            reply = await rig.bench.call(
+                test.charger, uuid.uuid4().hex, "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+            )
+            assert reply[0] == 3
+            rig.peer.paused = False
+            rig.peer.plan_session = None
+            await until(lambda: c.session.journal.next_delivery() is None)
+            assert (await healthy(c))["owner_control_enabled"]
+            assert c.requests.intent() == intent and not rig.bench.remote_stop.is_set()
+        rig.bench.cp, rig.bench.connection = "B", "Plug"
+        assert (await healthy(c))["vehicle_connected"]
+        assert c.session.journal.fault.read({}) == {}
+        assert not starts(rig)
 
 
 # Intent: an already admitted managed service can restart, prove owned zero and release6 while the car is absent.

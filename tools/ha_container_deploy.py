@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import hashlib
 import io
 import json
-import shutil
+import os
+import platform
 import sys
 import tarfile
+import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -44,48 +48,69 @@ def validated_files(domain: str, archive: bytes, expected: dict[str, str]) -> di
     return result
 
 
-# Keep a verified previous copy outside custom_components and restore it if writing or verification fails.
+# Exchange two fully written directories in one Linux operation so the live path never disappears.
+def exchange_directories(staged: Path, installed: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    args = (-100, os.fsencode(staged), -100, os.fsencode(installed), 2)  # AT_FDCWD and RENAME_EXCHANGE
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        result = renameat2(*args)
+    else:
+        # The Alpine HA image uses musl, which may lack a libc wrapper for this Linux syscall.
+        number = {"x86_64": 316, "aarch64": 276}.get(platform.machine())
+        if number is None:
+            raise OSError("atomic HA component replacement is unavailable on this architecture")
+        result = libc.syscall(number, *args)
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, f"atomic HA component replacement failed: {os.strerror(error)}")
+
+
+# Back up the previous directory and publish only a fully validated replacement.
 def install(config: Path, domain: str, archive: bytes, expected: dict[str, str]) -> dict[str, Any]:
     files = validated_files(domain, archive, expected)
     parent = config / "custom_components"
     target, backups = parent / domain, config / ("." + domain + "-backup")
-    if target.is_symlink():
-        raise ValueError("component directory must not be a symlink")
     parent.mkdir(parents=True, exist_ok=True)
     backups.mkdir(mode=0o700, exist_ok=True)
-    backup = None
-    if target.exists():
-        if any(p.is_symlink() for p in target.rglob("*")):
-            raise ValueError("installed component contains a symlink")
-        backup = backups / (domain + "-" + str(time.time_ns()) + ".tar.gz")
-        with tarfile.open(backup, "w:gz") as package:
-            package.add(target, arcname=domain)
-    try:
-        if target.exists():
-            shutil.rmtree(target)
-        target.mkdir()
+
+    with tempfile.TemporaryDirectory(prefix=f".{domain}-deploy-", dir=parent, ignore_cleanup_errors=True) as scratch:
+        staged = Path(scratch) / domain
         for name, data in files.items():
-            path = target / name
+            path = staged / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         actual = {
-            str(path.relative_to(target)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in target.rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
+            str(path.relative_to(staged)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in staged.rglob("*")
+            if path.is_file()
         }
         if actual != expected:
-            raise ValueError("installed component verification failed")
-    except Exception:
-        # This installer boundary must undo partial disk changes before reporting a failure to the operator.
-        if target.exists():
-            shutil.rmtree(target)
-        if backup is not None:
-            with tarfile.open(backup) as package:
-                package.extractall(parent, filter="data")
-        raise
-    for old in sorted(backups.glob(domain + "-*.tar.gz"), reverse=True)[3:]:
-        old.unlink()
-    return {"domain": domain, "verified_files": len(files), "backup_created": backup is not None}
+            raise ValueError("staged component verification failed")
+
+        with (backups / ".install.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise ValueError("component path must be a directory")
+            replacing = target.exists()
+            if replacing:
+                if any(path.is_symlink() for path in target.rglob("*")):
+                    raise ValueError("installed component contains a symlink")
+                backup = backups / f"{domain}-{time.time_ns()}.tar.gz"
+                pending = backup.with_suffix(".tmp")
+                try:
+                    with tarfile.open(pending, "w:gz") as package:
+                        package.add(target, arcname=domain)
+                    pending.rename(backup)
+                finally:
+                    pending.unlink(missing_ok=True)
+            for old in sorted(backups.glob(domain + "-*.tar.gz"), reverse=True)[3:]:
+                old.unlink()
+            if replacing:
+                exchange_directories(staged, target)
+            else:
+                staged.rename(target)
+    return {"domain": domain, "verified_files": len(files), "backup_created": replacing}
 
 
 # The Docker transport supplies only a fixed component choice, digests and tar bytes; no credential is accepted.

@@ -68,10 +68,12 @@ async def test_stop_delivery_sequences(tmp_path, model_tls, monkeypatch, capsys,
             transaction = dict(s.journal.db.execute("SELECT * FROM transactions WHERE local=?", (local,)).fetchone())
         await reconcile(rig, tmp_path, capsys)
         rig.bench.stop_error, rig.bench.stop_info, rig.bench.stop_gate = False, None, asyncio.Event()
+        rig.bench.held_stop_replies = []
         stack = AsyncExitStack()
         try:
             s, c, sock = await stack.enter_async_context(running(rig, "stop-held-ack", release_on_exit=False))
-            await until(lambda: any(row[1] == token for row in rig.bench.stop_wires))
+            # The original rejected call had the same token. Wait for a reply held on the new connection.
+            await until(lambda: token in rig.bench.held_stop_replies)
             for event in case.events:
                 if event == "ack":
                     rig.bench.stop_gate.set()
@@ -83,7 +85,10 @@ async def test_stop_delivery_sequences(tmp_path, model_tls, monkeypatch, capsys,
                 else:
                     await stack.aclose()
                     stack = AsyncExitStack()
+                    prior_replies = len(rig.bench.held_stop_replies)
                     s, c, sock = await stack.enter_async_context(running(rig, "stop-replaced", release_on_exit=False))
+                    if "ack" not in events:
+                        await until(lambda: token in rig.bench.held_stop_replies[prior_replies:])
                 current = s.journal.next_delivery()
                 if "ack" not in events and event != "ack":
                     assert current is not None and current.token == token and current.payload == body

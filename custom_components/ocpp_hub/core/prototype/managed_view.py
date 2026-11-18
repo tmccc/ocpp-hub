@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from .connection_scope import control_scope_matches, current_control_scope
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .store import Journal
 from .supervision import HealthVerdict, PollStatus
@@ -235,7 +234,7 @@ def observed_status(
 
     j, g = c.session.journal, c.session.gateway
     history = summarize_charger_history(native.history)
-    c.status_scope = current_control_scope(g)
+    c.status_authority = c.authority()
     c.status_vendor_epoch = g._vendor_epoch
     return {
         **base,
@@ -338,7 +337,14 @@ def _return_refusal(c: ManagedController, mode: str, status: dict[str, Any]) -> 
 def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[str, Any]:
     result = dict(published)
     intent = c.requests.intent()
-    g, runtime = c.session.gateway, c.session.runtime.status
+    g, runtime, j = c.session.gateway, c.session.runtime.status, c.session.journal
+    control = j.control.read()
+    phase = j.phase.read()
+    result.update(
+        phase=phase.value,
+        cloud_start_pending=g.authorisation.pending(),
+        requested_current_a=c.current.selected(),
+    )
     if not runtime.charger_connected or g.charger.sender is None:
         result["charger_connected"] = False
     if not g.current_boot_seen(g._charger_epoch):
@@ -350,8 +356,20 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         or c.status_vendor_epoch != g._vendor_epoch
     ):
         result["cloud_connected"] = False
-    if c.stopping or not result.get("charger_connected") or not control_scope_matches(g, c.status_scope):
+    if (
+        c.stopping
+        or j.fault.latched()
+        or not phase.active
+        or not result.get("charger_connected")
+        or c.latest_native is None
+        or c.status_authority is None
+        or c.authority() != c.status_authority
+    ):
         result.update(local_hold_verified=False, owner_control_enabled=False)
+    if not control.shared or c.released_epoch != g._charger_epoch:
+        result["owner_control_enabled"] = False
+    if not control.local_hold or control.values.get("uncertain"):
+        result["local_hold_verified"] = False
     if result.get("desired_control") != intent.mode or result.get("control_revision") != intent.revision:
         pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
         result.update(
@@ -362,10 +380,11 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     result.update(desired_control=intent.mode, control_revision=intent.revision)
     result["api_version"] = 1
     result = health_snapshot(result)
+    if result["state"] in ("healthy", "local_only") and not result["healthy"]:
+        result["state"] = "local_only" if result["local_healthy"] else "degraded"
     result["can_pause"] = not c.stopping
     result["can_start_test"] = result["healthy"] and c.charging.available(c.latest_native)
     result["can_start"] = result["local_healthy"] and c.charging.available(c.latest_native, normal=True)
-    result["requested_current_a"] = c.current.selected()
     result["start_authorization"] = c.charging.authorization_status()
     result["can_set_current"] = result["local_healthy"] and c.current.available(c.latest_native)
     result["can_return"] = _return_refusal(c, intent.mode, result) is None

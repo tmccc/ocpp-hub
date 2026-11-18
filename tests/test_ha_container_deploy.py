@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -57,7 +59,7 @@ def test_archive_validation_precedes_all_disk_mutation(tmp_path: Path, failure: 
     assert list(tmp_path.iterdir()) == []
 
 
-# Intent: a failure while publishing files restores the byte-for-byte previous copy from its validated backup.
+# Intent: a staging write failure leaves the byte-for-byte previous copy installed.
 # Why: permission or disk errors must leave the existing HA integration recoverable.
 def test_partial_write_failure_restores_previous_component(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
@@ -66,7 +68,7 @@ def test_partial_write_failure_restores_previous_component(tmp_path: Path, monke
     actual = Path.write_bytes
     failed = False
 
-    # Fail one publication write, preserving actual archive parsing, backup creation and rollback extraction.
+    # Fail one disk write after actual archive parsing.
     def write(path: Path, data: bytes) -> int:
         nonlocal failed
         if path.name == "__init__.py" and not failed:
@@ -79,3 +81,36 @@ def test_partial_write_failure_restores_previous_component(tmp_path: Path, monke
     with pytest.raises(OSError):
         install(tmp_path, "ics_proxy", data, expected)
     assert (tmp_path / "custom_components/ics_proxy/__init__.py").read_bytes() == old["__init__.py"]
+
+
+# Intent: abrupt process death during staging leaves the entire previous component available.
+# Why: a lost installer process cannot run Python's cleanup or restore an incomplete replacement.
+def test_interrupted_staging_keeps_the_old_live_component(tmp_path: Path) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    data, expected = archive(old)
+    install(tmp_path, "ics_proxy", data, expected)
+    data, expected = archive(old | {"__init__.py": b"VALUE = 2\n"})
+    code = """
+import json
+import os
+import sys
+from pathlib import Path
+from tools.ha_container_deploy import install
+
+write_bytes = Path.write_bytes
+
+# End the installer without letting any context manager run.
+def interrupted_write(path, body):
+    write_bytes(path, body)
+    os._exit(91)
+
+Path.write_bytes = interrupted_write
+install(Path(sys.argv[1]), "ics_proxy", sys.stdin.buffer.read(), json.loads(sys.argv[2]))
+"""
+    execution = subprocess.run(
+        [sys.executable, "-B", "-c", code, str(tmp_path), json.dumps(expected)],
+        input=data, cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=10,
+    )
+    assert execution.returncode == 91, execution.stderr
+    target = tmp_path / "custom_components/ics_proxy"
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == old

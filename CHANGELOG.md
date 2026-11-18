@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Hold the station at zero while an unplugged session closes. Keep old failed current and Return receipts
+  as history without treating settled requests as active work. Retry refused Pause and timed-flow publication.
+- Refresh cached management authority and expire the HA service and native readings independently.
+  Keep the timed cloud test countdown aligned with the first verified flow.
+- Reserve legacy transaction IDs before acknowledgement. Keep accepted native plan changes through a
+  vendor reconnect and apply clear filters only to matching profiles.
+- Verify the selected Home Assistant instance after restarting and publish staged Docker component updates
+  atomically. Check release tags against the packaged version and witness each held Stop retry in the model.
+
 - Keep accepted current selections running through reply-read failures. Commit cloud arm with its completed
   receipt, settle unsent Start preflight failures, and retry publication of a known native repair outcome.
 - Refresh control availability against the live connection. Keep management sockets usable after storage

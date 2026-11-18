@@ -4,18 +4,50 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.ocpp_hub import session_store
 from custom_components.ocpp_hub.const import DOMAIN
+from custom_components.ocpp_hub.core import central
 from custom_components.ocpp_hub.core.model import ChargeSession
 from tests_ha.conftest import state_of, wait_for
 
 CURRENT_SESSION = "sensor.ocpp_hub_test0001_current_session"
 LAST_SESSION = "sensor.ocpp_hub_test0001_last_session"
+
+
+# Intent: a delayed Stop for a transaction started before reload cannot close a new transaction.
+# Why: two listeners started in the same wall-clock second used to hand out the same first ID.
+async def test_open_transaction_id_is_reserved_across_reload(hass, setup_hub, connect_charger, monkeypatch):
+    frozen = 1_800_000_000
+    monkeypatch.setattr(central, "time", SimpleNamespace(time=lambda: frozen))
+    monkeypatch.setattr(session_store, "time", lambda: frozen)
+    entry = await setup_hub()
+    charger = await connect_charger(entry)
+    await charger.boot()
+    start = {"connectorId": 1, "idTag": "FIRST", "meterStart": 10, "timestamp": "2026-10-21T08:00:00Z"}
+    old_id = (await charger.call("StartTransaction", start))[2]["transactionId"]
+    assert entry.runtime_data.sessions.count() == 0
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    charger = await connect_charger(entry)
+    await charger.boot()
+    new_id = (await charger.call("StartTransaction", {**start, "connectorId": 2, "idTag": "SECOND"}))[2][
+        "transactionId"
+    ]
+    assert new_id > old_id
+    stop = {"transactionId": old_id, "meterStop": 20, "timestamp": "2026-10-21T08:10:00Z"}
+    assert (await charger.call("StopTransaction", stop))[2]["idTagInfo"]["status"] == "Accepted"
+    live = entry.runtime_data.central.session("TEST0001").snapshot
+    assert live.connectors[2].transaction_id == new_id and entry.runtime_data.sessions.count() == 0
+
+    await charger.call("StopTransaction", {**stop, "transactionId": new_id})
+    assert entry.runtime_data.sessions.newest_first()[0].transaction_id == new_id
 
 
 # Intent: malformed history containers cannot abort actual integration setup or the next reload.

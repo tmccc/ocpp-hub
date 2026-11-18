@@ -47,7 +47,7 @@ def current_candidate(c: ManagedController) -> TerminalCurrent | None:
     if (
         c.current.worker is not None
         and not c.current.worker.done()
-        or change.get("state") not in ("uncertain", "interrupted")
+        or change.get("state") not in ("uncertain", "interrupted", "cancelled")
         or change.get("mode") not in ("app", "paused")
         or type(change.get("previous_a")) is not int
         or change["previous_a"] != c.current.selected()
@@ -55,6 +55,7 @@ def current_candidate(c: ManagedController) -> TerminalCurrent | None:
         or request is None
         or request[1] != "set_current"
         or request[3] not in ("uncertain", "failed")
+        or (change.get("state") == "cancelled" and request[3] != "uncertain")
         or request[2] >= c.requests.intent().revision
         or target is None
         or type(change.get("current_a")) is not int
@@ -98,7 +99,7 @@ def require_record(c: ManagedController, record: TerminalCurrent | RetirementCan
         raise RecoveryRequiredError("terminal current target changed before settlement")
 
 
-# The caller owns the fresh physical proof and atomic transaction; terminal receipts remain byte for byte intact.
+# The caller owns the fresh physical proof and atomic transaction. Keep the original reported failure.
 def complete_record(c: ManagedController, record: TerminalCurrent | RetirementCandidate) -> None:
     if isinstance(record, RetirementCandidate):
         c.session.journal.starts.retire(record)
@@ -108,6 +109,10 @@ def complete_record(c: ManagedController, record: TerminalCurrent | RetirementCa
     if state["previous_a"] != c.current.selected() or state["previous_a"] != j.get("control", {}).get("resume_limit"):
         raise RecoveryRequiredError("previous current selection changed before settlement")
     j.current_change.cancel(state, recovery_reason="previous_selection_at_verified_zero")
+    j.db.execute(
+        "UPDATE managed_requests SET state='failed' WHERE id=? AND state='uncertain'",
+        (record.identifier,),
+    )
 
 
 # Only closed ordinary charging debt permits automatic metadata retirement or internal Pause completion.

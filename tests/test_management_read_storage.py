@@ -7,6 +7,7 @@ import pytest
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from websockets.asyncio.client import connect
 
+from tests.charge_rig import owner_start, ready
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy
 from tests.management_peer import TOKEN, call
@@ -64,6 +65,42 @@ async def test_management_read_storage_refusal_recovers_same_socket(
                 assert b.rig.bench.firmware.effective_limit() == 0
         finally:
             j.db.set_authorizer(None)
+            await api.close()
+
+
+# Intent: a known live authority change revokes cached health before the next complete observation.
+# Why: a prior healthy status is no longer evidence of authority after a newer live transition.
+@pytest.mark.parametrize("transition", ["cloud_start", "ordinary_hold"])
+async def test_cached_status_tracks_live_authority(tmp_path, tls, unused_tcp_port_factory, monkeypatch, transition):
+    async with ready(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c = b.controller
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        api = ManagementServer(
+            ManagementSettings(unused_tcp_port_factory(), tmp_path / "unused-token", TOKEN), c, lambda: published
+        )
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{api.settings.port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+            ) as socket:
+                before = (await call(socket, "status"))["result"]
+                assert before["healthy"] and before["owner_control_enabled"]
+                if transition == "cloud_start":
+                    await owner_start(b)
+                else:
+                    await c.ordinary.hold("native_observation_unavailable")
+                after = (await call(socket, "status"))["result"]
+                assert after["checked_at"] == before["checked_at"]
+                assert after["control_revision"] == before["control_revision"]
+                assert after["state"] == "degraded"
+                assert not after["healthy"] and not after["local_healthy"] and not after["can_start"]
+                if transition == "cloud_start":
+                    assert after["cloud_start_pending"] and "cloud_start_pending" in after["health_blockers"]
+                else:
+                    assert not after["owner_control_enabled"] and after["phase"] == "recovering"
+        finally:
             await api.close()
 
 

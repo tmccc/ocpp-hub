@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
@@ -37,6 +37,8 @@ class CentralSystem:
         settings: SessionSettings | None = None,
         clock: Callable[[], datetime] | None = None,
         policy: ControlPolicy | None = None,
+        *,
+        allocate_transaction_id: Callable[[], Awaitable[int]] | None = None,
     ) -> None:
         self._policy = policy or ControlPolicy()
         self._listeners = list(listeners)
@@ -44,8 +46,9 @@ class CentralSystem:
         self._clock = clock
         self._server: Server | None = None
         self._sessions: dict[str, ChargerSession] = {}
-        # Seeded from the clock so ids from before a restart cannot collide with ids a charger still holds offline.
+        # The in-memory fallback keeps standalone core sessions unique within this central lifetime.
         self._transaction_counter = int(time.time()) % 2**31
+        self._allocate_transaction_id = allocate_transaction_id or self._next_transaction_id
         # The charges that were running when a charger's connection ended, until the charger comes back.
         self._open_charges: dict[str, dict[int, ConnectorState]] = {}
         # The limit the hub set on a charger, as (amps, purpose), until the charger comes back. A station profile stays
@@ -97,7 +100,7 @@ class CentralSystem:
 
     # Hand out the next transaction id.
     # One counter for all chargers keeps ids unique across reconnects within a run.
-    def _next_transaction_id(self) -> int:
+    async def _next_transaction_id(self) -> int:
         self._transaction_counter += 1
         return self._transaction_counter
 
@@ -113,6 +116,8 @@ class CentralSystem:
             vendor_a=snapshot.vendor_limit_a if vendor else None,
             vendor_profile_id=snapshot.vendor_profile_id if vendor else None,
             vendor_purpose=snapshot.vendor_purpose if vendor else None,
+            vendor_profile_connector_id=snapshot.vendor_profile_connector_id if vendor else None,
+            vendor_profile_stack_level=snapshot.vendor_profile_stack_level if vendor else None,
             hub_restored=hub and snapshot.hub_limit_restored,
             vendor_restored=vendor and snapshot.vendor_limit_restored,
         )
@@ -164,7 +169,7 @@ class CentralSystem:
             protocol,
             connection,
             _Fanout(self._listeners),
-            self._next_transaction_id,
+            self._allocate_transaction_id,
             self._settings,
             self._clock,
             resume,

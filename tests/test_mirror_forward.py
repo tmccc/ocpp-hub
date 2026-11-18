@@ -67,20 +67,39 @@ async def test_a_forwarded_command_reaches_the_charger_and_its_answer_returns(st
     assert answer[0] == 3 and answer[2] == {"status": "Accepted"}
 
 
-# Intent: accepted clear-all forgets both profiles, while an accepted explicit unrelated ID preserves them.
-# Why: local policy and plan publication must match the scope of the forwarded charger ACK.
-@pytest.mark.parametrize("payload", [{}, {"id": 9, "connectorId": 0}])
-async def test_forwarded_clear_ack_updates_exact_profile_scope(start_rig, payload):
+# Intent: a successful clear forgets only the known profiles matching its ID, purpose, connector and stack.
+# Why: retiring an unrelated hub profile would also discard the saved HA plan.
+@pytest.mark.parametrize(
+    ("payload", "hub_cleared", "vendor_cleared"),
+    [
+        ({}, True, True),
+        ({"id": 9, "connectorId": 0}, False, False),
+        ({"id": 5, "connectorId": 0}, False, True),
+        ({"chargingProfilePurpose": "TxDefaultProfile"}, False, True),
+        ({"chargingProfilePurpose": "ChargePointMaxProfile"}, True, False),
+        ({"connectorId": 1}, False, True),
+        ({"connectorId": 0, "stackLevel": 1}, False, False),
+        ({"connectorId": 0, "stackLevel": 0}, True, False),
+    ],
+)
+async def test_forwarded_clear_ack_updates_exact_profile_scope(start_rig, payload, hub_cleared, vendor_cleared):
     rig, charger = await _forwarding_rig(start_rig)
     session = rig.hub.central.session(CHARGER)
-    session.record_limit(10, "ChargePointMaxProfile")
-    session.record_vendor_limit(8, 5, "TxDefaultProfile")
+    session.record_limit(None, "ChargePointMaxProfile", from_plan=True)
+    profile = {**PROFILE, "csChargingProfiles": {**PROFILE["csChargingProfiles"], "stackLevel": 1}}
+    setting = asyncio.create_task(rig.vendor.command("SetChargingProfile", profile))
+    await charger.answer(await charger.next_hub_call(), {"status": "Accepted"})
+    assert (await setting)[2] == {"status": "Accepted"}
+    assert session.snapshot.vendor_profile_id == 5
+
     task = asyncio.create_task(rig.vendor.command("ClearChargingProfile", payload))
     request = await charger.next_hub_call()
     assert request[2:] == ["ClearChargingProfile", payload]
     await charger.answer(request, {"status": "Accepted"})
     assert (await task)[2] == {"status": "Accepted"}
-    assert (session.snapshot.charge_limit_a, session.snapshot.vendor_limit_a) == ((10, 8) if payload else (None, None))
+    assert session.snapshot.limit_purpose == (None if hub_cleared else "ChargePointMaxProfile")
+    assert session.snapshot.external_profile_writes == int(hub_cleared)
+    assert session.snapshot.vendor_limit_a == (None if vendor_cleared else 10.0)
 
 
 # Intent: Reset, UpdateFirmware and GetDiagnostics stay refused with forwarding on, and nothing reaches the charger.

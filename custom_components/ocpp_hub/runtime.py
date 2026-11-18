@@ -114,19 +114,24 @@ class HubListener:
             vendor_a=snapshot.vendor_limit_a,
             vendor_profile_id=snapshot.vendor_profile_id,
             vendor_purpose=snapshot.vendor_purpose,
+            vendor_profile_connector_id=snapshot.vendor_profile_connector_id,
+            vendor_profile_stack_level=snapshot.vendor_profile_stack_level,
         )
         if not snapshot.connected or self._saved_limits.get(snapshot.cp_id) == current:
             return
         self._saved_limits[snapshot.cp_id] = current
         lasting = (commands.PURPOSE_CHARGE_POINT_MAX, commands.PURPOSE_TX_DEFAULT)
+        vendor = current.vendor_purpose in lasting
         self._limits.update(
             snapshot.cp_id,
             LimitMemory(
                 hub_a=current.hub_a if current.hub_purpose in lasting else None,
                 hub_purpose=current.hub_purpose if current.hub_purpose in lasting else None,
-                vendor_a=current.vendor_a if current.vendor_purpose in lasting else None,
-                vendor_profile_id=current.vendor_profile_id if current.vendor_purpose in lasting else None,
-                vendor_purpose=current.vendor_purpose if current.vendor_purpose in lasting else None,
+                vendor_a=current.vendor_a if vendor else None,
+                vendor_profile_id=current.vendor_profile_id if vendor else None,
+                vendor_purpose=current.vendor_purpose if vendor else None,
+                vendor_profile_connector_id=current.vendor_profile_connector_id if vendor else None,
+                vendor_profile_stack_level=current.vendor_profile_stack_level if vendor else None,
             ),
         )
 

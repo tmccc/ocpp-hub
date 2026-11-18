@@ -28,10 +28,10 @@ async def legacy_fault(b, kind):
     return copy.deepcopy(b.session.journal.get("managed_control_fault"))
 
 
-# Intent: both historical transport/staleness classifications require a new Pause and retain zero until Return.
-# Why: fresh evidence repairs availability, while a durable explicit owner acknowledgement scopes fault clearing.
+# Intent: historical availability and readiness latches require a fresh Pause and then a separate Return.
+# Why: fresh physical proof and explicit acknowledgement must precede retirement of a mistaken strict latch.
 @pytest.mark.parametrize("current", [6, 32])
-@pytest.mark.parametrize("kind", ["NativeTransportUnavailableError", "StaleEvidenceError"])
+@pytest.mark.parametrize("kind", ["NativeTransportUnavailableError", "StaleEvidenceError", "NativeReadinessError"])
 async def test_classified_legacy_availability_fault_requires_new_pause(
     tmp_path, tls, unused_tcp_port, monkeypatch, current, kind
 ):

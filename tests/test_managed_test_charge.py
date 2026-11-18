@@ -66,6 +66,50 @@ async def test_local_charge_confirms_power_then_stops_without_further_tick(
         assert len(starts(test.rig)) == 1 and not session.gateway.policy.allow_local_start
 
 
+# Intent: a refused first-flow receipt leaves the timed charge metadata and deadline unchanged until the next poll.
+# Why: a partial outcome must neither extend permission nor abort the service that owns the original Start and Stop.
+@pytest.mark.parametrize("failure", ["statement", "commit"])
+async def test_first_timed_flow_retries_atomic_publication(tmp_path, tls, unused_tcp_port, monkeypatch, failure):
+    clock = [time.monotonic()]
+    monkeypatch.setattr(charge_tests, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=60, startup=60) as test:
+        c, j = test.controller, test.session.journal
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start_test", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        lease = c.charging.lease
+        assert lease is not None
+        deadline, receipt, state = lease.deadline, c.requests.receipt(identifier), c.charging.state()
+        effect = "SELECT RAISE(ABORT,'first test-flow receipt refusal')"
+        if failure == "commit":
+            j.db.execute("CREATE TABLE flow_parent(id INTEGER PRIMARY KEY)")
+            j.db.execute("CREATE TABLE flow_child(id REFERENCES flow_parent(id) DEFERRABLE INITIALLY DEFERRED)")
+            effect = "INSERT INTO flow_child VALUES(1)"
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_test_flow BEFORE UPDATE OF state ON managed_requests "
+            "WHEN NEW.action='start_test' AND NEW.state='completed' BEGIN " + effect + "; END"
+        )
+        try:
+            clock[0] += 1
+            assert (await c.tick())["state"] == "reconciling"
+            assert not j.db.in_transaction and c.charging.state() == state
+            assert c.requests.receipt(identifier) == receipt
+            assert lease.deadline == deadline and lease.first_flow is not None
+            first_flow = lease.first_flow
+        finally:
+            j.db.execute("DROP TRIGGER refuse_test_flow")
+        clock[0] += 5
+        assert (await healthy(c))["power_w"] > 10
+        assert c.charging.state()["state"] == "charging"
+        assert c.charging.state()["flow_started_at"] == first_flow.observed_at
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert lease.deadline == first_flow.deadline == deadline + 1
+        assert len(starts(test.rig)) == 1
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+
+
 # Intent: arming the cloud path sends no Start; only a real subsequent cloud mutation proves that source.
 # Why: a native timetable or a local Start must not be reported as successful app/cloud compatibility.
 async def test_cloud_arm_waits_for_real_cloud_start_and_positive_native_power(
@@ -431,6 +475,8 @@ async def test_late_first_flow_respects_startup_and_immutable_hard_deadline(
             assert test.controller.charging.state()["state"] == "charging"
             assert lease.deadline == (1179 if source == "local" else 1180)
             assert lease.deadline <= lease.hard_deadline == 1180
+            summary = test.controller.charging.summary()
+            assert summary is not None and summary["seconds_remaining"] == 120
             test.controller.command(uuid.uuid4().hex, "pause", 0)
         else:
             assert test.controller.charging.state()["state"] == "stopping"

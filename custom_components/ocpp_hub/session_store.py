@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from threading import Lock
+from time import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import Store
+from homeassistant.helpers.storage import STORAGE_DIR, Store
+from homeassistant.util.file import write_utf8_file_atomic
 
 from .const import DOMAIN
 from .core.model import ChargeSession, LimitMemory
@@ -16,6 +20,10 @@ _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.sessions"
+TRANSACTION_ID_KEY = f"{DOMAIN}.transaction_id"
+MAX_TRANSACTION_ID = 2**31 - 1
+# An executor write can outlive cancellation of its session. All entry lifetimes use the same reservation lock.
+_TRANSACTION_ID_LOCK = Lock()
 # A save is delayed a few seconds so that a burst of events becomes one write; unload saves at once.
 SAVE_DELAY_S = 5.0
 
@@ -25,8 +33,11 @@ class SessionStore:
 
     # Keep the storage handle; nothing is read until async_load.
     def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._sessions: list[ChargeSession] = []
+        self._transaction_id_path = Path(hass.config.path(STORAGE_DIR, TRANSACTION_ID_KEY))
+        self._history_high_water = 0
 
     # Read the saved history. A record that cannot be read is skipped with a warning, so one damaged entry does not
     # cost the owner the rest of the history.
@@ -40,6 +51,31 @@ class SessionStore:
             except KeyError, TypeError, ValueError, OverflowError:
                 _LOGGER.warning("Skipping an unreadable charge record in the session history")
         self._sessions = loaded
+        self._history_high_water = max(
+            (session.transaction_id for session in loaded if 0 < session.transaction_id <= MAX_TRANSACTION_ID),
+            default=0,
+        )
+
+    # The charger must receive an ID only after its reservation survives an HA restart.
+    async def async_next_transaction_id(self) -> int:
+        return await self._hass.async_add_executor_job(self._reserve_transaction_id)
+
+    # Write the high-water mark independently of the delayed, potentially large finished-session history.
+    def _reserve_transaction_id(self) -> int:
+        path = self._transaction_id_path
+        with _TRANSACTION_ID_LOCK:
+            try:
+                last_id = int(path.read_text(encoding="ascii"))
+            except FileNotFoundError:
+                last_id = int(time()) % (MAX_TRANSACTION_ID + 1)
+            if not 0 <= last_id <= MAX_TRANSACTION_ID:
+                raise ValueError("Invalid saved transaction ID")
+            transaction_id = max(last_id, self._history_high_water) + 1
+            if transaction_id > MAX_TRANSACTION_ID:
+                raise OverflowError("Transaction IDs are exhausted")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_utf8_file_atomic(str(path), f"{transaction_id}\n")
+            return transaction_id
 
     # Add a finished charge and schedule a save.
     def add(self, session: ChargeSession) -> None:

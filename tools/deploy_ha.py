@@ -26,14 +26,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import time
-import urllib.error
-import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from tools import ha_restart  # noqa: E402
+
 INTEGRATION = Path("custom_components") / "ocpp_hub"
 BUILD_FILE = "BUILD"
 REMOTE_CONFIG = "/config"
@@ -275,54 +275,94 @@ def deploy(target: Target, archive: bytes, expected: dict[str, str], control_pat
         )
 
 
-# Poll the REST API until it answers 200 again after a restart.
-# The API first goes away and then comes back; a short wait first avoids mistaking the old instance for the new.
-def wait_for_home_assistant(base: str, token: str, timeout_s: int = 300, poll_s: int = 5) -> bool:
-    request = urllib.request.Request(base + "/", headers={"Authorization": f"Bearer {token}"})
-    time.sleep(poll_s)
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                if response.status == 200:
-                    return True
-        except OSError, http.client.HTTPException:
-            pass
-        time.sleep(poll_s)
-    return False
+@dataclass(frozen=True)
+class RestartAccess:
+    """Private API settings and the selected transport's optional binding."""
+
+    url: str
+    token: str = field(repr=False)
+    ssh_host: str | None = None
+    uptime_entity: str = "sensor.uptime"
+    container_port: int = 8123
 
 
-# Validate the Home Assistant configuration and restart it over the REST API, after a confirmation.
-# A new or changed integration is only loaded after a restart; the token is read from .env and never printed.
-def restart_home_assistant(env: dict[str, str], assume_yes: bool) -> None:
-    base, token = env.get("HA_API_URL", "").rstrip("/"), env.get("HA_API_TOKEN", "")
-    if not base or not token:
-        raise SystemExit("HA_API_URL and HA_API_TOKEN are needed for --restart.")
-    question = "Restart Home Assistant now? Automations and chargers are offline for 1-5 minutes. [y/N] "
-    if not assume_yes and input(question).strip().lower() != "y":
-        print("Not restarting. A new integration is only found after a restart.")
-        return
-
-    # POST to the Home Assistant API with the bearer token and return the JSON answer.
-    # The config check and the restart share one authenticated call and the token is never printed.
-    def call(path: str) -> dict[str, object]:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        request = urllib.request.Request(base + path, data=b"{}", method="POST", headers=headers)
-        with urllib.request.urlopen(request, timeout=60) as response:
-            body: dict[str, object] = json.loads(response.read() or "{}")
-            return body
-
-    check = call("/config/core/check_config")
-    if check.get("result") != "valid":
-        raise SystemExit(f"HA reports an invalid configuration, not restarting: {check.get('errors')}")
+# Collect the existing API credentials without exposing the token to arguments or logs.
+def restart_access(env: dict[str, str], path: Path | None) -> RestartAccess:
     try:
-        call("/services/homeassistant/restart")
-    except TimeoutError, ConnectionError, http.client.HTTPException, urllib.error.URLError:
-        pass  # HA drops the connection while it shuts down; that is the expected outcome
-    print("Restart requested, waiting for Home Assistant...")
-    print(
-        "Home Assistant is back." if wait_for_home_assistant(base, token) else "No answer within 5 minutes; check it."
-    )
+        if path is None:
+            access = RestartAccess(
+                env.get("HA_API_URL", ""), env.get("HA_API_TOKEN", ""), env.get("HA_API_SSH_HOST"),
+                env.get("HA_UPTIME_ENTITY", "sensor.uptime"),
+            )
+        else:
+            private = json.loads(path.read_text())
+            access = RestartAccess(
+                private["hass_url"], Path(private["token_file"]).read_text().strip(),
+                private.get("ssh_host"), private.get("uptime_entity", "sensor.uptime"),
+                private.get("container_port", 8123),
+            )
+    except (KeyError, OSError, TypeError, ValueError):
+        raise SystemExit("The private Home Assistant API settings could not be read.") from None
+    if not isinstance(access.url, str) or not isinstance(access.ssh_host, (str, type(None))):
+        raise SystemExit("The private Home Assistant API URL or SSH target is invalid.")
+    if not access.token or "\n" in access.token or "\r" in access.token:
+        raise SystemExit("A Home Assistant API token is needed for --restart.")
+    return access
+
+
+# Match the API configuration to the SSH deployment target before sending any request.
+def ssh_restart_api(target: Target, access: RestartAccess) -> ha_restart.HomeAssistantAPI:
+    url = urlsplit(access.url.rstrip("/"))
+    host = url.hostname
+    if url.scheme not in ("http", "https") or not host or url.username or url.password or url.query or url.fragment:
+        raise SystemExit("A valid Home Assistant API URL is needed for the SSH restart.")
+    if _bare_host(access.ssh_host or host).lower() != target.host.lower():
+        raise SystemExit("The Home Assistant API configuration does not name the selected SSH target.")
+    if not isinstance(access.uptime_entity, str) or re.fullmatch(r"sensor\.[a-z0-9_]+", access.uptime_entity) is None:
+        raise SystemExit("The SSH restart requires a configured Home Assistant Uptime sensor.")
+    prefix = url.path if url.path.endswith("/api") else url.path + "/api"
+    connection = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    return ha_restart.HomeAssistantAPI(lambda: connection(host, url.port, timeout=10), access.token, prefix)
+
+
+# Pin Docker operations to the inspected container rather than resolving its name again after installation.
+def container_id(name: str) -> str:
+    command = ["docker", "inspect", "--type", "container", "--format", "{{.Id}}", name]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    value = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise SystemExit("Cannot resolve the selected Home Assistant container.")
+    return value
+
+
+# Probe or restart Core through the selected container's own verified loopback connection.
+def container_core(container: str, access: RestartAccess, program: str, before: str | None = None) -> str:
+    port = access.container_port
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise SystemExit("The Home Assistant container API port is invalid.")
+    command = [
+        "docker", "exec", "-i", container, "python", "-B", "-c",
+        program, str(port),
+    ]
+    if before is not None:
+        command.append(before)
+    result = subprocess.run(command, input=access.token, capture_output=True, text=True, timeout=340)
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or "The selected Home Assistant Core could not be verified.")
+    value = result.stdout.strip()
+    if before is None and re.fullmatch(r"\[\d+, \"\d+\"\]", value) is None:
+        raise SystemExit("The selected Home Assistant Core did not report a verified lifetime.")
+    return value
+
+
+# Resolve the optional restart confirmation before modifying the selected installation.
+def confirm_restart(assume_yes: bool, batch: bool) -> bool:
+    if assume_yes:
+        return True
+    if batch:
+        raise SystemExit("A batch restart also requires --yes.")
+    question = "Restart Home Assistant now? Automations and chargers are offline for 1-5 minutes. [y/N] "
+    return input(question).strip().lower() == "y"
 
 
 # Command line entry point.
@@ -354,24 +394,26 @@ def main() -> int:
         if args.dry_run:
             print(f"Dry run: {args.domain}, container {args.container}, {len(files)} files; no changes")
             return 0
+        selected = container_id(args.container)
+        restart_requested = args.restart and confirm_restart(args.yes, args.batch)
+        access = restart_access(env, args.ha_api_config) if restart_requested else None
         with tempfile.TemporaryDirectory() as tmp:
             source, archive, expected = prepare_archive(
                 integration, Path(tmp), skip_checks=args.skip_checks, collection_executors=args.collection_executors
             )
             installer = (source / "tools/ha_container_deploy.py").read_text()
+            program = (source / "tools/ha_restart.py").read_text() if access is not None else ""
+            before = container_core(selected, access, program) if access is not None else None
             subprocess.run(
-                ["docker", "exec", "-i", args.container, "python", "-c", installer, args.domain, json.dumps(expected)],
+                ["docker", "exec", "-i", selected, "python", "-c", installer, args.domain, json.dumps(expected)],
                 input=archive,
                 check=True,
             )
-        if args.restart:
-            if args.ha_api_config is not None:
-                private = json.loads(args.ha_api_config.read_text())
-                api_base = private["hass_url"].rstrip("/")
-                if not api_base.endswith("/api"):
-                    api_base += "/api"
-                env.update(HA_API_URL=api_base, HA_API_TOKEN=Path(private["token_file"]).read_text().strip())
-            restart_home_assistant(env, args.yes)
+        if access is not None:
+            if not before:
+                raise SystemExit("The Home Assistant deployment has no verified restart baseline.")
+            container_core(selected, access, program, before)
+            print("Verified Home Assistant is running in a new Core process.")
         return 0
     if args.domain != "ocpp_hub":
         raise SystemExit("The separate proxy client requires explicit container transport")
@@ -389,17 +431,32 @@ def main() -> int:
         print("\n".join(f"  {name}" for name in files))
         print("Dry run: would run the checks, back up, deploy and verify. Nothing was changed.")
         return 0
+    access = restart_access(env, args.ha_api_config) if args.restart and confirm_restart(args.yes, args.batch) else None
+    if access is not None:
+        api = ssh_restart_api(target, access)
+
+        # Recheck the same API sensor before and after requesting restart.
+        def lifetime():
+            return ha_restart.uptime(api, access.uptime_entity, target.config_dir)
+
+        ssh_before = lifetime()
     with tempfile.TemporaryDirectory() as tmp:
         _, archive, expected = prepare_archive(
             INTEGRATION, Path(tmp), skip_checks=args.skip_checks, collection_executors=args.collection_executors
         )
         deploy(target, archive, expected, os.path.join(tmp, "ssh-%C"), args.batch)
-    if args.restart:
-        restart_home_assistant(env, args.yes)
+    if access is not None:
+        ha_restart.restart(api, ssh_before, lifetime)
+        print("Verified Home Assistant is running with a new Core start time.")
     else:
         print("Next: restart Home Assistant (a changed integration is loaded after a restart).")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ha_restart.RestartError as error:
+        raise SystemExit(str(error)) from None
+    except (http.client.HTTPException, OSError, ValueError):
+        raise SystemExit("Home Assistant access failed.") from None

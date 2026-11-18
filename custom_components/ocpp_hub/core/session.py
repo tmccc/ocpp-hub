@@ -6,7 +6,7 @@ import asyncio
 import logging
 import math
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -215,7 +215,7 @@ class ChargerSession:
         protocol: str,
         connection: Connection,
         listener: SessionListener,
-        next_transaction_id: Callable[[], int],
+        next_transaction_id: Callable[[], Awaitable[int]],
         settings: SessionSettings | None = None,
         clock: Callable[[], datetime] | None = None,
         resume: Mapping[int, ConnectorState] | None = None,
@@ -249,10 +249,12 @@ class ChargerSession:
             vendor_limit_a=remembered.vendor_a,
             vendor_profile_id=remembered.vendor_profile_id,
             vendor_purpose=remembered.vendor_purpose,
+            vendor_profile_connector_id=remembered.vendor_profile_connector_id,
+            vendor_profile_stack_level=remembered.vendor_profile_stack_level,
             hub_limit_restored=remembered.hub_restored,
             vendor_limit_restored=remembered.vendor_restored,
         )
-        self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+        self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any] | Awaitable[dict[str, Any]]]] = {
             "BootNotification": self._boot_notification,
             "Heartbeat": self._heartbeat,
             "StatusNotification": self._status_notification,
@@ -314,12 +316,21 @@ class ChargerSession:
 
     # Send a request to the charger and return the payload of its answer.
     # One request at a time per direction is a protocol rule, so calls are serialised with a lock.
-    async def call(self, action: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+    async def call(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        timeout: float | None = None,
+        *,
+        before_send: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         async with self._call_lock:
             unique_id = uuid.uuid4().hex
             future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
             self._pending[unique_id] = future
             try:
+                if before_send is not None:
+                    before_send()
                 await self._send(build_call(unique_id, action, payload))
                 frame = await asyncio.wait_for(future, timeout or self._settings.call_timeout_s)
             except TimeoutError:
@@ -357,13 +368,23 @@ class ChargerSession:
 
     # Remember the limit of a command from the vendor that the charger accepted, with the id and purpose of its profile.
     # A vendor limit of None means the vendor's profile is gone.
-    def record_vendor_limit(self, amps: float | None, profile_id: int | None, purpose: str | None) -> None:
+    def record_vendor_limit(
+        self,
+        amps: float | None,
+        profile_id: int | None,
+        purpose: str | None,
+        *,
+        connector_id: int | None = None,
+        stack_level: int | None = None,
+    ) -> None:
         if not self._snapshot.connected:
             return
         self._update(
             vendor_limit_a=amps,
             vendor_profile_id=profile_id,
             vendor_purpose=purpose,
+            vendor_profile_connector_id=connector_id,
+            vendor_profile_stack_level=stack_level,
             composite_limit_a=None,
             vendor_limit_restored=False,
         )
@@ -383,7 +404,13 @@ class ChargerSession:
         if snapshot.hub_limit_restored:
             changes |= {"charge_limit_a": None, "limit_purpose": None}
         if snapshot.vendor_limit_restored:
-            changes |= {"vendor_limit_a": None, "vendor_profile_id": None, "vendor_purpose": None}
+            changes |= {
+                "vendor_limit_a": None,
+                "vendor_profile_id": None,
+                "vendor_purpose": None,
+                "vendor_profile_connector_id": None,
+                "vendor_profile_stack_level": None,
+            }
         return changes
 
     # Ask for the limit in effect in a task of its own, so a charger that answers slowly or never does not hold up the
@@ -479,6 +506,8 @@ class ChargerSession:
             return
         try:
             result = handler(frame[3])
+            if isinstance(result, Awaitable):
+                result = await result
         except FormationError as error:
             await self._send(build_call_error(unique_id, ERROR_FORMATION_VIOLATION, str(error)))
         except Exception:  # noqa: BLE001
@@ -574,9 +603,10 @@ class ChargerSession:
     # A start on a connector that still has a running charge means the charger lost that charge's stop (a power cut,
     # a firmware that starts again); the old charge is closed first, at the new start, so it is not lost.
     # Every tag is accepted: this is a private charger on a trusted network, and refusing one only strands the owner.
-    def _start_transaction(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _start_transaction(self, payload: dict[str, Any]) -> dict[str, Any]:
         connector_id = _int_field(payload, "connectorId")
         started_at = parse_timestamp(payload.get("timestamp"), self._clock())
+        transaction_id = await self._next_transaction_id()
         connector = self._connector(connector_id)
         if connector.transaction_id is not None:
             interrupted = self._finished_session(
@@ -585,7 +615,6 @@ class ChargerSession:
                 {"timestamp": started_at.isoformat(), "reason": "Other", "meterStop": payload.get("meterStart")},
             )
             self._listener.on_session_finished(interrupted)
-        transaction_id = self._next_transaction_id()
         self._update_connector(
             replace(
                 connector,

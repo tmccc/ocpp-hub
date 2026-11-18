@@ -55,8 +55,8 @@ async def test_failed_app_current_returns_only_to_previous_selection(
         journal = test.session.journal
         receipt = test.controller.requests.receipt(identifier)
         assert failed and applied_at_failure == (6 if outcome == "rejected" else 16)
-        assert receipt["state"] == "uncertain"
-        assert receipt == historical
+        assert historical["state"] == "uncertain"
+        assert receipt == {**historical, "state": "failed"}
         assert test.controller.current.selected() == 6 and journal.get("control")["resume_limit"] == 6
         assert receipt["result"] == {
             "classification": "current_unconfirmed",

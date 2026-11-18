@@ -63,6 +63,32 @@ def test_terminal_history_retains_uuid_results_without_consuming_capacity(tmp_pa
         journal.close()
 
 
+# Intent: a refused receipt update leaves verified zero in place and retries on the next poll.
+# Why: supervision must remain available after a Pause has already reached the physical hold.
+async def test_pause_receipt_refusal_retries_without_another_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j = test.controller, test.session.journal
+        identifier = uuid.uuid4().hex
+        accepted = c.command(identifier, "pause", c.requests.intent().revision)
+        assert c.pause_task is not None
+        await c.pause_task
+        calls = list(test.rig.bench.device_calls)
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_pause_receipt BEFORE UPDATE OF state ON managed_requests "
+            "WHEN NEW.action='pause' AND NEW.state='completed' "
+            "BEGIN SELECT RAISE(ABORT,'Pause receipt publication refusal'); END"
+        )
+        try:
+            assert (await c.tick())["state"] == "reconciling"
+            assert c.requests.receipt(identifier) == accepted
+            assert test.rig.bench.firmware.effective_limit() == 0
+        finally:
+            j.db.execute("DROP TRIGGER refuse_pause_receipt")
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert test.rig.bench.device_calls == calls
+
+
 # Intent: every non-Pause command class reserves capacity for a later immediate restrictive intent.
 # Why: timed or cloud charge admission must not consume a slot that normal Start and Return deliberately reserve.
 @pytest.mark.parametrize("action", ["start", "start_test", "arm_cloud_test", "set_current", "app_control"])
