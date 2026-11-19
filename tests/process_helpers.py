@@ -41,8 +41,8 @@ class ServiceProcess:
             {"host": "127.0.0.1", "port": port, "token_file": str(directory / "process-management-token.json")},
         )
 
-    # Start the real service, then connect the independent verified-TLS device to its actual listener.
-    async def start(self):
+    # Start the real service, with an optional observation armed before the charger sends Boot.
+    async def start(self, *, arm: tuple[str, str] | None = None):
         self.generation += 1
         self.events = asyncio.Queue()
         log = (self.directory / f"process-{self.generation}.stderr.log").open("w")
@@ -71,6 +71,8 @@ class ServiceProcess:
                     break
                 except OSError:
                     await asyncio.sleep(0.05)
+        if arm is not None:
+            await self.arm(*arm)
         self.reader = asyncio.create_task(self.rig.bench.read_charger(self.socket))
         assert (await self.rig.bench.call(self.socket, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
 
@@ -108,7 +110,7 @@ class ServiceProcess:
                     return result["result"]
                 await asyncio.sleep(0.25)
 
-    # The marker is acknowledged before the management mutation is submitted; no timing sleep selects the kill point.
+    # Arm before the management request or replacement Boot that can reach this exact observation.
     async def arm(self, phase, identifier):
         self.process.stdin.write(json.dumps({"phase": phase, "id": identifier}).encode() + b"\n")
         await self.process.stdin.drain()

@@ -63,6 +63,14 @@ class ObservedConnection(sqlite3.Connection):
         owned = state.get("id") == Gate.identifier or current.get("id") == Gate.identifier or request is not None
         if not owned:
             return
+        if (
+            before
+            and request is not None
+            and request[0] == "pause"
+            and request[1] in ("accepted", "uncertain")
+            and operation.startswith("UPDATE MANAGED_REQUESTS SET STATE='COMPLETED',RESULT=? WHERE ACTION='PAUSE'")
+        ):
+            Gate.freeze(self, "before-pause-completion-sql")
         if before and operation.startswith("INSERT OR REPLACE INTO META") and parameters:
             value = json.loads(parameters[1])
             if parameters[0] == "local_start_receipt" and value.get("request_id") == Gate.identifier:

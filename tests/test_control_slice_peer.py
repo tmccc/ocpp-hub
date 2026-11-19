@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import uuid
+from datetime import timedelta
 
 import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
@@ -11,7 +12,7 @@ from ocpp_hub_core.prototype.recovery_contracts import AuthorityStamp
 
 from tests.charge_rig import actual_stop, owner_rig, positive_flow
 from tests.managed_rig import healthy, starts
-from tests.recovery_barriers import completed_control
+from tests.recovery_barriers import completed_control, fresh_daily_values
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests_model.control_slice import step
@@ -30,6 +31,7 @@ from tests_model.control_slice_state import (
     StartOutcome,
     StartPrepared,
 )
+from tests_model.test_start_recovery_sequences import close_daily
 
 
 # Observe exact live scope and ownership; the shadow never supplies these facts back to the engine.
@@ -43,6 +45,7 @@ def observed_authority(c):
 # Intent: an actual dispatched Start's genuine Accepted arrives after a new Pause has committed.
 # Why: the new owner must retain zero and exact authority while old acceptance/lifecycle/cloud debts survive.
 @pytest.mark.asyncio
+@pytest.mark.recovery_replay
 async def test_real_late_accepted_after_new_pause_keeps_authority_and_debt(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=20) as b:
         c, g, j, rig = b.controller, b.session.gateway, b.session.journal, b.rig
@@ -104,12 +107,13 @@ async def test_real_late_accepted_after_new_pause_keeps_authority_and_debt(tmp_p
                 await asyncio.wait_for(asyncio.shield(c.pause_task), 4)
             assert [3, wire_id, {"status": "Accepted"}] in replies
             actual = j.get("local_start_receipt")
-            assert actual["request_id"] == identifier and actual["stage"] == "accepted"
+            assert actual["request_id"] == identifier
+            assert actual["stage"] == "accepted", "the real Accepted reply was lost from the original Start receipt"
             assert actual["ticket"] == issued["ticket"] and actual["local"] is None
             assert observed_authority(c) == newer and j.get("control")["start_pending"]
             assert c.requests.receipt(identifier)["state"] == "uncertain"
             assert rig.bench.firmware.effective_limit() == 0 and j.active() is None
-            assert len(starts(rig)) == 1
+            assert starts(rig) == remote, "the charger received a second RemoteStartTransaction"
             assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
             shadow = step(shadow, StartAnswered(wire_id, StartOutcome.ACCEPTED)).state
             shadow = step(shadow, OutcomeCommitted(wire_id, StartOutcome.ACCEPTED)).state
@@ -127,7 +131,8 @@ async def test_real_late_accepted_after_new_pause_keeps_authority_and_debt(tmp_p
             stops = [frame for frame in rig.bench.device_calls if frame[2] == "RemoteStopTransaction"]
             assert stops and all(frame[3]["transactionId"] == local for frame in stops)
             status = await actual_stop(b, local)
-            assert status["local_hold_verified"] and c.requests.receipt(pause)["state"] == "completed"
+            paused = c.requests.receipt(pause)
+            assert status["local_hold_verified"] and paused["state"] == "completed"
             recovered = c.requests.receipt(identifier)
             assert recovered["state"] == "completed"
             assert recovered["result"] == {"local_session_verified": True, "charging": False, "timed": False}
@@ -140,10 +145,28 @@ async def test_real_late_accepted_after_new_pause_keeps_authority_and_debt(tmp_p
             shadow = step(shadow, CloudSettled(wire_id, local, "StopTransaction")).state
             assert not shadow.start(wire_id).debts and shadow.authority == newer
 
+            prior = tuple(j.db.execute("SELECT * FROM transactions WHERE local=?", (local,)).fetchone())
             returning, revision = uuid.uuid4().hex, c.requests.intent().revision
             c.command(returning, "app_control", revision)
             await completed_control(b, returning, mode="app", revision=revision + 1, ceiling=6)
-            assert len(starts(rig)) == 1
+            beginning, meter_start = fresh_daily_values(rig)
+            later = await positive_flow(
+                b, "daily", call_id=uuid.uuid4().hex, meter_start=meter_start, timestamp=beginning.isoformat()
+            )
+            assert later != local
+            assert (await healthy(c))["power_w"] > 0 and rig.bench.firmware.current == 6
+            await close_daily(
+                b,
+                later,
+                "native",
+                timestamp=(beginning + timedelta(minutes=1)).isoformat(),
+                meter_stop=meter_start + 100,
+            )
+            row = j.db.execute("SELECT stop,vendor FROM transactions WHERE local=?", (later,)).fetchone()
+            assert row["stop"] is not None and row["vendor"] is not None and j.next_delivery() is None
+            assert tuple(j.db.execute("SELECT * FROM transactions WHERE local=?", (local,)).fetchone()) == prior
+            assert c.requests.receipt(identifier) == recovered and c.requests.receipt(pause) == paused
+            assert starts(rig) == remote, "the charger received a second RemoteStartTransaction"
             assert rig.bench.firmware.plans == plans and rig.peer.configuration == configuration
         finally:
             release.set()

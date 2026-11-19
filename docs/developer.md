@@ -36,6 +36,26 @@ selection is useful for development and is labelled targeted, with the remaining
 Documentation-only changes need link/path/symbol checks and `git diff --check`, without executing qualification.
 Code review begins with static reading; a review prompt is not permission to run tests or deployment commands.
 
+### Fast recovery replays
+
+Run the standalone proxy's short recovery suite before a wider engine run:
+
+```bash
+TMPDIR=/absolute/task .venv/bin/python -B tools/offline_validate.py tests -m recovery_replay
+```
+
+The cases use the real SQLite journal and independent simulated charger. They cut the service after a Pause
+commit and again before the replacement can finish that same Pause. They also deliver a real Start reply after a
+newer Pause. The tests check the original request, charge outcome and actual commands before issuing Return, then
+verify a subsequent ordinary charge and its history.
+
+When a recovery defect is confirmed, mark its smallest reproducible case with `pytest.mark.recovery_replay`.
+Verify that it fails on the faulty code at the relevant assertion and passes on the correction. Check the original
+request and independent charger observations before any new Pause or other command can repair the outcome. Keep
+this development run under three minutes on the controller and retain the complete engine run for release.
+
+### Home Assistant checks
+
 The Home Assistant layer tests need their own virtualenv. Pin the plugin to the Home Assistant version of the server you deploy to (the plugin release pins it):
 
 ```bash

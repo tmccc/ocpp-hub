@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import os
+import signal
 import uuid
 
 import pytest
@@ -326,9 +327,13 @@ async def test_process_sigkill_current_selection(
     record_property("peers_survived", True)
 
 
-# Intent: a committed owner Pause survives SIGKILL during an older, still-pending paused current selection.
-# Why: neither the dead worker's target nor a replacement internal hold can substitute for the exact owner request.
-async def test_process_sigkill_after_newer_pause_commit(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory):
+# Intent: retain a committed owner Pause through one interruption and a second cut before receipt completion.
+# Why: an older current selection or a replacement hold can produce zero while losing the original request.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("interrupt_recovery", [False, True], ids=["saved-pause", "interrupted-recovery"])
+async def test_process_sigkill_after_newer_pause_commit(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, interrupt_recovery
+):
     async with process_rig(
         tmp_path,
         tls_for_case(tmp_path, model_tls),
@@ -370,15 +375,45 @@ async def test_process_sigkill_after_newer_pause_commit(tmp_path, model_tls, mon
                 request.cancel()
                 await asyncio.gather(request, return_exceptions=True)
 
-        await child.start()
+        phase = "before-pause-completion-sql"
+        await child.start(arm=(phase, pause) if interrupt_recovery else None)
+        recovered = child.durable()
+        assert recovered["metadata"]["managed_control_intent"] == intent, "restart lost the saved Pause revision"
+        assert recovered["metadata"]["managed_owner_pause"] == claim
+        if interrupt_recovery:
+            gate = await child.gate(phase, pause)
+            assert not gate["transaction_open"]
+            pending = child.durable()
+            assert pending["metadata"]["managed_control_intent"] == intent
+            assert pending["metadata"]["control"]["ticket"] == claim["ticket"]
+            assert pending["metadata"]["control"]["uncertain"] is False
+            assert pending["metadata"]["managed_current_change"]["state"] == "cancelled"
+            assert next(row for row in pending["requests"] if row["id"] == pause)["state"] == "accepted"
+            require_zero_held(child.rig, mark)
+            assert not starts(child.rig)
+            await child.kill()
+            await child.start()
+
+        pause_receipt = await child.completed_control(pause)
         status = await child.status(lambda value: value.get("local_hold_verified") is True)
         assert status["control_revision"] == intent["revision"] and status["requested_current_a"] == 6
         recovered = child.durable()["metadata"]
         assert recovered["managed_owner_pause"] == claim and recovered["control"]["ticket"] == claim["ticket"]
-        assert (await child.request("receipt", request_id=pause))["result"]["state"] == "completed"
-        assert (await child.request("receipt", request_id=change))["result"]["state"] == "failed"
-        assert len(child.kills) == 1 and not starts(child.rig)
+        change_receipt = (await child.request("receipt", request_id=change))["result"]
+        assert change_receipt["state"] == "failed"
+        assert [kill["generation"] for kill in child.kills] == ([1, 2] if interrupt_recovery else [1])
+        assert all(kill["returncode"] == -signal.SIGKILL for kill in child.kills)
+        assert len({kill["pid"] for kill in child.kills}) == len(child.kills)
+        assert not starts(child.rig)
         require_zero_held(child.rig, mark)
+
+        returned = await child.request("app_control", revision=intent["revision"])
+        assert returned["ok"]
+        await child.completed_control(returned["result"]["id"])
+        await child.scheduled_sessions(6, True)
+        assert (await child.request("receipt", request_id=pause))["result"] == pause_receipt
+        assert (await child.request("receipt", request_id=change))["result"] == change_receipt
+        assert not starts(child.rig)
 
 
 # Intent: a real accepted one-shot command can report its actual lifecycle after a process dies before publication.
