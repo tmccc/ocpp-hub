@@ -115,6 +115,17 @@ The separate `ics_proxy` client is tested on actual HA2026.10.4 and2026.11.0. Th
 config entries and entities, with synthetic loopback management peers and DNS construction isolated from multicast.
 The packaged legacy Hub retains its HA10 minimum; it is a different deployment domain.
 
+Run the owner workflow on each supported client runtime with that runtime's Python:
+
+```bash
+TMPDIR=/absolute/task .venv-ha-proxy/bin/python -B tools/offline_ha_validate.py tests_ha_proxy/test_owner_workflow.py
+```
+
+Home Assistant and the standalone proxy run as separate processes with a simulated charger. The test stops the
+proxy just after it saves Pause in one case and drops its reply while it keeps running in the other. A new Home
+Assistant process loads the same saved entry. Both restart orders preserve the original Pause, verify zero at
+the charger and let a later Return from Home Assistant restore scheduled charging.
+
 `tools/parallel_qualify.py` freezes ordinary tracked Git blobs and runs20 pinned Docker workers with separate network
 namespaces, read-only source/runtime, task-owned scratch, four spare CPUs and a bounded timeout. All runtime paths,
 immutable image IDs and optional SSH worker settings are explicit arguments. Output belongs outside the repository.

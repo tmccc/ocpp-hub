@@ -108,13 +108,19 @@ These controls model task/runtime/process death, not literal hardware power fail
 | Cloud debt | Accepted unbound/uncertain commands never replay automatically | Distinct independent attestations then later ordinary lifecycle | Single cloud command grammar. |
 | Closure disagreement | Exact known zero-output mismatch retains station zero | Fresh native/ledger agreement permits later sessions | Unknown IDs, nonzero phases and unrelated faults cannot use this path. |
 | SQLite writes | Real abort/deferred-FK COMMIT at proof/ACK; actual bounded FULL and writer contention controls | Atomic rollback and later supported retry preserve evidence | Named boundaries and rollback/retry; no arbitrary WAL corruption or physical power-loss claim. |
-| App receipts | Actual HA exchange rejects wrong UUID; never retries mutation | Honest recorded/unknown confirmation and readable status | Direct API coverage; charging recovery belongs to engine tests. |
-| App lifetime | Public setup/retry/reload/unload/remove/disable reject obsolete callbacks | Second fault can notify at60s and dismiss on its own success | Twenty-two focused held-read/public-replacement/actual HA-stop histories per runtime; no cross-process HA restart claim. |
+| App receipts | Actual HA exchange rejects wrong UUID; never retries mutation | Honest recorded/unknown confirmation and readable status | Direct API cases and a lost Pause reply in the owner workflow. |
+| App lifetime | Public setup/retry/reload/unload/remove/disable reject obsolete callbacks | Second fault can notify at60s and dismiss on its own success | Twenty-two focused lifecycle cases and two separate-process owner workflow cases per runtime. |
 | Qualification | Canonical input regeneration, complete roots, raw once-only phases and source/runtime pins | All events and full suffix in one complete attempt | Synthetic negative controls are never real execution receipts. |
 
 The machine matrix links exact tests for legacy state, source ownership, owner-request precedence and focused-only risks.
 No risk is marked universally covered. Real hardware/network behavior and unbounded repeated failures remain outside
 offline qualification. This work requires neither live charging nor deployment.
+
+The [owner workflow](../tests_ha_proxy/test_owner_workflow.py) starts real Home Assistant and standalone proxy
+processes with a simulated charger. It makes Home Assistant lose a Pause reply, then replaces both processes
+in either order using the same saved config entry and journal. It verifies that Home Assistant reports the
+unknown outcome, the original Pause completes and remains in force, and the charger stays at zero without a
+second Pause request. Return from Home Assistant allows two later scheduled charges to finish.
 
 ## Typed recovery boundary contracts
 
