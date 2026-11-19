@@ -198,6 +198,13 @@ async def test_real_tls_recovery_warns_on_later_absence_but_latches_changed_orig
                 }
                 rig.bench.history = [*fault.original, later]
                 assert (await healthy(controller))["charger_history_complete"]
+                # A damaged new version under the same ID must not make an older session look latest.
+                rig.bench.history[-1] = later | {
+                    "startTime": last["startTime"] - 10,
+                    "stopTime": last["startTime"] - 20,
+                }
+                status = await healthy(controller)
+                assert not status["charger_latest_completion_known"]
                 rig.bench.history[-1] = later | {"stopTime": 0, "meterStop": 0}
                 status = await healthy(controller)
                 assert status["history_warning"] is None

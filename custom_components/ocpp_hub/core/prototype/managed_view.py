@@ -160,10 +160,11 @@ def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHis
             continue
         start, stop = record.get("startTime"), record.get("stopTime", 0)
         first, last = record.get("meterStart"), record.get("meterStop", 0)
-        known_start = type(start) is int and 0 < start <= latest_time
+        if type(start) is not int or not 0 < start <= latest_time:
+            newest_unreadable_start = math.inf
+            continue
         if (
             type(identifier) is not int
-            or not known_start
             or type(stop) is not int
             or type(first) is not int
             or type(last) is not int
@@ -173,7 +174,7 @@ def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHis
             or stop != 0
             and (stop < start or last < first)
         ):
-            newest_unreadable_start = max(newest_unreadable_start, start if known_start else math.inf)
+            newest_unreadable_start = max(newest_unreadable_start, start)
             continue
         if stop:
             completed[identifier] = start
@@ -269,9 +270,11 @@ def observed_status(
     history = summarize_charger_history(native.history)
     archive = j.get("native_history_summary")
     records_missing = bool(archive and archive.get("missing_records", 0))
-    # A previously completed charge can also come back as open under the same transaction ID.
+    # A previously completed charge can come back damaged or open under the same transaction ID.
     check_archive = archive and (
-        records_missing or any(row.get("transactionId") != -1 and row.get("stopTime", 0) == 0 for row in native.history)
+        records_missing
+        or not history.complete
+        or any(row.get("transactionId") != -1 and row.get("stopTime", 0) == 0 for row in native.history)
     )
     latest_known = history.latest_completion_known and (
         not check_archive or latest_completion_available(j, history.completed)
