@@ -217,11 +217,18 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
     return value
 
 
-# A stopped pass publishes its named state and no verified owner authority.
+# An early return reports current vendor registration and no verified owner authority.
 def poll_status(
     c: ManagedController, result: PollStatus, *, base: dict[str, Any] | None = None, pending: bool = False
 ) -> dict[str, Any]:
     value = poll_base(c, pending=pending) if base is None else dict(base)
+    gateway = c.session.gateway
+    c.status_vendor_epoch = gateway._vendor_epoch
+    value["cloud_connected"] = (
+        c.session.runtime.status.vendor_connected
+        and gateway.vendor.sender is not None
+        and gateway.vendor_registration == "Accepted"
+    )
     value["state"] = result.state
     if result.fault is not None:
         value["fault"] = result.fault

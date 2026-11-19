@@ -8,6 +8,16 @@ The repository has two deployment domains: the standalone iCS proxy with its thi
 older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
 Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
+## Vendor catch-up and overnight observations — 19 November 2026
+
+- [x] Archived charger, proxy and Home Assistant histories agree for three midnight sessions on November 10, 12
+  and 13. The sessions used 5.614, 0.000 and 32.508 kWh. On two nights the car stopped drawing power before the
+  session closed. The zero-energy session stayed open until the scheduled end. The offline catch-up test
+  covers early zero and zero throughout a scheduled session. The reason for the early drops remains unknown.
+- [x] Three timer sessions catch up after a vendor outage, interrupted delivery and a proxy restart. The
+  [tests](recovery-coverage.md#risk-matrix) also cover the case where the vendor accepts a Start but its reply goes
+  missing. The proxy retains the reports and keeps the charger at zero while the outcome is uncertain.
+
 ## Current iCS implementation — 18 November 2026
 
 - [x] Backend `bb10464` implements the five simplification stages below. The four full suites passed with

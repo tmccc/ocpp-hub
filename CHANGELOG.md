@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Show when the vendor reconnects while an earlier charge report remains unconfirmed.
 - Retry restoration of app/schedule control when an expired Start has closed and its cloud Stop reply is pending.
 - Keep verified zero visible while lifecycle delivery is blocked, and refresh control availability when the
   failure arrives between supervision polls.

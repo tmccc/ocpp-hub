@@ -122,6 +122,13 @@ in either order using the same saved config entry and journal. It verifies that 
 unknown outcome, the original Pause completes and remains in force, and the charger stays at zero without a
 second Pause request. Return from Home Assistant allows two later scheduled charges to finish.
 
+The [vendor catch-up tests](../tests/test_managed_vendor_catchup.py) queue three timer sessions and their meter
+readings over three simulated nights, then interrupt delivery and restart the standalone proxy. When a Stop reply
+goes missing, the simulator recognises the exact retry by its original message ID and body. All three sessions
+reach the vendor ledger once, the readings keep their assigned session, and a later timer session works. When a
+Start reply goes missing after the vendor accepts it, the proxy retains the first unconfirmed report and the rest
+of the queue, shows that delivery is uncertain, and keeps the charger at zero across restart and reconnection.
+
 ## Typed recovery boundary contracts
 
 Permission, prerequisites, physical effects and committed publication are separate
