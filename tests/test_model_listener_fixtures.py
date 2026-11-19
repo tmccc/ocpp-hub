@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ACTUAL_FILES = (
     "tests/__init__.py",
     "tests/conftest.py",
+    "tests/core_loader.py",
     "tests/worker_ports.py",
     "tests_model/__init__.py",
     "tests_model/conftest.py",
