@@ -22,6 +22,36 @@ VALUES = (
     ("control_mode", "Control mode", None, None),
     ("last_session_energy", "Last session energy", "kWh", SensorDeviceClass.ENERGY),
 )
+CONTROL_MODE_LABELS = {
+    "pause_requested": "Pause requested",
+    "return_requested": "Return requested",
+    "updating_current": "Updating current",
+    "start_pending": "Start pending",
+    "starting_locally": "Starting locally",
+    "stopping_locally": "Stopping locally",
+    "local_charging": "Local charging",
+    "local_session": "Local session",
+    "local_test": "Local test",
+    "app_test": "App test",
+    "paused": "Paused locally",
+    "app": "App / schedule",
+    "app_offline": "App / schedule (cloud offline)",
+    "attention": "Needs attention",
+    "waiting": "Waiting for verification",
+}
+NATIVE_CONTROL_MODES = frozenset(
+    {
+        "starting_locally",
+        "stopping_locally",
+        "local_charging",
+        "local_session",
+        "local_test",
+        "app_test",
+        "paused",
+        "app",
+        "app_offline",
+    }
+)
 
 
 # Add the same stable set after every reload, independent of whether a vehicle or active session is present.
@@ -56,47 +86,52 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def native_value(self) -> Any:
         data = self.coordinator.data
         if self.key == "control_mode":
-            if data.get("desired_control") == "paused" and data.get("pause_pending") is True:
-                return "Pause requested"
-            if data.get("desired_control") == "paused" and data.get("return_pending") is True:
-                return "Return requested"
-            if data.get("fault") == "current_update_pending":
-                return "Updating current"
-            if data.get("fault") == "start_operation_pending":
-                return "Start pending"
-            local = data.get("local_charge")
-            if isinstance(local, dict) and local.get("state") in (
-                "starting",
-                "awaiting_session",
-                "running",
-                "stopping",
-            ):
-                if self.local_charge_progress is None:
-                    return "Waiting for verification"
-                if local["state"] in ("starting", "awaiting_session"):
-                    return "Starting locally"
-                if local["state"] == "stopping":
-                    return "Stopping locally"
-                return "Local charging" if local["charging"] else "Local session"
-            test = data.get("test_charge")
-            if (
-                isinstance(test, dict)
-                and test.get("source") in ("local", "cloud")
-                and test.get("state") in ("armed", "starting", "awaiting_power", "charging", "stopping")
-            ):
-                if self.charge_test_progress is None:
-                    return "Waiting for verification"
-                return "Local test" if test["source"] == "local" else "App test"
-            if data.get("desired_control") == "paused":
-                return "Paused locally" if data.get("local_hold_verified") and self.native_fresh else "Pause requested"
-            if self.coordinator.fresh_local_healthy and data.get("owner_control_enabled") is True:
-                return "App / schedule (cloud offline)" if data.get("cloud_connected") is False else "App / schedule"
-            return "Needs attention" if data.get("state") in ("attention", "degraded") else "Waiting for verification"
+            if "control_mode" not in data:
+                return self.legacy_control_mode()
+            mode = data["control_mode"]
+            if not isinstance(mode, str):
+                mode = "waiting"
+            if mode in NATIVE_CONTROL_MODES and not self.native_fresh:
+                mode = "pause_requested" if mode == "paused" else "waiting"
+            return CONTROL_MODE_LABELS.get(mode, CONTROL_MODE_LABELS["waiting"])
         if self.key == "last_session_energy":
-            if data.get("charger_latest_completion_known") is not True:
-                return None
-            return next((r["energy_kwh"] for r in data.get("charger_sessions", []) if r.get("stopped_at")), None)
+            return data.get("last_session_energy_kwh")
         return data.get(self.key)
+
+    # Older proxy versions supply the ingredient fields without an owner-facing mode.
+    def legacy_control_mode(self) -> str:
+        data = self.coordinator.data
+        if data.get("desired_control") == "paused" and data.get("pause_pending") is True:
+            return "Pause requested"
+        if data.get("desired_control") == "paused" and data.get("return_pending") is True:
+            return "Return requested"
+        if data.get("fault") == "current_update_pending":
+            return "Updating current"
+        if data.get("fault") == "start_operation_pending":
+            return "Start pending"
+        local = data.get("local_charge")
+        if isinstance(local, dict) and local.get("state") in ("starting", "awaiting_session", "running", "stopping"):
+            if self.local_charge_progress is None:
+                return "Waiting for verification"
+            if local["state"] in ("starting", "awaiting_session"):
+                return "Starting locally"
+            if local["state"] == "stopping":
+                return "Stopping locally"
+            return "Local charging" if local["charging"] else "Local session"
+        test = data.get("test_charge")
+        if (
+            isinstance(test, dict)
+            and test.get("source") in ("local", "cloud")
+            and test.get("state") in ("armed", "starting", "awaiting_power", "charging", "stopping")
+        ):
+            if self.charge_test_progress is None:
+                return "Waiting for verification"
+            return "Local test" if test["source"] == "local" else "App test"
+        if data.get("desired_control") == "paused":
+            return "Paused locally" if data.get("local_hold_verified") and self.native_fresh else "Pause requested"
+        if self.coordinator.fresh_local_healthy and data.get("owner_control_enabled") is True:
+            return "App / schedule (cloud offline)" if data.get("cloud_connected") is False else "App / schedule"
+        return "Needs attention" if data.get("state") in ("attention", "degraded") else "Waiting for verification"
 
     # Normal local sessions expose their verified lifecycle and charging fact, without a fabricated duration.
     @property

@@ -114,6 +114,15 @@ class ProxyClient:
             latest_known = result.get("charger_latest_completion_known", result.get("charger_history_complete", True))
             result["charger_latest_completion_known"] = complete and latest_known is True
             result["charger_history_complete"] = complete and result.get("charger_history_complete", True) is True
+            if "last_session_energy_kwh" in result:
+                energy = result["last_session_energy_kwh"]
+                result["last_session_energy_kwh"] = (
+                    energy if type(energy) in (int, float) and 0 <= energy <= 1e9 else None
+                )
+            elif result["charger_latest_completion_known"]:
+                result["last_session_energy_kwh"] = next(
+                    (row["energy_kwh"] for row in result["charger_sessions"] if row["stopped_at"] is not None), None
+                )
         return result
 
     # Acceptance is separate from actual zero/release confirmation; a lost response never repeats the physical write.

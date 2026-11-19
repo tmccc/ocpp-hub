@@ -47,11 +47,12 @@ class ProxyCurrent(ProxyEntity, NumberEntity):
     # The service proves idle closed/all-phase zero independently from manufacturer cloud connectivity.
     @property
     def available(self) -> bool:
+        data = self.coordinator.data
         return (
             super().available
             and self.native_fresh
-            and self.coordinator.fresh_local_healthy
-            and self.coordinator.data.get("can_set_current") is True
+            and data.get("can_set_current") is True
+            and ("control_mode" in data or self.coordinator.fresh_local_healthy)
             and self.native_value is not None
         )
 

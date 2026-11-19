@@ -69,6 +69,16 @@ async def test_invalid_nested_history_preserves_siblings(actual_hass, peer):
     peer["state"]["charger_sessions"] = [valid]
     await entry.runtime_data.async_refresh()
     assert actual_hass.states.get(sensor_id).state == str(valid["energy_kwh"])
+    peer["state"]["last_session_energy_kwh"] = None
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(sensor_id).state == "unknown"
+    peer["state"]["last_session_energy_kwh"] = True
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(sensor_id).state == "unknown"
+    peer["state"]["last_session_energy_kwh"] = 0.0
+    peer["state"]["charger_sessions"] = [None, valid]
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(sensor_id).state == "0.0"
 
 
 # Intent: even a direct enormous-integer current request gets a safe validation error before any management command.

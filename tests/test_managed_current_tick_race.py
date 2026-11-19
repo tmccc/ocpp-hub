@@ -206,6 +206,15 @@ async def test_controller_current_acceptance_during_tick_resource_wait_completes
                 status = await asyncio.wait_for(tick, 2)
                 assert status["state"] == "reconciling" and not j.get("managed_control_fault")
                 assert j.get("managed_current_change")["state"] == "pending"
+                published = {
+                    **status,
+                    "fault": "current_update_pending",
+                    "running": True,
+                    "certificate_remaining_seconds": 86400,
+                }
+                pending = (await call(management, "status"))["result"]
+                assert pending["control_mode"] == "updating_current" and pending["requested_current_a"] == 16
+                assert pending["station_ceiling_a"] is None and not pending["can_set_current"]
                 assert not any(
                     f[2] == "SetChargingProfile"
                     and f[3]["csChargingProfiles"]["chargingProfileId"] == 7001
@@ -214,7 +223,12 @@ async def test_controller_current_acceptance_during_tick_resource_wait_completes
                 )
                 peer.release.set()
                 await asyncio.wait_for(c.current.settle(), 5)
+                completed = (await call(management, "status"))["result"]
+                assert completed["control_mode"] == "waiting" and completed["requested_current_a"] == 16
+                assert completed["station_ceiling_a"] is None and not completed["can_set_current"]
                 published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+                verified = (await call(management, "status"))["result"]
+                assert verified["control_mode"] == "app" and verified["station_ceiling_a"] == 16
                 assert c.requests.receipt(identifier)["state"] == "completed"
                 assert published["owner_control_enabled"] and published["station_ceiling_a"] == 16
                 assert j.get("control")["resume_limit"] == 16 and not j.get("managed_control_fault")

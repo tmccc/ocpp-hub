@@ -36,6 +36,7 @@ NATIVE_SAMPLE_FIELDS = (
 def clear_native_sample(status: dict[str, Any]) -> None:
     status.update(dict.fromkeys((*NATIVE_SAMPLE_FIELDS, "vehicle_connected", "history_records")))
     status.update(charger_sessions=[], charger_history_complete=False, charger_latest_completion_known=False)
+    status["last_session_energy_kwh"] = None
 
 
 # Reject booleans and non-finite values before calculating status ages or certificate coverage.
@@ -276,6 +277,7 @@ def observed_status(
     latest_known = history.latest_completion_known and (
         not check_archive or latest_completion_available(j, history.completed)
     )
+    last_energy = next((row["energy_kwh"] for row in history.sessions if row["stopped_at"] is not None), None)
     c.status_authority = c.authority()
     c.status_vendor_epoch = g._vendor_epoch
     return {
@@ -310,6 +312,7 @@ def observed_status(
         "charger_sessions": history.sessions,
         "charger_history_complete": history.complete and latest_known,
         "charger_latest_completion_known": latest_known,
+        "last_session_energy_kwh": last_energy if latest_known else None,
         "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
     }
 
@@ -379,6 +382,38 @@ def _return_refusal(c: ManagedController, mode: str, status: dict[str, Any]) -> 
     return None
 
 
+# Decide the owner-facing mode once from live work and the retained physical proof.
+def control_mode(status: dict[str, Any], pending_fault: str | None, *, fresh: bool) -> str:
+    paused = status["desired_control"] == "paused"
+    if paused and status["pause_pending"]:
+        return "pause_requested"
+    if paused and status["return_pending"]:
+        return "return_requested"
+    if pending_fault == "current_update_pending":
+        return "updating_current"
+    if pending_fault == "start_operation_pending":
+        return "start_pending"
+    local = status.get("local_charge")
+    if local and local["state"] in ("starting", "awaiting_session", "running", "stopping"):
+        if not fresh or not status["local_healthy"]:
+            return "waiting"
+        if local["state"] in ("starting", "awaiting_session"):
+            return "starting_locally"
+        if local["state"] == "stopping":
+            return "stopping_locally"
+        return "local_charging" if local["charging"] else "local_session"
+    test = status.get("test_charge")
+    if test and test["state"] in ("armed", "starting", "awaiting_power", "charging", "stopping"):
+        if not fresh or not status["healthy"]:
+            return "waiting"
+        return "local_test" if test["source"] == "local" else "app_test"
+    if paused:
+        return "paused" if fresh and status["local_hold_verified"] else "pause_requested"
+    if fresh and status["local_healthy"] and status["owner_control_enabled"]:
+        return "app_offline" if status.get("cloud_connected") is False else "app"
+    return "attention" if status["state"] in ("attention", "degraded") else "waiting"
+
+
 # Apply newer intent and refresh live availability without promoting stale poll evidence to current authority.
 def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[str, Any]:
     result = dict(published)
@@ -424,6 +459,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     )
     if not sample_available:
         clear_native_sample(result)
+    result.setdefault("last_session_energy_kwh", None)
     supervising = not c.stopping and not j.fault.latched()
     scope_current = sample_available and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
@@ -456,6 +492,11 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         local_hold_verified=proof.hold_verified,
     )
     result = health_snapshot(result, delivery_blocked=runtime.delivery_blocked)
+    fresh = all(
+        age is not None and 0 <= age <= 15 for age in (result["status_age_seconds"], result["native_age_seconds"])
+    )
+    if not fresh:
+        result["last_session_energy_kwh"] = None
     if result["state"] in ("healthy", "local_only") and not result["healthy"]:
         result["state"] = "local_only" if result["local_healthy"] else "degraded"
     result["can_pause"] = not c.stopping
@@ -464,5 +505,6 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     result["start_authorization"] = c.charging.authorization_status()
     result["can_set_current"] = result["local_healthy"] and c.current.available(c.latest_native)
     result["can_return"] = _return_refusal(c, intent.mode, result) is None
+    result["control_mode"] = control_mode(result, pending_fault if supervising else None, fresh=fresh)
     result["sessions"] = session_history(c.session.journal)
     return result
