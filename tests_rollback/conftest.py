@@ -15,12 +15,17 @@ def pytest_addoption(parser):
 
 
 # Supply the exact two source directories to each isolated simulator.
-@pytest.fixture
-def builds(pytestconfig):
-    paths = tuple(pytestconfig.getoption(name) for name in ("--rollback-current", "--rollback-previous"))
+def verified_builds(current, previous):
+    paths = (current, previous)
     if any(path is None or not path.is_absolute() or not path.is_dir() for path in paths):
         raise pytest.UsageError("supply two absolute archived source directories for the rollback rehearsal")
     current, previous = (path.resolve() for path in paths)
     if not build_matches(current, CURRENT) or not build_matches(previous, PREVIOUS):
         raise pytest.UsageError("the supplied source directories do not match the exact rollback pair")
     return current, previous
+
+
+# Read the source directories for the focused rollback suite.
+@pytest.fixture
+def builds(pytestconfig):
+    return verified_builds(pytestconfig.getoption("--rollback-current"), pytestconfig.getoption("--rollback-previous"))

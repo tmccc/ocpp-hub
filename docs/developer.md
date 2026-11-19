@@ -126,6 +126,23 @@ proxy just after it saves Pause in one case and drops its reply while it keeps r
 Assistant process loads the same saved entry. Both restart orders preserve the original Pause, verify zero at
 the charger and let a later Return from Home Assistant restore scheduled charging.
 
+#### One-week installation rehearsal
+
+Use the two source snapshots in the [rollback instructions](release-process.md#rehearsed-standalone-software-rollback)
+and run the week on either supported Home Assistant runtime.
+
+```bash
+.venv-ha-proxy/bin/python -B tools/offline_ha_validate.py tests_installation \
+  --week-current="$TMPDIR/current" --week-previous="$TMPDIR/previous"
+```
+
+The test advances seven dates on one simulated charger timetable. Program time runs normally while the charger
+reports the scheduled session times. Home Assistant changes the selected current from 6 A to 16 A, the charger
+unplugs and reconnects, and one active charge continues after a brief interruption. On the newer build, a Pause
+from Home Assistant ends that day's scheduled session early and keeps the vendor app from starting another one.
+The older build reopens the same migrated journal, keeps the exact Pause and charges, and runs the last three
+scheduled sessions after Return.
+
 `tools/parallel_qualify.py` freezes ordinary tracked Git blobs and runs20 pinned Docker workers with separate network
 namespaces, read-only source/runtime, task-owned scratch, four spare CPUs and a bounded timeout. All runtime paths,
 immutable image IDs and optional SSH worker settings are explicit arguments. Output belongs outside the repository.

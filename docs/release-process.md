@@ -119,6 +119,11 @@ managed charge and its delivery, the original newer Pause after the switch, and 
 Separate cases prove refusal before the previous process starts. The cross-build rehearsal takes explicit source
 snapshots alongside the usual release qualification.
 
+The [one-week installation rehearsal](developer.md#one-week-installation-rehearsal) uses the same build pair
+with synthetic records in the audited migrated layout. It verifies the ordinary delivery records and a retained
+older schedule entry on the same journal. The operator check above still covers the fresh layout. The installed
+history policies require their own rehearsal before using it for an installed rollback.
+
 ## Older integration and HACS releases
 
 On public working forks, HACS publishing validation runs on release tags and manual workflow runs. Hassfest
