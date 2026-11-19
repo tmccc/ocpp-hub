@@ -315,7 +315,7 @@ def test_unknown_connections_do_not_become_disconnected():
 # Intent: a pending Start/current snapshot cannot become a fictitious new Pause at a nonzero revision.
 # Why: the API may merge current intent without inventing physical progress or disconnected connections.
 @pytest.mark.parametrize("mode", ["app", "paused"])
-@pytest.mark.parametrize("fault", ["current_update_pending", "start_operation_pending"])
+@pytest.mark.parametrize("fault", ["current_update_pending", "start_operation_pending", "owner_release_pending"])
 async def test_partial_pending_status_keeps_its_operation(tmp_path, tls, unused_tcp_port, monkeypatch, mode, fault):
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c = b.controller

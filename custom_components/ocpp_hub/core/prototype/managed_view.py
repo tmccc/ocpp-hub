@@ -431,7 +431,12 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     if pending_fault is not None and supervising:
         result.update(state="reconciling", fault=pending_fault)
     elif not intent_current:
-        result["state"] = "pausing" if intent.mode == "paused" else "reconciling"
+        published_pending = result.get("fault") in (
+            "current_update_pending",
+            "start_operation_pending",
+            "owner_release_pending",
+        )
+        result["state"] = "pausing" if intent.mode == "paused" and not published_pending else "reconciling"
     proof = ControlProof(
         shared=result.get("owner_control_enabled") is True,
         hold_verified=result.get("local_hold_verified") is True,
