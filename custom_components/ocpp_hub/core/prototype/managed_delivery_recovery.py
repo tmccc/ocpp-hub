@@ -274,7 +274,7 @@ def reconcile_delivery_start(
     stop = j.db.execute(
         "SELECT token FROM outbox WHERE local=? AND action='StopTransaction'", (evidence.local,)
     ).fetchone()
-    anchor, fault = delivery_anchor(j, spec), j.fault.read()
+    anchor, fault = delivery_anchor(j, spec), j.fault.read({})
     head = j.next_delivery()
     assert head is not None
     source, parent = delivery_source(j, fault, head)
@@ -297,7 +297,7 @@ def reconcile_delivery_start(
         "prior_closed_normal_start": normal,
     }
 
-    # This callback runs inside acknowledge's transaction after mapping and Start removal, with no await.
+    # Check the updated mapping and write its proof in the transaction that removes the Start.
     def recorded() -> None:
         if delivery_anchor(j, spec) != anchor or j.fault.read() != fault or j.get(KEY, {}) != records:
             raise RecoveryRequiredError("delivery reconciliation authority changed")
