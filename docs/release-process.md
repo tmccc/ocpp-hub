@@ -48,8 +48,8 @@ source relationship, checks and limits separately; do not call mixed-source evid
 
 ## Current iCS deployment
 
-The repository provides no standalone-service installer. Its entry point supports `check`, `serve` and `health`;
-only `serve` starts network activity. For an already configured installation, offline preflight has this form:
+The repository provides no standalone-service installer. Its entry point supports `check`, `serve`, `health` and
+`incident`. The `serve` action starts network activity. Run offline preflight with the existing configuration.
 
 ```bash
 python tools/managed_proxy.py check --config "$PROXY_CONFIG" \
@@ -83,6 +83,41 @@ defaults to `sensor.uptime` and can be set via `uptime_entity`.
 Verify installed software identity, fresh local/native and HA state, preserved records and the requested mode.
 Record cloud connectivity separately from local readiness. Respect commissioning's documented physical limits;
 routine updates do not require another dedicated charging trial when the owner has excluded one.
+
+### Rehearsed standalone software rollback
+
+The first rehearsal goes from `fc2dc0a` to `7a08f2a` over one advancing SQLite journal. It covers the fresh journal
+layout exercised by the simulator. A different layout, including a migrated one, needs its own compatibility
+evidence. Keep the verified configuration, native specification and pinned runtime with the two immutable builds.
+
+For a stopped installation, the read-only check reports whether the two supplied builds and the retained journal
+match the rehearsed conditions. Use the actual stopped service build as the current root.
+
+```bash
+python -B tools/check_proxy_rollback.py --config "$PROXY_CONFIG" \
+  --current-root "$CURRENT_BUILD" --previous-root "$PREVIOUS_BUILD"
+```
+
+Establish a fresh idle Pause and zero before stopping the service. Keep the service stopped from the check until
+the planned switch. The check reads a single snapshot under the existing journal lock and reports a refusal for
+an unproved build or layout, unresolved request, undelivered lifecycle, or uncertain control state. The lock covers
+the check itself. A passing result establishes eligibility for that stopped journal. Verify a fresh Pause and zero
+after starting the previous build on the same journal, before considering Return.
+
+To reproduce the offline rehearsal, extract the two exact commits to new directories under task scratch.
+
+```bash
+mkdir "$TMPDIR/current" "$TMPDIR/previous"
+git archive fc2dc0a95585ca19d75384965aacf1d4d51345ab | tar -x -C "$TMPDIR/current"
+git archive 7a08f2ade3b9e597099aaece2aef2f8542852a41 | tar -x -C "$TMPDIR/previous"
+.venv/bin/python -B tools/offline_validate.py tests_rollback \
+  --rollback-current="$TMPDIR/current" --rollback-previous="$TMPDIR/previous"
+```
+
+The rehearsal uses the same simulated charger, vendor and journal across both releases. It verifies a genuine
+managed charge and its delivery, the original newer Pause after the switch, and two later charges after Return.
+Separate cases prove refusal before the previous process starts. The cross-build rehearsal takes explicit source
+snapshots alongside the usual release qualification.
 
 ## Older integration and HACS releases
 

@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import uuid
 from contextlib import asynccontextmanager, closing
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
@@ -41,13 +42,14 @@ class ServiceProcess:
             {"host": "127.0.0.1", "port": port, "token_file": str(directory / "process-management-token.json")},
         )
 
-    # Start the real service, with an optional observation armed before the charger sends Boot.
-    async def start(self, *, arm: tuple[str, str] | None = None):
+    # Start the real service from the selected build, optionally arming one observation before charger Boot.
+    async def start(self, *, arm: tuple[str, str] | None = None, source: Path | None = None):
         self.generation += 1
         self.events = asyncio.Queue()
         log = (self.directory / f"process-{self.generation}.stderr.log").open("w")
         self.process = await asyncio.create_subprocess_exec(
             sys.executable,
+            *(("-E",) if source is not None else ()),
             "-B",
             "-m",
             "tests.process_service_child",
@@ -59,6 +61,7 @@ class ServiceProcess:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=log,
+            cwd=source,
             env={**os.environ, "NOTIFY_SOCKET": "", "PYTHONDONTWRITEBYTECODE": "1"},
         )
         log.close()
