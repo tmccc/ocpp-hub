@@ -50,6 +50,12 @@ async def test_current_poll_during_pending_physical_or_sql_work(
                 additional_headers={"Authorization": "Bearer " + TOKEN},
                 subprotocols=["ics-proxy.v1"],
             ) as socket:
+                # The management read must recognise the accepted work before the next service poll.
+                immediate = (await call(socket, "status"))["result"]
+                assert immediate["checked_at"] == prior_checked
+                assert immediate["fault"] == "current_update_pending" and immediate["requested_current_a"] == 16
+                assert immediate["native_age_seconds"] is None
+                assert all(immediate[key] is None for key in ("current_a", "power_w", "vehicle_connected"))
                 for _ in range(2):
                     pending = await asyncio.wait_for(c.tick(), 1)
                     assert pending["checked_at"] > prior_checked
@@ -77,6 +83,8 @@ async def test_current_poll_during_pending_physical_or_sql_work(
                 # A separate, real owner Pause can enforce zero even while the old operation's settlement waits.
                 newer = await call(socket, "pause", revision=status["control_revision"])
                 assert newer["ok"]
+                pausing = (await call(socket, "status"))["result"]
+                assert pausing["desired_control"] == "paused" and pausing["pause_pending"] is True
                 if c.pause_task is not None:
                     await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
                 intent, control = c.requests.intent(), j.get("control")

@@ -22,6 +22,24 @@ if TYPE_CHECKING:
     from .trial_handover_evidence import HandoverEvidence
 
 
+NATIVE_SAMPLE_FIELDS = (
+    "native_observed_at",
+    "native_limit_a",
+    "current_a",
+    "power_w",
+    "charging_session_open",
+    "vehicle_connected",
+    "vehicle_drawing_power",
+    "history_records",
+)
+
+
+# An unavailable native sample leaves the independently saved proxy history intact.
+def clear_native_sample(status: dict[str, Any]) -> None:
+    status.update(dict.fromkeys(NATIVE_SAMPLE_FIELDS))
+    status.update(charger_sessions=[], charger_history_complete=False)
+
+
 # Reject booleans and non-finite values before calculating status ages or certificate coverage.
 def finite_number(value: object) -> float | None:
     return (
@@ -184,20 +202,8 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
         "local_hold_verified": False,
     }
     if pending:
-        value.update(
-            {
-                key: None
-                for key in (
-                    "native_observed_at",
-                    "native_limit_a",
-                    "current_a",
-                    "power_w",
-                    "station_ceiling_a",
-                    "charging_session_open",
-                    "vehicle_drawing_power",
-                )
-            }
-        )
+        clear_native_sample(value)
+        value["station_ceiling_a"] = None
     else:
         j = c.session.journal
         value.update(
@@ -379,20 +385,32 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         or c.status_vendor_epoch != g._vendor_epoch
     ):
         result["cloud_connected"] = False
-    scope_current = not (
-        c.stopping
-        or j.fault.latched()
-        or not result.get("charger_connected")
-        or c.latest_native is None
-        or c.status_authority is None
-        or c.authority() != c.status_authority
+    current, observed = c.authority(), c.status_authority
+    current_worker, start_worker = c.current.worker, c.charging.worker
+    pending_fault = None
+    if c.current.pending() or (current_worker is not None and not current_worker.done()):
+        pending_fault = "current_update_pending"
+    elif start_worker is not None and not start_worker.done():
+        pending_fault = "start_operation_pending"
+    sample_current = (
+        result.get("charger_connected") is True
+        and current is not None
+        and observed is not None
+        and current.scope == observed.scope
+        and c.latest_native is not None
+        and pending_fault is None
     )
+    if not sample_current:
+        clear_native_sample(result)
+    supervising = not c.stopping and not j.fault.latched()
+    scope_current = sample_current and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):
-        result["station_ceiling_a"] = None
-    if not intent_current:
-        pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
-        result.update(state="pausing" if intent.mode == "paused" and not pending else "reconciling")
+        result.update(station_ceiling_a=None, local_charge=None, test_charge=None)
+    if pending_fault is not None and supervising:
+        result.update(state="reconciling", fault=pending_fault)
+    elif not intent_current:
+        result["state"] = "pausing" if intent.mode == "paused" else "reconciling"
     proof = ControlProof(
         shared=result.get("owner_control_enabled") is True,
         hold_verified=result.get("local_hold_verified") is True,
@@ -405,6 +423,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         api_version=1,
         desired_control=intent.mode,
         control_revision=intent.revision,
+        pause_pending=c.requests.pending_pause(),
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
     )

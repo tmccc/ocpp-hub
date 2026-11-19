@@ -72,6 +72,8 @@ async def control_peer():
             station_ceiling_a=0,
             current_a=0,
             power_w=0,
+            local_charge=None,
+            pause_pending=False,
             local_hold_verified=True,
             can_return=True,
             can_start=True,
@@ -119,6 +121,7 @@ async def control_peer():
                 healthy=False,
                 local_healthy=False,
                 state="pausing",
+                pause_pending=True,
                 owner_control_enabled=False,
                 local_hold_verified=False,
                 can_return=False,
@@ -162,9 +165,18 @@ async def test_pending_pause_waits_for_independent_zero(actual_hass, control_pee
     hass, peer = actual_hass, control_peer
     configured_timing(monkeypatch, 1)
     peer["pending_pause"] = True
-    peer["state"].update(current_a=6, power_w=1440)
+    peer["state"].update(current_a=6, power_w=1440, local_charge={"state": "running", "charging": True})
+
+    # An older worker can still be running after the service has recorded the newer Pause.
+    def pending_status(command, request, result):
+        if command == "status" and result.get("pause_pending") is True:
+            result["fault"] = "start_operation_pending"
+        return result
+
+    peer["result_filter"] = pending_status
     entry = await setup(hass, peer)
     await hass.async_start()
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "Local charging"
     request = asyncio.create_task(
         hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
     )

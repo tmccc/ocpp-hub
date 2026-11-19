@@ -168,6 +168,12 @@ async def test_current_reply_storage_and_cached_disconnect(tmp_path, tls, unused
                 assert after["checked_at"] == before["checked_at"]
                 assert after["control_revision"] == before["control_revision"]
                 assert not any(after[key] for key in ("healthy", "local_hold_verified", "can_return", "boot_verified"))
+                assert before["native_age_seconds"] is not None and before["vehicle_connected"] is True
+                measurements = (
+                    "native_age_seconds", "power_w", "current_a", "vehicle_connected", "charging_session_open"
+                )
+                assert all(after[key] is None for key in measurements)
+                assert after["sessions"] == before["sessions"] and after["requested_current_a"] == 16
         finally:
             j.db.set_authorizer(None)
             j.db.set_trace_callback(None)
