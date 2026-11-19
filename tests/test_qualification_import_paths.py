@@ -16,13 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 # Why: a direct collector test never reached the HA runner's conflicting regular tools package.
 @pytest.mark.parametrize(
     ("entrypoint", "foreign_tools"),
-    [("script", True), ("script", False), ("copied", True), ("qualified", False)],
+    [("script", True), ("script", False), ("copied", True), ("qualified", False), ("qualified", True)],
 )
 def test_evidence_resolves_source_helper_across_import_contexts(tmp_path, entrypoint, foreign_tools):
     source = tmp_path / "source"
     tools = source / "tools"
     tools.mkdir(parents=True)
-    for name in ("offline_validate.py", "qualification_evidence.py", "qualification_collection.py"):
+    for name in ("__init__.py", "offline_validate.py", "qualification_evidence.py", "qualification_collection.py"):
         shutil.copyfile(ROOT / "tools" / name, tools / name)
     (source / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
     witness = source / "test_never_run.py"
