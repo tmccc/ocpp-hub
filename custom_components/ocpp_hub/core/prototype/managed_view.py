@@ -414,17 +414,21 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         pending_fault = "start_operation_pending"
     elif c.recovery.pending():
         pending_fault = "owner_release_pending"
-    sample_current = (
+    pause_pending = c.requests.pending_pause()
+    # A pending Pause can still show the last measured app reading with its original age.
+    sample_available = (
         result.get("charger_connected") is True
         and current is not None
-        and current == observed
+        and observed is not None
+        and current.scope == observed.scope
+        and (current == observed or pause_pending and observed.intent.mode == "app")
         and c.latest_native is not None
         and pending_fault is None
     )
-    if not sample_current:
+    if not sample_available:
         clear_native_sample(result)
     supervising = not c.stopping and not j.fault.latched()
-    scope_current = sample_current and supervising
+    scope_current = sample_available and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):
         result.update(station_ceiling_a=None, local_charge=None, test_charge=None)
@@ -449,7 +453,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         api_version=1,
         desired_control=intent.mode,
         control_revision=intent.revision,
-        pause_pending=c.requests.pending_pause(),
+        pause_pending=pause_pending,
         return_pending=intent.mode == "paused" and c.requests.return_in_progress(intent.revision),
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
