@@ -212,6 +212,26 @@ async def test_pending_pause_waits_for_independent_zero(actual_hass, control_pee
         await asyncio.gather(request, return_exceptions=True)
 
 
+# Intent: HA identifies an accepted Return while the station change is awaiting verification.
+# Why: the old Pause can no longer certify zero output once its release may have reached the charger.
+async def test_return_is_visible_while_awaiting_verification(actual_hass, control_peer):
+    hass, peer = actual_hass, control_peer
+    peer["state"].update(
+        desired_control="paused",
+        return_pending=True,
+        fault="owner_release_pending",
+        state="reconciling",
+        healthy=False,
+        local_healthy=False,
+        native_age_seconds=None,
+        power_w=None,
+        owner_control_enabled=False,
+    )
+    await setup(hass, peer)
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "Return requested"
+    assert hass.states.get("sensor.ics_proxy_power").state == "unavailable"
+
+
 # Intent: losing a current request before any effect retains the observed old value and never retries the write.
 # Why: the applied-then-lost case alone cannot expose an entity which optimistically adopts an unconfirmed target.
 @pytest.mark.parametrize("paused", [False, True])

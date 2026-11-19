@@ -19,6 +19,7 @@ from ocpp_hub_core.prototype import recovery_policy
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.gateway import Gateway
 from ocpp_hub_core.prototype.local_control import ControlSupersededError, LocalControl
+from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, Prerequisite, RestoreState, WireReply
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
@@ -367,11 +368,13 @@ async def test_actual_release_publication_failure_rolls_back_all_authority(
 
 
 # Intent: cancelling a poll during a genuine positive RPC cannot abandon final Return publication or its receipt.
-# Why: physical write ownership and the common completion lifetime must survive disappearance of the original waiter.
+# Why: running Return invalidates the old zero reading and retains one completion after its original waiter leaves.
 async def test_cancelled_poll_cannot_abandon_owned_return_publication(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, g, j = b.controller, b.session.gateway, b.session.journal
         before = await pause_prefix(b)
+        published = dict(await c.tick(), running=True, certificate_remaining_seconds=7200)
+        assert published["power_w"] == 0 and published["local_hold_verified"]
         replies = observe_device_replies(SimpleNamespace(sock=b.charger), monkeypatch)
         entered, release = asyncio.Event(), asyncio.Event()
         witness, previous = capture_positive(b, entered=entered, release=release)
@@ -385,6 +388,11 @@ async def test_cancelled_poll_cannot_abandon_owned_return_publication(tmp_path, 
             assert child in g.controls._operations and completion in g.controls._completions
             assert not child.done() and not completion.done() and g.charger._pending
             assert c.requests.intent() == before["intent"] and c.requests.receipt(returning)["state"] == "running"
+            reading = refresh_for_read(c, published)
+            assert reading["return_pending"] and not reading["local_hold_verified"]
+            assert reading["fault"] == "owner_release_pending"
+            assert reading["power_w"] is reading["current_a"] is reading["native_age_seconds"] is None
+            assert reading["charging_session_open"] is reading["station_ceiling_a"] is None
             polling.cancel()
             await asyncio.gather(polling, return_exceptions=True)
             assert polling.cancelled() and not child.cancelled() and not completion.cancelled()

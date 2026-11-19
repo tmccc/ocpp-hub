@@ -392,18 +392,19 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         pending_fault = "current_update_pending"
     elif start_worker is not None and not start_worker.done():
         pending_fault = "start_operation_pending"
+    elif c.recovery.pending():
+        pending_fault = "owner_release_pending"
     sample_current = (
         result.get("charger_connected") is True
         and current is not None
-        and observed is not None
-        and current.scope == observed.scope
+        and current == observed
         and c.latest_native is not None
         and pending_fault is None
     )
     if not sample_current:
         clear_native_sample(result)
     supervising = not c.stopping and not j.fault.latched()
-    scope_current = sample_current and current == observed and supervising
+    scope_current = sample_current and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):
         result.update(station_ceiling_a=None, local_charge=None, test_charge=None)
@@ -424,6 +425,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         desired_control=intent.mode,
         control_revision=intent.revision,
         pause_pending=c.requests.pending_pause(),
+        return_pending=intent.mode == "paused" and c.requests.return_in_progress(intent.revision),
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
     )

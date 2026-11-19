@@ -58,6 +58,8 @@ class ProxySensor(ProxyEntity, SensorEntity):
         if self.key == "control_mode":
             if data.get("desired_control") == "paused" and data.get("pause_pending") is True:
                 return "Pause requested"
+            if data.get("desired_control") == "paused" and data.get("return_pending") is True:
+                return "Return requested"
             if data.get("fault") == "current_update_pending":
                 return "Updating current"
             if data.get("fault") == "start_operation_pending":
