@@ -32,12 +32,12 @@ def collection_targets() -> list[str]:
     ]
 
 
-# Verify the shared engine denominator came from unfiltered discovery of this checkout.
-def engine_collection(path: Path) -> list[str]:
+# Verify the hosted suite's test list came from unfiltered discovery of this checkout.
+def hosted_collection(path: Path, suite: str) -> list[str]:
     plan = json.loads(path.read_text())
-    files, definitions = source_inventory(ROOT, "engine-model")
+    files, definitions = source_inventory(ROOT, suite)
     if (
-        plan.get("suite") != "engine-model"
+        plan.get("suite") != suite
         or plan.get("errors") != []
         or plan.get("test_bodies_executed") is not False
         or plan.get("source_files") != files
@@ -45,7 +45,7 @@ def engine_collection(path: Path) -> list[str]:
         or not valid_collection_contract(plan)
         or not set(definitions) <= {identifier.split("[", 1)[0] for identifier in plan["ids"]}
     ):
-        raise RuntimeError("hosted engine plan differs from this checkout's complete discovery")
+        raise RuntimeError(f"hosted {suite} plan differs from this checkout's complete discovery")
     return plan["ids"]
 
 
@@ -144,7 +144,7 @@ def main() -> int:
             [json.loads(line) for line in (args.output / "collection.jsonl").read_text().splitlines()]
         )
     else:
-        ids = engine_collection(args.engine_collection)
+        ids = hosted_collection(args.engine_collection, "engine-model")
     manifest_path = args.output / "sequence-manifest.jsonl"
     generated = subprocess.run(
         [sys.executable, "-B", "tools/schedule_sequence_manifest.py", str(manifest_path)],

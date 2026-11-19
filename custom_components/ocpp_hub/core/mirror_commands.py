@@ -8,6 +8,7 @@ from typing import Any
 
 from .frames import ERROR_FORMATION_VIOLATION, ERROR_NOT_SUPPORTED, build_call_error, build_call_result
 from .mirror_queue import ACTION_BOOT, ACTION_STATUS, is_integer
+from .readings import ScheduleWindow
 
 # A fixed refusal per command. Every status below is a value OCPP 1.6 allows for that command, so a strict vendor
 # backend still accepts the answer. ClearChargingProfile has no "Rejected": "Unknown" is its way to say nothing was
@@ -56,7 +57,7 @@ def answer_vendor_call(
     configuration: Mapping[str, str],
     can_trigger: Callable[[TriggerRequest], bool],
     limit_a: float | None = None,
-    schedule_for: Callable[[int], list[tuple[int, float]] | None] | None = None,
+    schedule_for: Callable[[int], ScheduleWindow | None] | None = None,
 ) -> VendorAnswer:
     match action:
         case "GetConfiguration":
@@ -76,17 +77,20 @@ def answer_vendor_call(
 def _composite_answer(
     payload: dict[str, Any],
     limit_a: float | None,
-    schedule_for: Callable[[int], list[tuple[int, float]] | None] | None,
+    schedule_for: Callable[[int], ScheduleWindow | None] | None,
 ) -> dict[str, Any]:
     connector = payload.get("connectorId")
     duration = payload.get("duration")
-    if limit_a is None or not is_integer(connector) or not is_integer(duration):
+    if not is_integer(connector) or not is_integer(duration) or duration <= 0:
         return {"status": "Rejected"}
     # A question about more than the present moment gets the charger's own schedule when the hub has it.
     real = schedule_for(duration) if schedule_for is not None and duration > 3600 else None
-    pairs = real or [(0, limit_a)]
-    periods = [{"startPeriod": start, "limit": limit} for start, limit in pairs]
-    schedule = {"duration": duration, "chargingRateUnit": "A", "chargingSchedulePeriod": periods}
+    if real is None:
+        if limit_a is None:
+            return {"status": "Rejected"}
+        real = ScheduleWindow(duration, ((0, limit_a),))
+    periods = [{"startPeriod": start, "limit": limit} for start, limit in real.periods]
+    schedule = {"duration": real.duration_s, "chargingRateUnit": "A", "chargingSchedulePeriod": periods}
     return {"status": "Accepted", "connectorId": connector, "chargingSchedule": schedule}
 
 

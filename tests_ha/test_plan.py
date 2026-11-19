@@ -236,6 +236,37 @@ async def test_the_planning_switch_clears_and_restores_the_profile(
     assert hass.states.get(PLAN).attributes["planning"] == "on"
 
 
+# Intent: reject overlapping enabled windows when saving a plan even if planning is currently switched off.
+# Why: the saved plan must be ready to apply when the owner turns planning back on.
+async def test_overlapping_windows_are_rejected_while_planning_is_off(hass, setup_hub, connect_charger):
+    charger, entry = await _booted(hass, setup_hub, connect_charger)
+    await _call(hass, charger, {"windows": [MONDAY_NOON]})
+    plans = entry.runtime_data.plans
+    off = asyncio.create_task(plans.planning_switched("TEST0001", False))
+    cleared = await charger.next_hub_call()
+    assert cleared[2] == "ClearChargingProfile"
+    await charger.answer(cleared, {"status": "Accepted"})
+    await off
+
+    overlapping = {"day": "monday", "from": "13:00", "to": "15:00"}
+    attempted = asyncio.create_task(
+        hass.services.async_call(DOMAIN, "set_plan", {"windows": [MONDAY_NOON, overlapping]}, blocking=True)
+    )
+    write = asyncio.create_task(charger.next_hub_call())
+    done, _ = await asyncio.wait((attempted, write), return_when=asyncio.FIRST_COMPLETED)
+    if write in done:
+        await charger.answer(write.result(), {"status": "Accepted"})
+    else:
+        write.cancel()
+        await asyncio.gather(write, return_exceptions=True)
+    with pytest.raises(HomeAssistantError) as error:
+        await attempted
+    assert error.value.translation_key == "control_invalid_schedule"
+    assert write not in done
+    assert not plans.planning_on("TEST0001")
+    assert plans.plan("TEST0001") == [PlanWindow(1, 43200, 50400)]
+
+
 # Intent: rejected secondary profile writes retain the accepted native switch and expose persistent pending sync.
 # Why: an app's genuine native acknowledgement must not hide a failed hub restriction or be reverted as a fake fix.
 @pytest.mark.parametrize("on", [False, True])

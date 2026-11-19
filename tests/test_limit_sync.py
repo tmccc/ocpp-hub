@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ocpp_hub_core import readings
-from ocpp_hub_core.model import LimitMemory
+from ocpp_hub_core.model import ChargerSnapshot, LimitMemory
 
+from tests.fake_charger import FakeCharger
 from tests.fake_vendor import eventually
 
 PROFILE = {
@@ -280,3 +283,60 @@ async def test_the_vendor_is_told_the_schedule_when_it_asks_for_a_day(start_rig)
     periods = day[2]["chargingSchedule"]["chargingSchedulePeriod"]
     assert periods[0] == {"startPeriod": 0, "limit": 6.0} and any(p["limit"] == 16.0 for p in periods)
     assert len(now_only[2]["chargingSchedule"]["chargingSchedulePeriod"]) == 1
+
+
+# Intent: short and long schedule reads respect the charger's start time before supplying a limit in effect now.
+# Why: a future limit cannot replace a confirmed present limit in Home Assistant or the vendor app.
+async def test_composite_schedules_respect_the_start_and_active_period(start_rig, monkeypatch) -> None:
+    rig = await start_rig()
+    charger = await rig.hub.charger()
+    now = datetime.now(UTC)
+
+    # Answer through the real charger connection with different periods for short and long reads.
+    def schedule_reply(charger: FakeCharger, frame: list[Any]) -> list[Any]:
+        duration = frame[3]["duration"]
+        start = now + timedelta(seconds=1800 if duration > 3600 else -120)
+        periods = [(0, 32), (3600, 16)] if duration > 3600 else [(0, 32), (60, 6)]
+        return [
+            3,
+            frame[1],
+            {
+                "status": "Accepted",
+                "connectorId": 1,
+                "scheduleStart": start.isoformat(),
+                "chargingSchedule": {
+                    "duration": 7200 if duration > 3600 else duration,
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": offset, "limit": limit} for offset, limit in periods],
+                },
+            },
+        ]
+
+    monkeypatch.setattr(FakeCharger, "_composite_reply", schedule_reply)
+    await charger.boot()
+    await eventually(lambda: rig.vendor.calls, message="no frame arrived")
+    await _set(rig.hub.central.control("TEST0001"), charger, 8)
+    await eventually(lambda: rig.hub.listener.latest.schedule_periods, message="schedule not read")
+
+    assert rig.hub.listener.latest.composite_limit_a == 6
+    short = await rig.vendor.command("GetCompositeSchedule", {"connectorId": 1, "duration": 600})
+    assert short[2]["chargingSchedule"]["chargingSchedulePeriod"] == [{"startPeriod": 0, "limit": 6}]
+    day = await rig.vendor.command("GetCompositeSchedule", {"connectorId": 1, "duration": 86400})
+    schedule = day[2]["chargingSchedule"]
+    present, future, later = schedule["chargingSchedulePeriod"]
+    assert present == {"startPeriod": 0, "limit": 6}
+    assert 0 < future["startPeriod"] < later["startPeriod"] < schedule["duration"] <= 9000
+    assert future["limit"] == 32 and later["limit"] == 16
+
+
+# Intent: a future period provides no current limit and a fraction of a second still counts as future.
+# Why: rounding or guessing would turn an unconfirmed offer into the limit shown for the current moment.
+def test_future_schedule_requires_a_known_present_limit() -> None:
+    now = datetime(2026, 10, 21, 12, tzinfo=UTC)
+    start = now + timedelta(milliseconds=500)
+    snapshot = ChargerSnapshot("TEST0001", schedule_start=start, schedule_periods=((0, 32.0),), schedule_duration_s=60)
+    assert readings.schedule_from_now(snapshot, now, 3600) is None
+    confirmed = replace(snapshot, composite_limit_a=6)
+    assert readings.schedule_from_now(confirmed, now, 3600) == readings.ScheduleWindow(60, ((0, 6), (1, 32)))
+    assert readings.schedule_from_now(snapshot, start, 3600) == readings.ScheduleWindow(60, ((0, 32),))
+    assert readings.schedule_from_now(snapshot, start + timedelta(seconds=60), 3600) is None

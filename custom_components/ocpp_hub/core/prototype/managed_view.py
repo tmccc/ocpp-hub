@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .managed_diagnostics import snapshot as diagnostic_snapshot
+from .native_history import latest_completion_available
 from .store import Journal
 from .supervision import ControlProof, HealthVerdict, PollStatus
 
@@ -237,6 +238,12 @@ def observed_status(
 
     j, g = c.session.journal, c.session.gateway
     history = summarize_charger_history(native.history)
+    archive = j.get("native_history_summary")
+    records_missing = bool(archive and archive.get("missing_records", 0))
+    # A previously completed charge can also come back as open under the same transaction ID.
+    check_archive = archive and (
+        records_missing or any(row.get("transactionId") != -1 and row.get("stopTime", 0) == 0 for row in native.history)
+    )
     c.status_authority = c.authority()
     c.status_vendor_epoch = g._vendor_epoch
     return {
@@ -266,12 +273,11 @@ def observed_status(
         "test_start_ready": c.charging.available(native),
         "local_charge": c.charging.normal_summary(),
         "normal_start_ready": c.charging.available(native, normal=True),
-        "history_archive": j.get("native_history_summary"),
-        "history_warning": "records_absent_from_charger"
-        if j.get("native_history_summary", {}).get("missing_records", 0)
-        else None,
+        "history_archive": archive,
+        "history_warning": "records_absent_from_charger" if records_missing else None,
         "charger_sessions": history.sessions,
-        "charger_history_complete": history.complete,
+        "charger_history_complete": history.complete
+        and (not check_archive or latest_completion_available(j, native.history)),
         "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
     }
 

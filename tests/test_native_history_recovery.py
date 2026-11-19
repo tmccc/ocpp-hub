@@ -176,14 +176,36 @@ async def test_real_tls_recovery_warns_on_later_absence_but_latches_changed_orig
                 await introduced(rig, replacement, charger, "history-replacement-boot")
                 status = await healthy(controller)
                 assert status["owner_control_enabled"] and rig.bench.firmware.effective_limit() == 6
+                assert status["charger_history_complete"]
                 assert replacement.journal.get("native_history_summary") == {
                     "archived_records": 3,
                     "missing_records": 2,
                 }
+                # An older row can still be shown, but it must never stand in for the archived latest completion.
+                rig.bench.history = fault.original[:1]
+                status = await healthy(controller)
+                assert status["history_warning"] == "records_absent_from_charger"
+                assert len(status["charger_sessions"]) == 1
+                assert not status["charger_history_complete"]
+                rig.bench.history = fault.original[-1:]
+                assert (await healthy(controller))["charger_history_complete"]
+                # A later completed row is archived, then reported as open under its existing transaction ID.
+                last = fault.original[-1]
+                later = last | {
+                    "transactionId": last["transactionId"] + 1,
+                    "startTime": last["startTime"] + 120,
+                    "stopTime": last["stopTime"] + 120,
+                }
+                rig.bench.history = [*fault.original, later]
+                assert (await healthy(controller))["charger_history_complete"]
+                rig.bench.history[-1] = later | {"stopTime": 0, "meterStop": 0}
+                status = await healthy(controller)
+                assert status["history_warning"] is None
+                assert not status["charger_history_complete"]
                 # The last remaining original can later leave native retention, while its full archive remains.
                 rig.bench.history = []
                 assert (await healthy(controller))["state"] == "healthy"
-                assert replacement.journal.get("native_history_summary")["missing_records"] == 3
+                assert replacement.journal.get("native_history_summary")["missing_records"] == 4
                 # Reappearing original ids must still carry their exact original bodies, including numeric types.
                 changed = copy.deepcopy(fault.original[-1])
                 changed["original_record"]["preserve"][1]["number"] = 1.0

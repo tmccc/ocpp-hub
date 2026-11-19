@@ -152,8 +152,8 @@ def test_hostile_schedule_answers_are_refused(periods: list[dict[str, Any]]) -> 
         "chargingSchedule": {"chargingSchedulePeriod": [{"startPeriod": 0, "limit": 6}]},
     }
 
-    assert _composite_schedule(answer, now) == (None, ())
-    assert _composite_schedule(far, now) == (None, ())
+    assert _composite_schedule(answer, now, 86400) is None
+    assert _composite_schedule(far, now, 86400) is None
 
 
 # Intent: many requests to read the limit in effect, made while a read runs, end in a small number of reads.

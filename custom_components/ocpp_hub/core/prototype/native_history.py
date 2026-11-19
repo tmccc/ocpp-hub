@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -149,6 +150,30 @@ class NativeHistoryArchive:
             summary = {"archived_records": len(identifiers), "missing_records": len(identifiers - present.keys())}
             self.journal.put("native_history_summary", summary)
         return summary
+
+
+# The latest completed charge is unknown if an absent archive entry could be as recent as the displayed one.
+def latest_completion_available(journal: Journal, current: tuple[dict[str, Any], ...]) -> bool:
+    completed = {
+        row["transactionId"]: row["startTime"]
+        for row in current
+        if row.get("transactionId") != -1 and row.get("stopTime", 0) > 0
+    }
+    latest = max(completed.values(), default=0)
+    try:
+        for identifier, body in journal.db.execute("SELECT transaction_id,body FROM native_history_records"):
+            if identifier in completed:
+                continue
+            record = json.loads(body)
+            if not isinstance(record, dict) or type(stop := record.get("stopTime")) is not int:
+                return False
+            start = record.get("startTime")
+            if stop > 0 and (type(start) is not int or not 0 < start < latest):
+                return False
+    except sqlite3.Error, ValueError:
+        # A failed display check must not interrupt charger supervision or present a plausible older value.
+        return False
+    return True
 
 
 # Bind the retention permission to this exact admitted managed journal; ordinary commissioning remains strict.

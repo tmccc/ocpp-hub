@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from tests.qualification_test_helpers import synthetic_collection_row
-from tools.run_model_shard import ROOT, assigned_ids, collection_targets, engine_collection, verify_execution
+from tools.run_model_shard import ROOT, assigned_ids, collection_targets, hosted_collection, verify_execution
 
 
 # Run genuine pytest collection with separate evidence so nested collection cannot contaminate qualification phases.
@@ -101,7 +101,7 @@ def test_hosted_engine_shards_partition_controlled_collection_once(tmp_path):
         capture_output=True,
         timeout=30,
     )
-    ids = engine_collection(plan)
+    ids = hosted_collection(plan, "engine-model")
     rows = [json.loads(line) for line in manifest.read_text().splitlines()]
     shards = [assigned_ids(ids, rows, index, 20, full_engine=True) for index in range(20)]
     assert all(shards)
@@ -118,7 +118,7 @@ def test_hosted_engine_shards_partition_controlled_collection_once(tmp_path):
 
 # Intent: each shard must prove actual once-only execution of its assigned IDs.
 # Why: a collector and all selected phases may look correct while an extra case also ran.
-@pytest.mark.parametrize("fault", [None, "foreign", "duplicate", "missing"])
+@pytest.mark.parametrize("fault", [None, "foreign", "duplicate", "missing", "skipped"])
 def test_hosted_shard_execution_requires_exact_assignment(fault):
     assigned = ["tests/test_device.py::test_one"]
     rows = [synthetic_collection_row(assigned), {"event": "start", "id": assigned[0]}]
@@ -130,6 +130,8 @@ def test_hosted_shard_execution_requires_exact_assignment(fault):
         rows.append(rows[1])
     elif fault == "missing":
         rows.pop()
+    elif fault == "skipped":
+        rows[-2]["outcome"] = "skipped"
     if fault is None:
         verify_execution(rows, assigned, {})
     else:

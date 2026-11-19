@@ -92,7 +92,7 @@ class PlanSync:
             error_code = None
             if windows:
                 try:
-                    await self._apply(cp_id, windows, on)
+                    await self._apply(cp_id, windows if on else [], on)
                 except (ControlError, SchedulePlanError) as error:
                     error_code = error.code if isinstance(error, ControlError) else "invalid_schedule"
                     _LOGGER.warning(
@@ -119,7 +119,8 @@ class PlanSync:
         control = self._central.control(cp_id) if self._central is not None else None
         if control is None:
             raise ControlError("not_connected", "the charger is not connected")
-        if on and any(window.enabled for window in windows):
+        plan = None
+        if any(window.enabled for window in windows):
             inside = self._options.get(CONF_SCHEDULE_INSIDE)
             outside = self._options.get(CONF_SCHEDULE_OUTSIDE)
             plan = plan_week(
@@ -127,6 +128,7 @@ class PlanSync:
                 float(control.policy.max_current_a if inside is None else inside),  # type: ignore[arg-type]
                 float(0 if outside is None else outside),  # type: ignore[arg-type]
             )
+        if on and plan is not None:
             await control.set_schedule(anchor_for(plan), plan.periods, plan.kind, from_plan=True)
         else:
             await control.clear_current_limit(from_plan=True)

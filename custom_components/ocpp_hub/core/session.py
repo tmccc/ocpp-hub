@@ -30,6 +30,7 @@ from .frames import (
 from .metering import merge_samples, parse_meter_values, parse_timestamp
 from .model import (
     MAX_STORED_LIMIT_A,
+    SCHEDULE_HORIZON_S,
     ChargerInfo,
     ChargerSnapshot,
     ChargeSession,
@@ -37,7 +38,7 @@ from .model import (
     ConnectorState,
     LimitMemory,
 )
-from .readings import PRIMARY_CONNECTOR
+from .readings import PRIMARY_CONNECTOR, schedule_limit_at
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -138,21 +139,6 @@ def _int_field(payload: dict[str, Any], name: str) -> int:
 MAX_TEXT = 64
 
 
-# The limit in amperes that a GetCompositeSchedule answer says is in effect now (its first period), or None when the
-# answer is not an accepted schedule in amperes with a usable limit.
-def _composite_limit(answer: dict[str, Any]) -> float | None:
-    schedule = answer.get("chargingSchedule")
-    periods = schedule.get("chargingSchedulePeriod") if isinstance(schedule, dict) else None
-    if answer.get("status") != "Accepted" or not isinstance(schedule, dict) or not isinstance(periods, list):
-        return None
-    if schedule.get("chargingRateUnit") not in (None, "A") or not periods or not isinstance(periods[0], dict):
-        return None
-    limit = _finite(periods[0].get("limit"))
-    return limit if limit is not None and 0 <= limit <= MAX_STORED_LIMIT_A else None
-
-
-# How far ahead the schedule is read, in seconds, and the most periods of it that are kept.
-SCHEDULE_HORIZON_S = 86400
 MAX_SCHEDULE_PERIODS = 48
 # A schedule reaches at most a week ahead, and its start may differ from the hub's clock by at most two days; anything
 # else is not a schedule the hub can trust or show.
@@ -160,30 +146,55 @@ MAX_SCHEDULE_OFFSET_S = 7 * 86400
 MAX_SCHEDULE_SKEW_S = 2 * 86400
 
 
-# The start and the periods of a GetCompositeSchedule answer, as (seconds after the start, amperes). An answer that is
-# not accepted, not in amperes or with unusable periods gives nothing. The start is the one the charger names, or now.
-def _composite_schedule(answer: dict[str, Any], now: datetime) -> tuple[datetime | None, tuple[tuple[int, float], ...]]:
+@dataclass(frozen=True)
+class CompositeSchedule:
+    """The validated interval and current limits reported by the charger."""
+
+    start: datetime
+    duration_s: int
+    periods: tuple[tuple[int, float], ...]
+
+
+# Use the charger's start and duration when supplied. Older replies omit them and start at receipt time.
+def _composite_schedule(answer: dict[str, Any], now: datetime, requested_s: int) -> CompositeSchedule | None:
     schedule = answer.get("chargingSchedule")
     raw = schedule.get("chargingSchedulePeriod") if isinstance(schedule, dict) else None
     if answer.get("status") != "Accepted" or not isinstance(schedule, dict) or not isinstance(raw, list):
-        return None, ()
+        return None
     if schedule.get("chargingRateUnit") not in (None, "A") or len(raw) > MAX_SCHEDULE_PERIODS:
-        return None, ()
+        return None
+    duration = schedule.get("duration", requested_s)
+    if type(duration) is not int or not 0 < duration <= MAX_SCHEDULE_OFFSET_S:
+        return None
     periods: list[tuple[int, float]] = []
     for period in raw:
         offset = period.get("startPeriod") if isinstance(period, dict) else None
         limit = _finite(period.get("limit")) if isinstance(period, dict) else None
         if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= MAX_SCHEDULE_OFFSET_S:
-            return None, ()
+            return None
         if periods and offset <= periods[-1][0]:
-            return None, ()
+            return None
         if limit is None or not 0 <= limit <= MAX_STORED_LIMIT_A:
-            return None, ()
+            return None
         periods.append((offset, limit))
-    start = parse_timestamp(answer.get("scheduleStart") or schedule.get("startSchedule"), now)
+
+    raw_start = answer.get("scheduleStart")
+    if raw_start is None:
+        raw_start = schedule.get("startSchedule")
+    start = now
+    if raw_start is not None:
+        if not isinstance(raw_start, str):
+            return None
+        try:
+            start = datetime.fromisoformat(raw_start)
+        except ValueError:
+            return None
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
     if abs((start - now).total_seconds()) > MAX_SCHEDULE_SKEW_S:
-        return None, ()
-    return start, tuple(periods)
+        return None
+    usable = tuple((offset, limit) for offset, limit in periods if offset < duration)
+    return CompositeSchedule(start, duration, usable) if usable else None
 
 
 # A text the charger sent, cut to MAX_TEXT; None when it is not a string or is empty.
@@ -439,8 +450,7 @@ class ChargerSession:
     # Ask the charger for its schedule over the next 24 hours and keep it. A read; a charger that cannot answer leaves
     # the schedule empty.
     async def refresh_schedule(self) -> None:
-        start: datetime | None = None
-        periods: tuple[tuple[int, float], ...] = ()
+        schedule = None
         try:
             answer = await self.call(
                 "GetCompositeSchedule", commands.get_composite_schedule(PRIMARY_CONNECTOR, SCHEDULE_HORIZON_S)
@@ -448,21 +458,32 @@ class ChargerSession:
         except CallError as error:
             _LOGGER.info("[read] %s could not tell its schedule: %s", self.cp_id, error)
         else:
-            start, periods = _composite_schedule(answer, self._clock())
-            _LOGGER.info("[read] %s reports %s schedule period(s) for the next day", self.cp_id, len(periods))
+            schedule = _composite_schedule(answer, self._clock(), SCHEDULE_HORIZON_S)
+            count = len(schedule.periods) if schedule is not None else 0
+            _LOGGER.info("[read] %s reports %s schedule period(s) for the next day", self.cp_id, count)
         if self._snapshot.connected:
-            self._update(schedule_start=start, schedule_periods=periods)
+            self._update(
+                schedule_start=schedule.start if schedule is not None else None,
+                schedule_periods=schedule.periods if schedule is not None else (),
+                schedule_duration_s=schedule.duration_s if schedule is not None else SCHEDULE_HORIZON_S,
+            )
 
     # Ask the charger what limit is in effect now and keep the answer. It is a read, and a charger that does not support
     # it (or does not answer) simply leaves the limit unknown: the hub then shows the lowest of the limits it knows.
     async def refresh_effective_limit(self) -> None:
         limit: float | None = None
+        request = commands.get_composite_schedule(PRIMARY_CONNECTOR)
         try:
-            answer = await self.call("GetCompositeSchedule", commands.get_composite_schedule(PRIMARY_CONNECTOR))
+            answer = await self.call("GetCompositeSchedule", request)
         except CallError as error:
             _LOGGER.info("[read] %s could not tell its effective limit: %s", self.cp_id, error)
         else:
-            limit = _composite_limit(answer)
+            now = self._clock()
+            schedule = _composite_schedule(answer, now, request["duration"])
+            if schedule is not None:
+                elapsed = (now - schedule.start).total_seconds()
+                if elapsed < schedule.duration_s:
+                    limit = schedule_limit_at(schedule.periods, elapsed)
             _LOGGER.info(
                 "[read] %s says its limit in effect is %s A (answer %s)", self.cp_id, limit, answer.get("status")
             )
@@ -585,18 +606,42 @@ class ChargerSession:
             return {}
         connectors = dict(self._snapshot.connectors)
         running = self._running_connector(payload)
+        previous = self._snapshot.meter
+        named = payload.get("connectorId")
+        if (
+            running is None
+            and "transactionId" in payload
+            and (
+                any(
+                    connector.transaction_id is not None and (type(named) is not int or connector.connector_id == named)
+                    for connector in connectors.values()
+                )
+                or previous is not None
+                and sample.sampled_at <= previous.sampled_at
+            )
+        ):
+            return {}  # A reading from another charge cannot become the active charge's live meter data.
         if running is not None:
             connectors[running.connector_id] = replace(running, stats=running.stats.add(sample))
-        self._update(meter=merge_samples(self._snapshot.meter, sample), connectors=connectors)
+        self._update(meter=merge_samples(previous, sample), connectors=connectors)
         return {}
 
-    # The connector a meter reading belongs to: the one it names, or the only one with a charge running.
+    # Match a reported transaction exactly. Untagged readings may use the named or sole running connector.
     def _running_connector(self, payload: dict[str, Any]) -> ConnectorState | None:
         named = payload.get("connectorId")
-        if isinstance(named, int) and not isinstance(named, bool):
-            connector = self._snapshot.connectors.get(named)
-            return connector if connector is not None and connector.transaction_id is not None else None
-        running = [c for c in self._snapshot.connectors.values() if c.transaction_id is not None]
+        transaction = payload.get("transactionId")
+        if "transactionId" in payload and type(transaction) is not int:
+            return None
+        candidates = (
+            (self._snapshot.connectors.get(named),) if type(named) is int else self._snapshot.connectors.values()
+        )
+        running = [
+            c
+            for c in candidates
+            if c is not None
+            and c.transaction_id is not None
+            and (transaction is None or c.transaction_id == transaction)
+        ]
         return running[0] if len(running) == 1 else None
 
     # Hand out a transaction id and remember which connector it runs on.

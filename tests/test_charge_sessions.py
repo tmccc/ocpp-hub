@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from ocpp_hub_core import readings
 from ocpp_hub_core.model import ChargeSession
 
@@ -68,6 +69,42 @@ async def test_a_finished_charge_is_reported_with_its_numbers(start_hub) -> None
             stop_reason="EVDisconnected",
         )
     ]
+
+
+# Intent: a delayed reading identified with a closed charge cannot change the next charge on the same connector.
+# Why: reported transaction IDs are more precise than the connector and prevent mixing measurements across charges.
+@pytest.mark.parametrize("before_first_sample", [False, True])
+async def test_delayed_meter_values_stay_with_their_charge(start_hub, before_first_sample) -> None:
+    hub = await start_hub()
+    charger = await hub.charger()
+    first = await charger.call(
+        "StartTransaction", {"connectorId": 1, "idTag": "T", "meterStart": 0, "timestamp": "2026-10-21T08:00:00Z"}
+    )
+    first_id = first[2]["transactionId"]
+    await charger.call(
+        "StopTransaction", {"transactionId": first_id, "meterStop": 1000, "timestamp": "2026-10-21T08:30:00Z"}
+    )
+    second = await charger.call(
+        "StartTransaction", {"connectorId": 1, "idTag": "T", "meterStart": 1000, "timestamp": "2026-10-21T09:00:00Z"}
+    )
+    second_id = second[2]["transactionId"]
+    delayed = _meter("2026-10-21T08:25:00Z", 900, 7000) | {"transactionId": first_id}
+    if before_first_sample:
+        await charger.call("MeterValues", delayed)
+        assert hub.listener.latest.meter is None
+    await charger.call("MeterValues", _meter("2026-10-21T09:10:00Z", 1300, 2000) | {"transactionId": second_id})
+    if not before_first_sample:
+        await charger.call("MeterValues", delayed)
+    running = hub.listener.latest
+    assert running.meter.power_w == 2000 and readings.session_energy_kwh(running) == 0.3
+    assert readings.session_duration_s(running) == 600
+
+    await charger.call(
+        "StopTransaction", {"transactionId": second_id, "meterStop": 1800, "timestamp": "2026-10-21T09:30:00Z"}
+    )
+    assert [charge.transaction_id for charge in hub.listener.finished] == [first_id, second_id]
+    last = hub.listener.finished[-1]
+    assert last.max_power_w == last.average_power_w == 2000
 
 
 # Intent: a stop for a transaction the hub never saw start produces no charge, and a stop without a stop reading falls

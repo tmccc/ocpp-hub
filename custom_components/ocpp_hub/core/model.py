@@ -10,6 +10,8 @@ from typing import Any
 
 # The highest current per phase a stored or reported limit may have; no charger offers more.
 MAX_STORED_LIMIT_A = 80.0
+# The span requested for the full schedule, also used for replies that omit a duration.
+SCHEDULE_HORIZON_S = 86400
 
 # Key used for a measurement that has no phase (the total, or a single-phase charger).
 PHASE_TOTAL = "total"
@@ -114,6 +116,7 @@ class ChargerSnapshot:
     # that schedule starts. Empty when the charger did not say.
     schedule_start: datetime | None = None
     schedule_periods: tuple[tuple[int, float], ...] = ()
+    schedule_duration_s: int = SCHEDULE_HORIZON_S
     # Accepted profile changes outside the plan, counted per connection.
     external_profile_writes: int = 0
     # The planning windows the Raedian app has set in the charger, as (weekday 1-7, start, end in seconds after

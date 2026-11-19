@@ -76,11 +76,12 @@ async def test_future_selection_after_pause(tmp_path, tls, unused_tcp_port, monk
             peer.release.set()
 
 
-# Intent: losing the process during paused-current verification preserves the last confirmed selection.
-# Why: an uncertain command cannot become future permission through process replacement and explicit Return.
+# Intent: replacement preserves the last confirmed selection and any Pause accepted after the current request.
+# Why: interrupted current work must neither become future permission nor take ownership from a newer Pause.
 @pytest.mark.parametrize("previous,target", [(6, 16), (16, 32)])
+@pytest.mark.parametrize("newer_pause", [False, True])
 async def test_pending_paused_selection_restarts_at_previous_current(
-    tmp_path, tls, unused_tcp_port, monkeypatch, previous, target
+    tmp_path, tls, unused_tcp_port, monkeypatch, previous, target, newer_pause
 ):
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         c, peer = b.controller, b.rig.peer
@@ -94,6 +95,13 @@ async def test_pending_paused_selection_restarts_at_previous_current(
         request = uuid.uuid4().hex
         c.command(request, "set_current", c.requests.intent().revision, current_a=target)
         await asyncio.wait_for(peer.entered.wait(), 2)
+        if newer_pause:
+            pause_id = uuid.uuid4().hex
+            c.command(pause_id, "pause", c.requests.intent().revision)
+            c.pause_task.cancel()
+            await asyncio.gather(c.pause_task, return_exceptions=True)
+            pause_claim = b.session.journal.get("managed_owner_pause")
+            pause_intent = c.requests.intent()
         c.current.worker.cancel()
         await asyncio.gather(c.current.worker, return_exceptions=True)
         assert b.session.journal.get("managed_current_change")["state"] == "pending"
@@ -103,10 +111,18 @@ async def test_pending_paused_selection_restarts_at_previous_current(
         await replacement.start()
         recovered = ManagedController(replacement)
         try:
+            if newer_pause:
+                assert recovered.requests.intent() == pause_intent
+                assert replacement.journal.get("managed_owner_pause") == pause_claim
+                assert replacement.journal.get("control")["ticket"] == pause_claim["ticket"]
+                assert recovered.requests.pending_pause()
+                assert recovered.requests.receipt(pause_id)["state"] == "accepted"
             async with b.rig.charger(replacement) as charger:
                 await introduced(b.rig, replacement, charger, "paused-selection-replacement")
                 status = await healthy(recovered)
                 assert status["local_hold_verified"] and recovered.current.selected() == previous
+                if newer_pause:
+                    assert recovered.requests.receipt(pause_id)["state"] == "completed"
                 settled = recovered.requests.receipt(request)
                 assert settled["state"] == "failed"
                 assert settled["result"] == {"classification": "process_replaced"}

@@ -168,17 +168,20 @@ class ManagedCurrentLimits:
                 previous = row["current_a"] if row else 6
             previous = integer(previous, 6, 32)
             change = {**change, "previous_a": previous}
-            if change.get("mode") == "app" and controller.requests.intent().mode == "paused":
-                # A durable explicit Pause already owns its ticket; the interrupted increase cannot replace it.
+            intent = controller.requests.intent()
+            owner_pause = self.journal.get("managed_owner_pause", {})
+            if intent.mode == "paused" and (
+                change.get("mode") == "app" or owner_pause.get("revision") == intent.revision
+            ):
+                # A newer explicit Pause owns its ticket regardless of the mode the current change began in.
                 with self.journal.atomic():
                     self.journal.control.project(self.journal.get("control"), resume_limit=previous)
                     self.journal.current_change.cancel(change)
                 return
-            if controller.requests.intent().mode == "app":
+            if intent.mode == "app":
                 self.cancel_overlap(change["id"], previous, "process_replaced")
                 return
             with self.journal.atomic():
-                intent = controller.requests.intent()
                 write_intent(self.journal, intent, "paused")
                 claim_internal_pause(controller, "current", change["id"])
                 control = self.journal.get("control")

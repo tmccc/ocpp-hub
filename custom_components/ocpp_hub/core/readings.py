@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
+from math import ceil
 
 from .model import ChargerSnapshot, ConnectorState
 
@@ -190,21 +192,36 @@ def confirmed_limit_a(snapshot: ChargerSnapshot) -> float | None:
     return effective_limit_a(snapshot)
 
 
-# The charger's reported schedule as seen from `now`: (seconds from now, amperes), starting with the limit in effect
-# at this moment and then each change within `duration_s`. None when the hub has no schedule from the charger, or the
-# one it has is older than the day it covers.
-def schedule_from_now(snapshot: ChargerSnapshot, now: datetime, duration_s: int) -> list[tuple[int, float]] | None:
+# Return the last period that has already started. A future period gives no information about the present limit.
+def schedule_limit_at(periods: tuple[tuple[int, float], ...], elapsed: float) -> float | None:
+    return next((limit for offset, limit in reversed(periods) if offset <= elapsed), None)
+
+
+@dataclass(frozen=True)
+class ScheduleWindow:
+    """The known span from now and its current and future periods."""
+
+    duration_s: int
+    periods: tuple[tuple[int, float], ...]
+
+
+# Describe the known current limit and each future change within the requested interval.
+def schedule_from_now(snapshot: ChargerSnapshot, now: datetime, duration_s: int) -> ScheduleWindow | None:
     start = snapshot.schedule_start
     if start is None or not snapshot.schedule_periods:
         return None
     elapsed = (now - start).total_seconds()
-    if elapsed > 86400:
+    covered = min(duration_s, int(snapshot.schedule_duration_s - elapsed))
+    if covered <= 0:
         return None
-    current = snapshot.schedule_periods[0][1]
-    changes: list[tuple[int, float]] = []
-    for offset, limit in snapshot.schedule_periods:
-        if offset <= elapsed:
-            current = limit
-        elif offset - elapsed < duration_s:
-            changes.append((int(offset - elapsed), limit))
-    return [(0, current), *changes]
+    current = schedule_limit_at(snapshot.schedule_periods, elapsed)
+    if current is None:
+        current = confirmed_limit_a(snapshot)
+    if current is None:
+        return None
+    changes = tuple(
+        (ceil(offset - elapsed), limit)
+        for offset, limit in snapshot.schedule_periods
+        if offset > elapsed and ceil(offset - elapsed) < covered
+    )
+    return ScheduleWindow(covered, ((0, current), *changes))
