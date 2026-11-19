@@ -83,15 +83,25 @@ async def test_migrated_snapshot_requires_intact_history_and_later_pause(
         status = await proxy.status(lambda state: state["local_hold_verified"])
         await proxy.close()
         config = proxy.rig.prepared.config
+        deferred_start = "managed_deferred_start"
         with closing(sqlite3.connect(config.journal)) as db, db:
             old_pause = retain_history(db, time.time())
+            # Successful association of a same-tag Start retains the empty marker.
+            db.execute("INSERT INTO meta VALUES(?,?)", (deferred_start, "{}"))
         snapshot = proxy.durable()
         with stopped_journal(config.journal) as db:
             assert check_snapshot(db, config, migrated_only=True) == status["control_revision"]
         assert proxy.durable() == snapshot
 
+        with closing(sqlite3.connect(config.journal)) as db, db:
+            pending = {"local": 1001, "owner": True, "ticket": "a" * 32, "vendor": None}
+            db.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps(pending), deferred_start))
+        with stopped_journal(config.journal) as db, pytest.raises(RollbackRefusedError, match="^unresolved_start$"):
+            check_snapshot(db, config, migrated_only=True)
+
         control = snapshot["metadata"]["control"]
         with closing(sqlite3.connect(config.journal)) as db, db:
+            db.execute("UPDATE meta SET value='{}' WHERE key=?", (deferred_start,))
             db.execute("UPDATE meta SET value=? WHERE key='control'", (json.dumps(control | {"resume_limit": 6.5}),))
         with (
             stopped_journal(config.journal) as db,

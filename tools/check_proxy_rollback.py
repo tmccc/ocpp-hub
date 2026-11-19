@@ -73,8 +73,8 @@ MIGRATED_RELEASES = (
         recovered_journal=True,
     ),
     Build(
-        "1b77415cae9e1e7125cf0f3a03aaced529780c56",
-        "4812b699cffef02e607168ed80d2c84897545840a451a49c78f98c8c08abd488",
+        "e45eddb7032521b7637a1e3711a418187e6270d6",
+        "c1f7dbec095c31ec1b42c549bd55709bcb6838e2e8410232b1cd54e8ff8cb049",
         True,
         migrated_only=True,
         recovered_journal=True,
@@ -89,6 +89,9 @@ REQUIREMENTS = "2773b4a9f9b16cfe90626e328db61ff281810c3f53d9a86f3178c0b54455586d
 REHEARSED_SCHEMA = "1b3d8757ddca8f860ff1d69e9d092839efcf948bda9a70524e04aa361bd9c8a4"
 MIGRATED_SCHEMA = "0b08c43048c89c897d8224d2335e43294652dd9ba58fd940030a61437c776f0d"
 
+# ManagedStartBinding retains this key when it clears the matched report.
+DEFERRED_START = "managed_deferred_start"
+
 # These include the inactive history labels and markers the two rehearsed builds can retain.
 SUPPORTED_METADATA = frozenset(
     """
@@ -99,7 +102,7 @@ SUPPORTED_METADATA = frozenset(
     native_bounded_handover next_transaction observation_boot_epoch observation_generation station_selection
     trial_allocation trial_baseline trial_binding trial_phase trial_starting vendor_profile_transactions vendor_profiles
     """.split()
-)
+) | {DEFERRED_START}
 MIGRATED_METADATA = SUPPORTED_METADATA | frozenset(
     """
     last_status managed_release_operator_acknowledgement managed_temporary_occurrences managed_temporary_schedule
@@ -210,7 +213,10 @@ def require_allocation(db: sqlite3.Connection, config: TrialConfig, meta: dict[s
 
 # An acknowledged Start remains unresolved until its exact local lifecycle closed.
 def require_settled_start(db: sqlite3.Connection, meta: dict[str, Any], control: dict[str, Any]) -> None:
-    require(control.get("start_pending", False) is False, "unresolved_start")
+    require(
+        control.get("start_pending", False) is False and meta.get(DEFERRED_START, {}) == {},
+        "unresolved_start",
+    )
     receipt = meta.get("local_start_receipt", {})
     require(isinstance(receipt, dict), "unrehearsed_journal_state")
     if not receipt:
