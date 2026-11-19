@@ -15,11 +15,10 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 
 from tests.handover_helpers import crash
-from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.managed_rig import ReplyBench, healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, TimerBench, timer_bench
 from tests.prototype_rig import START
 from tests.runtime_rig import until
-from tests.test_managed_stop_reply_recovery import ReplyBench
 from tests.tls_support import tls as tls
 
 

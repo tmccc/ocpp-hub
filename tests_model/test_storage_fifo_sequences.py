@@ -27,13 +27,14 @@ from tests.charge_rig import ChargeRig, positive_flow
 from tests.connected_rig import strategy_file
 from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.managed_rig import CloudReplyPeer
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import START
 from tests.recovery_barriers import returned_to_app, witnessed_native_loss
 from tests.runtime_rig import until
-from tests.test_managed_stop_reply_recovery import CloudReplyPeer, pause, running
+from tests.test_managed_stop_reply_recovery import pause, running
 from tests_model.catalog import input_digest
 from tests_model.storage_debt_cases import storage_fifo_candidates
 from tests_model.test_start_recovery_sequences import close_daily

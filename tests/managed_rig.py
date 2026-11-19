@@ -10,7 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ocpp_hub_core.frames import build_call
+from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
+from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.trial_session import TrialSession
 from websockets.asyncio.server import ServerConnection
@@ -35,6 +36,52 @@ class OwnerBench(Bench):
         await self.cloud.send(build_call(token, action, payload))
         await until(lambda: any(frame[0] in (3, 4) and frame[1] == token for frame in self.calls))
         return next(frame for frame in self.calls if frame[0] in (3, 4) and frame[1] == token)
+
+
+class CloudReplyPeer:
+    """Only the independent cloud's Stop response changes; engine, journal and TLS transport stay real."""
+
+    # Record actions by actual correlated RPC identity before the peer sends its response.
+    def __init__(self, connection, bench):
+        self.connection, self.bench, self.actions = connection, bench, {}
+
+    # Keep the websocket interface and its ordinary independent vendor behavior intact.
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    # Observe actual Stop transmissions without replacing a gateway or RPC method.
+    async def __aiter__(self):
+        async for raw in self.connection:
+            frame = decode(raw)
+            if frame[0] == 2:
+                self.actions[frame[1]] = frame[2]
+                if frame[2] == "StopTransaction":
+                    self.bench.stop_wires = getattr(self.bench, "stop_wires", []) + [frame]
+            yield raw
+
+    # A retry still needs a real response on this socket; operator proof cannot manufacture that response.
+    async def send(self, raw):
+        frame = decode(raw)
+        if frame[0] == 3 and self.actions.get(frame[1]) == "StopTransaction":
+            gate = getattr(self.bench, "stop_gate", None)
+            if gate is not None and not gate.is_set():
+                waits = getattr(self.bench, "held_stop_replies", [])
+                self.bench.held_stop_replies = [*waits, frame[1]]
+                await gate.wait()
+            info = getattr(self.bench, "stop_info", None)
+            if getattr(self.bench, "stop_error", False):
+                raw = build_call_error(frame[1], "InternalError", "synthetic cloud refusal")
+            elif info is not None:
+                raw = build_call_result(frame[1], {"idTagInfo": info})
+        await self.connection.send(raw)
+
+
+class ReplyBench(OwnerBench):
+    """Use the same independent cloud implementation behind its transparent response wrapper."""
+
+    # Keep ordinary cloud Boot/Authorize/Start behavior, changing only the final Stop reply at the peer.
+    async def vendor(self, connection):
+        await super().vendor(CloudReplyPeer(connection, self))
 
 
 # Share the connected native bench while approving one synthetic timer identity for the owner-control tests.

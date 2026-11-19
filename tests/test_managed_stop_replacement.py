@@ -11,11 +11,12 @@ from ocpp_hub_core.prototype.gateway import decode
 
 from tests import managed_rig as mp
 from tests.charge_rig import ChargeRig, positive_flow
+from tests.managed_rig import ReplyBench
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
 from tests.prototype_rig import START
 from tests.runtime_rig import until
-from tests.test_managed_stop_reply_recovery import ReplyBench, pause, reconcile, return_after_ack, running
+from tests.test_managed_stop_reply_recovery import pause, reconcile, return_after_ack, running
 
 
 # Intent: a crash before the first fault-publishing tick must not remove the exact retained Stop's recovery route.
