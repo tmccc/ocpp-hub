@@ -79,6 +79,13 @@ MIGRATED_RELEASES = (
         migrated_only=True,
         recovered_journal=True,
     ),
+    Build(
+        "10597b0fc41989e98d86943b9907621504926c39",
+        "7fab74624775546e77faa09ddbb7b1a2c9c04059a5bfab7f53293286c89de4c4",
+        True,
+        migrated_only=True,
+        recovered_journal=True,
+    ),
 )
 PREVIOUS = Build(
     "7a08f2ade3b9e597099aaece2aef2f8542852a41",
