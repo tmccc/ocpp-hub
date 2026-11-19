@@ -113,9 +113,9 @@ async def test_current_reply_storage_and_cached_disconnect(tmp_path, tls, unused
         identifier, revision = uuid.uuid4().hex, c.requests.intent().revision
         committed, refused = False, []
 
-        # Invalidate SQLite's prepared reads after the exact acceptance transaction.
+        # Refuse the owner request lookup; a background metadata read cannot consume the injected failure.
         def authorize(action, table, column, database, trigger):
-            if not refused and action == sqlite3.SQLITE_READ and table in ("meta", "managed_requests"):
+            if not refused and action == sqlite3.SQLITE_READ and table == "managed_requests":
                 refused.append(table)
                 return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
