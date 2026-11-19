@@ -64,6 +64,13 @@ with one case of lookahead so pytest can keep its session fixtures. Each contain
 port range and scratch directory for the entire session. The dispatch log and worker evidence must agree on every
 grant, start and completion. An interrupted grant stays recorded and is never retried within the attempt.
 
+Each engine execution worker mounts a private 128 MiB tmpfs for the Start recovery matrix. That matrix creates
+each case's configuration and SQLite journal there, including the journal reopened after simulated replacement.
+The default Python and pytest scratch paths, disk-specific tests, shared fixtures and qualification logs are
+disk-backed. The auditor checks each case against the canonical Start recovery IDs and verifies the worker
+mounts and the actual Start journals. Failed cases copy their RAM files to the worker's disk when pytest can
+report the failure. Abrupt container removal can discard in-flight RAM files while retaining disk-backed logs.
+
 For an existing provisioned Linux worker, the invocation has this form; all capitalized paths/IDs are operator inputs:
 
 ```bash
@@ -88,10 +95,11 @@ must all pass the auditor. The source-pinned registry declares33,194 raw/9,202 r
 584 raw/360 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen
 source, including HA families, then verifies exact input/event/recovery evidence. See the
 [recovery coverage matrix](recovery-coverage.md) for scopes, focused-only risks and limits.
-CI derives the exact model collection from that registry across20 independent runner jobs and includes all HA suites.
-The model shard collector retains the complete `tests_model` root and adds exact registered engine test functions
-from other roots. Its structural regression checks the real collection against the canonical manifest, including
-process-death families, while excluding ordinary named tests from the model-only CI partition.
+Hosted CI collects the complete engine suite once and distributes that shared plan across 20 independent runners.
+The plan includes ordinary engine tests, the full `tests_model` root and registered model cases under `tests/`.
+Each job verifies its exact assignment and all reported phases against the plan. Model cases also retain their
+input, event and recovery checks against the registry. The aggregate check requires all engine, static and HA
+jobs to pass.
 
 Large targeted socket-test batches also need separate offline network environments. The Python loopback guard alone
 shares the host's connection tables; sustained parallel HTTP traffic has exhausted that table and caused unrelated
@@ -130,8 +138,8 @@ checked before collection. SSH and collection have bounded timeouts and no cache
 `parallel_qualify.py` forwards its explicitly chosen worker settings to its immediate audit. Later validator,
 coverage-matrix and deployment-gate invocations must pass their intended trusted executor map themselves.
 The supported `deploy_ha.py --collection-executors` option forwards the same caller-selected map to its validation gate.
-CI performs the same controlled discovery before its ordinary and HA jobs; this does not replace the separate
-four-suite twenty-worker qualification.
+CI uses the same controlled discovery for its engine plan and HA jobs. The four-suite twenty-worker
+qualification supplies the separate release evidence.
 
 ## Rules for code
 
@@ -155,9 +163,9 @@ An operation completes only its current ticket. The owner preserves unknown fiel
 performs no I/O beyond the existing journal write and joins its caller's transaction without nesting one.
 
 `ManagedController._tick()` is the orchestration: pending work, fault maintenance, supervised observation,
-assessment and view publication. The effect-bearing methods retain their original ordering. `ControlFacts` and
-`assess()` in `supervision.py` explain when a completed observation needs a fault and how authority, local health
-and cloud health differ. A fault or shutdown removes authority labels while retaining physical evidence. Shared
+assessment and view publication. The poll and the API use `ControlProof` in `supervision.py` to keep observed
+authority scoped to the current control record. A delivery wait can block local and cloud readiness while a
+verified zero remains visible. A fault or shutdown withdraws authority labels while retaining physical evidence. Shared
 and local-hold predicates distinguish legacy falsey flags from explicit Boolean confirmations. Optional cloud
 authorization is read only after local readiness, preserving fault precedence. A snapshot never grants permission
 for a later send; exact native/Boot/ticket checks remain at the actual effect and COMMIT boundaries.

@@ -5,7 +5,10 @@ import os
 import subprocess
 import sys
 
-from tools.run_model_shard import ROOT, collection_targets
+import pytest
+
+from tests.qualification_test_helpers import synthetic_collection_row
+from tools.run_model_shard import ROOT, assigned_ids, collection_targets, engine_collection, verify_execution
 
 
 # Run genuine pytest collection with separate evidence so nested collection cannot contaminate qualification phases.
@@ -65,3 +68,70 @@ def test_model_ci_enrolls_external_families_without_ordinary_cases(tmp_path):
     partitions = [observed[index::20] for index in range(20)]
     flattened = [identifier for partition in partitions for identifier in partition]
     assert len(flattened) == len(set(flattened)) and set(flattened) == declared
+
+
+# Intent: all hosted jobs share the exact complete engine plan, including both kinds of case in the process-death file.
+# Why: separate serial and model jobs used to execute registered out-of-root model cases twice.
+def test_hosted_engine_shards_partition_controlled_collection_once(tmp_path):
+    plan = tmp_path / "collection.json"
+    collected = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "tools/qualification_collection.py",
+            "--source",
+            str(ROOT),
+            "--suite",
+            "engine-model",
+            "--output",
+            str(plan),
+        ],
+        cwd=ROOT,
+        env={**os.environ, "TMPDIR": str(tmp_path), "PYTEST_ADDOPTS": "", "PYTEST_PLUGINS": ""},
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    manifest = tmp_path / "manifest.jsonl"
+    subprocess.run(
+        [sys.executable, "-B", "tools/schedule_sequence_manifest.py", str(manifest)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    ids = engine_collection(plan)
+    rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+    shards = [assigned_ids(ids, rows, index, 20, full_engine=True) for index in range(20)]
+    assert all(shards)
+    flattened = [identifier for shard in shards for identifier in shard]
+    assert len(flattened) == len(set(flattened)) == len(ids) and set(flattened) == set(ids)
+    process = {identifier for identifier in flattened if identifier.startswith("tests/test_real_process_death.py::")}
+    models = {row["node_id"] for row in rows if row["exclusion"] is None}
+    assert len(models & process) == 80
+    assert any("test_process_return_commit_preserves_honest_receipt" in case for case in process - models)
+    omitted = next(iter(models & process))
+    with pytest.raises(RuntimeError, match="exact registered finite universe"):
+        assigned_ids([case for case in ids if case != omitted], rows, 0, 20, full_engine=True)
+
+
+# Intent: each shard must prove actual once-only execution of its assigned IDs.
+# Why: a collector and all selected phases may look correct while an extra case also ran.
+@pytest.mark.parametrize("fault", [None, "foreign", "duplicate", "missing"])
+def test_hosted_shard_execution_requires_exact_assignment(fault):
+    assigned = ["tests/test_device.py::test_one"]
+    rows = [synthetic_collection_row(assigned), {"event": "start", "id": assigned[0]}]
+    for phase in ("setup", "call", "teardown"):
+        rows.append({"event": "report", "id": assigned[0], "phase": phase, "outcome": "passed"})
+    if fault == "foreign":
+        rows.append({**rows[-1], "id": "tests/test_other.py::test_two"})
+    elif fault == "duplicate":
+        rows.append(rows[1])
+    elif fault == "missing":
+        rows.pop()
+    if fault is None:
+        verify_execution(rows, assigned, {})
+    else:
+        with pytest.raises(RuntimeError, match="exact assignment|every assigned phase"):
+            verify_execution(rows, assigned, {})

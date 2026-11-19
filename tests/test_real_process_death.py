@@ -35,6 +35,7 @@ async def test_process_sigkill_automatic_current_overlap(
         monkeypatch,
         case.initial,
         native_peer=BoundaryPeer,
+        timing="fast-poll",
     ) as child:
         await child.start()
         ready = await child.status()
@@ -202,6 +203,7 @@ async def test_process_sigkill_before_start_dispatch(
         monkeypatch,
         case.selected,
         native_peer=InterruptedNativePeer,
+        timing="fast-poll",
     ) as child:
         plans, config = copy.deepcopy(child.rig.bench.firmware.plans), copy.deepcopy(child.rig.peer.configuration)
         await child.start()
@@ -279,6 +281,7 @@ async def test_process_sigkill_current_selection(
         monkeypatch,
         case.initial,
         native_peer=InterruptedNativePeer,
+        timing="fast-poll",
     ) as child:
         await child.start()
         state = await child.status()
@@ -337,6 +340,7 @@ async def test_process_accepted_start_late_lifecycle(
         monkeypatch,
         bench_type=StartReplyBench,
         native_peer=InterruptedNativePeer,
+        timing="fast-poll",
     ) as child:
         await child.start()
         ready = await child.status()
@@ -393,6 +397,7 @@ async def test_process_return_commit_preserves_honest_receipt(
         monkeypatch,
         selected,
         native_peer=InterruptedNativePeer,
+        timing="production" if selected == 6 and phase == "before-return-success-commit" else "fast-poll",
     ) as child:
         await child.start()
         state = await child.status()
@@ -435,6 +440,7 @@ async def test_process_unknown_issued_start_retains_debt(
         unused_tcp_port_factory(),
         monkeypatch,
         native_peer=InterruptedNativePeer,
+        timing="fast-poll",
     ) as child:
         await child.start()
         state = await child.status()

@@ -1,4 +1,4 @@
-"""Pure assessment of a completed supervision pass; evidence and requested authority remain distinct."""
+"""Pure control proof and health decisions for supervision and management status."""
 
 from __future__ import annotations
 
@@ -30,36 +30,27 @@ class Observation:
 
 
 @dataclass(frozen=True)
-class ControlFacts:
-    """Current synchronous facts; the caller still rechecks permission at every later effect boundary."""
+class ControlProof:
+    """Observed shared control and observed closed zero, scoped to the current charger and intent."""
 
-    control: ControlState
-    verified_pause: bool
-    delivery_uncertain: bool
-    vendor_uncertain: bool
+    shared: bool = False
+    hold_verified: bool = False
 
-    # Independent Pause proof can establish authority without shared app ownership.
-    @property
-    def has_authority(self) -> bool:
-        return self.control.shared or self.verified_pause
-
-    # Faults and retirement revoke labels without discarding the recorded physical observations.
-    def authority_valid(self, faulted: bool, stopping: bool) -> bool:
-        return self.has_authority and not faulted and not stopping
-
-    # This stage is evaluated before the caller reads optional cloud authorization state.
-    def locally_ready(self, *, faulted: bool, stopping: bool, active: bool, delivery_blocked: bool) -> bool:
-        return bool(
-            self.authority_valid(faulted, stopping)
-            and active
-            and not self.control.values.get("uncertain")
-            and not delivery_blocked
+    # Current ownership can retain an observation. A local claim alone never proves physical zero.
+    def retain(self, control: ControlState, *, scope_current: bool = True, released: bool = True) -> ControlProof:
+        return ControlProof(
+            self.shared and scope_current and released and control.shared,
+            self.hold_verified and scope_current and control.local_hold,
         )
 
-    # A completed audit without matching authority, or with uncertain delivery, needs the existing strict latch.
+    # Either kind of proof can establish local supervision.
     @property
-    def requires_fault(self) -> bool:
-        return not self.has_authority or self.delivery_uncertain or self.vendor_uncertain
+    def available(self) -> bool:
+        return self.shared or self.hold_verified
+
+    # This stage is evaluated before the caller reads optional cloud authorization state.
+    def locally_ready(self, *, active: bool, control_uncertain: bool, delivery_blocked: bool) -> bool:
+        return self.available and active and not control_uncertain and not delivery_blocked
 
 
 @dataclass(frozen=True)
@@ -67,31 +58,22 @@ class HealthVerdict:
     """Health is an assessment, never a request to resume, Start, Stop or erase debt."""
 
     state: str
-    shared: bool
-    hold_verified: bool
+    proof: ControlProof
     local_healthy: bool
     healthy: bool
     cloud_ready: bool
 
 
-# A latched fault or retirement removes every authority label, including a previously proved physical hold.
+# Pending cloud authorization blocks health without changing the physical proof.
 def assess(
-    facts: ControlFacts,
+    proof: ControlProof,
     *,
-    faulted: bool,
     stopping: bool,
-    active: bool,
-    delivery_blocked: bool,
+    locally_ready: bool,
     cloud_pending: bool,
     cloud_ready: bool,
 ) -> HealthVerdict:
-    valid = facts.authority_valid(faulted, stopping)
-    shared = facts.control.shared and valid
-    hold = facts.verified_pause and valid
-    local = (
-        facts.locally_ready(faulted=faulted, stopping=stopping, active=active, delivery_blocked=delivery_blocked)
-        and not cloud_pending
-    )
+    local = locally_ready and not cloud_pending
     healthy = local and cloud_ready
     state = "stopping" if stopping else "healthy" if healthy else "local_only" if local else "degraded"
-    return HealthVerdict(state, shared, hold, local, healthy, cloud_ready)
+    return HealthVerdict(state, proof, local, healthy, cloud_ready)

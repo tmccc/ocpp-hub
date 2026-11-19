@@ -6,64 +6,40 @@ import pytest
 from ocpp_hub_core.prototype.control_state import ControlState
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_view import poll_base, poll_status
-from ocpp_hub_core.prototype.supervision import ControlFacts, Observation, PollStatus, assess
+from ocpp_hub_core.prototype.supervision import ControlProof, Observation, PollStatus, assess
 
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session
 from tests.tls_support import tls as tls
 
 
-# Intent: a complete observation has one explicit verdict for app control, intentional holds and lost authority.
-# Why: health labels must never be used to infer a Start, manufacture closure or waive uncertain cloud delivery.
-@pytest.mark.parametrize(
-    ("owner", "pause", "uncertain", "delivery_uncertain", "vendor_uncertain", "latch"),
-    [
-        ("shared", False, False, False, False, False),
-        ("local", True, False, False, False, False),
-        ("local", False, False, False, False, True),
-        ("shared", False, True, False, False, True),
-        ("shared", False, False, True, False, True),
-        ("shared", False, False, False, True, True),
-        ("local", True, False, True, False, True),
-    ],
-)
-def test_observation_authority_and_delivery_are_independent(
-    owner, pause, uncertain, delivery_uncertain, vendor_uncertain, latch
-):
-    state = ControlState({"owner": owner, "inhibit": owner == "local", "uncertain": uncertain})
-    facts = ControlFacts(state, pause, delivery_uncertain, vendor_uncertain)
-    assert facts.requires_fault is latch
-    result = assess(
-        facts, faulted=latch, stopping=False, active=True, delivery_blocked=False, cloud_pending=False, cloud_ready=True
-    )
-    assert result.healthy is (not latch)
-    assert result.shared is (owner == "shared" and not latch)
-    assert result.hold_verified is (pause and not latch)
-    assert result.state == ("degraded" if latch else "healthy")
+# Intent: live claims can only retain the matching proof while the published scope still matches.
+# Why: a remaining local inhibit or a shared grant cannot manufacture a newer native observation.
+def test_current_scope_can_only_retain_observed_proof():
+    for local, published, pause, scope, released, uncertain in product((False, True), repeat=6):
+        control = ControlState({"owner": "local" if local else "shared", "inhibit": local, "uncertain": uncertain})
+        proof = ControlProof(shared=published, hold_verified=pause).retain(
+            control, scope_current=scope, released=released
+        )
+        assert proof.shared is (published and scope and released and not local and not uncertain)
+        assert proof.hold_verified is (pause and scope and local)
 
 
 # Intent: all combinations of health prerequisites retain fault, retirement, freshness and cloud constraints.
 # Why: the pure decision must stay conservative for simultaneous conditions rather than relying on branch order.
 def test_health_product_preserves_independent_constraints():
-    for shared, hold, faulted, stopping, active, uncertain, blocked, pending, cloud in product((False, True), repeat=9):
-        facts = ControlFacts(
-            ControlState({"owner": "shared" if shared else "local", "inhibit": not shared, "uncertain": uncertain}),
-            hold,
-            False,
-            False,
-        )
+    for shared, hold, stopping, active, uncertain, blocked, pending, cloud in product((False, True), repeat=8):
+        proof = ControlProof(shared=shared, hold_verified=hold) if not stopping else ControlProof()
         result = assess(
-            facts,
-            faulted=faulted,
+            proof,
             stopping=stopping,
-            active=active,
-            delivery_blocked=blocked,
+            locally_ready=proof.locally_ready(active=active, control_uncertain=uncertain, delivery_blocked=blocked),
             cloud_pending=pending,
             cloud_ready=cloud,
         )
-        if faulted or stopping:
-            assert not result.shared and not result.hold_verified and not result.local_healthy
-        if not active or uncertain or blocked or pending:
-            assert not result.local_healthy
+        assert result.proof == proof
+        assert result.local_healthy is (
+            (shared or hold) and not stopping and active and not uncertain and not blocked and not pending
+        )
         assert result.healthy is (result.local_healthy and cloud)
         assert result.cloud_ready is cloud
         if stopping:
@@ -129,7 +105,7 @@ async def test_real_poll_shapes_and_post_fault_read_order(tmp_path, tls, unused_
             try:
                 result = c._assess_observation(Observation(native, False))
                 assert not isinstance(result, PollStatus)
-                assert result.state == "degraded" and not result.shared and not result.local_healthy
+                assert result.state == "degraded" and not result.proof.available and not result.local_healthy
                 assert (
                     session.journal.get("managed_control_fault")["classification"]
                     == "owner_control_or_delivery_uncertain"

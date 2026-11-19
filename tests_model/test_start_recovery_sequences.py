@@ -3,8 +3,10 @@
 import asyncio
 import copy
 import os
+import tempfile
 import uuid
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 import pytest
 from ocpp_hub_core.frames import build_call_error
@@ -24,6 +26,20 @@ from tests.runtime_rig import until
 from tests.test_managed_start_cap_failure import BeforeCapFailurePeer
 from tests_model.catalog import input_digest
 from tests_model.recovery_cases import start_cases
+
+
+# Intent: only this matrix gives its per-case files to the qualified worker's private RAM mount.
+# Why: its recovery reopens real SQLite while disk-specific tests keep the ordinary pytest scratch.
+@pytest.fixture(name="tmp_path")
+def start_recovery_tmp_path(tmp_path, request):
+    if not request.config.getoption("qualification_start_recovery_ram", default=False):
+        yield tmp_path
+        return
+    from tools.qualification_scratch import RAM_DIRECTORY
+
+    ram = tmp_path.parent.parent / RAM_DIRECTORY
+    with tempfile.TemporaryDirectory(prefix="case-", dir=ram) as directory:
+        yield Path(directory)
 
 
 # Select one ordering per physical/fault seed solely for explicit development checks.

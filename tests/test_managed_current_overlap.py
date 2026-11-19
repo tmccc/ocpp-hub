@@ -18,6 +18,7 @@ from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, timer_bench
 from tests.prototype_rig import START
+from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
@@ -225,6 +226,8 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
                 assert j.get("control") == pause_control and b.c.requests.intent() == pause_intent
                 assert b.c.requests.receipt(identifier) == before and b.device.effective_limit() == 0
                 await b.close_transaction(local)
+                # The local Stop reply can arrive before cloud delivery settles the lifecycle.
+                await until(lambda: j.next_delivery() is None)
                 assert (await healthy(b.c))["local_hold_verified"]
                 settled = {**before, "state": "failed"}
                 assert b.c.requests.receipt(identifier) == settled

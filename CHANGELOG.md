@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep verified zero visible while lifecycle delivery is blocked, and refresh control availability when the
+  failure arrives between supervision polls.
 - Hold the station at zero while an unplugged session closes. Keep old failed current and Return receipts
   as history without treating settled requests as active work. Retry refused Pause and timed-flow publication.
 - Refresh cached management authority and expire the HA service and native readings independently.

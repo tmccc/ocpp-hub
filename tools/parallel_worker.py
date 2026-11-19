@@ -87,7 +87,7 @@ def select(ids, config):
 
 
 # Build a network-isolated container with only its own scratch writable and explicit read-only runtime inputs.
-def container_command(config, directory, cpu, name, env):
+def container_command(config, directory, cpu, name, env, start_recovery_ram=False):
     from tools.qualification_collection import validate_readonly_mounts
 
     validate_readonly_mounts(config, ROOT, directory)
@@ -123,6 +123,17 @@ def container_command(config, directory, cpu, name, env):
         ]
     for mount in config["readonly_mounts"]:
         command += ["--mount", f"type=bind,src={mount['source']},dst={mount['target']},readonly"]
+    if start_recovery_ram:
+        from tools.qualification_scratch import RAM_DIRECTORY
+
+        ram = directory / RAM_DIRECTORY
+        if config["suite"] != "engine-model" or ":" in str(ram):
+            raise ValueError("invalid engine Start recovery tmpfs destination")
+        ram.mkdir(mode=0o700)
+        command += [
+            "--tmpfs",
+            f"{ram}:rw,noexec,nosuid,nodev,size=128m,mode=0700,uid={os.getuid()},gid={os.getgid()}",
+        ]
     for key, value in env.items():
         if key in (
             "PYTHONPATH",
@@ -525,7 +536,13 @@ def main():
                 "XDG_CACHE_HOME": str(directory / "cache"),
             }
             container_name = "icsq-" + hashlib.sha256(config["label"].encode()).hexdigest()[:20] + "-" + str(index)
-            docker = container_command(config, directory, cpu, container_name, worker_env)
+            mixed_scratch = config["suite"] == "engine-model"
+            docker = container_command(config, directory, cpu, container_name, worker_env, mixed_scratch)
+            scratch_option = []
+            if mixed_scratch:
+                from tools.qualification_scratch import RAM_OPTION
+
+                scratch_option = [RAM_OPTION]
             remaining()
             process = subprocess.Popen(
                 [
@@ -535,6 +552,7 @@ def main():
                     "qualification_evidence",
                     "-x",
                     "--qualification-work-queue",
+                    *scratch_option,
                     *config["specs"],
                     "--tb=short",
                     "--basetemp=" + str(directory / "tmp"),

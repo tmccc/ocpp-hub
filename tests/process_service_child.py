@@ -116,9 +116,20 @@ async def controls():
         transport.close()
 
 
-# Keep real service composition/signal handling; only the synthetic native port and SQLite observer are supplied.
+# Keep real service composition and signal handling with synthetic peers and selected timer lengths.
 async def main():
-    config, spec, management, native_port = sys.argv[1:]
+    from ocpp_hub_core.prototype import managed_charging, managed_start_delivery
+
+    config, spec, management, native_port, timing = sys.argv[1:]
+    if timing not in ("production", "fast-poll", "fast-start-expiry", "fast-cloud-retry"):
+        raise ValueError("unknown process test timing")
+    # These waits still run on real clocks. Every replacement uses its original case's timing.
+    if timing != "production":
+        service._SUPERVISION_POLL_SECONDS = 1
+    if timing == "fast-start-expiry":
+        managed_charging.STARTUP_BUDGET = 12
+    elif timing == "fast-cloud-retry":
+        managed_start_delivery.RETRY_INTERVAL = 1.0
     original_preflight, original_connect = service.preflight, sqlite3.connect
 
     # NativeObserver normally uses port80; the parent owns an explicit ephemeral loopback endpoint instead.

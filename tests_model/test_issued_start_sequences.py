@@ -39,6 +39,7 @@ async def test_issued_start_proof_sequences(
             case.selected,
             native_peer=InterruptedNativePeer,
             bench_type=StartReplyBench,
+            timing="production" if case.selected == 6 and not case.demand else "fast-start-expiry",
         ) as child:
             peer, bench = child.rig.peer, child.rig.bench
             ledger = PeerStartLedger(child.rig.bench)

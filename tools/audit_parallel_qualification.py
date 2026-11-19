@@ -176,7 +176,78 @@ def dispatch_grants(root, selected, workers):
     return grants, []
 
 
-# Reconcile raw phase evidence against the exact collection, assignment, manifest and caller-pinned snapshot.
+# Match a resolved path observed during setup to this worker's recorded scratch device.
+def scratch_matches(record, root, *, exact=False):
+    if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+        return False
+    path = Path(record["path"])
+    device = record.get("device")
+    if ".." in path.parts or str(path) != record["path"] or type(device) is not int or device != root["device"]:
+        return False
+    parent = Path(root["path"])
+    return path == parent if exact else path != parent and path.is_relative_to(parent)
+
+
+# Reconcile the case's actual fixture and Start journal with the canonical model's storage policy.
+def audit_engine_scratch(result, worker_count, namespaces, selected, evidence, expected_model):
+    roots = {}
+    ram_devices = set()
+    counts = Counter({"disk": 0, "ram": 0})
+    invalid = []
+    batch = Path(result.get("remote_batch_directory") or ".")
+    for worker in range(worker_count):
+        records = namespaces.get(worker, [])
+        paths = records[0].get("scratch_roots") if len(records) == 1 else None
+        if not isinstance(paths, dict) or not all(isinstance(paths.get(role), dict) for role in ("disk", "ram")):
+            continue
+        disk, ram = paths["disk"], paths["ram"]
+        expected_disk = batch / str(worker)
+        expected_ram = str(expected_disk / "start-recovery-ram")
+        filesystem = disk.get("filesystem")
+        if (
+            not batch.is_absolute()
+            or not isinstance(filesystem, str)
+            or not filesystem
+            or filesystem in ("tmpfs", "ramfs")
+            or disk.get("path") != str(expected_disk)
+            or ram.get("path") != expected_ram
+            or ram.get("mountpoint") != expected_ram
+            or ram.get("filesystem") != "tmpfs"
+            or type(disk.get("device")) is not int
+            or type(ram.get("device")) is not int
+            or disk["device"] == ram["device"]
+            or ram["device"] in ram_devices
+        ):
+            continue
+        ram_devices.add(ram["device"])
+        roots[worker] = {"disk": {**disk, "path": str(expected_disk / "tmp")}, "ram": ram}
+    for identifier in selected:
+        rows = evidence.get(identifier, [])
+        setup = next((row for row in rows if row["phase"] == "setup"), {})
+        paths = roots.get(setup.get("worker"))
+        if paths is None or "scratch" not in setup:
+            invalid.append(identifier)
+            continue
+        location = setup["scratch"]
+        role = "ram" if expected_model.get(identifier, {}).get("family") == "start_recovery" else "disk"
+        valid = scratch_matches(location, paths[role])
+        if role == "ram" and valid:
+            journal = {**paths["ram"], "path": str(Path(location["path"]) / "state.db")}
+            call = next((row for row in rows if row["phase"] == "call"), {})
+            valid = scratch_matches(call.get("scratch"), journal, exact=True)
+        if valid or (role == "disk" and location is None):
+            counts[role] += 1
+        else:
+            invalid.append(identifier)
+    errors = []
+    if len(roots) != worker_count:
+        errors.append("worker scratch is missing a verified disk and private Start recovery tmpfs")
+    if invalid:
+        errors.append("case scratch or Start journal differs from the canonical storage policy")
+    return dict(counts), invalid, errors
+
+
+# Audit execution and independent source-pinned collection for a single attempt.
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("batch", type=Path)
@@ -487,6 +558,13 @@ def main(argv=None):
                 errors.append("full collection differs from exact registered model IDs")
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         errors.append("canonical model manifest failed: " + str(exc))
+    scratch_counts, invalid_scratch = {}, []
+    mixed_scratch = config.get("suite") == "engine-model" and (source / "tools/qualification_scratch.py").is_file()
+    if mixed_scratch:
+        scratch_counts, invalid_scratch, scratch_errors = audit_engine_scratch(
+            result, config["workers"], namespaces, selected, evidence, expected_model
+        )
+        errors.extend(scratch_errors)
     independently_collected = None
     try:
         if not source_verified:
@@ -500,6 +578,8 @@ def main(argv=None):
             errors.append("controlled recollection runtime differs from original collection")
         if independently_collected.get("runtime_digest") != result.get("runtime_digest_after"):
             errors.append("controlled recollection mounted runtime differs from qualification")
+        if mixed_scratch and independently_collected["batch"] != result.get("remote_batch_directory"):
+            errors.append("worker scratch batch differs from the trusted collection executor")
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         errors.append("independent complete collection failed: " + str(exc))
     invalid_model = []
@@ -559,6 +639,8 @@ def main(argv=None):
         "model_manifest_raw": len(manifest),
         "model_manifest_runnable": len(expected_model),
         "completed_model_families": dict(model_completed),
+        "scratch_usage": scratch_counts,
+        "invalid_scratch": invalid_scratch,
         "errors": sorted(set(errors)),
         "snapshot_bad": snapshot_bad,
         "invalid_model": invalid_model,

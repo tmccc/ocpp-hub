@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import replace
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
@@ -51,7 +50,7 @@ from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .start_settlement import RetirementCandidate
 from .store import RecoveryRequiredError, encoded, fingerprint
-from .supervision import ControlFacts, HealthVerdict, Observation, PollStatus, assess
+from .supervision import ControlProof, HealthVerdict, Observation, PollStatus, assess
 from .trial_evidence import Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import lifecycle_decision
@@ -944,7 +943,7 @@ class ManagedController:
     # The pure verdict requests a latch; the controller still owns its actual write and Return completion.
     def _assess_observation(self, observed: Observation) -> HealthVerdict | PollStatus:
         s, g, j = self.session, self.session.gateway, self.session.journal
-        control = j.get("control", {})
+        control = j.control.read()
         if (
             self.current.applying()
             and not s.runtime.status.delivery_blocked
@@ -952,38 +951,34 @@ class ManagedController:
             and not j.fault.latched()
             and not j.get("trial_preservation_fault")
             and not j.get("trial_inventory_fault")
-            and not control.get("start_pending")
+            and not control.values.get("start_pending")
             and not j.get("vendor_start_grant")
             and not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
         ):
             intent = self.requests.intent()
             return PollStatus("reconciling", intent=intent)
         paused = self.requests.intent().mode == "paused"
-        facts = ControlFacts(
-            ControlState(control),
-            observed.verified_pause,
-            s.runtime.status.delivery_blocked
-            and (s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain),
-            False,
+        proof = ControlProof(shared=True, hold_verified=observed.verified_pause).retain(control)
+        delivery_blocked = s.runtime.status.delivery_blocked
+        delivery_uncertain = delivery_blocked and (
+            s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain
         )
-        if not facts.requires_fault:
-            facts = replace(facts, vendor_uncertain=bool(j.get("uncertain_vendor_command")))
-        if facts.requires_fault and not self.stopping:
+        if (not proof.available or delivery_uncertain or j.get("uncertain_vendor_command")) and not self.stopping:
             self.fault("owner_control_or_delivery_uncertain")
-        faulted = facts.has_authority and j.fault.latched()
+        if (proof.available and j.fault.latched()) or self.stopping:
+            proof = ControlProof()
         cloud = (
             s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
         )
-        active = facts.authority_valid(faulted, self.stopping) and j.phase.read().active
-        local_ready = facts.locally_ready(
-            faulted=faulted, stopping=self.stopping, active=active, delivery_blocked=s.runtime.status.delivery_blocked
+        local_ready = proof.locally_ready(
+            active=proof.available and j.phase.read().active,
+            control_uncertain=bool(control.values.get("uncertain")),
+            delivery_blocked=s.runtime.status.delivery_blocked,
         )
         verdict = assess(
-            facts,
-            faulted=faulted,
+            proof,
             stopping=self.stopping,
-            active=active,
-            delivery_blocked=s.runtime.status.delivery_blocked,
+            locally_ready=local_ready,
             cloud_pending=local_ready and g.authorisation.pending(),
             cloud_ready=cloud,
         )

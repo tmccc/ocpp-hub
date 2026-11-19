@@ -79,6 +79,48 @@ def test_snapshot_requires_clean_ordinary_committed_blobs(tmp_path):
         freeze(source)
 
 
+# Intent: audit actual worker/local fixture devices against the canonical Start recovery IDs.
+# Why: a complete-looking pass can otherwise hide a Start test on disk or a disk-specific test on RAM.
+@pytest.mark.parametrize(
+    "fault", [None, "start_on_disk", "disk_on_ram", "missing_journal", "ram_default", "missing_case"]
+)
+def test_mixed_scratch_requires_exact_case_and_journal_locations(fault):
+    base = "/pinned/worker-batch"
+    disk = base + "/0"
+    ram = disk + "/start-recovery-ram"
+    model = "tests_model/example.py::test_start[order]"
+    ordinary = "tests/test_disk.py::test_committed_state"
+    roots = {
+        "disk": {"path": disk, "filesystem": "ext4", "device": 21},
+        "ram": {"path": ram, "mountpoint": ram, "filesystem": "tmpfs", "device": 42},
+    }
+    model_setup = {"phase": "setup", "worker": 0, "scratch": {"path": ram + "/case-a", "device": 42}}
+    model_call = {"phase": "call", "worker": 0, "scratch": {"path": ram + "/case-a/state.db", "device": 42}}
+    disk_setup = {"phase": "setup", "worker": 0, "scratch": {"path": disk + "/tmp/ordinary", "device": 21}}
+    if fault == "start_on_disk":
+        model_setup["scratch"] = disk_setup["scratch"]
+    elif fault == "disk_on_ram":
+        disk_setup["scratch"] = model_setup["scratch"]
+    elif fault == "missing_journal":
+        model_call.pop("scratch")
+    elif fault == "ram_default":
+        roots["disk"]["filesystem"] = "tmpfs"
+    elif fault == "missing_case":
+        model_setup.pop("scratch")
+    counts, invalid, errors = audit.audit_engine_scratch(
+        {"remote_batch_directory": base},
+        1,
+        {0: [{"scratch_roots": roots}]},
+        [model, ordinary],
+        {model: [model_setup, model_call], ordinary: [disk_setup]},
+        {model: {"family": "start_recovery"}},
+    )
+    if fault is None:
+        assert counts == {"ram": 1, "disk": 1} and invalid == errors == []
+    else:
+        assert invalid and errors
+
+
 # Construct a small synthetic HA-scope input for the auditor, explicitly not a real qualification receipt.
 @pytest.fixture
 def audit_fixture(tmp_path, monkeypatch):

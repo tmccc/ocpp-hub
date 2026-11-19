@@ -104,10 +104,12 @@ identity. These values are observations, not reusable permission. Narrower Stop,
 guards keep their existing epoch/Boot rules, since adding a metadata fence could prevent a legitimate restriction.
 
 The main poll reads top to bottom: settle owned work, maintain faults, supervise recovery/native evidence, assess
-authority, publish a view. `_supervise()` keeps native and recovery effects explicit. `ControlFacts` and `assess()`
-in `supervision.py` make the health decision pure; the controller still performs the fault latch and Return
-completion. Optional cloud-grant decoding remains lazy after valid local authority. A status is no permission
-across an await. Public pending and observed status shapes share their common fields in `managed_view.py`.
+authority, publish a view. `_supervise()` keeps native and recovery effects explicit. The poll and API both use
+`ControlProof` in `supervision.py` to keep the observed shared grant or physical zero only while the matching
+authority remains current. An unsettled delivery blocks readiness while a verified zero can remain visible.
+The controller still owns the fault latch and Return completion. It decodes cloud grants only after local
+readiness. Live command and commit guards recheck their own evidence. Pending and observed status share common
+fields in `managed_view.py`.
 
 `Journal.starts` is the synchronous Start lifecycle owner; pending-bit updates use `Journal.control`. It reads
 the existing journal keys into a typed
