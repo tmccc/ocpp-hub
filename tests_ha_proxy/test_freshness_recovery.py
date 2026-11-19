@@ -124,16 +124,20 @@ async def test_incomplete_charger_history_does_not_relabel_previous_energy(actua
 
 # Intent: complete native HTTP history feeds the real published status and actual HA last-energy sensor.
 # Why: unreadable later history hides last energy, while an unreadable older entry leaves a valid new charge visible.
-@pytest.mark.parametrize("clock", ["normal", "reversed", "future_stop", "older_reversed", "zero_energy"])
+@pytest.mark.parametrize(
+    "clock", ["normal", "reversed", "future_stop", "older_reversed", "zero_energy", "delayed_history"]
+)
 async def test_native_history_to_actual_ha_sensor(
     actual_hass, tmp_path, tls, unused_tcp_port_factory, monkeypatch, clock
 ):
     import time
+    from datetime import UTC, datetime
 
     from ocpp_hub_core.prototype.managed import ManagedController
     from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 
     from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+    from tests.prototype_rig import START
     from tests_ha_proxy.test_client import TOKEN
 
     now = int(time.time())
@@ -156,8 +160,8 @@ async def test_native_history_to_actual_ha_sensor(
         async with rig.charger(session) as charger:
             await introduced(rig, session, charger, "history-real-boot")
             published = await healthy(controller)
-            assert published["charger_history_complete"] == (clock in ("normal", "zero_energy"))
-            latest_known = clock in ("normal", "older_reversed", "zero_energy")
+            assert published["charger_history_complete"] == (clock in ("normal", "zero_energy", "delayed_history"))
+            latest_known = clock in ("normal", "older_reversed", "zero_energy", "delayed_history")
             expected_energy = (latest["meterStop"] - latest["meterStart"]) / 1000 if latest_known else None
             assert published["charger_latest_completion_known"] is latest_known
             assert published["last_session_energy_kwh"] == expected_energy
@@ -172,6 +176,42 @@ async def test_native_history_to_actual_ha_sensor(
                 entity = actual_hass.states.get("sensor.ics_proxy_last_session_energy")
                 assert entity.state == ("unknown" if expected_energy is None else str(expected_energy))
                 assert rig.bench.history == original and not starts(rig)
+                if clock == "delayed_history":
+                    timestamp = datetime.fromtimestamp(now, UTC).isoformat()
+                    body = START | {"idTag": "NATIVE_TIMER", "timestamp": timestamp}
+                    opened = await rig.bench.call(charger, "recent-scheduled-start", "StartTransaction", body)
+                    local = opened[2]["transactionId"]
+                    rig.peer.permission_enabled = True
+                    rig.bench.cp, rig.bench.connection = "C", "Charging"
+                    rig.bench.firmware.fire_plan(9)
+                    assert (await healthy(controller))["charging_session_open"]
+                    meter_stop = body["meterStart"] + 3000
+                    await rig.bench.call(
+                        charger,
+                        "recent-scheduled-stop",
+                        "StopTransaction",
+                        {"transactionId": local, "meterStop": meter_stop, "timestamp": timestamp},
+                    )
+                    rig.peer.permission_enabled = False
+                    rig.bench.cp, rig.bench.connection = "B", "Plug"
+                    published = await healthy(controller)
+                    assert not published["charging_session_open"] and published["last_session_energy_kwh"] is None
+                    await entry.runtime_data.async_refresh()
+                    assert actual_hass.states.get(entity.entity_id).state == "unknown"
+                    rig.bench.history = [
+                        {
+                            "transactionId": local,
+                            "startTime": now,
+                            "stopTime": now + 1,
+                            "meterStart": body["meterStart"],
+                            "meterStop": meter_stop,
+                        },
+                        *original,
+                    ]
+                    published = await healthy(controller)
+                    assert published["last_session_energy_kwh"] == 3.0
+                    await entry.runtime_data.async_refresh()
+                    assert actual_hass.states.get(entity.entity_id).state == "3.0"
                 await actual_hass.config_entries.async_unload(entry.entry_id)
             finally:
                 await server.close()

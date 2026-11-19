@@ -277,6 +277,11 @@ def observed_status(
     latest_known = history.latest_completion_known and (
         not check_archive or latest_completion_available(j, history.completed)
     )
+    # A delivered Stop can reach the journal before the charger includes that same assigned ID in its history.
+    newest_closed = j.db.execute("SELECT local FROM transactions WHERE stop IS NOT NULL ORDER BY local DESC LIMIT 1")
+    closed = newest_closed.fetchone()
+    if closed is not None and closed[0] > max(history.completed, default=-1):
+        latest_known = False
     last_energy = next((row["energy_kwh"] for row in history.sessions if row["stopped_at"] is not None), None)
     c.status_authority = c.authority()
     c.status_vendor_epoch = g._vendor_epoch

@@ -65,10 +65,15 @@ async def test_paused_current_selection_preserves_zero_until_explicit_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        from ocpp_hub_core.prototype.managed_view import refresh_for_read
+
         test.controller.command(uuid.uuid4().hex, "pause", 0)
-        await healthy(test.controller)
+        paused = await healthy(test.controller)
         before = list(test.rig.bench.received_limits)
         identifier = await select(test, 16)
+        between = refresh_for_read(test.controller, dict(paused, running=True, certificate_remaining_seconds=86400))
+        assert between["control_mode"] == "waiting" and not between["pause_pending"]
+        assert between["requested_current_a"] == 16 and between["station_ceiling_a"] is None
         status = await healthy(test.controller)
         assert test.controller.requests.receipt(identifier)["state"] == "completed"
         assert status["desired_control"] == "paused" and status["local_hold_verified"]
