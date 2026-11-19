@@ -39,6 +39,8 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint  # 
 from ocpp_hub_core.prototype.trial_config import TrialConfig  # noqa: E402
 from ocpp_hub_core.prototype.trial_evidence import profile_projection  # noqa: E402
 
+from tools.rollback_recovery_state import RECOVERY_METADATA, recovery_history_settled  # noqa: E402
+
 
 @dataclass(frozen=True)
 class Build:
@@ -48,6 +50,7 @@ class Build:
     digest: str
     incident: bool
     migrated_only: bool = False
+    recovered_journal: bool = False
 
 
 CURRENT = Build(
@@ -67,6 +70,14 @@ MIGRATED_RELEASES = (
         "2c21808bd8345d9f623b7d459d2ef763176ee78e8f48b1cf2876401f35c7f8cb",
         True,
         migrated_only=True,
+        recovered_journal=True,
+    ),
+    Build(
+        "1b77415cae9e1e7125cf0f3a03aaced529780c56",
+        "4812b699cffef02e607168ed80d2c84897545840a451a49c78f98c8c08abd488",
+        True,
+        migrated_only=True,
+        recovered_journal=True,
     ),
 )
 PREVIOUS = Build(
@@ -373,7 +384,9 @@ def require_settled_requests(db: sqlite3.Connection, meta: dict[str, Any], *, mi
 
 
 # Evaluate only the paused, settled journal variant proved by the cross-build rehearsal.
-def check_snapshot(db: sqlite3.Connection, config: TrialConfig, *, migrated_only: bool = False) -> int:
+def check_snapshot(
+    db: sqlite3.Connection, config: TrialConfig, *, migrated_only: bool = False, recovered_journal: bool = False
+) -> int:
     schema = schema_digest(db)
     migrated = schema == MIGRATED_SCHEMA
     require(migrated or not migrated_only and schema == REHEARSED_SCHEMA, "journal_schema_unrehearsed")
@@ -384,6 +397,8 @@ def check_snapshot(db: sqlite3.Connection, config: TrialConfig, *, migrated_only
     )
     raw = db.execute("SELECT key,value FROM meta").fetchall()
     supported = MIGRATED_METADATA if migrated else SUPPORTED_METADATA
+    if migrated and recovered_journal:
+        supported |= RECOVERY_METADATA
     require(all(key in supported for key, _ in raw), "unrehearsed_journal_metadata")
     meta = {key: json.loads(value) for key, value in raw}
     control = meta.get("control")
@@ -435,6 +450,8 @@ def check_snapshot(db: sqlite3.Connection, config: TrialConfig, *, migrated_only
     require_settled_requests(db, meta, migrated=migrated, revision=intent.revision)
     if migrated:
         require_migrated_history(db, meta)
+    if RECOVERY_METADATA.intersection(meta):
+        require(recovery_history_settled(db, meta, intent.revision), "unsettled_vendor_recovery")
     return intent.revision
 
 
@@ -445,7 +462,9 @@ def check_rollback(config: TrialConfig, current: Path, previous: Path) -> Rollba
         build = next((build for build in (CURRENT, *MIGRATED_RELEASES) if build_matches(current, build)), None)
         require(build is not None and build_matches(previous, PREVIOUS), "build_pair_unrehearsed")
         with stopped_journal(config.journal) as db:
-            revision = check_snapshot(db, config, migrated_only=build.migrated_only)
+            revision = check_snapshot(
+                db, config, migrated_only=build.migrated_only, recovered_journal=build.recovered_journal
+            )
         return RollbackCheck(True, "rehearsed_stopped_journal", current_commit=build.commit, pause_revision=revision)
     except RollbackRefusedError as error:
         reason = str(error)

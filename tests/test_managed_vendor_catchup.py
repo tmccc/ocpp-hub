@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed_delivery_recovery import KEY as MAPPINGS
+from ocpp_hub_core.prototype.managed_delivery_recovery import delivery_recovery_digest
+from ocpp_hub_core.prototype.managed_release_recovery import PROOF as RELEASE_PROOF
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
 
@@ -26,6 +28,7 @@ from tests.tls_support import tls as tls
 from tests_installation.migrated_layout import seed_old_layout
 from tools import reconcile_managed_debt as debt_tool
 from tools import reconcile_managed_delivery as delivery_tool
+from tools.rollback_recovery_state import recovery_history_settled
 
 REPORTS = ("StartTransaction", "MeterValues", "StopTransaction")
 OPERATOR = "managed_operator_debt_reconciliations"
@@ -506,7 +509,7 @@ async def approve_unaccepted_start(child, charge, capsys):
     assert dropped is not None and dropped[2:] == ["StartTransaction", charge.start]
     assert all(entry["token"] != dropped[1] for entry in bench.backend_starts)
     old_records = child.durable()["metadata"][OPERATOR]
-    (old_id, old_entry), = old_records.items()
+    ((old_id, old_entry),) = old_records.items()
     assert old_entry["proof"]["wire_ack"] is not None and old_entry["completed"] is None
 
     kind = "start-delivery"
@@ -719,6 +722,16 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
         proof = entry["proof"]
         assert entry["completed"]["pause"] == fresh
         assert proof["stop_wire_ack"]["delivery_token"] == proof["stop_token"]
+    if later_reply in ("accepted", "rejected-stop"):
+        # The stopped reader recognises records produced by ordinary recovery while keeping exact wire identity.
+        metadata = child.durable()["metadata"]
+        journal = child.rig.prepared.config.journal
+        with closing(sqlite3.connect(f"{journal.as_uri()}?mode=ro", uri=True)) as db:
+            assert recovery_history_settled(db, metadata, paused["control_revision"])
+            (mapped_proof,) = [entry["proof"] for entry in metadata[MAPPINGS].values()]
+            mapped_proof["stop_wire_ack"]["delivery_token"] = "e-" + uuid.uuid4().hex
+            metadata[RELEASE_PROOF]["delivery_reconciliation"] = delivery_recovery_digest([mapped_proof])
+            assert not recovery_history_settled(db, metadata, paused["control_revision"])
     if retry:
         recovered = child.durable()["metadata"][OPERATOR]
         start_proof = recovered[retry_id]["proof"]

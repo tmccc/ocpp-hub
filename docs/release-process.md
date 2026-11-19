@@ -101,10 +101,10 @@ routine updates do not require another dedicated charging trial when the owner h
 
 ### Rehearsed standalone software rollback
 
-The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and from `051500f` and `3fdace8` on saved
-copies of the migrated journal. Each rehearsal used one advancing SQLite journal. The migrated rehearsals preserved the
-saved 32 A selection, the archive and original receipts. The older build kept the newer Pause and completed the
-next simulated scheduled charge after Return.
+The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and from `051500f`, `3fdace8` and
+`1b77415` on saved copies of the migrated journal. Each rehearsal used one advancing SQLite journal.
+The migrated rehearsals preserved the saved 32 A selection, the archive and original receipts. The older
+build kept the newer Pause and completed the next simulated scheduled charge after Return.
 
 For a stopped installation, the read-only check reports whether the two supplied builds and the retained journal
 match the rehearsed conditions. Use the actual stopped service build as the current root.
@@ -120,8 +120,10 @@ an unproved build or layout, unresolved request, undelivered lifecycle, or uncer
 the check itself. A passing result establishes eligibility for that stopped journal. Verify a fresh Pause and zero
 after starting the previous build on the same journal, before considering Return.
 
-Finish pending Start mapping recovery on the build that recorded it. The checker refuses journals that contain
-the newer mapping records, including completed mappings. Those journals still need their own rollback rehearsal.
+Finish pending Start mapping recovery on the build that recorded it. The saved-copy rehearsals from `3fdace8` and
+`1b77415` also covered a completed Start mapping and operator delivery recovery. The checker verifies the
+rehearsed recovery records against closed transactions, vendor replies and the completed Pause. Pending
+recovery and proof formats outside those covered by the check still block rollback.
 
 To reproduce the offline rehearsal, extract the two exact commits to new directories under task scratch.
 
