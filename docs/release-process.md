@@ -102,7 +102,7 @@ routine updates do not require another dedicated charging trial when the owner h
 ### Rehearsed standalone software rollback
 
 The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and from `051500f`, `3fdace8` and
-`954bf77` on saved copies of the migrated journal. Each rehearsal used one advancing SQLite journal.
+`8bd7290` on saved copies of the migrated journal. Each rehearsal used one advancing SQLite journal.
 The migrated rehearsals preserved the saved 32 A selection, the archive and original receipts. The older
 build kept the newer Pause and completed the next simulated scheduled charge after Return.
 
@@ -121,7 +121,7 @@ the check itself. A passing result establishes eligibility for that stopped jour
 after starting the previous build on the same journal, before considering Return.
 
 Finish pending Start mapping recovery on the build that recorded it. The saved-copy rehearsals from `3fdace8` and
-`954bf77` also covered a completed Start mapping and operator delivery recovery. The checker verifies the
+`8bd7290` also covered a completed Start mapping and operator delivery recovery. The checker verifies the
 rehearsed recovery records against closed transactions, vendor replies and the completed Pause. Pending
 recovery and proof formats outside those covered by the check still block rollback.
 
