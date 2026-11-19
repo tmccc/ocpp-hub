@@ -193,12 +193,17 @@ publication, actual statement and deferred-FK COMMIT rollback, and the absence o
 
 `ManagedRequests` owns durable control-intent serialization and Pause/Return request transitions. Domain recovery
 uses `write_intent(journal, current, mode)` with its original captured intent and transaction; constructing a
-request owner during native admission would prematurely normalize requests. `ControlIntent.next` owns revision
-advancement; legacy read recovery explicitly coalesces an already-paused mode. The writer creates no permission,
-schema, request row or replay task. Start and explicit Return app publication share `_publish_app`, which requires
-the current expected intent inside the existing wire-child transaction. Start keeps its distinct Pause supersession
-and metadata publication. Return preserves intent, previous-current settlement and request completion in that order.
-Its post-COMMIT memory notification stays with the existing handoff.
+request owner during native admission would prematurely normalize requests. `ControlIntent.next` advances the
+revision. Legacy read recovery explicitly coalesces an already-paused mode. The same saved Pause revision decides
+precedence across restart, including when the Pause receipt has completed. It supersedes interrupted work from an
+older revision. A Start admitted during an existing Pause can share its revision. Exact physical hold checks use
+the corresponding saved Pause or Stop ticket for the current revision.
+
+In the reply transaction, Start and Return check the current intent, charger Boot scope, control revision and
+ticket through `ManagedController.publication_is_current`. Start and explicit Return app publication then share
+`_publish_app`. Confirmed charger outcomes and Start lifecycle records retain their own settlement. Start keeps
+its Pause supersession and metadata publication. Return preserves the order of intent, previous-current settlement
+and request completion. Its post-COMMIT memory notification stays with the existing handoff.
 
 Return's running claim follows the recovery owner's busy/stopping exits and precedes completion launch. Queue
 refusal retains `return_not_confirmed`; once launched, the owned completion alone requeues or records uncertainty.

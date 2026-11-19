@@ -73,8 +73,8 @@ def test_pause_ownership_keeps_its_committed_generation(owner):
     ownership = owner.pause_ownership()
     assert expected == ControlIntent("paused", 8)
     assert ownership.supersedes(7) and not ownership.supersedes(8)
-    assert ownership.owns_ticket("pause-ticket") and ownership.owns_ticket("stop-ticket", stopping=True)
-    assert not ownership.owns_ticket("stop-ticket") and not ownership.owns_ticket("pause-ticket", stopping=True)
+    assert ownership.owns_ticket("pause-ticket") and owner.stop_owns_ticket("stop-ticket")
+    assert not ownership.owns_ticket("stop-ticket") and not owner.stop_owns_ticket("pause-ticket")
     assert owner.pending_pause() and owner.existing(identifier, "pause", 2)["state"] == "accepted"
     owner.confirm_pauses()
     assert not owner.pending_pause() and owner.pause_ownership() == ownership
@@ -88,13 +88,25 @@ def test_partial_pause_marker_has_precedence_without_a_hold_ticket(owner):
     owner.journal.put("managed_owner_pause", {"revision": 8})
     ownership = owner.pause_ownership()
     assert ownership.supersedes(7)
-    assert not ownership.supersedes(None) and not ownership.supersedes(True)
+    assert not ownership.supersedes(None) and not ownership.supersedes(True) and not ownership.supersedes(-1)
     assert not ownership.owns_ticket(None) and not ownership.owns_ticket("old-ticket")
     with pytest.raises(RecoveryRequiredError, match="owning transaction"):
         owner.record_pause_claim(ownership.intent, "outside-transaction")
     with owner.journal.atomic(), pytest.raises(RecoveryRequiredError, match="current paused intent"):
         owner.record_pause_claim(ControlIntent("paused", 7), "stale-ticket")
     assert owner.journal.get("managed_owner_pause") == {"revision": 8}
+
+
+# Intent: unrecognized saved markers have no precedence or ticket ownership.
+# Why: startup recovery must still work when the journal contains an older or malformed marker.
+@pytest.mark.parametrize("marker", [None, True, []])
+def test_unknown_pause_and_stop_markers_have_no_claim(owner, marker):
+    owner.journal.put("managed_control_intent", {"mode": "paused", "revision": 8})
+    owner.journal.put("managed_owner_pause", marker)
+    owner.journal.put("managed_owner_stop", marker)
+    ownership = owner.pause_ownership()
+    assert not ownership.requested and not ownership.owns_ticket(None)
+    assert not owner.stop_owns_ticket(None) and not owner.pending_pause()
 
 
 # Intent: replacement marks only the five replay-sensitive actions accepted/running as uncertain.
@@ -162,16 +174,23 @@ def test_invalid_intent_does_not_sweep_or_grant(owner, value):
 @pytest.mark.parametrize("revision", [7, 8])
 def test_current_return_identity(owner, state, action, revision):
     identifier = seed(owner, action=action, revision=revision, state=state)
-    assert owner.return_current(identifier, ControlIntent("paused", 7)) is (
+    paused = ControlIntent("paused", 7)
+    owner.journal.put("managed_control_intent", {"mode": "paused", "revision": 7})
+    assert owner.return_current(identifier, paused) is (
         action == "app_control" and revision == 7 and state in ("accepted", "running")
     )
     assert owner.return_in_progress() is (action == "app_control" and state in ("accepted", "running"))
     assert owner.return_in_progress(7) is (
         action == "app_control" and revision == 7 and state in ("accepted", "running")
     )
-    assert not owner.return_current(None, ControlIntent("paused", 7))
-    assert owner.return_current(None, ControlIntent("app", 7))
-    assert not owner.return_current(identifier, ControlIntent("app", 7))
+    assert not owner.return_current(None, paused)
+    owner.journal.put("managed_control_intent", {"mode": "paused", "revision": 8})
+    assert not owner.return_current(identifier, paused)
+    app = ControlIntent("app", 8)
+    assert not owner.return_current(None, app)
+    owner.journal.put("managed_control_intent", {"mode": "app", "revision": 8})
+    assert owner.return_current(None, app)
+    assert not owner.return_current(identifier, app)
 
 
 # Intent: beginning an owned attempt changes only accepted rows without touching their opaque result.

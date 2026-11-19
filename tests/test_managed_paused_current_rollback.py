@@ -36,15 +36,24 @@ async def test_future_selection_after_pause(tmp_path, tls, unused_tcp_port, monk
             }
             assert before["selected_a"] == 16 and before["effective_a"] == 0
             if supersede:
-                c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                pause_id = uuid.uuid4().hex
+                c.command(pause_id, "pause", c.requests.intent().revision)
+                intent = c.requests.intent()
+                claim = b.session.journal.get("managed_owner_pause")
             peer.release.set()
             await asyncio.wait_for(c.current.settle(), 5)
+            if supersede:
+                assert c.requests.intent() == intent
+                assert b.session.journal.get("control")["ticket"] == claim["ticket"]
+                assert b.session.journal.get("managed_owner_pause") == claim
             if c.pause_task is not None:
                 await c.pause_task
             status = await healthy(c)
             receipt = c.requests.receipt(change_id)
             assert receipt["state"] == ("failed" if supersede else "completed")
             assert c.current.selected() == (6 if supersede else 16) and status["local_hold_verified"]
+            if supersede:
+                assert c.requests.receipt(pause_id)["state"] == "completed"
             assert b.rig.bench.firmware.effective_limit() == 0 and not starts(b.rig)
             returning = uuid.uuid4().hex
             c.command(returning, "app_control", c.requests.intent().revision)

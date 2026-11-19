@@ -200,7 +200,7 @@ class RecoveryCoordinator:
 
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> GateDecision:
-            if not c.requests.return_current(return_request, expected_intent):
+            if c.stopping or not c.requests.return_current(return_request, expected_intent):
                 return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
             if c.ordinary.active():
                 decision = c.ordinary.authority_decision(continuing_local)
@@ -218,8 +218,6 @@ class RecoveryCoordinator:
                 and not (c.charging.scoped_normal_stop() and c.charging.current_daily(continuing_local))
             ):
                 return Pending(Prerequisite.SOURCE, "source-specific continuation was superseded")
-            if c.stopping or c.requests.intent() != expected_intent:
-                return Pending(Prerequisite.SUPERSEDED, "a newer requested hold superseded managed release")
             return ALLOW
 
         decision = guard()
@@ -261,14 +259,10 @@ class RecoveryCoordinator:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
-        release_guard = guard
-        decision = release_guard()
+        decision = guard()
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
         if expected_intent.mode == "paused":
-            decision = guard()
-            if isinstance(decision, Pending):
-                return RestoreProgress(RestoreState.WAITING, decision)
             c.require_paused(native)
             c.requests.confirm_pauses()
         scope = current_scope(g)
@@ -279,7 +273,7 @@ class RecoveryCoordinator:
             expected_intent,
             scope,
             revision,
-            release_guard,
+            guard,
             before_ticket=ticket,
         )
 
@@ -290,12 +284,9 @@ class RecoveryCoordinator:
 
         # Final SQL joins the wire child's transaction; this callback grants no permission across an await.
         def publish(authority: AuthorityStamp) -> AuthorityStamp | Pending:
-            if not j.db.in_transaction or c.authority() != authority:
+            if not c.publication_is_current(authority):
                 return Pending(Prerequisite.SUPERSEDED, "release publication was superseded")
             decision = guard()
-            if isinstance(decision, Pending):
-                return decision
-            decision = release_guard()
             if isinstance(decision, Pending):
                 return decision
             j.put("managed_owner_epoch", epoch)
@@ -313,7 +304,7 @@ class RecoveryCoordinator:
         result = await g.controls.release_result(
             attempt,
             guard=guard,
-            context=c.session.book.positive_release_guard(release_guard),
+            context=c.session.book.positive_release_guard(guard),
             rollback_guard=rollback_guard,
             handoff=ReleaseHandoff(publish, committed),
         )

@@ -73,6 +73,8 @@ class ObservedConnection(sqlite3.Connection):
                     Gate.freeze(self, "receipt-before-marker")
         if operation == "COMMIT":
             prefix = "before-" if before else "after-"
+            if request is not None and request[0] == "pause" and request[1] == "accepted" and not before:
+                Gate.freeze(self, "after-pause-request-commit")
             if request is not None and request[0] == "app_control":
                 if request[1] == "accepted":
                     Gate.freeze(self, prefix + "return-request-commit")

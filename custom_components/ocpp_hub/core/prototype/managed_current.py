@@ -14,7 +14,7 @@ from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
 from .managed_facts import ManagedFacts
-from .managed_intent import write_intent
+from .managed_intent import ControlIntent, write_intent
 from .managed_settlement import claim_internal_pause
 from .managed_sources import recorded_station_profile
 from .native_bounded import NativeBoundedSpec
@@ -440,23 +440,19 @@ class ManagedCurrentLimits:
             )
             control = j.get("control", {})
             j.control.select(control, value, app=intent.mode == "app")
-        self.worker = asyncio.create_task(
-            self._apply(identifier, value, previous_value, expected.mode, expected.revision)
-        )
+        self.worker = asyncio.create_task(self._apply(identifier, value, previous_value, expected))
         return c.requests.receipt(identifier)
 
     # One service-owned worker survives a disappearing HA client and confirms native profile bytes after the ACK.
-    async def _apply(self, identifier: str, value: int, previous_value: int, mode: str, revision: int) -> None:
+    async def _apply(self, identifier: str, value: int, previous_value: int, expected: ControlIntent) -> None:
         c, g, j = self.controller, self.controller.session.gateway, self.journal
         epoch, control_revision = g._charger_epoch, g.controls._revision
 
         # Every actual outgoing RPC rechecks this request's intent and transport generation after awaited evidence.
         def guard() -> None:
-            intent = c.requests.intent()
             if (
                 c.stopping
-                or intent.mode != mode
-                or intent.revision != revision
+                or c.requests.intent() != expected
                 or epoch != g._charger_epoch
                 or control_revision != g.controls._revision
                 or not g.current_boot_seen(epoch)
@@ -472,7 +468,7 @@ class ManagedCurrentLimits:
 
         try:
             guard()
-            if mode == "app":
+            if expected.mode == "app":
                 await c.native.read(closed=True)
                 guard()
                 await g.controls.set_limit(value, guard=guard, shared=True)
@@ -480,7 +476,7 @@ class ManagedCurrentLimits:
             native = await c.native.read(closed=True)
             guard()
             present = c.session.book.owned_present(native.physical)
-            target = 0 if mode == "paused" else value
+            target = 0 if expected.mode == "paused" else value
             if not g.controls.ready or not any(
                 r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == target for r in present
             ):
@@ -497,16 +493,16 @@ class ManagedCurrentLimits:
             TimeoutError,
             sqlite3.Error,
         ) as error:
-            await self._failed_apply(identifier, value, previous_value, mode, revision, error)
+            await self._failed_apply(identifier, value, previous_value, expected, error)
 
     # Keep exact failed work owned while SQLite is unavailable; repair cannot replay a positive profile.
     async def _failed_apply(
-        self, identifier: str, value: int, previous_value: int, mode: str, revision: int, error: Exception
+        self, identifier: str, value: int, previous_value: int, expected: ControlIntent, error: Exception
     ) -> None:
         c, j = self.controller, self.journal
         cause = {
             "id": identifier,
-            "revision": revision - 1,
+            "revision": expected.revision - 1,
             "current_a": value,
             "type": type(error).__name__,
             "detail": str(error)[:1024],
@@ -517,10 +513,10 @@ class ManagedCurrentLimits:
                 if change.get("id") != identifier or change.get("state") != "pending":
                     return
                 intent = c.requests.intent()
-                superseded = intent.mode != mode or intent.revision != revision
+                superseded = intent != expected
                 active = j.active()
                 overlap = active is not None or j.current_change.read().value.get("observed_open")
-                if not superseded and mode == "app" and overlap:
+                if not superseded and expected.mode == "app" and overlap:
                     self.cancel_overlap(identifier, previous_value, "session_opened", failure=cause)
                     try:
                         await self.protect_overlap()
@@ -541,7 +537,7 @@ class ManagedCurrentLimits:
                             "id": identifier,
                             "current_a": value,
                             "previous_a": previous_value,
-                            "mode": mode,
+                            "mode": expected.mode,
                             "state": "uncertain",
                             "failure": cause,
                         },

@@ -18,7 +18,7 @@ from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype import recovery_policy
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.gateway import Gateway
-from ocpp_hub_core.prototype.local_control import LocalControl
+from ocpp_hub_core.prototype.local_control import ControlSupersededError, LocalControl
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, Prerequisite, RestoreState, WireReply
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
@@ -420,6 +420,54 @@ async def test_cancelled_poll_cannot_abandon_owned_return_publication(tmp_path, 
         c.command(pause, "pause", revision)
         await completed_control(b, pause, mode="paused", revision=revision + 1, ceiling=0)
         assert c.requests.receipt(returning) == receipt
+
+
+# Intent: a genuine positive Return reply arriving after a newer Pause cannot publish app control.
+# Why: the late reply matters for the physical outcome, while only the newer request can settle the resulting hold.
+async def test_late_return_reply_keeps_the_newer_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        before = await pause_prefix(b)
+        replies = observe_device_replies(SimpleNamespace(sock=b.charger), monkeypatch)
+        entered, release = asyncio.Event(), asyncio.Event()
+        witness, previous = capture_positive(b, entered=entered, release=release)
+        returning = accepted_return(b, before)
+        consumer = asyncio.create_task(
+            c.recovery.restore(before["intent"], return_request=returning, claim_return=True)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            attempt = witness["attempt"]
+            assert witness["live"] and witness["physical"] == 6 and witness["positive_dispatched"]
+            positive = positive_calls(b, before["wire"])
+            assert len(positive) == 1 and not any(reply[1] == positive[0][1] for reply in replies)
+
+            pause, revision = uuid.uuid4().hex, c.requests.intent().revision
+            c.command(pause, "pause", revision)
+            expected = c.requests.intent()
+            claim = copy.deepcopy(j.get("managed_owner_pause"))
+            old_outcome = c.requests.receipt(returning)
+            assert old_outcome["state"] == "failed"
+            assert old_outcome["result"] == {"classification": "superseded_by_pause"}
+            release.set()
+
+            with pytest.raises(ControlSupersededError):
+                await asyncio.wait_for(asyncio.shield(consumer), 8)
+            assert [3, positive[0][1], {"status": "Accepted"}] in replies
+            assert attempt.finished and not attempt.published
+            assert attempt.positive_reply is WireReply.ACCEPTED
+            assert j.get("managed_owner_epoch") == before["owner_epoch"]
+            assert c.requests.intent() == expected and j.get("managed_owner_pause") == claim
+            assert j.get("control")["ticket"] == claim["ticket"]
+            assert c.requests.receipt(returning) == old_outcome
+
+            await completed_control(b, pause, mode="paused", revision=revision + 1, ceiling=0)
+            assert c.requests.receipt(returning) == old_outcome
+            assert len(positive_calls(b, before["wire"])) == 1 and not starts(b.rig)
+        finally:
+            release.set()
+            b.rig.bench.before_reply = previous
+            await asyncio.gather(consumer, return_exceptions=True)
 
 
 # Intent: a real matching Boot after child COMMIT retires successful result A without faulting current authority B.

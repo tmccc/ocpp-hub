@@ -15,6 +15,7 @@ from tests.model_tls_support import tls_for_case
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import process_rig
 from tests.prototype_rig import START
+from tests.recovery_barriers import require_zero_held
 from tests_model.catalog import input_digest
 from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
 from tests_model.test_current_sequences import BoundaryPeer
@@ -323,6 +324,61 @@ async def test_process_sigkill_current_selection(
     record_property("actual_sigkill", child.kills[0]["returncode"] == -9)
     record_property("independent_durable_read", True)
     record_property("peers_survived", True)
+
+
+# Intent: a committed owner Pause survives SIGKILL during an older, still-pending paused current selection.
+# Why: neither the dead worker's target nor a replacement internal hold can substitute for the exact owner request.
+async def test_process_sigkill_after_newer_pause_commit(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory):
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        native_peer=BoundaryPeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        ready = await child.status()
+        assert (await child.request("pause", revision=ready["control_revision"]))["ok"]
+        paused = await child.status(lambda value: value.get("local_hold_verified") is True)
+        mark = len(child.rig.bench.device_calls)
+        peer = child.rig.peer
+        change, pause = uuid.uuid4().hex, uuid.uuid4().hex
+        request = None
+        try:
+            peer.arm = True
+            reply = await child.request("set_current", id=change, revision=paused["control_revision"], current_a=16)
+            assert reply["ok"]
+            await asyncio.wait_for(peer.entered.wait(), 5)
+            await child.arm("after-pause-request-commit", pause)
+            request = asyncio.create_task(child.request("pause", id=pause, revision=paused["control_revision"]))
+            gate = await child.gate("after-pause-request-commit", pause)
+            assert not gate["transaction_open"] and not request.done()
+            committed = child.durable()
+            stored = committed["metadata"]
+            intent, claim = stored["managed_control_intent"], stored["managed_owner_pause"]
+            assert intent == {"mode": "paused", "revision": paused["control_revision"] + 2}
+            assert claim == {"revision": intent["revision"], "ticket": stored["control"]["ticket"]}
+            assert stored["managed_current_change"]["id"] == change
+            assert stored["managed_current_change"]["state"] == "pending"
+            assert next(row for row in committed["requests"] if row["id"] == pause)["state"] == "accepted"
+            await child.kill()
+        finally:
+            peer.release.set()
+            if request is not None:
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+
+        await child.start()
+        status = await child.status(lambda value: value.get("local_hold_verified") is True)
+        assert status["control_revision"] == intent["revision"] and status["requested_current_a"] == 6
+        recovered = child.durable()["metadata"]
+        assert recovered["managed_owner_pause"] == claim and recovered["control"]["ticket"] == claim["ticket"]
+        assert (await child.request("receipt", request_id=pause))["result"]["state"] == "completed"
+        assert (await child.request("receipt", request_id=change))["result"]["state"] == "failed"
+        assert len(child.kills) == 1 and not starts(child.rig)
+        require_zero_held(child.rig, mark)
 
 
 # Intent: a real accepted one-shot command can report its actual lifecycle after a process dies before publication.

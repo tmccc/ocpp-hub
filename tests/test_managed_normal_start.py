@@ -440,6 +440,7 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
         if newer_pause:
             pause = uuid.uuid4().hex
             # Pause is allowed when the client has an older displayed revision.
+            assert test.controller.requests.intent().revision > 0
             test.controller.command(pause, "pause", 0)
             task = test.controller.pause_task
             assert task is not None
@@ -448,6 +449,7 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
             intent = test.controller.requests.intent()
             claim = test.session.journal.get("managed_owner_pause")
             assert claim["revision"] == intent.revision
+        mark = len(test.rig.bench.device_calls)
         await test.controller.charging.close()
         await crash(test.session)
         replacement = managed_session(test.rig)
@@ -466,6 +468,12 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
                 await introduced(test.rig, replacement, charger, "normal-start-replacement")
                 recovered_test = ChargeRig(test.rig, replacement, recovered, charger)
                 stopped = await actual_stop(recovered_test, local)
+                stop_targets = [
+                    frame[3]["transactionId"]
+                    for frame in test.rig.bench.device_calls[mark:]
+                    if frame[2] == "RemoteStopTransaction"
+                ]
+                assert stop_targets and set(stop_targets) == {local}
                 assert stopped["local_hold_verified"] and stopped["power_w"] == 0
                 assert stopped["local_charge"]["charging"] is False
                 if newer_pause:

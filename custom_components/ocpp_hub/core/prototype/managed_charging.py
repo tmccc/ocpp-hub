@@ -21,7 +21,7 @@ from .managed_start_binding import known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
+from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite
 from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
@@ -326,13 +326,12 @@ class ManagedCharging:
     # Pause, deadline, shutdown, introduction, permission changes and a replaced request all revoke positive sends.
     def guard(self, lease: ChargeLease, *, stopping: bool = False) -> None:
         c, j = self.controller, self.journal
-        g, intent = c.session.gateway, c.requests.intent()
+        g = c.session.gateway
         if (
             self.lease is not lease
             or c.stopping
             or time.monotonic() >= lease.deadline
-            or intent.mode != lease.mode
-            or intent.revision != lease.revision
+            or c.requests.intent() != ControlIntent(lease.mode, lease.revision)
             or g._charger_epoch != lease.epoch
             or g.controls._revision != lease.control_revision
             or not g.current_boot_seen(lease.epoch)
@@ -447,10 +446,12 @@ class ManagedCharging:
             # This synchronous writer joins the child's transaction; it never opens a nested atomic block.
             def publish(context: StartHandoffContext) -> StartPublication:
                 self.guard(lease)
-                if not control_scope_matches(c.session.gateway, context.control_scope):
+                expected = ControlIntent(lease.mode, lease.revision)
+                authority = AuthorityStamp(expected, context.scope, context.control_revision, context.ticket)
+                if not c.publication_is_current(authority):
                     raise RecoveryRequiredError("owned Start publication was superseded")
                 if lease.normal:
-                    c.requests.start_published(lease.identifier, ControlIntent(lease.mode, lease.revision), lease.epoch)
+                    c.requests.start_published(lease.identifier, expected, lease.epoch)
                     if previous_current is not None:
                         try:
                             require_record(c, previous_current)

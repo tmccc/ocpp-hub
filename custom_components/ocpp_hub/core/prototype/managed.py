@@ -119,6 +119,10 @@ class ManagedController:
             return None
         return AuthorityStamp(self.requests.intent(), scope, g.controls._revision, j.get("control", {}).get("ticket"))
 
+    # A real reply may be retained even when its owner can no longer publish a change of control.
+    def publication_is_current(self, expected: AuthorityStamp) -> bool:
+        return self.session.journal.db.in_transaction and self.authority() == expected
+
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
     def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
         if self.stopping:
@@ -232,7 +236,7 @@ class ManagedController:
         if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
             return
         self.reclaim_failed_start_pause()
-        epoch, ticket = g._charger_epoch, j.get("control", {}).get("ticket")
+        ticket = j.get("control", {}).get("ticket")
         connection = current_control_scope(g)
 
         # Recheck the owner's claim and authenticated device immediately before each wire operation.
@@ -244,7 +248,6 @@ class ManagedController:
                 or not ticket
                 or control.get("ticket") != ticket
                 or not ControlState(control).explicit_local_hold
-                or g._charger_epoch != epoch
                 or not control_scope_matches(g, connection)
                 or fingerprint(j.get("boot")) != self.native.spec.boot_digest
                 or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
@@ -271,12 +274,7 @@ class ManagedController:
         await self.ensure_pause_zero()
         try:
             g, j = self.session.gateway, self.session.journal
-            intent, epoch, boot, revision = (
-                self.requests.intent(),
-                g._charger_epoch,
-                g.boot_observation,
-                g.controls._revision,
-            )
+            intent, connection = self.requests.intent(), current_control_scope(g)
             local = j.active()
             prior_control = j.get("control", {})
             stop_epoch, prior_ticket = prior_control.get("stop_epoch", 0), prior_control.get("ticket")
@@ -289,10 +287,7 @@ class ManagedController:
                     self.stopping
                     or intent.mode != "paused"
                     or self.requests.intent() != intent
-                    or g._charger_epoch != epoch
-                    or g.boot_observation != boot
-                    or g.controls._revision != revision
-                    or not g.current_boot_seen(epoch)
+                    or not control_scope_matches(g, connection)
                     or fingerprint(j.get("boot")) != self.native.spec.boot_digest
                     or j.active() != local
                 ):
@@ -433,7 +428,7 @@ class ManagedController:
         ownership = self.requests.pause_ownership()
         if control.get("uncertain") and (
             ownership.owns_ticket(control.get("ticket"))
-            or ownership.owns_ticket(control.get("ticket"), stopping=True)
+            or self.requests.stop_owns_ticket(control.get("ticket"))
             or receipt.get("stage") in ("unsent", "rejected")
             and receipt.get("settled_ticket") == control.get("ticket")
             or receipt.get("bound_ticket") == control.get("ticket")
@@ -676,9 +671,7 @@ class ManagedController:
             return  # An already accepted Return survives until observation completes the timed test under Pause.
         j = self.session.journal
         control = j.get("control", {})
-        if control.get("uncertain") and self.requests.pause_ownership().owns_ticket(
-            control.get("ticket"), stopping=True
-        ):
+        if control.get("uncertain") and self.requests.stop_owns_ticket(control.get("ticket")):
             # Verify this exact protective Stop before treating Return as a positive release attempt.
             try:
                 await self.maintain_pause()
