@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .local_control import local_start_receipt
+from .managed_intent import read_pause_claim
 from .store import Journal
 
 
@@ -21,7 +22,7 @@ def preserved_start_debt(journal: Journal, *, continuing_local: int | None = Non
         and state.get("start_rpc_accepted") is True
         and intent.get("mode") == "app"
         and intent.get("revision") == state.get("revision")
-        and journal.get("managed_owner_pause", {}).get("revision") != intent.get("revision")
+        and read_pause_claim(journal).revision != intent.get("revision")
         and journal.get("control", {}).get("start_pending") is True
         and journal.active() == continuing_local
         and owner.get("stage") == "accepted"

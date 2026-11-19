@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .control_state import ControlState
 from .managed_current import current_failure, managed_current_ceiling
+from .managed_intent import read_pause_claim
 from .native_bounded import NativeBoundedSpec
 from .store import Journal
 
@@ -35,7 +36,7 @@ def capture_interrupted_collision(j: Journal, spec: NativeBoundedSpec) -> None:
         "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
         (change.get("id"),),
     ).fetchone()
-    intent, control, pause = j.get("managed_control_intent", {}), j.get("control", {}), j.get("managed_owner_pause", {})
+    intent, control, pause = j.get("managed_control_intent", {}), j.get("control", {}), read_pause_claim(j)
     if (
         row is None
         or row["action"] != "set_current"
@@ -45,8 +46,8 @@ def capture_interrupted_collision(j: Journal, spec: NativeBoundedSpec) -> None:
             intent == {"mode": "app", "revision": row["revision"] + 1}
             or intent.get("mode") == "paused"
             and intent.get("revision", -1) > row["revision"] + 1
-            and pause.get("revision") == intent["revision"]
-            and bool(pause.get("ticket"))
+            and pause.revision == intent["revision"]
+            and pause.ticket is not None
             and ControlState(control).explicit_local_hold
         )
     ):

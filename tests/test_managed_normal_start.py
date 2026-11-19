@@ -421,13 +421,15 @@ async def test_closed_lifecycle_retired_by_timer_without_any_poll_or_pause(
         assert len(starts(test.rig)) == 1
 
 
-# Intent: crashing an established normal charge creates a persisted pause and stops only the known real session.
-# Why: a running normal record must not become automatic Start authority after service replacement.
+# Intent: replacing an established normal charge retains a later accepted Pause or creates an internal hold.
+# Why: restart must stop only the known session, without replaying Start or requiring the owner to Pause again.
+@pytest.mark.parametrize("newer_pause", [False, True])
 async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
+    newer_pause: bool,
 ) -> None:
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         identifier = uuid.uuid4().hex
@@ -435,6 +437,17 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
         await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
+        if newer_pause:
+            pause = uuid.uuid4().hex
+            # Pause is allowed when the client has an older displayed revision.
+            test.controller.command(pause, "pause", 0)
+            task = test.controller.pause_task
+            assert task is not None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            intent = test.controller.requests.intent()
+            claim = test.session.journal.get("managed_owner_pause")
+            assert claim["revision"] == intent.revision
         await test.controller.charging.close()
         await crash(test.session)
         replacement = managed_session(test.rig)
@@ -442,6 +455,12 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
         recovered = ManagedController(replacement)
         try:
             assert recovered.requests.intent().mode == "paused"
+            if newer_pause:
+                assert recovered.requests.intent() == intent
+                assert replacement.journal.get("managed_owner_pause") == claim
+                assert replacement.journal.get("control")["ticket"] == claim["ticket"]
+                assert recovered.requests.pending_pause()
+                assert recovered.requests.receipt(pause)["state"] == "accepted"
             assert recovered.charging.normal_summary()["charging"] is False
             async with test.rig.charger(replacement) as charger:
                 await introduced(test.rig, replacement, charger, "normal-start-replacement")
@@ -449,6 +468,9 @@ async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
                 stopped = await actual_stop(recovered_test, local)
                 assert stopped["local_hold_verified"] and stopped["power_w"] == 0
                 assert stopped["local_charge"]["charging"] is False
+                if newer_pause:
+                    assert recovered.requests.receipt(pause)["state"] == "completed"
+                    assert recovered.requests.intent() == intent
                 assert len(starts(test.rig)) == 1 and test.rig.bench.firmware.effective_limit() == 0
                 assert recovered.requests.intent().mode == "paused" and recovered.charging.lease is None
         finally:

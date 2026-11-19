@@ -148,7 +148,7 @@ class ManagedController:
         # This claim shares the intent transaction, so no accepted Pause can leave old shared authority committed.
         def claim() -> None:
             _, ticket = self.session.gateway.controls._claim(True, stopping=True)
-            self.session.journal.put("managed_owner_pause", self.requests.intent().pause_claim(ticket))
+            self.requests.record_pause_claim(self.requests.intent(), ticket)
             record_release_pause(self, identifier)
 
         receipt = self.requests.accept(identifier, action, revision, claim)
@@ -177,7 +177,8 @@ class ManagedController:
             or failure.get("effects_started") is not True
         ):
             return
-        receipt, control, owner_pause = local_start_receipt(j), j.get("control", {}), j.get("managed_owner_pause", {})
+        receipt, control = local_start_receipt(j), j.get("control", {})
+        ownership = self.requests.pause_ownership()
         connection = current_control_scope(g)
         row = j.db.execute(
             "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
@@ -192,7 +193,7 @@ class ManagedController:
             or not receipt.get("ticket")
             or control.get("ticket") != receipt["ticket"]
             or not ControlState(control).confirmed_shared
-            or owner_pause.get("revision") != intent.revision
+            or not ownership.requested
         ):
             return
 
@@ -210,7 +211,7 @@ class ManagedController:
                 and self.charging.state() == state
                 and local_start_receipt(j) == receipt
                 and j.get("control") == control
-                and j.get("managed_owner_pause") == owner_pause
+                and self.requests.pause_ownership().pause == ownership.pause
                 and fingerprint(j.get("boot")) == self.native.spec.boot_digest
                 and recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
                 and j.db.execute(
@@ -312,7 +313,7 @@ class ManagedController:
                 if stop_ticket is None:
                     stop_ticket = control["ticket"]
                     # Preserve the original Pause identity used by Return and historical Start recovery.
-                    j.put("managed_owner_stop", intent.pause_claim(stop_ticket))
+                    self.requests.record_pause_claim(intent, stop_ticket, stopping=True)
 
             try:
                 # Closing the exact locally known session may proceed even after cable removal.
@@ -429,9 +430,10 @@ class ManagedController:
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         control = j.get("control", {})
         receipt = local_start_receipt(j)
+        ownership = self.requests.pause_ownership()
         if control.get("uncertain") and (
-            j.get("managed_owner_pause") == self.requests.intent().pause_claim(control.get("ticket"))
-            or j.get("managed_owner_stop") == self.requests.intent().pause_claim(control.get("ticket"))
+            ownership.owns_ticket(control.get("ticket"))
+            or ownership.owns_ticket(control.get("ticket"), stopping=True)
             or receipt.get("stage") in ("unsent", "rejected")
             and receipt.get("settled_ticket") == control.get("ticket")
             or receipt.get("bound_ticket") == control.get("ticket")
@@ -674,7 +676,9 @@ class ManagedController:
             return  # An already accepted Return survives until observation completes the timed test under Pause.
         j = self.session.journal
         control = j.get("control", {})
-        if control.get("uncertain") and j.get("managed_owner_stop") == expected.pause_claim(control.get("ticket")):
+        if control.get("uncertain") and self.requests.pause_ownership().owns_ticket(
+            control.get("ticket"), stopping=True
+        ):
             # Verify this exact protective Stop before treating Return as a positive release attempt.
             try:
                 await self.maintain_pause()
@@ -696,10 +700,8 @@ class ManagedController:
             )
             or receipt.get("pause_revision") == expected.revision
             and receipt.get("verified_pause_revision") != expected.revision
-            or j.get("managed_owner_pause") == expected.pause_claim(control.get("ticket"))
-            and j.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') LIMIT 1"
-            ).fetchone()
+            or self.requests.pause_ownership().owns_ticket(control.get("ticket"))
+            and self.requests.pending_pause()
         ):
             return  # The same Return survives the real Start and both closure reports under its Pause.
         try:

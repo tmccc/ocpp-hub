@@ -168,12 +168,10 @@ class ManagedCurrentLimits:
                 previous = row["current_a"] if row else 6
             previous = integer(previous, 6, 32)
             change = {**change, "previous_a": previous}
-            intent = controller.requests.intent()
-            owner_pause = self.journal.get("managed_owner_pause", {})
-            if intent.mode == "paused" and (
-                change.get("mode") == "app" or owner_pause.get("revision") == intent.revision
-            ):
-                # A newer explicit Pause owns its ticket regardless of the mode the current change began in.
+            ownership = controller.requests.pause_ownership()
+            intent = ownership.intent
+            if intent.mode == "paused" and (change.get("mode") == "app" or ownership.requested):
+                # Current admission advances intent, so a matching owner Pause was accepted after this selection.
                 with self.journal.atomic():
                     self.journal.control.project(self.journal.get("control"), resume_limit=previous)
                     self.journal.current_change.cancel(change)

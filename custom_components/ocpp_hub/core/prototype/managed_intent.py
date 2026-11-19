@@ -12,6 +12,9 @@ from typing import Any
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError
 
+OWNER_PAUSE = "managed_owner_pause"
+OWNER_STOP = "managed_owner_stop"
+
 
 @dataclass(frozen=True)
 class ControlIntent:
@@ -19,10 +22,6 @@ class ControlIntent:
 
     mode: str
     revision: int
-
-    # Both owner Pause and its later Stop retain this exact persisted ticket/revision identity.
-    def pause_claim(self, ticket: str | None) -> dict[str, str | int | None]:
-        return {"ticket": ticket, "revision": self.revision}
 
     # Domain changes advance revision; legacy read recovery may retain a mode it already requested.
     def next(self, mode: str, *, coalesce: bool = False) -> ControlIntent:
@@ -34,6 +33,51 @@ def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesc
     intent = current.next(mode, coalesce=coalesce)
     journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
     return intent
+
+
+@dataclass(frozen=True)
+class PauseClaim:
+    """An owner's persisted generation and, when complete, the exact ticket it claimed."""
+
+    revision: int | None
+    ticket: str | None
+    complete: bool
+
+    # A historical generation alone can denote precedence but cannot prove ownership of a physical hold.
+    def owns(self, revision: int, ticket: object) -> bool:
+        return self.complete and self.revision == revision and self.ticket == ticket
+
+
+# Keep the same journal format and distinguish a partial historical marker from an exact ticket.
+def read_pause_claim(journal: Journal, *, stopping: bool = False) -> PauseClaim:
+    record = journal.get(OWNER_STOP if stopping else OWNER_PAUSE, {})
+    revision, ticket = record.get("revision"), record.get("ticket")
+    generation = revision if type(revision) is int else None
+    claim_ticket = ticket if isinstance(ticket, str) and ticket else None
+    return PauseClaim(generation, claim_ticket, set(record) == {"revision", "ticket"} and claim_ticket is not None)
+
+
+@dataclass(frozen=True)
+class PauseOwnership:
+    """The current desired mode, the owner's Pause, and its separately claimed Stop."""
+
+    intent: ControlIntent
+    pause: PauseClaim
+    stop: PauseClaim
+
+    # A completed owner Pause still takes precedence over work admitted under an older generation.
+    @property
+    def requested(self) -> bool:
+        return self.intent.mode == "paused" and self.pause.revision == self.intent.revision
+
+    # A Start can be admitted under an existing Pause, so equal revisions do not establish a newer request.
+    def supersedes(self, operation_revision: object) -> bool:
+        return self.requested and type(operation_revision) is int and operation_revision < self.intent.revision
+
+    # Stop may take a separate physical ticket without replacing the original Pause marker.
+    def owns_ticket(self, ticket: object, *, stopping: bool = False) -> bool:
+        claim = self.stop if stopping else self.pause
+        return self.intent.mode == "paused" and claim.owns(self.intent.revision, ticket)
 
 
 class ManagedRequests:
@@ -152,12 +196,22 @@ class ManagedRequests:
         ).fetchone()
         return (row["id"], row["revision"]) if row is not None else None
 
+    # Read precedence from the current journal rather than reviving a ticket remembered before an await.
+    def pause_ownership(self) -> PauseOwnership:
+        return PauseOwnership(
+            self.intent(), read_pause_claim(self.journal), read_pause_claim(self.journal, stopping=True)
+        )
+
+    # Bind Pause or Stop to the transaction that took its physical claim.
+    def record_pause_claim(self, intent: ControlIntent, ticket: str, *, stopping: bool = False) -> None:
+        if not self.journal.db.in_transaction or self.intent() != intent or intent.mode != "paused":
+            raise RecoveryRequiredError("Pause claim requires the current paused intent in its owning transaction")
+        self.journal.put(OWNER_STOP if stopping else OWNER_PAUSE, {"ticket": ticket, "revision": intent.revision})
+
     # Retry Stop only for the still-current explicit Pause, including its replacement-uncertain receipt.
     def pending_pause(self) -> bool:
-        intent = self.intent()
         return (
-            intent.mode == "paused"
-            and self.journal.get("managed_owner_pause", {}).get("revision") == intent.revision
+            self.pause_ownership().requested
             and self.journal.db.execute(
                 "SELECT 1 FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') LIMIT 1"
             ).fetchone()

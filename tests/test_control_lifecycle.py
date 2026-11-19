@@ -60,6 +60,43 @@ def raw(owner, identifier):
     )
 
 
+# Intent: durable precedence uses the accepted generation, with separate tickets for Pause and its Stop.
+# Why: a stale client revision and a later Stop claim must not detach the original owner request.
+def test_pause_ownership_keeps_its_committed_generation(owner):
+    journal = owner.journal
+    journal.put("managed_control_intent", {"mode": "app", "revision": 7})
+    identifier = "a" * 32
+    owner.accept(identifier, "pause", 2, lambda: owner.record_pause_claim(owner.intent(), "pause-ticket"))
+    expected = owner.intent()
+    with journal.atomic():
+        owner.record_pause_claim(expected, "stop-ticket", stopping=True)
+    ownership = owner.pause_ownership()
+    assert expected == ControlIntent("paused", 8)
+    assert ownership.supersedes(7) and not ownership.supersedes(8)
+    assert ownership.owns_ticket("pause-ticket") and ownership.owns_ticket("stop-ticket", stopping=True)
+    assert not ownership.owns_ticket("stop-ticket") and not ownership.owns_ticket("pause-ticket", stopping=True)
+    assert owner.pending_pause() and owner.existing(identifier, "pause", 2)["state"] == "accepted"
+    owner.confirm_pauses()
+    assert not owner.pending_pause() and owner.pause_ownership() == ownership
+    assert owner.receipt(identifier)["state"] == "completed"
+
+
+# Intent: recognize the generation of a partial older Pause marker without treating it as an exact hold.
+# Why: interrupted older work must not take priority, and Stop completion needs its real ticket.
+def test_partial_pause_marker_has_precedence_without_a_hold_ticket(owner):
+    owner.journal.put("managed_control_intent", {"mode": "paused", "revision": 8})
+    owner.journal.put("managed_owner_pause", {"revision": 8})
+    ownership = owner.pause_ownership()
+    assert ownership.supersedes(7)
+    assert not ownership.supersedes(None) and not ownership.supersedes(True)
+    assert not ownership.owns_ticket(None) and not ownership.owns_ticket("old-ticket")
+    with pytest.raises(RecoveryRequiredError, match="owning transaction"):
+        owner.record_pause_claim(ownership.intent, "outside-transaction")
+    with owner.journal.atomic(), pytest.raises(RecoveryRequiredError, match="current paused intent"):
+        owner.record_pause_claim(ControlIntent("paused", 7), "stale-ticket")
+    assert owner.journal.get("managed_owner_pause") == {"revision": 8}
+
+
 # Intent: replacement marks only the five replay-sensitive actions accepted/running as uncertain.
 # Why: Pause and terminal history retain their lifetimes; unfinished retired one-offs refuse without normalization.
 @pytest.mark.parametrize(

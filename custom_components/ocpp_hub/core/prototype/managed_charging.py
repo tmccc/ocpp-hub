@@ -90,7 +90,8 @@ class ManagedCharging:
         saved = self.state()
         if saved.get("state") in ACTIVE:
             with self.journal.atomic():
-                intent = controller.requests.intent()
+                ownership = controller.requests.pause_ownership()
+                intent = ownership.intent
                 preserve = (
                     saved.get("kind") == "normal"
                     and intent.mode == "app"
@@ -98,9 +99,10 @@ class ManagedCharging:
                     and local_start_receipt(self.journal).get("local") is None
                     and local_start_receipt(self.journal).get("stage") in ("issued", "accepted")
                 )
-                if not preserve:
-                    write_intent(self.journal, intent, "paused")
-                claim_internal_pause(controller, "test", saved["id"])
+                if not ownership.supersedes(saved.get("revision")):
+                    if not preserve:
+                        write_intent(self.journal, intent, "paused")
+                    claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.retire_refused_unsent()
         controller.native.observation_listener = self.record_source
@@ -610,12 +612,11 @@ class ManagedCharging:
 
     # A newer explicit Pause owns unrestricted Stop; an expired normal Start owns only its exact receipt.
     def scoped_normal_stop(self) -> bool:
-        c, state = self.controller, self.state()
-        return bool(
-            state.get("expired_normal")
-            and state.get("state") != "completed"
-            and self.journal.get("managed_owner_pause", {}).get("revision") != c.requests.intent().revision
-        )
+        state = self.state()
+        if not state.get("expired_normal") or state.get("state") == "completed":
+            return False
+        ownership = self.controller.requests.pause_ownership()
+        return ownership.pause.revision != ownership.intent.revision
 
     # Preserve only this expired local command's debt after fresh closure, without granting a new Start or Stop.
     def idle_debt(self, native: HandoverEvidence) -> bool:
