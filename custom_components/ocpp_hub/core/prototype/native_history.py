@@ -153,12 +153,7 @@ class NativeHistoryArchive:
 
 
 # The latest completed charge is unknown if an absent archive entry could be as recent as the displayed one.
-def latest_completion_available(journal: Journal, current: tuple[dict[str, Any], ...]) -> bool:
-    completed = {
-        row["transactionId"]: row["startTime"]
-        for row in current
-        if row.get("transactionId") != -1 and row.get("stopTime", 0) > 0
-    }
+def latest_completion_available(journal: Journal, completed: dict[int, int]) -> bool:
     latest = max(completed.values(), default=0)
     try:
         for identifier, body in journal.db.execute("SELECT transaction_id,body FROM native_history_records"):

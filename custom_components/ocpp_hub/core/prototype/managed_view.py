@@ -37,7 +37,7 @@ NATIVE_SAMPLE_FIELDS = (
 # An unavailable native sample leaves the independently saved proxy history intact.
 def clear_native_sample(status: dict[str, Any]) -> None:
     status.update(dict.fromkeys(NATIVE_SAMPLE_FIELDS))
-    status.update(charger_sessions=[], charger_history_complete=False)
+    status.update(charger_sessions=[], charger_history_complete=False, charger_latest_completion_known=False)
 
 
 # Reject booleans and non-finite values before calculating status ages or certificate coverage.
@@ -140,35 +140,43 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class ChargerHistorySummary:
-    """Redacted valid records and whether any real record could not be represented honestly."""
+    """Redacted history and the valid completed sessions used to identify the latest one."""
 
     sessions: list[dict[str, Any]]
     complete: bool
+    completed: dict[int, int]
+    latest_completion_known: bool
 
 
-# A rejected timestamp cannot establish which session was latest; retain this fact alongside the valid summaries.
+# An unreadable record can hide the latest completion only if its start is unknown or may be as recent.
 def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHistorySummary:
     summaries: list[dict[str, Any]] = []
-    complete = True
+    completed: dict[int, int] = {}
+    newest_unreadable_start = 0.0
+    latest_time = time.time() + 30
     for record in records:
-        if record.get("transactionId") == -1:
+        identifier = record.get("transactionId")
+        if identifier == -1:
             continue
         start, stop = record.get("startTime"), record.get("stopTime", 0)
         first, last = record.get("meterStart"), record.get("meterStop", 0)
+        known_start = type(start) is int and 0 < start <= latest_time
         if (
-            type(start) is not int
+            type(identifier) is not int
+            or not known_start
             or type(stop) is not int
             or type(first) is not int
             or type(last) is not int
-            or not 0 < start <= time.time() + 30
-            or not 0 <= stop <= time.time() + 30
+            or not 0 <= stop <= latest_time
             or not 0 <= first <= 10**12
             or not 0 <= last <= 10**12
             or stop != 0
             and (stop < start or last < first)
         ):
-            complete = False
+            newest_unreadable_start = max(newest_unreadable_start, start if known_start else math.inf)
             continue
+        if stop:
+            completed[identifier] = start
         summaries.append(
             {
                 "started_at": datetime.fromtimestamp(start, UTC).isoformat(),
@@ -176,7 +184,13 @@ def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHis
                 "energy_kwh": (last - first) / 1000 if stop else None,
             }
         )
-    return ChargerHistorySummary(sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20], complete)
+    complete = newest_unreadable_start == 0
+    return ChargerHistorySummary(
+        sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20],
+        complete,
+        completed,
+        complete or max(completed.values(), default=0) > newest_unreadable_start,
+    )
 
 
 # Callers needing just the bounded archive retain the same redacted list contract.
@@ -259,6 +273,9 @@ def observed_status(
     check_archive = archive and (
         records_missing or any(row.get("transactionId") != -1 and row.get("stopTime", 0) == 0 for row in native.history)
     )
+    latest_known = history.latest_completion_known and (
+        not check_archive or latest_completion_available(j, history.completed)
+    )
     c.status_authority = c.authority()
     c.status_vendor_epoch = g._vendor_epoch
     return {
@@ -291,8 +308,8 @@ def observed_status(
         "history_archive": archive,
         "history_warning": "records_absent_from_charger" if records_missing else None,
         "charger_sessions": history.sessions,
-        "charger_history_complete": history.complete
-        and (not check_archive or latest_completion_available(j, native.history)),
+        "charger_history_complete": history.complete and latest_known,
+        "charger_latest_completion_known": latest_known,
         "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
     }
 

@@ -111,6 +111,8 @@ class ProxyClient:
             result["sessions"], _ = _history(result.get("sessions"), proxy=True)
         if command == "status":
             result["charger_sessions"], complete = _history(result.get("charger_sessions", []))
+            latest_known = result.get("charger_latest_completion_known", result.get("charger_history_complete", True))
+            result["charger_latest_completion_known"] = complete and latest_known is True
             result["charger_history_complete"] = complete and result.get("charger_history_complete", True) is True
         return result
 

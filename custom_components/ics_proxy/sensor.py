@@ -93,7 +93,7 @@ class ProxySensor(ProxyEntity, SensorEntity):
                 return "App / schedule (cloud offline)" if data.get("cloud_connected") is False else "App / schedule"
             return "Needs attention" if data.get("state") in ("attention", "degraded") else "Waiting for verification"
         if self.key == "last_session_energy":
-            if data.get("charger_history_complete", True) is not True:
+            if data.get("charger_latest_completion_known") is not True:
                 return None
             return next((r["energy_kwh"] for r in data.get("charger_sessions", []) if r.get("stopped_at")), None)
         return data.get(self.key)

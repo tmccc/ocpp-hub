@@ -123,8 +123,8 @@ async def test_incomplete_charger_history_does_not_relabel_previous_energy(actua
 
 
 # Intent: complete native HTTP history feeds the real published status and actual HA last-energy sensor.
-# Why: independently invalid chronology must survive producer filtering as unknown instead of an older energy value.
-@pytest.mark.parametrize("clock", ["normal", "reversed", "future_stop"])
+# Why: unreadable later history hides last energy, while an unreadable older entry leaves a valid new charge visible.
+@pytest.mark.parametrize("clock", ["normal", "reversed", "future_stop", "older_reversed"])
 async def test_native_history_to_actual_ha_sensor(
     actual_hass, tmp_path, tls, unused_tcp_port_factory, monkeypatch, clock
 ):
@@ -143,6 +143,8 @@ async def test_native_history_to_actual_ha_sensor(
         latest["stopTime"] = now - 200
     elif clock == "future_stop":
         latest["stopTime"] = now + 45
+    elif clock == "older_reversed":
+        old["stopTime"] = now - 3700
     original = [latest, old]
     async with managed_bench(tmp_path, tls, unused_tcp_port_factory(), initial_history=original) as rig:
         session = managed_session(rig)
@@ -153,6 +155,8 @@ async def test_native_history_to_actual_ha_sensor(
             await introduced(rig, session, charger, "history-real-boot")
             published = await healthy(controller)
             assert published["charger_history_complete"] == (clock == "normal")
+            latest_known = clock in ("normal", "older_reversed")
+            assert published["charger_latest_completion_known"] is latest_known
             server = ManagementServer(
                 ManagementSettings(unused_tcp_port_factory(), tmp_path / "unused", TOKEN),
                 controller,
@@ -162,7 +166,7 @@ async def test_native_history_to_actual_ha_sensor(
             try:
                 entry = await setup(actual_hass, {"port": server.settings.port})
                 entity = actual_hass.states.get("sensor.ics_proxy_last_session_energy")
-                assert entity.state == ("1.0" if clock == "normal" else "unknown")
+                assert entity.state == ("1.0" if latest_known else "unknown")
                 assert rig.bench.history == original and not starts(rig)
                 await actual_hass.config_entries.async_unload(entry.entry_id)
             finally:
