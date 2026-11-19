@@ -711,7 +711,9 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
     assert (await child.status(lambda value: value.get("control_revision") == drained["control_revision"]))[
         "fault"
     ] == fault
-    fresh = await request_pause(child, drained)
+    # Pause from a stale dashboard still takes a new server-side revision and can settle this recovery.
+    pause_status = drained | {"control_revision": 0} if later_reply == "rejected-stop" else drained
+    fresh = await request_pause(child, pause_status)
     await child.completed_control(fresh)
     paused = await child.status(lambda state: state.get("can_return") is True)
     assert paused["local_hold_verified"] and bench.firmware.effective_limit() == 0
@@ -727,6 +729,11 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
         metadata = child.durable()["metadata"]
         journal = child.rig.prepared.config.journal
         with closing(sqlite3.connect(f"{journal.as_uri()}?mode=ro", uri=True)) as db:
+            requested = db.execute("SELECT revision FROM managed_requests WHERE id=?", (fresh,)).fetchone()[0]
+            assert requested == pause_status["control_revision"]
+            assert metadata[RELEASE_PROOF]["revision"] == paused["control_revision"]
+            if later_reply == "rejected-stop":
+                assert paused["control_revision"] > requested + 1
             assert recovery_history_settled(db, metadata, paused["control_revision"])
             (mapped_proof,) = [entry["proof"] for entry in metadata[MAPPINGS].values()]
             mapped_proof["stop_wire_ack"]["delivery_token"] = "e-" + uuid.uuid4().hex

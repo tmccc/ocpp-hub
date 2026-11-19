@@ -45,18 +45,16 @@ def wire_acknowledged(ack: object, token: object) -> bool:
     )
 
 
-# Historical recovery records can refer to any retained genuine Pause no later than the currently stopped one.
-def pause_revision(db: sqlite3.Connection, identifier: object) -> int | None:
+# The exact receipt proves verification even when Pause was submitted from an older dashboard.
+def verified_pause(db: sqlite3.Connection, identifier: object) -> bool:
     if not isinstance(identifier, str):
-        return None
+        return False
     row = db.execute(
-        "SELECT revision,result FROM managed_requests WHERE id=? AND action='pause' AND state='completed'",
+        "SELECT result FROM managed_requests WHERE id=? AND action='pause' AND state='completed'",
         (identifier,),
     ).fetchone()
-    if row is None or type(row[0]) is not int or row[0] < 0:
-        return None
-    result = json.loads(row[1])
-    return row[0] + 1 if isinstance(result, dict) and result.get("pause_verified") is True else None
+    result = json.loads(row[0]) if row is not None else None
+    return isinstance(result, dict) and result.get("pause_verified") is True
 
 
 # Validate the two reports belonging to the closed session recorded in a terminal operator proof.
@@ -134,12 +132,11 @@ def recovery_history_settled(db: sqlite3.Connection, meta: dict[str, Any], revis
     mappings, operators, release = (meta.get(key, {}) for key in (DELIVERY_MAPPINGS, PROOFS, RELEASE_PROOF))
     if not all(isinstance(value, dict) for value in (mappings, operators, release)):
         return False
-    pause = release.get("pause_request")
-    verified = pause_revision(db, pause)
+    pause, pause_revision = release.get("pause_request"), release.get("revision")
     if (
-        verified is None
-        or verified != release.get("revision")
-        or verified > revision
+        not verified_pause(db, pause)
+        or type(pause_revision) is not int
+        or not 0 < pause_revision <= revision
         or release.get("zero_hold_retained") is not True
         or release.get("charging_started") is not False
     ):
@@ -152,12 +149,10 @@ def recovery_history_settled(db: sqlite3.Connection, meta: dict[str, Any], revis
         if not isinstance(proof, dict) or proof.get("version") != 2 or not isinstance(completed, dict):
             return False
         attestation = DeliveryAttestation.parse(proof.get("attestation"), recent=False)
-        completed_revision = pause_revision(db, completed.get("pause"))
         if (
             local != str(attestation.local)
             or fingerprint(proof["attestation"]) != proof.get("input_digest")
-            or completed_revision is None
-            or completed_revision > verified
+            or not verified_pause(db, completed.get("pause"))
             or not closed_pair(
                 db, attestation.local, attestation.vendor, attestation.start_digest, attestation.stop_digest
             )
@@ -173,8 +168,7 @@ def recovery_history_settled(db: sqlite3.Connection, meta: dict[str, Any], revis
         if not isinstance(proof, dict) or not proof_headers_match(proof, identifier) or not operator_closed(db, proof):
             return False
         if isinstance(completed, dict):
-            completed_revision = pause_revision(db, completed.get("pause"))
-            if completed_revision is None or completed_revision > verified or entry.get("superseded"):
+            if not verified_pause(db, completed.get("pause")) or entry.get("superseded"):
                 return False
             if completed["pause"] == pause:
                 latest_operators.append(proof)
