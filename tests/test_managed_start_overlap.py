@@ -19,6 +19,7 @@ from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, TimerBench, timer_bench
 from tests.prototype_rig import START
 from tests.runtime_rig import until
+from tests.test_managed_stop_reply_recovery import ReplyBench
 from tests.tls_support import tls as tls
 
 
@@ -77,8 +78,8 @@ async def close_in_order(b: TimerBench, owner: int, first: str, returning: str |
         b.device.active = None
 
 
-# Intent: daily before/after Start ACK survives normal startup expiry, following nights and late owner closure.
-# Why: an unrelated command's timeout must not acquire durable Pause or Stop authority over a real native daily.
+# Intent: daily charging survives expired Start before/after its ACK and a delayed cloud Stop reply at closure.
+# Why: the expired Start may stop only its own session, and app control must recover once that Stop settles.
 @pytest.mark.parametrize("before_ack", [False, True])
 @pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("selected", [6, 32])
@@ -91,7 +92,7 @@ async def test_daily_survives_owner_start_timeout_and_following_nights(
     demand: bool,
     selected: int,
 ) -> None:
-    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+    async with timer_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as b:
         owner_tag(b)
         if selected != 6:
             b.c.command(uuid.uuid4().hex, "set_current", b.c.requests.intent().revision, current_a=selected)
@@ -144,7 +145,18 @@ async def test_daily_survives_owner_start_timeout_and_following_nights(
         for _ in range(3):
             await b.c.tick()
         assert set(b.stops()) == {owner} and b.device.effective_limit() == 0
-        await close_in_order(b, owner, "native" if before_ack else "ledger")
+        await until(lambda: b.session.journal.next_delivery() is None)
+        stop_ack = b.rig.bench.stop_gate = asyncio.Event()
+        try:
+            await close_in_order(b, owner, "native" if before_ack else "ledger")
+            await until(lambda: bool(getattr(b.rig.bench, "held_stop_replies", [])))
+            # Across repeated polls, pending delivery retains zero and the retry that will restore app control.
+            for _ in range(2):
+                status = await b.c.tick()
+                assert not b.session.journal.fault.latched(), status
+                assert not status["owner_control_enabled"] and b.device.effective_limit() == 0
+        finally:
+            stop_ack.set()
         assert (await healthy(b.c))["station_ceiling_a"] == selected
         assert b.c.requests.intent() == intent
         next_night = await b.advance_idle_to(int(datetime(2026, 11, 13, tzinfo=ZONE).timestamp()))

@@ -790,6 +790,9 @@ class ManagedCharging:
             owner_closed = self.ended_at_idle(native, unissued=unissued)
             if owner_closed:
                 if expected.mode == "app" and (not g.controls.ready or g.controls.desired() == 0):
+                    if not self.scoped_normal_stop():
+                        # If the Start is settled, connection recovery owns any retry while cloud Stop is pending.
+                        c.released_epoch = None
                     progress = await c.recovery.restore(expected)
                     if not progress.shared:
                         return True

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Retry restoration of app/schedule control when an expired Start has closed and its cloud Stop reply is pending.
 - Keep verified zero visible while lifecycle delivery is blocked, and refresh control availability when the
   failure arrives between supervision polls.
 - Hold the station at zero while an unplugged session closes. Keep old failed current and Return receipts
