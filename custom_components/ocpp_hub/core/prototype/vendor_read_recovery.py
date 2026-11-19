@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .managed_intent import ControlIntent, write_intent
+from .managed_intent import ControlIntent, unfinished_owner_requests, write_intent
 from .policy import READS
 from .store import Journal
 
@@ -64,13 +64,7 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
         managed_requests = journal.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'"
         ).fetchone()
-        if (
-            managed_requests
-            and journal.db.execute(
-                "SELECT 1 FROM managed_requests WHERE action!='pause' "
-                "AND state IN ('accepted','running','uncertain') LIMIT 1"
-            ).fetchone()
-        ):
+        if managed_requests and unfinished_owner_requests(journal):
             return False
         migration: dict[str, Any] = {"marker": marker, "prior_fault": fault, "at_epoch": time.time()}
         journal.put("vendor_read_failure_recovery", migration)

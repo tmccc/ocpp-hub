@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -46,6 +47,82 @@ def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesc
     intent = current.next(mode, coalesce=coalesce)
     journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
     return intent
+
+
+# Recognise an old timed Start only when the saved history repair proves its exact later, verified Pause.
+def resolved_timed_starts(
+    db: sqlite3.Connection, proof: object, revision: int, active_test_id: object
+) -> frozenset[str]:
+    if not isinstance(proof, dict):
+        return frozenset()
+    prior = decode_intent(proof.get("prior_intent"))
+    fault, entries = proof.get("prior_fault"), proof.get("superseded_test_proofs")
+    if not isinstance(fault, dict) or not isinstance(entries, list):
+        return frozenset()
+    fault_at, repaired_at = fault.get("at_epoch"), proof.get("at_epoch")
+    if (
+        fault.get("classification") != "native_authority_or_preservation_failed"
+        or not isinstance(fault_at, (int, float))
+        or not isinstance(repaired_at, (int, float))
+        or isinstance(fault_at, bool)
+        or isinstance(repaired_at, bool)
+        or not 0 < fault_at <= repaired_at <= time.time() + 2
+        or prior.revision >= revision
+    ):
+        return frozenset()
+    resolved: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return frozenset()
+        request, pause = entry.get("request_id"), entry.get("verified_pause_id")
+        if (
+            not isinstance(request, str)
+            or not isinstance(pause, str)
+            or request == active_test_id
+            or request in resolved
+        ):
+            return frozenset()
+        row = db.execute(
+            "SELECT start.result, pause.result FROM managed_requests start JOIN managed_requests pause ON pause.id=? "
+            "WHERE start.id=? AND start.action='start_test' AND start.state='uncertain' "
+            "AND pause.action='pause' AND pause.state='completed' AND start.rowid<pause.rowid "
+            "AND 0<=start.revision AND start.revision<pause.revision AND pause.revision<?",
+            (pause, request, prior.revision),
+        ).fetchone()
+        if row is None or json.loads(row[0]) != {"classification": "start_not_confirmed"}:
+            return frozenset()
+        result = json.loads(row[1])
+        if not isinstance(result, dict):
+            return frozenset()
+        completed = result.get("completed_at")
+        if (
+            result.get("pause_verified") is not True
+            or not isinstance(completed, (int, float))
+            or isinstance(completed, bool)
+            or not 0 < completed <= fault_at
+        ):
+            return frozenset()
+        resolved.add(request)
+    return frozenset(resolved)
+
+
+# Keep live owner debt separate from a completed historical proof, without rewriting either receipt.
+def unfinished_owner_requests(journal: Journal, *, include_pause: bool = False) -> list[sqlite3.Row]:
+    rows = journal.db.execute(
+        "SELECT * FROM managed_requests WHERE (action!='pause' OR ?) "
+        "AND state IN ('accepted','running','uncertain') ORDER BY rowid DESC",
+        (include_pause,),
+    ).fetchall()
+    proof = journal.get("native_start_attempt_recovery")
+    if not rows or proof is None:
+        return rows
+    resolved = resolved_timed_starts(
+        journal.db,
+        proof,
+        decode_intent(journal.get("managed_control_intent")).revision,
+        journal.get("managed_test_charge", {}).get("id"),
+    )
+    return [row for row in rows if row["id"] not in resolved]
 
 
 @dataclass(frozen=True)
@@ -125,12 +202,10 @@ class ManagedRequests:
 
     # Historical UUID results remain immutable identities; only unresolved work consumes the bounded ordinary pool.
     def has_capacity(self) -> bool:
-        return bool(
-            self.journal.db.execute(
-                "SELECT COUNT(*) FROM managed_requests WHERE state IN ('accepted','running','uncertain')"
-            ).fetchone()[0]
-            < 4095
-        )
+        count = self.journal.db.execute(
+            "SELECT COUNT(*) FROM managed_requests WHERE state IN ('accepted','running','uncertain')"
+        ).fetchone()[0]
+        return count < 4095 or len(unfinished_owner_requests(self.journal, include_pause=True)) < 4095
 
     # Duplicate request identifiers bind both the action and caller's observed revision; no retry repeats a write.
     def existing(self, identifier: str, action: str, revision: int) -> dict[str, Any] | None:

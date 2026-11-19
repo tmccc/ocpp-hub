@@ -40,9 +40,9 @@ class HeartbeatPeer:
         return frames()
 
 
-# Intent: a Heartbeat arriving during native validation retains one accepted Return; genuine queued debt does not.
-# Why: fresh proof can wait before dispatch, while pending history and uncertain outcomes retain their own guards.
-@pytest.mark.parametrize("case", ["fast", "heartbeat", "observation_debt", "new_pause"])
+# Intent: routine cloud observations before or during native validation retain the same accepted Return.
+# Why: a later Pause may still supersede it, and no positive offer can precede verified delivery and zero.
+@pytest.mark.parametrize("case", ["fast", "heartbeat", "observation-before", "observation-during", "new_pause"])
 async def test_return_waits_for_cloud_rpc_before_positive_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch, case):
     armed, seen, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     actual = Bench.vendor
@@ -58,25 +58,34 @@ async def test_return_waits_for_cloud_rpc_before_positive_dispatch(tmp_path, tls
         assert (await healthy(c))["local_hold_verified"]
         before = len(b.rig.bench.received_limits)
         request = uuid.uuid4().hex
+
+        # Use a real charger observation while the vendor transport is busy with a Heartbeat.
+        async def queue_observation():
+            reply = await b.rig.bench.call(
+                b.charger,
+                "genuine-queued-observation",
+                "StatusNotification",
+                {"connectorId": 1, "status": "Available", "errorCode": "NoError"},
+            )
+            assert reply[0] == 3 and b.session.journal.next_delivery() is not None
+
+        if case == "observation-before":
+            armed.set()
+            await asyncio.wait_for(seen.wait(), 2)
+            await queue_observation()
         peer.arm = True
         c.command(request, "app_control", c.requests.intent().revision)
         tick = asyncio.create_task(c.tick())
         try:
             await asyncio.wait_for(peer.entered.wait(), 2)
-            if case != "fast":
+            if case not in ("fast", "observation-before"):
                 armed.set()
                 await asyncio.wait_for(seen.wait(), 2)
-            if case == "observation_debt":
-                reply = await b.rig.bench.call(
-                    b.charger,
-                    "genuine-queued-observation",
-                    "StatusNotification",
-                    {"connectorId": 1, "status": "Available", "errorCode": "NoError"},
-                )
-                assert reply[0] == 3 and b.session.journal.next_delivery() is not None
+            if case == "observation-during":
+                await queue_observation()
             peer.release.set()
             await tick
-            expected = "completed" if case == "fast" else "uncertain" if case == "observation_debt" else "accepted"
+            expected = "completed" if case == "fast" else "accepted"
             assert c.requests.receipt(request)["state"] == expected
             if case != "fast":
                 assert b.rig.bench.firmware.effective_limit() == 0
@@ -87,11 +96,6 @@ async def test_return_waits_for_cloud_rpc_before_positive_dispatch(tmp_path, tls
                 assert c.requests.receipt(request)["state"] == "failed"
             release.set()
             await until(lambda: not g.vendor._pending and b.session.journal.next_delivery() is None)
-            if case == "observation_debt":
-                old = request
-                request = uuid.uuid4().hex
-                c.command(request, "app_control", c.requests.intent().revision)
-                assert c.requests.receipt(old)["state"] == "uncertain"
             if case == "new_pause":
                 assert (await healthy(c))["local_hold_verified"] and b.rig.bench.firmware.effective_limit() == 0
             else:

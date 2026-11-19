@@ -10,7 +10,7 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
-from .managed_intent import ControlIntent, write_intent
+from .managed_intent import ControlIntent, unfinished_owner_requests, write_intent
 from .native_bounded import NativeBoundedSpec
 from .native_history import NativeHistoryArchive, audit_history, history_policy
 from .native_start_attempts import split_attempts
@@ -104,12 +104,8 @@ def _reconcile(
         or journal.active() is not None
         or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
         or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-        or (
-            not attempts
-            and journal.db.execute(
-                "SELECT 1 FROM managed_requests WHERE state IN ('accepted','running','uncertain') LIMIT 1"
-            ).fetchone()
-        )
+        or not attempts
+        and unfinished_owner_requests(journal, include_pause=True)
     ):
         raise RecoveryRequiredError("history reconciliation requires the matching native fault and a settled journal")
     spec.require_boot(journal.get("boot"))

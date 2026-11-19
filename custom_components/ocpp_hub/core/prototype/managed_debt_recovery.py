@@ -17,10 +17,12 @@ from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
 from .managed_denial_faults import (
     current_operator_proof,
+    operator_for_queued_start,
     operator_wire_settled,
     pending_mapping_headers,
     proof_headers_match,
 )
+from .managed_intent import unfinished_owner_requests
 from .managed_recovery_zero import require_original_zero
 from .managed_start_delivery import KIND as START_KIND
 from .managed_start_delivery import RETRIES, start_resolution
@@ -39,16 +41,32 @@ KEY = "managed_operator_debt_reconciliations"
 FAULT = "operator_debt_reconciled_at_zero"
 
 
+# A later Start may take over only after the earlier proof's own wire work genuinely settled.
+def start_retry_predecessor(j: Journal, spec: NativeBoundedSpec) -> dict[str, Any] | None:
+    head = j.next_delivery()
+    if head is None or head.action != "StartTransaction" or head.state not in ("ambiguous", "rejected"):
+        return None
+    previous = operator_for_queued_start(j, j.fault.read({}), head)
+    if (
+        previous is None
+        or previous["anchor"] != delivery_anchor(j, spec)
+        or previous["resolved"] != resolved_debt(j, previous["kind"], previous)
+    ):
+        return None
+    return previous
+
+
 # Preserve exact private preimages in the durable proof without publishing raw tags, native bodies or credentials.
 def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, Any]:
     grant = j.get("vendor_start_grant")
     row = j.db.execute("SELECT * FROM mutations WHERE token=?", ((grant or {}).get("mutation"),)).fetchone()
     mappings = pending_mapping_headers(j)
+    previous = start_retry_predecessor(j, spec) if kind == START_KIND else None
     return {
         "anchor": delivery_anchor(j, spec),
         "intent": j.get("managed_control_intent"),
         "control": j.get("control"),
-        "fault": j.fault.read(),
+        "fault": previous["prior"]["fault"] if previous is not None else j.fault.read(),
         "mutations": [dict(r) for r in j.db.execute("SELECT * FROM mutations WHERE state!='confirmed' ORDER BY token")],
         "marker": j.get("uncertain_vendor_command"),
         "grant": grant,
@@ -60,27 +78,32 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "test": j.get("managed_test_charge"),
         "receipt": j.get("local_start_receipt"),
         "deferred": j.get("managed_deferred_start"),
-        "requests": [
-            dict(r)
-            for r in j.db.execute(
-                "SELECT * FROM managed_requests WHERE action!='pause' AND state IN ('accepted','running','uncertain') "
-                "ORDER BY id"
-            )
-        ],
+        "requests": [dict(row) for row in sorted(unfinished_owner_requests(j), key=lambda row: row["id"])],
         "head": asdict(head) if (head := j.next_delivery()) is not None else None,
         "outbox": [dict(row) for row in j.db.execute("SELECT * FROM outbox ORDER BY seq")],
         "transactions": [dict(row) for row in j.db.execute("SELECT * FROM transactions ORDER BY local")],
         "kind": kind,
+        **(
+            {"previous_operator": {"id": previous["installed_fault"]["proof"], "digest": fingerprint(previous)}}
+            if previous is not None
+            else {}
+        ),
         **({"delivery_mappings": mappings} if mappings else {}),
         **({"storage_resolution": storage_resolution(j)} if kind == "storage-fault" else {}),
     }
 
 
 # Current work, other owner requests and original-session uncertainty cannot be waived by another debt's proof.
-def require_common_debt_idle(j: Journal, kind: str) -> None:
+def require_common_debt_idle(j: Journal, kind: str, snapshot: dict[str, Any]) -> None:
+    predecessor = snapshot.get("previous_operator")
     if (
-        any(entry.get("completed") is None and not entry.get("superseded") for entry in j.get(KEY, {}).values())
-        or j.fault.read({}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
+        any(
+            entry.get("completed") is None
+            and not entry.get("superseded")
+            and (predecessor is None or key != predecessor["id"])
+            for key, entry in j.get(KEY, {}).items()
+        )
+        or (snapshot["fault"] or {}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
         or kind not in ("observation", "stop-delivery", START_KIND, COMBINED_KIND)
         and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
@@ -387,8 +410,8 @@ def debt_candidate(
     if kind not in ATTESTATIONS:
         raise RecoveryRequiredError("unknown operator reconciliation kind")
     require_original_zero(j, book, spec, n)
-    require_common_debt_idle(j, kind)
     snapshot = debt_snapshot(j, spec, kind)
+    require_common_debt_idle(j, kind, snapshot)
     if kind == COMBINED_KIND:
         specific = combined_candidate(j, snapshot)
     elif kind == "local-start":
@@ -477,7 +500,7 @@ def reconcile_debt(
     records, identifier = j.get(KEY, {}), fingerprint(e)
     if identifier in records:
         if records[identifier].get("superseded"):
-            raise RecoveryRequiredError("operator proof was superseded by another actual cloud reply")
+            raise RecoveryRequiredError("operator proof was superseded by later delivery recovery")
         proof = records[identifier]["proof"]
         if (
             proof["kind"] != kind
@@ -566,6 +589,12 @@ def reconcile_debt(
             j.db.execute("DELETE FROM outbox WHERE token=?", (head.token,))
         control = j.get("control")
         j.starts.operator_control(control)
+        if predecessor := snapshot.get("previous_operator"):
+            key = predecessor["id"]
+            records[key] = {
+                **records[key],
+                "superseded": {"reason": "later_start_retry", "proof": identifier, "at_epoch": time.time()},
+            }
         j.fault.replace(fault)
         proof["resolved"] = resolved_debt(j, kind, proof)
         j.put(KEY, {**records, identifier: {"proof": proof, "completed": None}})

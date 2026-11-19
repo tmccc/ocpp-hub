@@ -9,7 +9,7 @@ from typing import Any
 
 from .managed_combined_start_recovery import KIND as COMBINED_KIND
 from .managed_combined_start_recovery import combined_stop_matches, record_combined_stop_ack
-from .managed_denial_faults import DELIVERY_MAPPINGS, retained_denial_fault
+from .managed_denial_faults import DELIVERY_MAPPINGS, operator_wire_settled, retained_denial_fault
 from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 
 REJECTION = "managed_stop_reply_rejection"
@@ -88,7 +88,7 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
                     or proof["kind"] == "start-delivery"
                     and proof["attestation"]["local_transaction_id"] == item.transaction
                     and proof.get("start_wire_ack") is not None
-                    or proof.get("wire_ack") is not None
+                    or operator_wire_settled(proof)
                     and j.db.execute(
                         "SELECT 1 FROM outbox WHERE token=?", (proof["attestation"]["delivery_token"],)
                     ).fetchone()

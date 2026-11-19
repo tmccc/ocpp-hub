@@ -315,7 +315,19 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
     if authorization is not None:
         return START_AUTHORIZATION[authorization]
     if detail["pending_command_count"]:
-        return "A recorded command is still awaiting its confirmed outcome."
+        rows = detail["pending_commands"]
+        if any(row["confirmation"] == "pending" for row in rows):
+            return "A recorded command is still awaiting its confirmed outcome."
+        if (
+            data.get("desired_control") == "paused"
+            and rows
+            and not detail["commands_truncated"]
+            and all(row["action"] == "app_control" for row in rows)
+        ):
+            if data.get("can_return") is True:
+                return "The previous Return ended without confirmation. Press Return again to try again."
+            return "The previous Return ended without confirmation."
+        return REASONS["command_outcome_unknown"]
     return (
         "No problem reported in the latest verified status."
         if data.get("healthy") is True

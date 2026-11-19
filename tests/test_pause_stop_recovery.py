@@ -2,7 +2,6 @@
 
 import asyncio
 import copy
-import sqlite3
 import uuid
 
 import pytest
@@ -285,8 +284,7 @@ async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
         )
         try:
             assert c.pause_task is not None
-            with pytest.raises(sqlite3.IntegrityError):
-                await asyncio.wait_for(c.pause_task, 8)
+            await asyncio.wait_for(c.pause_task, 8)
         finally:
             j.db.execute("DROP TRIGGER review_pause_binding_refusal")
         assert len(attempts) == 1 and attempts[0] != original_ticket

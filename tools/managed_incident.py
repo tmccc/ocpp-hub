@@ -200,7 +200,7 @@ def lifecycle_fields(db: sqlite3.Connection, local: object) -> tuple[str, str, l
     delivery = [
         {
             "event": action,
-            "state": state if state in ("queued", "inflight", "ambiguous") else UNKNOWN,
+            "state": state if state in ("queued", "inflight", "ambiguous", "rejected") else UNKNOWN,
             "reply_saved": bool(reply_saved),
         }
         for action, state, reply_saved in db.execute(

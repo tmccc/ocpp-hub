@@ -139,6 +139,26 @@ def proof_denial_member(proof: dict[str, Any], denial: dict[str, Any]) -> bool:
     return archived_start_matches(proof, denial["start_token"], denial["local"], denial["start_digest"])
 
 
+# A later queued Start belongs to the same recovery only after the earlier proof's wire work is settled.
+def operator_for_queued_start(j: Journal, fault: dict[str, Any], head: Delivery) -> dict[str, Any] | None:
+    proof = current_operator_proof(j, fault)
+    if (
+        proof is None
+        or proof["kind"] not in ("start-delivery", "stop-delivery")
+        or not operator_wire_settled(proof)
+        or not operator_mapping_members_match(j, proof)
+        or not archived_start_matches(proof, head.token, head.transaction, fingerprint(head.payload), queued_only=True)
+    ):
+        return None
+    source = proof["prior"].get("fault") or {}
+    if source.get("classification") != GENERIC or any(
+        denial.get("completed") is None and denial.get("fault") == source and not proof_denial_member(proof, denial)
+        for denial in j.get(DENIALS, {}).values()
+    ):
+        return None
+    return proof
+
+
 # A new explicit proof may explain today's generic latch, but never an older null or unrelated native fault.
 def denial_source_fault(j: Journal, fault: dict[str, Any]) -> dict[str, Any] | None:
     if fault.get("classification") == GENERIC:

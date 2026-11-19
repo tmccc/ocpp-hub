@@ -14,12 +14,8 @@ from .control_state import ControlState
 from .events import OBSERVATION_ACTIONS
 from .managed_current import managed_current_ceiling
 from .managed_denial_faults import DELIVERY_MAPPINGS as KEY
-from .managed_denial_faults import (
-    archived_start_matches,
-    current_operator_proof,
-    operator_mapping_members_match,
-    operator_wire_settled,
-)
+from .managed_denial_faults import operator_for_queued_start, operator_mapping_members_match
+from .managed_intent import unfinished_owner_requests
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .security import SecurityError
@@ -141,10 +137,7 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
         or any(v != 0 for v in n.currents_a + n.powers_w)
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
         or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-        or j.db.execute(
-            "SELECT 1 FROM managed_requests WHERE action!='pause' "
-            "AND state IN ('accepted','running','uncertain') LIMIT 1"
-        ).fetchone()
+        or unfinished_owner_requests(j)
         or not j.current_change.read().settled_or_missing
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
         or j.get("managed_test_charge", {}).get("state") not in (None, "completed")
@@ -214,16 +207,9 @@ def require_queued_backlog(j: Journal, head: Delivery) -> None:
 def delivery_source(j: Journal, fault: dict[str, Any], head: Delivery) -> tuple[dict[str, Any], str | None]:
     if fault.get("classification") == FAULT:
         return fault, None
-    operator = current_operator_proof(j, fault)
-    if (
-        operator is not None
-        and operator["kind"] in ("start-delivery", "stop-delivery")
-        and operator_wire_settled(operator)
-        and operator_mapping_members_match(j, operator)
-        and archived_start_matches(operator, head.token, head.transaction, fingerprint(head.payload), queued_only=True)
-        and (source := operator["prior"].get("fault") or {}).get("classification") == FAULT
-    ):
-        return source, fault["proof"]
+    operator = operator_for_queued_start(j, fault, head)
+    if operator is not None:
+        return operator["prior"]["fault"], fault["proof"]
     raise RecoveryRequiredError("the Start belongs to a different or unfinished operator recovery")
 
 

@@ -93,6 +93,27 @@ async def test_actual_control_mode_sensor_explains_start_renewal(actual_hass, pe
     assert entry.runtime_data.data["healthy"] is True
 
 
+# Intent: an unconfirmed Return has ended, while an accepted Return is still in progress.
+# Why: the owner needs to know whether to wait or press Return again.
+async def test_actual_control_mode_explains_unconfirmed_return(actual_hass, peer):
+    value = detail()
+    value["pending_commands"][0]["action"] = "app_control"
+    state = peer["state"]
+    state.update(diagnostics=value, desired_control="paused", local_hold_verified=True, can_return=True)
+    entry = await setup(actual_hass, peer)
+    entity_id = "sensor.ics_proxy_control_mode"
+    assert "Press Return again" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]
+
+    state["can_return"] = False
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(entity_id).attributes["diagnostic_summary"] == (
+        "The previous Return ended without confirmation."
+    )
+    value["pending_commands"][0].update(state="accepted", confirmation="pending")
+    await entry.runtime_data.async_refresh()
+    assert "still awaiting" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]
+
+
 # Intent: English explanations distinguish unknown/strict outcomes, storage waits, measurement faults and Pause.
 # Why: a fault label must not suggest ordinary Pause/Return can waive an interrupted or strict recovery audit.
 @pytest.mark.parametrize(

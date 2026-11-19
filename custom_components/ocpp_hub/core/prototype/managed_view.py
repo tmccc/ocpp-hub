@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .managed_diagnostics import snapshot as diagnostic_snapshot
+from .managed_facts import ManagedFacts
+from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .native_history import latest_completion_available
 from .store import Journal
 from .supervision import ControlProof, HealthVerdict, PollStatus
@@ -346,6 +348,11 @@ def _return_refusal(c: ManagedController, mode: str, status: dict[str, Any]) -> 
         return "managed_start_active"
     if not c.requests.has_capacity():
         return "request_capacity_exhausted"
+    journal = c.session.journal
+    if not ManagedFacts(c).cloud_queue_empty() and not (
+        awaiting_known_stops(journal) or awaiting_observations(journal)
+    ):
+        return "delivery_needs_reconciliation"
     return None
 
 
@@ -381,6 +388,8 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         or c.authority() != c.status_authority
     )
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
+    if not (scope_current and intent_current):
+        result["station_ceiling_a"] = None
     if not intent_current:
         pending = result.get("fault") in ("current_update_pending", "start_operation_pending")
         result.update(state="pausing" if intent.mode == "paused" and not pending else "reconciling")

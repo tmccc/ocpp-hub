@@ -1146,8 +1146,9 @@ management credentials do not grant transaction-mapping authority.
 
 Each later unmapped charge must have its exact saved Start and Stop in the queue, and meter readings must name their
 own session. The tool refuses separately uncertain reports, missing closure, unresolved commands, changed configuration
-or history, and unconfirmed station zero. Unfinished retired one-off obligations refuse journal startup before this
-workflow can run.
+or history, and unconfirmed station zero. Vendor recovery and rollback use the same verified Pause proof for a resolved
+historical timed Start. The original timed Start receipt remains in history. Unfinished retired one-off obligations
+refuse journal startup before this workflow can run.
 
 `tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for nine specific debts:
 
@@ -1194,6 +1195,8 @@ event identity and queued genuine Stop. Actual Start mapping and Stop acknowledg
 a new Pause can consume the proof. A further unknown outcome or exhausted retry supersedes that permission and
 supports new exact mapping or retry evidence, including after process replacement. Legacy rejected Starts can
 also use the mapping workflow when the actual cloud transaction number is independently established.
+If a later report needs its own recovery after an earlier one has received its required wire acknowledgements,
+the next recovery can take over while retaining the earlier acknowledgements and the zero hold.
 
 `storage-fault` requires literal `command_quiescent: true`, `fault_origin_independently_verified: true` and
 `original_state_independently_verified: true`, with the inspected fault and diagnostic/history digests. Zero and an

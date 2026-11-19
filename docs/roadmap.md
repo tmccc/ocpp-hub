@@ -26,6 +26,9 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] The [rollback check](release-process.md#rehearsed-standalone-software-rollback) accepts the settled migrated
   journal used in the offline rehearsal. The older build kept its history, saved current and latest Pause. A
   separate Return allowed the next scheduled charge to complete.
+- [x] Vendor recovery, rollback and diagnostics share the same proof for a resolved historical timed Start.
+  The catch-up regression keeps that receipt and verifies successive accepted Start, rejected Stop and unaccepted
+  Start repairs on the same migrated journal before a fresh Pause and Return.
 
 ## Current iCS implementation — 18 November 2026
 

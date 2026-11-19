@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+from .events import OBSERVATION_ACTIONS
 from .managed_sources import awaiting_owner_start
 from .store import Journal
+
+
+# Routine observations wait for delivery without owning or changing any physical command.
+def awaiting_observations(journal: Journal) -> bool:
+    rows = journal.db.execute(
+        "SELECT q.action,q.state,q.local,t.vendor FROM outbox q LEFT JOIN transactions t ON t.local=q.local"
+    ).fetchall()
+    return bool(rows) and all(
+        action in OBSERVATION_ACTIONS and state in ("queued", "inflight") and (local is None or vendor is not None)
+        for action, state, local, vendor in rows
+    )
 
 
 # No inferred lifecycle, unrelated observation, unknown mapping or ambiguous write qualifies for this narrow wait.

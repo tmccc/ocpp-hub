@@ -322,6 +322,8 @@ async def test_pause_requires_actual_closure_and_works_with_cloud_offline(
 # Intent: an explicit Pause lowers the commissioned charger before waiting on even the first native response.
 # Why: a stalled read can outlast a deadline and zero current alone cannot complete the owner's Pause receipt.
 async def test_pause_restricts_station_while_native_observation_is_stalled(tmp_path, tls, unused_tcp_port, monkeypatch):
+    from ocpp_hub_core.prototype.managed_view import refresh_for_read
+
     async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
         await session.start()
@@ -329,7 +331,7 @@ async def test_pause_restricts_station_while_native_observation_is_stalled(tmp_p
         rig.route_to_trial()
         async with rig.charger(session) as charger:
             await introduced(rig, session, charger, "pause-telemetry-stall")
-            await healthy(controller)
+            published = envelope(await healthy(controller))
             observe = controller.native.observe
             entered, resume = asyncio.Event(), asyncio.Event()
 
@@ -345,10 +347,14 @@ async def test_pause_restricts_station_while_native_observation_is_stalled(tmp_p
             try:
                 await asyncio.wait_for(entered.wait(), 2)
                 assert rig.bench.firmware.effective_limit() == 0
+                with_old_sample = refresh_for_read(controller, published)
+                assert with_old_sample["station_ceiling_a"] is None
+                assert with_old_sample["requested_current_a"] == 6 and with_old_sample["native_age_seconds"] < 15
                 assert controller.requests.receipt(request)["state"] == "accepted"
                 assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
             finally:
                 resume.set()
                 await controller.pause_task
-            assert (await healthy(controller))["local_hold_verified"]
+            paused = refresh_for_read(controller, envelope(await healthy(controller)))
+            assert paused["local_hold_verified"] and paused["station_ceiling_a"] == 0
             assert controller.requests.receipt(request)["state"] == "completed" and not starts(rig)

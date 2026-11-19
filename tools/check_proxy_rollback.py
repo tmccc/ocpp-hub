@@ -24,7 +24,11 @@ from tools.trial_proxy import load_core  # noqa: E402
 load_core()
 from ocpp_hub_core.control import HUB_PROFILE_ID  # noqa: E402
 from ocpp_hub_core.prototype.control_state import ControlState  # noqa: E402
-from ocpp_hub_core.prototype.managed_intent import decode_intent, decode_pause_claim  # noqa: E402
+from ocpp_hub_core.prototype.managed_intent import (  # noqa: E402
+    decode_intent,
+    decode_pause_claim,
+    resolved_timed_starts,
+)
 from ocpp_hub_core.prototype.native_history import indexed  # noqa: E402
 from ocpp_hub_core.prototype.native_start_attempts import split_attempts  # noqa: E402
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
@@ -344,64 +348,18 @@ def require_migrated_history(db: sqlite3.Connection, meta: dict[str, Any]) -> No
     require({fingerprint(body) for body in attempts.values()} <= archived_attempts, "native_history_unverified")
 
 
-# Admit only old timed Starts whose exact later verified Pause is in the saved reconciliation proof.
+# Require every unsettled row to have the same exact historical proof understood by vendor recovery.
 def require_settled_requests(db: sqlite3.Connection, meta: dict[str, Any], *, migrated: bool, revision: int) -> None:
-    pending = db.execute(
-        "SELECT rowid,id,action,revision,state,result FROM managed_requests WHERE state NOT IN ('completed','failed')"
-    ).fetchall()
+    pending = {
+        row[0] for row in db.execute("SELECT id FROM managed_requests WHERE state NOT IN ('completed','failed')")
+    }
     if not pending:
         return
-    proof = meta.get("native_start_attempt_recovery")
-    require(migrated and isinstance(proof, dict), "unresolved_request")
-    prior = decode_intent(proof.get("prior_intent"))
-    fault = proof.get("prior_fault")
-    entries = proof.get("superseded_test_proofs")
-    require(
-        isinstance(fault, dict) and isinstance(entries, list) and len(entries) == len(pending), "unresolved_request"
+    require(migrated, "unresolved_request")
+    resolved = resolved_timed_starts(
+        db, meta.get("native_start_attempt_recovery"), revision, meta.get("managed_test_charge", {}).get("id")
     )
-    fault_at, recovered_at = fault.get("at_epoch"), proof.get("at_epoch")
-    require(
-        fault.get("classification") == "native_authority_or_preservation_failed"
-        and type(fault_at) in (int, float)
-        and type(recovered_at) in (int, float)
-        and 0 < fault_at <= recovered_at <= time.time() + 2
-        and prior.revision < revision
-        and all(
-            isinstance(entry, dict)
-            and isinstance(entry.get("request_id"), str)
-            and isinstance(entry.get("verified_pause_id"), str)
-            for entry in entries
-        ),
-        "unresolved_request",
-    )
-    pauses = {entry["request_id"]: entry["verified_pause_id"] for entry in entries}
-    active_test = meta.get("managed_test_charge", {})
-    for rowid, identifier, action, request_revision, state, result in pending:
-        require(
-            action == "start_test"
-            and state == "uncertain"
-            and identifier != active_test.get("id")
-            and identifier in pauses
-            and json.loads(result) == {"classification": "start_not_confirmed"},
-            "unresolved_request",
-        )
-        pause = db.execute(
-            "SELECT rowid,revision,result FROM managed_requests WHERE id=? AND action='pause' AND state='completed'",
-            (pauses[identifier],),
-        ).fetchone()
-        require(pause is not None, "unresolved_request")
-        pause_order, pause_revision, raw_pause = pause
-        pause_result = json.loads(raw_pause)
-        require(isinstance(pause_result, dict), "unresolved_request")
-        completed = pause_result.get("completed_at")
-        require(
-            rowid < pause_order
-            and 0 <= request_revision < pause_revision < prior.revision
-            and pause_result.get("pause_verified") is True
-            and type(completed) in (int, float)
-            and 0 < completed <= fault_at,
-            "unresolved_request",
-        )
+    require(pending == resolved, "unresolved_request")
 
 
 # Evaluate only the paused, settled journal variant proved by the cross-build rehearsal.

@@ -21,11 +21,14 @@ from tests.native_schedule_support import ZONE, SchedulePeer, window
 from tests.process_helpers import process_rig
 from tests.prototype_rig import START
 from tests.runtime_rig import until
+from tests.test_proxy_rollback_history import retain_timed_start
 from tests.tls_support import tls as tls
+from tests_installation.migrated_layout import seed_old_layout
 from tools import reconcile_managed_debt as debt_tool
 from tools import reconcile_managed_delivery as delivery_tool
 
 REPORTS = ("StartTransaction", "MeterValues", "StopTransaction")
+OPERATOR = "managed_operator_debt_reconciliations"
 
 
 class LostVendorReply:
@@ -41,6 +44,14 @@ class LostVendorReply:
     async def __aiter__(self):
         async for raw in self.connection:
             frame = decode(raw)
+            if frame[0] == 2 and frame[2] == "StartTransaction" and frame[3]["timestamp"] == self.bench.drop_start:
+                # This Start reaches the vendor transport but never enters the independent vendor ledger.
+                self.bench.drop_start = None
+                self.bench.unaccepted_start = frame
+                self.bench.vendor_available = False
+                await self.connection.close(code=1011)
+                self.bench.interrupted.set()
+                return
             wanted = self.bench.interrupt
             if wanted is not None and frame[0] == 2 and (frame[2], frame[3].get("timestamp")) == wanted:
                 self.pending_token = frame[1]
@@ -73,6 +84,8 @@ class CatchupBench(StartReplyBench):
         self.refused = asyncio.Event()
         self.interrupted = asyncio.Event()
         self.interrupt = None
+        self.drop_start = None
+        self.unaccepted_start = None
         self.hold_stop = None
         self.stop_waiting = asyncio.Event()
         self.release_stop = asyncio.Event()
@@ -304,6 +317,7 @@ def queued_reports(snapshot):
 # Why: inserting rows directly could conceal a failure in the proxy's acceptance or saved ordering.
 @pytest.fixture
 async def backlog(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    seed_old_layout(tmp_path / "state.db")
     port = unused_tcp_port_factory
     async with process_rig(
         tmp_path,
@@ -467,7 +481,7 @@ async def approve_rejected_stop(child, charge, capsys):
     assert candidate["local_transaction_id"] == charge.local
     assert candidate["vendor_transaction_id"] == record["answer"]["transactionId"]
     assert candidate["stop_digest"] == fingerprint(charge.stop)
-    evidence = directory / "independent-vendor-stop-review.json"
+    evidence = directory / f"independent-vendor-stop-review-{charge.local}.json"
     save_private(
         evidence,
         candidate
@@ -481,6 +495,45 @@ async def approve_rejected_stop(child, charge, capsys):
     )
     assert await debt_tool.run("reconcile", *args, evidence, port, kind="stop-delivery") == 0
     assert json.loads(capsys.readouterr().out)["zero_hold_retained"] is True
+
+
+# The peer independently confirms that this exact observed Start was never allocated.
+async def approve_unaccepted_start(child, charge, capsys):
+    directory, bench = child.directory, child.rig.bench
+    args = (directory / "trial.json", directory / "process-strategy.json")
+    port = child.rig.prepared.observer.port
+    dropped = bench.unaccepted_start
+    assert dropped is not None and dropped[2:] == ["StartTransaction", charge.start]
+    assert all(entry["token"] != dropped[1] for entry in bench.backend_starts)
+    old_records = child.durable()["metadata"][OPERATOR]
+    (old_id, old_entry), = old_records.items()
+    assert old_entry["proof"]["wire_ack"] is not None and old_entry["completed"] is None
+
+    kind = "start-delivery"
+    assert await debt_tool.run("inspect", *args, None, port, kind=kind) == 0
+    candidate = json.loads(capsys.readouterr().out)["candidate"]
+    assert candidate["local_transaction_id"] == charge.local
+    assert candidate["delivery_token"] == dropped[1] and candidate["start_digest"] == fingerprint(charge.start)
+    evidence = directory / "independent-vendor-start-review.json"
+    save_private(
+        evidence,
+        candidate
+        | {
+            "evidence_sha256": fingerprint({"unaccepted_start": dropped}),
+            "verified_at_epoch": time.time(),
+            "cloud_start_not_accepted": True,
+            "original_state_independently_verified": True,
+            "fault_origin_independently_verified": True,
+        },
+    )
+    assert await debt_tool.run("reconcile", *args, evidence, port, kind=kind) == 0
+    assert json.loads(capsys.readouterr().out)["zero_hold_retained"] is True
+    records = child.durable()["metadata"][OPERATOR]
+    (new_id,) = records.keys() - {old_id}
+    assert records[old_id]["proof"] == old_entry["proof"]
+    assert records[old_id]["superseded"]["proof"] == new_id
+    assert records[new_id]["proof"]["prior"]["previous_operator"]["id"] == old_id
+    return new_id
 
 
 # Intent: preserve three scheduled charges and their readings through two vendor outages and a service replacement.
@@ -513,11 +566,18 @@ async def test_scheduled_charge_backlog_survives_interrupted_catchup(backlog):
 
 # Intent: retain a vendor-accepted Start and the later reports when the proxy loses the vendor's answer.
 # Why: retrying an unknown Start can duplicate it, and skipping it can send later readings under the wrong number.
-@pytest.mark.parametrize("later_reply", ["accepted", "lost-start", "rejected-stop", "rejected-stop-then-lost-start"])
+@pytest.mark.parametrize(
+    "later_reply",
+    ["accepted", "lost-start", "rejected-stop", "rejected-stop-then-lost-start", "rejected-stop-then-retry-start"],
+)
 async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlog, capsys, later_reply):
     child, charges, offline = backlog
     bench = child.rig.bench
-    combined = later_reply == "rejected-stop-then-lost-start"
+    retry = later_reply == "rejected-stop-then-retry-start"
+    combined = later_reply == "rejected-stop-then-lost-start" or retry
+    if retry:
+        charges.append(await scheduled_charge(child, 3, 360))
+        offline = child.durable()
     first_index = 0 if combined else 1
     uncertain = charges[first_index]
     await interrupt_catchup(child, "StartTransaction", uncertain.start)
@@ -561,8 +621,12 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
     await request_pause(child, disconnected)
     await child.close()
     assert child.process.returncode == 0
+    if retry:
+        with closing(sqlite3.connect(child.rig.prepared.config.journal)) as db, db:
+            retain_timed_start(db, time.time())
+        old_timed_start = next(row for row in child.durable()["requests"] if row["action"] == "start_test")
     await map_accepted_start(child, uncertain, capsys, check_invalid_tail=later_reply == "accepted")
-    bench.hold_stop = charges[2].stop["timestamp"]
+    bench.hold_stop = charges[-1].stop["timestamp"]
     if later_reply == "lost-start":
         bench.interrupted.clear()
         bench.interrupt = ("StartTransaction", charges[2].start["timestamp"])
@@ -598,28 +662,44 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
         await approve_rejected_stop(child, rejected_charge, capsys)
         if combined:
             bench.interrupted.clear()
-            bench.interrupt = ("StartTransaction", charges[2].start["timestamp"])
+            if retry:
+                bench.drop_start = charges[2].start["timestamp"]
+            else:
+                bench.interrupt = ("StartTransaction", charges[2].start["timestamp"])
         await child.start()
         if combined:
             await asyncio.wait_for(bench.interrupted.wait(), 15)
             await until(lambda: child.durable()["outbox"][0]["state"] == "ambiguous")
             await child.close()
-            await map_accepted_start(child, charges[2], capsys)
+            if retry:
+                retry_id = await approve_unaccepted_start(child, charges[2], capsys)
+                bench.stop_replies = ["accepted", "error"]
+            else:
+                await map_accepted_start(child, charges[2], capsys)
             bench.vendor_available = True
             await child.start()
+            if retry:
+                await until(lambda: child.durable()["outbox"][0]["state"] == "rejected")
+                await child.close()
+                blocked = child.durable()
+                assert blocked["outbox"][0]["local"] == charges[-1].local
+                previous = blocked["metadata"][OPERATOR][retry_id]
+                assert previous["superseded"] and previous["proof"]["stop_wire_ack"] is not None
+                await approve_rejected_stop(child, charges[-1], capsys)
+                await child.start()
 
     await asyncio.wait_for(bench.stop_waiting.wait(), 15)
     waiting = await child.status(lambda state: state.get("pending_lifecycle_events") == 1)
     fault = waiting["fault"]
     assert waiting["can_return"] is False and bench.firmware.effective_limit() == 0
     early = await request_pause(child, waiting)
-    await check_owner_history(child, charges, 2)
+    await check_owner_history(child, charges, len(charges) - 1)
     bench.release_stop.set()
     await until(lambda: not child.durable()["outbox"], timeout=23)
     for index, charge in enumerate(charges):
-        retried = later_reply.startswith("rejected-stop") and index == first_index + 1
+        retried = later_reply.startswith("rejected-stop") and (index == first_index + 1 or retry and index == 3)
         await check_vendor_charge(child, charge, stop_attempts=2 if retried else 1)
-    await check_owner_history(child, charges, 3)
+    await check_owner_history(child, charges, len(charges))
     drained = await child.status(lambda state: state.get("pending_lifecycle_events") == 0)
     assert drained["fault"] == fault and drained["can_return"] is False
     assert bench.firmware.effective_limit() == 0
@@ -633,20 +713,30 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
     paused = await child.status(lambda state: state.get("can_return") is True)
     assert paused["local_hold_verified"] and bench.firmware.effective_limit() == 0
     proofs = child.durable()["metadata"][MAPPINGS]
-    mapped = [uncertain, charges[2]] if later_reply == "lost-start" or combined else [uncertain]
+    mapped = [uncertain, charges[2]] if later_reply in ("lost-start", "rejected-stop-then-lost-start") else [uncertain]
     assert set(proofs) == {str(charge.local) for charge in mapped}
     for entry in proofs.values():
         proof = entry["proof"]
         assert entry["completed"]["pause"] == fresh
         assert proof["stop_wire_ack"]["delivery_token"] == proof["stop_token"]
-    if combined:
-        recovered = child.durable()["metadata"]["managed_operator_debt_reconciliations"]
+    if retry:
+        recovered = child.durable()["metadata"][OPERATOR]
+        start_proof = recovered[retry_id]["proof"]
+        assert start_proof["start_wire_ack"] is not None and start_proof["stop_wire_ack"] is not None
+        (last_stop,) = [entry for entry in recovered.values() if entry.get("completed") is not None]
+        assert last_stop["completed"]["pause"] == fresh
+        assert last_stop["proof"]["attestation"]["local_transaction_id"] == charges[-1].local
+        assert old_timed_start in child.durable()["requests"]
+        (record,) = [entry for entry in bench.backend_starts if entry["body"] == charges[2].start]
+        assert record["token"] == bench.unaccepted_start[1]
+    elif combined:
+        recovered = child.durable()["metadata"][OPERATOR]
         parent = proofs[str(charges[2].local)]["proof"]["operator_parent"]
         assert recovered[parent]["completed"]["pause"] == fresh
     resumed = await child.request("app_control", revision=paused["control_revision"])
     assert resumed["ok"]
     await child.completed_control(resumed["result"]["id"])
     await child.status()
-    final = await scheduled_charge(child, 3, 360)
+    final = await scheduled_charge(child, len(charges), 360)
     await check_vendor_charge(child, final)
     assert not starts(child.rig)

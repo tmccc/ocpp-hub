@@ -8,6 +8,7 @@ import sqlite3
 import time
 from typing import TYPE_CHECKING, Any
 
+from .managed_intent import unfinished_owner_requests
 from .managed_native_repair import AUDITS, REVOCATIONS, repair_pending, repair_revoked, repair_sources
 from .security import SecurityError
 from .store import RecoveryRequiredError, fingerprint
@@ -113,18 +114,20 @@ def fault_summary(c: ManagedController) -> tuple[dict[str, Any] | None, list[str
 
 # Receipt states remain durable facts; neither a completed worker nor an old accepted time proves physical success.
 def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, Any]], int]:
-    journal = c.session.journal
     intent = c.requests.intent()
     # Once a newer app intent won, old uncertain Returns are receipt history rather than pending work.
-    cutoff = (intent.revision if intent.mode == "app" else 0,)
-    where = (
-        " FROM managed_requests WHERE state IN ('accepted','running','uncertain') "
-        "AND NOT (action='app_control' AND state='uncertain' AND revision<?)"
-    )
-    count = journal.db.execute("SELECT COUNT(*)" + where, cutoff).fetchone()[0]
-    rows = journal.db.execute("SELECT action,state,result" + where + " ORDER BY rowid DESC LIMIT 5", cutoff).fetchall()
+    rows = [
+        row
+        for row in unfinished_owner_requests(c.session.journal, include_pause=True)
+        if not (
+            intent.mode == "app"
+            and row["action"] == "app_control"
+            and row["state"] == "uncertain"
+            and row["revision"] < intent.revision
+        )
+    ]
     commands = []
-    for row in rows:
+    for row in rows[:5]:
         result = json.loads(row["result"])
         if not isinstance(result, dict):
             raise ValueError("diagnostic receipt metadata is unavailable")
@@ -139,7 +142,7 @@ def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, A
                 "confirmation": "unknown" if row["state"] == "uncertain" else "pending",
             }
         )
-    return commands, count
+    return commands, len(rows)
 
 
 # This synchronous projection reads retained state only: it never calls tick, audit, reconciliation or charger I/O.

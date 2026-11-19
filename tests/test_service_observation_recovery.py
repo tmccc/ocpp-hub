@@ -82,6 +82,37 @@ async def test_actual_service_completes_original_faulted_pause(tmp_path, tls, un
         assert not starts(rig)
 
 
+# Intent: storage refusal during both the first Stop and the service's retry leaves the original Pause active.
+# Why: a foreground retry must keep supervision running until the same guarded Stop can be sent.
+async def test_actual_service_retries_pause_when_stop_write_fails(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        b = service.charge
+        c, j, rig = b.controller, b.session.journal, b.rig
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await service.published(state="healthy", power=True)
+        reached, attempts = failing_cleanup(j, "managed_owner_stop")
+        request, revision = uuid.uuid4().hex, c.requests.intent().revision
+        try:
+            assert (await call(service.api, "pause", id=request, revision=revision))["ok"]
+            claim = j.get("managed_owner_pause")
+            await asyncio.wait_for(reached.wait(), 15)
+            assert len(attempts) >= 2 and not service.task.done()
+            assert j.get("managed_owner_pause") == claim and c.requests.receipt(request)["state"] == "accepted"
+            assert rig.bench.firmware.effective_limit() == 0 and not rig.bench.remote_stop.is_set()
+        finally:
+            if not service.task.done():
+                j.db.execute("DROP TRIGGER review_cleanup_unavailable")
+        await asyncio.wait_for(rig.bench.remote_stop.wait(), 10)
+        assert c.requests.receipt(request)["state"] == "accepted"
+        await service.close_daily(local)
+        paused = await service.published(state="healthy", desired="paused")
+        assert paused["local_hold_verified"] and j.get("managed_owner_pause") == claim
+        assert c.requests.receipt(request)["state"] == "completed"
+        assert [frame[3] for frame in rig.bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+
+
 # Intent: cancelling an unprepared Start after initial zero restores original app authority through serve alone.
 # Why: an explicit Pause before the first poll used to conceal this cancellation's permanent zero/fault state.
 @pytest.mark.parametrize("current", [6, 32])

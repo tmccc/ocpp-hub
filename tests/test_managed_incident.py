@@ -318,5 +318,9 @@ def test_incident_binds_only_exact_bounded_records(tmp_path):
         assert learned["journal"]["start"]["lifecycle"] == "closed"
         assert learned["waiting_for_evidence"] == ["saved_cloud_reply_settlement"]
         assert "private-" not in json.dumps(learned)
+        journal.db.execute("DELETE FROM delivery_replies WHERE token=?", (token,))
+        journal.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (token,))
+        rejected = incident_report(path, event_path)["journal"]["start"]["pending_delivery"]
+        assert rejected == [{"event": "StopTransaction", "state": "rejected", "reply_saved": False}]
     finally:
         journal.close()

@@ -14,6 +14,27 @@ from tests_installation.migrated_layout import seed_old_layout
 from tools.check_proxy_rollback import RollbackRefusedError, check_snapshot, stopped_journal
 
 
+# Save the same immutable timed-Start outcome and later verified Pause found in the installed journal.
+def retain_timed_start(db, now):
+    start, pause = "a" * 32, "b" * 32
+    proof = {
+        "prior_intent": {"mode": "app", "revision": 2},
+        "prior_fault": {"classification": "native_authority_or_preservation_failed", "at_epoch": now - 20},
+        "at_epoch": now - 10,
+        "superseded_test_proofs": [{"request_id": start, "verified_pause_id": pause}],
+    }
+    db.execute("INSERT INTO meta VALUES('native_start_attempt_recovery',?)", (json.dumps(proof),))
+    db.execute(
+        "INSERT INTO managed_requests VALUES(?,'start_test',0,'uncertain',?)",
+        (start, json.dumps({"classification": "start_not_confirmed"})),
+    )
+    db.execute(
+        "INSERT INTO managed_requests VALUES(?,'pause',1,'completed',?)",
+        (pause, json.dumps({"pause_verified": True, "completed_at": now - 30})),
+    )
+    return pause
+
+
 # Save a synthetic historical charge and the exact reconciliation proof for an old timed Start.
 def retain_history(db, now):
     meta = {key: json.loads(value) for key, value in db.execute("SELECT key,value FROM meta")}
@@ -27,13 +48,6 @@ def retain_history(db, now):
         "spec_digest": meta["managed_mode"]["spec_digest"],
         "original_history_digest": binding["original"],
     }
-    start, pause = "a" * 32, "b" * 32
-    proof = {
-        "prior_intent": {"mode": "app", "revision": 2},
-        "prior_fault": {"classification": "native_authority_or_preservation_failed", "at_epoch": now - 20},
-        "at_epoch": now - 10,
-        "superseded_test_proofs": [{"request_id": start, "verified_pause_id": pause}],
-    }
     entries = {
         "native_bounded_handover": handover,
         "native_history_archive_binding": binding,
@@ -44,7 +58,6 @@ def retain_history(db, now):
             "native_digest": fingerprint([]),
             "charging_started": False,
         },
-        "native_start_attempt_recovery": proof,
     }
     rows = [(key, json.dumps(value)) for key, value in entries.items()]
     db.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", rows)
@@ -52,15 +65,7 @@ def retain_history(db, now):
         "INSERT INTO native_history_records VALUES(?,?,?,?,?,1)",
         (original["transactionId"], fingerprint(original), json.dumps(original), now - 60, now - 60),
     )
-    db.execute(
-        "INSERT INTO managed_requests VALUES(?,'start_test',0,'uncertain',?)",
-        (start, json.dumps({"classification": "start_not_confirmed"})),
-    )
-    db.execute(
-        "INSERT INTO managed_requests VALUES(?,'pause',1,'completed',?)",
-        (pause, json.dumps({"pause_verified": True, "completed_at": now - 30})),
-    )
-    return pause
+    return retain_timed_start(db, now)
 
 
 # Intent: allow a stopped migrated journal only with intact retained history and a proved old timed Start.

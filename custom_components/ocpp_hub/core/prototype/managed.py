@@ -22,7 +22,7 @@ from .managed_faults import latch_managed_fault
 from .managed_intent import ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
-from .managed_release_wait import awaiting_known_stops
+from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .managed_settlement import (
     charge_test_candidate,
     complete_record,
@@ -241,29 +241,29 @@ class ManagedController:
         intent = self.requests.intent()
         if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
             return
-        self.reclaim_failed_start_pause()
-        ticket = j.get("control", {}).get("ticket")
-        connection = current_control_scope(g)
-
-        # Recheck the owner's claim and authenticated device immediately before each wire operation.
-        def guard() -> None:
-            control = j.get("control", {})
-            if (
-                self.stopping
-                or self.requests.intent() != intent
-                or not ticket
-                or control.get("ticket") != ticket
-                or not ControlState(control).explicit_local_hold
-                or not control_scope_matches(g, connection)
-                or fingerprint(j.get("boot")) != self.native.spec.boot_digest
-                or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
-            ):
-                raise RecoveryRequiredError("owner Pause awaits the current commissioned station")
-
         try:
+            self.reclaim_failed_start_pause()
+            ticket = j.get("control", {}).get("ticket")
+            connection = current_control_scope(g)
+
+            # Recheck the owner's claim and authenticated device immediately before each wire operation.
+            def guard() -> None:
+                control = j.get("control", {})
+                if (
+                    self.stopping
+                    or self.requests.intent() != intent
+                    or not ticket
+                    or control.get("ticket") != ticket
+                    or not ControlState(control).explicit_local_hold
+                    or not control_scope_matches(g, connection)
+                    or fingerprint(j.get("boot")) != self.native.spec.boot_digest
+                    or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
+                ):
+                    raise RecoveryRequiredError("owner Pause awaits the current commissioned station")
+
             await g.controls.ensure_ceiling(guard=guard)
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError:
-            return  # A failed zero acknowledgement still permits Stop if independent native verification succeeds.
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, sqlite3.Error:
+            return  # A failed attempt never confirms zero. The saved Pause can try again.
 
     # Optional observation notes cannot interrupt supervision; required fault proof still commits atomically in fault().
     def record_optional_native_failure(self, diagnostic: dict[str, Any]) -> None:
@@ -274,11 +274,11 @@ class ManagedController:
 
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
-        if self.charging.scoped_normal_stop():
-            await self.charging.reconcile_expired()
-            return
-        await self.ensure_pause_zero()
         try:
+            if self.charging.scoped_normal_stop():
+                await self.charging.reconcile_expired()
+                return
+            await self.ensure_pause_zero()
             g, j = self.session.gateway, self.session.journal
             intent, connection = self.requests.intent(), current_control_scope(g)
             local = j.active()
@@ -339,7 +339,7 @@ class ManagedController:
                 return
             if not controls.stop_acknowledged(local):
                 await controls.stop(expected_local=local, guard=guard)
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
@@ -612,11 +612,12 @@ class ManagedController:
             )
             if isinstance(decision, Pending):
                 return decision
-        refusal = self._zero_refusal(present, row, allow_offline=allow_offline, pending_stop=pending_stop)
+        pending_delivery = pending_stop or (not allow_offline and awaiting_observations(j))
+        refusal = self._zero_refusal(present, row, allow_offline=allow_offline, pending_delivery=pending_delivery)
         if refusal is not None:
             return Pending(Prerequisite.ZERO_PROOF, refusal)
-        if pending_stop or g.vendor._pending:
-            # A known closed Stop or ordinary RPC can finish before any positive release is dispatched.
+        if pending_delivery or g.vendor._pending:
+            # The original Return can wait without claiming a release or dispatching a positive ceiling.
             return Pending(Prerequisite.CLOUD_ACK, "shared control awaits the current cloud acknowledgement")
         return ALLOW
 
@@ -627,7 +628,7 @@ class ManagedController:
         row: sqlite3.Row | None,
         *,
         allow_offline: bool,
-        pending_stop: bool,
+        pending_delivery: bool,
     ) -> str | None:
         s, g, j = self.session, self.session.gateway, self.session.journal
         facts = ManagedFacts(self)
@@ -657,7 +658,7 @@ class ManagedController:
             return "owned station profile is unconfirmed"
         if not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present):
             return "owned station zero receipt is missing"
-        if not allow_offline and not pending_stop and not facts.cloud_queue_empty():
+        if not allow_offline and not pending_delivery and not facts.cloud_queue_empty():
             return "cloud delivery is pending"
         if g.controls._operations:
             return "control operation is pending"
