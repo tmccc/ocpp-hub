@@ -28,15 +28,13 @@ NATIVE_SAMPLE_FIELDS = (
     "current_a",
     "power_w",
     "charging_session_open",
-    "vehicle_connected",
     "vehicle_drawing_power",
-    "history_records",
 )
 
 
 # An unavailable native sample leaves the independently saved proxy history intact.
 def clear_native_sample(status: dict[str, Any]) -> None:
-    status.update(dict.fromkeys(NATIVE_SAMPLE_FIELDS))
+    status.update(dict.fromkeys((*NATIVE_SAMPLE_FIELDS, "vehicle_connected", "history_records")))
     status.update(charger_sessions=[], charger_history_complete=False, charger_latest_completion_known=False)
 
 
@@ -217,8 +215,7 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
         "local_hold_verified": False,
     }
     if pending:
-        clear_native_sample(value)
-        value["station_ceiling_a"] = None
+        value.update(dict.fromkeys((*NATIVE_SAMPLE_FIELDS, "station_ceiling_a")))
     else:
         j = c.session.journal
         value.update(
