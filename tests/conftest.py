@@ -7,10 +7,8 @@ proves it needs nothing from Home Assistant.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import ssl
-import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,26 +16,10 @@ from typing import Any
 
 import pytest
 
+from tests.core_loader import load_test_core
 from tests.worker_ports import listener_port_factory
 
-CORE_DIR = Path(__file__).resolve().parents[1] / "custom_components" / "ocpp_hub" / "core"
-
-
-# Intent: register the core package in sys.modules under the name ``ocpp_hub_core``.
-# Why: tests import ``ocpp_hub_core.frames`` the same way the integration imports ``.core.frames``.
-def _load_core() -> None:
-    if "ocpp_hub_core" in sys.modules:
-        return
-    spec = importlib.util.spec_from_file_location(
-        "ocpp_hub_core", CORE_DIR / "__init__.py", submodule_search_locations=[str(CORE_DIR)]
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["ocpp_hub_core"] = module
-    spec.loader.exec_module(module)
-
-
-_load_core()
+load_test_core(Path(__file__).resolve().parents[1])
 
 
 # Intent: parallel workers reserve planned listeners in disjoint ranges, separate from automatic client ports.

@@ -188,8 +188,15 @@ def ssh_command(
 
 # Run the CI-equivalent checks and abort the deploy when they fail.
 # A failing tree must never reach the server; one command gives the same answer as CI.
-def run_checks(root: Path = ROOT, collection_executors: Path | None = None, *, snapshot: Path | None = None) -> None:
+def run_checks(
+    root: Path = ROOT,
+    collection_executors: Path | None = None,
+    *,
+    snapshot: Path | None = None,
+    domain: str = "ocpp_hub",
+) -> None:
     command = [sys.executable, str(root / "tools" / "validate.py")]
+    command += ["--deployment-target", "ics-client" if domain == "ics_proxy" else "legacy-ha"]
     if collection_executors is not None:
         command += ["--collection-executors", str(collection_executors)]
     if snapshot is not None:
@@ -230,7 +237,7 @@ def prepare_archive(
         files = relative_files(source, integration)
         stamp = write_build_stamp(source, integration)
     else:
-        run_checks(source, collection_executors, snapshot=scratch)
+        run_checks(source, collection_executors, snapshot=scratch, domain=integration.name)
         metadata = json.loads((scratch / "snapshot.json").read_text())
         source = scratch / "source"
         prefix = integration.as_posix() + "/"
@@ -291,17 +298,21 @@ def restart_access(env: dict[str, str], path: Path | None) -> RestartAccess:
     try:
         if path is None:
             access = RestartAccess(
-                env.get("HA_API_URL", ""), env.get("HA_API_TOKEN", ""), env.get("HA_API_SSH_HOST"),
+                env.get("HA_API_URL", ""),
+                env.get("HA_API_TOKEN", ""),
+                env.get("HA_API_SSH_HOST"),
                 env.get("HA_UPTIME_ENTITY", "sensor.uptime"),
             )
         else:
             private = json.loads(path.read_text())
             access = RestartAccess(
-                private["hass_url"], Path(private["token_file"]).read_text().strip(),
-                private.get("ssh_host"), private.get("uptime_entity", "sensor.uptime"),
+                private["hass_url"],
+                Path(private["token_file"]).read_text().strip(),
+                private.get("ssh_host"),
+                private.get("uptime_entity", "sensor.uptime"),
                 private.get("container_port", 8123),
             )
-    except (KeyError, OSError, TypeError, ValueError):
+    except KeyError, OSError, TypeError, ValueError:
         raise SystemExit("The private Home Assistant API settings could not be read.") from None
     if not isinstance(access.url, str) or not isinstance(access.ssh_host, (str, type(None))):
         raise SystemExit("The private Home Assistant API URL or SSH target is invalid.")
@@ -341,8 +352,15 @@ def container_core(container: str, access: RestartAccess, program: str, before: 
     if type(port) is not int or not 1 <= port <= 65535:
         raise SystemExit("The Home Assistant container API port is invalid.")
     command = [
-        "docker", "exec", "-i", container, "python", "-B", "-c",
-        program, str(port),
+        "docker",
+        "exec",
+        "-i",
+        container,
+        "python",
+        "-B",
+        "-c",
+        program,
+        str(port),
     ]
     if before is not None:
         command.append(before)
@@ -458,5 +476,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except ha_restart.RestartError as error:
         raise SystemExit(str(error)) from None
-    except (http.client.HTTPException, OSError, ValueError):
+    except http.client.HTTPException, OSError, ValueError:
         raise SystemExit("Home Assistant access failed.") from None

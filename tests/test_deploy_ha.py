@@ -156,7 +156,8 @@ def test_checked_deployment_packages_only_the_pinned_snapshot(tmp_path, monkeypa
     capture = []
 
     # Change the live checkout only after the validation boundary has returned its own pinned source.
-    def checked(root, collection_executors, *, snapshot):
+    def checked(root, collection_executors, *, snapshot, domain):
+        assert domain == ("ics_proxy" if container else "ocpp_hub")
         metadata = freeze(root, snapshot / "source")
         (snapshot / "snapshot.json").write_text(json.dumps(metadata))
         (root / component).write_text("# changed\n")
@@ -193,7 +194,6 @@ def test_checked_deployment_packages_only_the_pinned_snapshot(tmp_path, monkeypa
         monkeypatch.setattr(deploy.subprocess, "run", transport)
         args = ["--domain", domain, "--container", "unit-home-assistant"]
     else:
-
         # Capture the SSH package at the same boundary as the container package.
         def transport(target, archive, expected, control_path, batch):
             receive(archive, expected)

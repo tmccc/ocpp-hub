@@ -25,7 +25,8 @@ test ownership and review checkpoints. The two HA integration domains have diffe
 python3.14 -m venv .venv
 .venv/bin/pip install -r requirements-offline.txt
 .venv/bin/python tools/validate.py --quick
-.venv/bin/python tools/validate.py --qualification-report /absolute/task/qualification.json
+.venv/bin/python tools/validate.py --deployment-target qualification-only \
+  --qualification-report /absolute/task/qualification.json
 ```
 
 `--quick` runs static checks only, including strict typing for the core and HA-free client API, compilation of both
@@ -81,7 +82,8 @@ timeout --kill-after=5s 295s .venv/bin/python -B tools/offline_validate.py tests
 Use `failure.json` to replay the original sequence. A replay that finds a rule failure exits with a failing test.
 The replay summary records whether the rule and event matched the saved ones. Confirm any real defect against
 the independent evidence and add its shortest useful sequence to the fast recovery replays. The discovery run
-is an explicit test target alongside release qualification.
+can be run directly during development. The full [iCS release gate](release-process.md#qualification-for-implementation-changes)
+runs it automatically.
 
 ### Recreating a reported interruption
 
@@ -128,8 +130,10 @@ the charger and let a later Return from Home Assistant restore scheduled chargin
 
 #### One-week installation rehearsal
 
-Use the two source snapshots in the [rollback instructions](release-process.md#rehearsed-standalone-software-rollback)
-and run the week on either supported Home Assistant runtime.
+To repeat the historical rehearsal, use the two source snapshots in the
+[rollback instructions](release-process.md#rehearsed-standalone-software-rollback) and either supported
+Home Assistant runtime. For a new standalone release, the full
+[release gate](release-process.md#qualification-for-implementation-changes) selects the installed build and candidate.
 
 ```bash
 .venv-ha-proxy/bin/python -B tools/offline_ha_validate.py tests_installation \
@@ -217,7 +221,7 @@ a missing local runtime fails rather than trusting `independent-collection.json`
 For remote runtimes, explicitly pass a trusted executor map:
 
 ```bash
-python tools/validate.py --qualification-report "$QUALIFICATION_BUNDLE" \
+python tools/validate.py --deployment-target qualification-only --qualification-report "$QUALIFICATION_BUNDLE" \
   --collection-executors "$TRUSTED_COLLECTION_EXECUTORS"
 python tools/recovery_coverage.py --output "$MATRIX_OUTPUT" --qualification-report "$QUALIFICATION_BUNDLE" \
   --collection-executors "$TRUSTED_COLLECTION_EXECUTORS"

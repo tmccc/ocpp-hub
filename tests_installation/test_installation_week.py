@@ -13,11 +13,11 @@ from tests_installation.scheduled_week import ScheduledWeek, WeekPeer, press_but
 
 
 # Check that the actual process and saved file are those used by the rehearsal, rather than backups or copies.
-def verify_build(proxy, source, journal, original):
+def verify_build(proxy, source, journal, original, layout):
     assert Path(f"/proc/{proxy.process.pid}/cwd").resolve() == source
     current = journal.stat()
     assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
-    verify_layout(journal)
+    verify_layout(journal, layout)
 
 
 # Wait for the selected current to be both saved and usable and refresh the actual Home Assistant entity.
@@ -37,7 +37,7 @@ async def verify_current(proxy, hass, entry, amperes):
 # Intent: retain the same week of charging, owner controls, and migrated journal while updating and going back.
 # Why: a new journal or a simulated app reply would miss failures that depend on previously saved work.
 async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_port_factory, monkeypatch, builds):
-    current, previous = builds
+    current, previous, layout = builds
     journal = tmp_path / "state.db"
     seed_old_layout(journal)
     original = journal.stat()
@@ -56,7 +56,7 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
     ):
         await proxy.start(source=previous)
         await proxy.status()
-        verify_build(proxy, previous, journal, original)
+        verify_build(proxy, previous, journal, original, layout)
         entry = await setup(hass, {"port": proxy.port})
         week = ScheduledWeek(proxy)
 
@@ -75,7 +75,7 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
         await proxy.close()
         assert proxy.process.returncode == 0
         await proxy.start(source=current)
-        verify_build(proxy, current, journal, original)
+        verify_build(proxy, current, journal, original, layout)
         await verify_current(proxy, hass, entry, 16)
         week.verify_history()
         await week.finish(await week.start(2, 16))
@@ -97,9 +97,9 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
 
         await proxy.close()
         assert proxy.process.returncode == 0
-        verify_layout(journal)
+        verify_layout(journal, layout)
         await proxy.start(source=previous)
-        verify_build(proxy, previous, journal, original)
+        verify_build(proxy, previous, journal, original, layout)
         recovered = await proxy.status(
             lambda state: state.get("local_hold_verified") is True and state.get("can_return") is True
         )
@@ -121,4 +121,4 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
         assert len(week.records) == len({row["local"] for row in week.records}) == 7
         assert len(week.cloud_pairs) == 14 and await proxy.completed_control(pause["id"]) == pause
         assert len(week.bench.history) == len(week.starting_history) + 7
-        verify_build(proxy, previous, journal, original)
+        verify_build(proxy, previous, journal, original, layout)

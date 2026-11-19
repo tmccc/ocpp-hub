@@ -32,16 +32,30 @@ Pre-releases use `X.Y.Z-rcN` (HACS shows it as a pre-release).
 ## Qualification for implementation changes
 
 The normal full gate requires all four complete twenty-worker suites on the exact clean commit. Follow
-[the developer guide](developer.md#setup-and-checks) for pinned runtimes, raw evidence and explicit collection
-executors. Targeted checks do not establish full qualification. The validator audits evidence; it does not launch
-the four suites:
+[the developer guide](developer.md#setup-and-checks) for pinned runtimes, raw evidence and collection executors.
+The validator audits the four suites and runs the additional iCS checks on the frozen release candidate.
+
+For a standalone proxy release, use the full commit from the target's verified installation record. Supply the
+Python interpreter from either pinned Home Assistant runtime for the week rehearsal.
 
 ```bash
 python tools/validate.py --qualification-report "$QUALIFICATION_BUNDLE" \
-  --collection-executors "$TRUSTED_COLLECTION_EXECUTORS"
+  --collection-executors "$TRUSTED_COLLECTION_EXECUTORS" \
+  --installed-proxy-commit "$INSTALLED_PROXY_COMMIT" --ics-ha-python "$HA_TEST_PYTHON"
 ```
 
-Bare `python tools/validate.py` needs `OCPP_QUALIFICATION_REPORT` in its environment; without a report it fails.
+The corresponding environment settings are `OCPP_QUALIFICATION_REPORT`, `OCPP_INSTALLED_PROXY_COMMIT` and
+`OCPP_ICS_HA_PYTHON`. The gate runs the recovery search for each iCS release and the installation week when
+the standalone proxy source or its dependency pins differ from the installed build. The week commissions a
+synthetic journal with the installed build, uses the candidate, then reopens the same journal on the installed build.
+Passing results beside the qualification bundle are reused for matching source, builds and test environments.
+A failed check stops validation before it produces a deployment snapshot.
+
+The normal Home Assistant deployment helper selects the target automatically. For `ics_proxy` it adds the
+recovery search to the pre-deployment checks. The two standard Home Assistant suites include the owner restart
+tests. The older `ocpp_hub` deployment keeps its existing gate. Use `--deployment-target qualification-only`
+when you only need to audit the four suites' evidence.
+
 Executor selection is explicit when evidence needs a remote runtime. Retain failed attempts and keep every result
 bound to its actual source. If the owner restricts testing or authorizes retained evidence, document the precise
 source relationship, checks and limits separately; do not call mixed-source evidence a fresh same-commit pass.
@@ -50,6 +64,7 @@ source relationship, checks and limits separately; do not call mixed-source evid
 
 The repository provides no standalone-service installer. Its entry point supports `check`, `serve`, `health` and
 `incident`. The `serve` action starts network activity. Run offline preflight with the existing configuration.
+Run the full release validator above as part of preparing the standalone replacement, before this configuration check.
 
 ```bash
 python tools/managed_proxy.py check --config "$PROXY_CONFIG" \

@@ -70,6 +70,8 @@ def main():
                 sys.executable,
                 "-B",
                 str(ROOT / "tools/validate.py"),
+                "--deployment-target",
+                "qualification-only",
                 "--tests-only",
                 "--qualification-report",
                 str(args.qualification_report),

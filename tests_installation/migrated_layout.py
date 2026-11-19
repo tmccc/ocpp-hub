@@ -3,8 +3,6 @@
 import sqlite3
 from contextlib import closing
 
-from tools.check_proxy_rollback import schema_digest
-
 AUDITED_SCHEMA = "0b08c43048c89c897d8224d2335e43294652dd9ba58fd940030a61437c776f0d"
 OLD_SCHEDULE = ("d" * 32, 1_735_689_600)
 
@@ -33,10 +31,13 @@ def seed_old_layout(path):
 
 
 # Check the whole layout, old marker and journal integrity independently of either running build.
-def verify_layout(path):
+def verify_layout(path, expected=AUDITED_SCHEMA):
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("BEGIN")
-        assert schema_digest(db) == AUDITED_SCHEMA
+        if expected is not None:
+            from tools.check_proxy_rollback import schema_digest
+
+            assert schema_digest(db) == expected
         assert db.execute("SELECT id,start_epoch FROM managed_schedule_requests").fetchall() == [OLD_SCHEDULE]
         assert db.execute("PRAGMA quick_check(1)").fetchone() == ("ok",)
         assert db.execute("PRAGMA foreign_key_check").fetchone() is None

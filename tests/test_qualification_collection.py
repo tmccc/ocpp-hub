@@ -392,4 +392,13 @@ def test_supported_deployment_checks_forward_collection_executor(tmp_path, monke
 
     monkeypatch.setattr(deploy_ha.subprocess, "run", capture)
     deploy_ha.run_checks(tmp_path, chosen)
-    assert commands == [[sys.executable, str(tmp_path / "tools/validate.py"), "--collection-executors", str(chosen)]]
+    assert commands == [
+        [
+            sys.executable,
+            str(tmp_path / "tools/validate.py"),
+            "--deployment-target",
+            "legacy-ha",
+            "--collection-executors",
+            str(chosen),
+        ]
+    ]

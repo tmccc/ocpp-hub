@@ -18,16 +18,29 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from tools import ics_predeployment  # noqa: E402
 from tools.qualification_snapshot import freeze  # noqa: E402
 
 BASELINE_FILE = ROOT / "tools" / "known_env_failures.txt"
 # Keep in sync with the "Format check" and "Type check" steps of .github/workflows/checks.yml.
 FORMAT_TARGETS = ["custom_components"]
 MYPY_TARGETS = ["custom_components/ocpp_hub/core", "custom_components/ics_proxy/api.py"]
+
+
+@dataclass(frozen=True)
+class Deployment:
+    """Identify the rollout so that only the relevant iCS checks are required."""
+
+    target: str
+    installed: str | None
+    ha_python: Path | None
 
 
 # Pick the repository virtualenv interpreter for the current OS, falling back to the running Python.
@@ -104,7 +117,51 @@ def check_yaml(python: str, results: dict[str, bool]) -> None:
     run_step("yaml", [python, "-c", code], results)
 
 
-# Re-audit raw evidence against the exact clean source; a saved green boolean cannot establish qualification.
+# Check all four raw qualification phases against the exact clean source.
+def audit_qualification(path, source, metadata, python, results, collection_executors):
+    bundle = json.loads(path.read_text())
+    required = {"engine-model", "ha-proxy", "ha-legacy", "ha-proxy-legacy"}
+    if (
+        bundle.get("commit") != metadata["commit"]
+        or bundle.get("source_digest") != metadata["source_digest"]
+        or set(bundle.get("phases", {})) != required
+    ):
+        raise ValueError("qualification bundle does not cover this exact source and every required suite")
+    for suite in sorted(required):
+        batch = Path(bundle["phases"][suite])
+        config = json.loads((batch / "config.json").read_text())
+        if config.get("suite") != suite or config.get("workers") != 20 or config.get("mode") != "full":
+            raise ValueError("qualification phase requires its entire suite in full mode with20 workers")
+        completed = run_step(
+            f"qualification ({suite})",
+            [
+                python,
+                "-B",
+                str(source / "tools/audit_parallel_qualification.py"),
+                str(batch),
+                "--expected-commit",
+                metadata["commit"],
+                "--expected-source-digest",
+                metadata["source_digest"],
+                *(["--collection-executors", str(collection_executors)] if collection_executors else []),
+            ],
+            results,
+        )
+        audited = json.loads(completed.stdout)
+        if (
+            completed.returncode != 0
+            or audited.get("full_qualification_passed") is not True
+            or audited.get("mode") != "full"
+            or audited.get("suite") != suite
+            or audited.get("workers") != 20
+            or audited.get("commit") != metadata["commit"]
+            or audited.get("source_digest") != metadata["source_digest"]
+        ):
+            results[f"qualification ({suite})"] = False
+            raise ValueError("fresh raw audit did not establish full qualification for this exact suite/source")
+
+
+# Finish the normal gate and the focused iCS checks before publishing a deployable snapshot.
 def run_full_qualification(
     path: Path | None,
     python: str,
@@ -112,59 +169,55 @@ def run_full_qualification(
     collection_executors: Path | None = None,
     *,
     validated_snapshot: Path | None = None,
+    deployment: Deployment | None = None,
 ) -> None:
     if path is None:
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
         results["full qualification"] = False
         return
-    try:
-        source = validated_snapshot / "source" if validated_snapshot is not None else None
-        metadata = freeze(ROOT, source)
-        bundle = json.loads(path.read_text())
-        required = {"engine-model", "ha-proxy", "ha-legacy", "ha-proxy-legacy"}
-        if (
-            bundle.get("commit") != metadata["commit"]
-            or bundle.get("source_digest") != metadata["source_digest"]
-            or set(bundle.get("phases", {})) != required
-        ):
-            raise ValueError("qualification bundle does not cover this exact source and every required suite")
-        for suite in sorted(required):
-            batch = Path(bundle["phases"][suite])
-            config = json.loads((batch / "config.json").read_text())
-            if config.get("suite") != suite or config.get("workers") != 20 or config.get("mode") != "full":
-                raise ValueError("qualification phase requires its entire suite in full mode with20 workers")
-            completed = run_step(
-                f"qualification ({suite})",
-                [
-                    python,
-                    "-B",
-                    str((source or ROOT) / "tools/audit_parallel_qualification.py"),
-                    str(batch),
-                    "--expected-commit",
-                    metadata["commit"],
-                    "--expected-source-digest",
-                    metadata["source_digest"],
-                    *(["--collection-executors", str(collection_executors)] if collection_executors else []),
-                ],
-                results,
+    with tempfile.TemporaryDirectory(prefix="ocpp-release-") as tmp:
+        scratch = Path(tmp)
+        try:
+            target = deployment.target if deployment is not None else "qualification-only"
+            ics_release = target in ("ics-proxy", "ics-client")
+            source = (validated_snapshot or scratch).resolve() / "source" if ics_release or validated_snapshot else None
+            metadata = freeze(ROOT, source)
+            week = target == "ics-proxy" and ics_predeployment.changed_proxy(
+                ROOT, metadata["commit"], deployment.installed
             )
-            audited = json.loads(completed.stdout)
-            if (
-                completed.returncode != 0
-                or audited.get("full_qualification_passed") is not True
-                or audited.get("mode") != "full"
-                or audited.get("suite") != suite
-                or audited.get("workers") != 20
-                or audited.get("commit") != metadata["commit"]
-                or audited.get("source_digest") != metadata["source_digest"]
-            ):
-                results[f"qualification ({suite})"] = False
-                raise ValueError("fresh raw audit did not establish full qualification for this exact suite/source")
-        if validated_snapshot is not None and all(results.values()):
-            (validated_snapshot / "snapshot.json").write_text(json.dumps(metadata) + "\n")
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-        print(f"Full qualification is invalid: {type(error).__name__}: {error}")
-        results["full qualification"] = False
+            if week and (deployment.ha_python is None or not deployment.ha_python.is_file()):
+                raise ValueError(
+                    "provide --ics-ha-python from a pinned Home Assistant runtime for the installation week"
+                )
+            audit_qualification(path, source or ROOT, metadata, python, results, collection_executors)
+            if ics_release and all(results.values()):
+                output = path.resolve().parent / "ics-predeployment"
+                ics_predeployment.ensure_check(ics_predeployment.DISCOVERY, source, output, metadata, python)
+                results["recovery search"] = True
+                if week:
+                    previous = scratch / "installed"
+                    ics_predeployment.export_installed(ROOT, deployment.installed, previous)
+                    ics_predeployment.ensure_check(
+                        ics_predeployment.WEEK,
+                        source,
+                        output,
+                        metadata,
+                        str(deployment.ha_python.absolute()),
+                        installed=(deployment.installed, previous),
+                    )
+                    results["installation week"] = True
+            if validated_snapshot is not None and all(results.values()):
+                (validated_snapshot / "snapshot.json").write_text(json.dumps(metadata) + "\n")
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            RuntimeError,
+            ElementTree.ParseError,
+            subprocess.SubprocessError,
+        ) as error:
+            print(f"Full qualification is invalid: {type(error).__name__}: {error}")
+            results["full qualification"] = False
 
 
 # Orchestrate the CI-equivalent checks.
@@ -180,9 +233,28 @@ def main() -> int:
         "--collection-executors", type=Path, help="explicit trusted source-pinned collection executor map"
     )
     parser.add_argument("--validated-snapshot", type=Path, help="retain the source that passed full qualification")
+    parser.add_argument(
+        "--deployment-target",
+        choices=("ics-proxy", "ics-client", "legacy-ha", "qualification-only"),
+        default="ics-proxy",
+        help="release target, or qualification-only for an evidence audit",
+    )
+    parser.add_argument(
+        "--installed-proxy-commit",
+        default=os.environ.get("OCPP_INSTALLED_PROXY_COMMIT"),
+        help="verified full commit currently installed on this standalone proxy target",
+    )
+    parser.add_argument(
+        "--ics-ha-python",
+        type=Path,
+        default=os.environ.get("OCPP_ICS_HA_PYTHON"),
+        help="pinned Home Assistant interpreter used for a changed standalone proxy",
+    )
     args = parser.parse_args()
     if args.validated_snapshot and (args.quick or args.tests_only or args.expression):
         parser.error("--validated-snapshot requires full validation")
+    if args.validated_snapshot and args.deployment_target == "qualification-only":
+        parser.error("an evidence audit cannot produce a deployment snapshot")
     python = venv_python()
     results: dict[str, bool] = {}
 
@@ -214,6 +286,7 @@ def main() -> int:
             results,
             validated_snapshot=args.validated_snapshot,
             collection_executors=args.collection_executors,
+            deployment=Deployment(args.deployment_target, args.installed_proxy_commit, args.ics_ha_python),
         )
 
     print("\nSummary")
