@@ -28,6 +28,19 @@ class ControlIntent:
         return ControlIntent(mode, self.revision + int(not coalesce or self.mode != mode))
 
 
+# Recognize the exact saved intent without opening a request owner or guessing a historical value.
+def decode_intent(value: object) -> ControlIntent:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"mode", "revision"}
+        or value["mode"] not in ("app", "paused")
+        or type(value["revision"]) is not int
+        or not 0 <= value["revision"] < 2**53
+    ):
+        raise SecurityError("managed control intent is malformed")
+    return ControlIntent(value["mode"], value["revision"])
+
+
 # Apply the shared revision transition inside the caller's original transaction, without creating request work.
 def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesce: bool = False) -> ControlIntent:
     intent = current.next(mode, coalesce=coalesce)
@@ -50,7 +63,11 @@ class PauseClaim:
 
 # Keep the same journal format and distinguish a partial historical marker from an exact ticket.
 def read_pause_claim(journal: Journal, *, stopping: bool = False) -> PauseClaim:
-    record = journal.get(OWNER_STOP if stopping else OWNER_PAUSE, {})
+    return decode_pause_claim(journal.get(OWNER_STOP if stopping else OWNER_PAUSE, {}))
+
+
+# Read an existing marker without needing an active journal owner.
+def decode_pause_claim(record: object) -> PauseClaim:
     if not isinstance(record, dict):
         return PauseClaim(None, None, False)
     revision, ticket = record.get("revision"), record.get("ticket")
@@ -104,16 +121,7 @@ class ManagedRequests:
 
     # Corrupted intent never becomes an implicit permission to release the zero hold.
     def intent(self) -> ControlIntent:
-        value = self.journal.get("managed_control_intent")
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"mode", "revision"}
-            or value["mode"] not in ("app", "paused")
-            or type(value["revision"]) is not int
-            or not 0 <= value["revision"] < 2**53
-        ):
-            raise SecurityError("managed control intent is malformed")
-        return ControlIntent(value["mode"], value["revision"])
+        return decode_intent(self.journal.get("managed_control_intent"))
 
     # Historical UUID results remain immutable identities; only unresolved work consumes the bounded ordinary pool.
     def has_capacity(self) -> bool:

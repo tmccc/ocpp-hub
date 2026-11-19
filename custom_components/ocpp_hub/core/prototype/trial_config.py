@@ -132,6 +132,28 @@ class TrialConfig:
     max_current_a: float = 6
     local_tags: frozenset[str] = field(default_factory=frozenset)
 
+    # Name the optional incident file alongside the private journal.
+    @property
+    def incident_events(self) -> Path:
+        return self.journal.with_suffix(".start-events.jsonl")
+
+    # Preflight and managed input checks share the actual files the service can write.
+    def output_paths(self) -> tuple[Path, ...]:
+        return (
+            self.journal,
+            Path(str(self.journal) + ".lock"),
+            Path(str(self.journal) + "-wal"),
+            Path(str(self.journal) + "-shm"),
+            self.journal.with_suffix(".status.json"),
+            self.journal.with_suffix(".events.jsonl"),
+            self.journal.with_suffix(".events.jsonl.1"),
+            self.incident_events,
+            self.incident_events.with_suffix(".jsonl.1"),
+            self.baseline,
+            self.baseline.with_suffix(".original-config.json"),
+            self.evidence,
+        )
+
     # Output files must never alias a credential, certificate, configuration input or another state file.
     def check_paths(self, configuration: Path | None = None) -> None:
         inputs = [self.native_secret, self.certificate, self.private_key]
@@ -140,19 +162,7 @@ class TrialConfig:
             for path in (self.incoming_secret, self.upstream_secret, self.ca_file, configuration)
             if path is not None
         ]
-        outputs = [
-            self.journal,
-            Path(str(self.journal) + ".lock"),
-            Path(str(self.journal) + "-wal"),
-            Path(str(self.journal) + "-shm"),
-            self.journal.with_suffix(".status.json"),
-            self.journal.with_suffix(".events.jsonl"),
-            self.journal.with_suffix(".events.jsonl.1"),
-            self.baseline,
-            self.baseline.with_suffix(".original-config.json"),
-            self.evidence,
-        ]
-        resolved = [path.resolve(strict=False) for path in outputs]
+        resolved = [path.resolve(strict=False) for path in self.output_paths()]
         input_paths = {path.resolve(strict=False) for path in inputs}
         if len(resolved) != len(set(resolved)) or input_paths.intersection(resolved):
             raise SecurityError("trial output paths must not alias inputs or other state files")

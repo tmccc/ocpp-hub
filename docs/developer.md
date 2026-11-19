@@ -54,6 +54,23 @@ Verify that it fails on the faulty code at the relevant assertion and passes on 
 request and independent charger observations before any new Pause or other command can repair the outcome. Keep
 this development run under three minutes on the controller and retain the complete engine run for release.
 
+### Recreating a reported interruption
+
+Use the [local Start incident report](../README.md#read-an-interrupted-start-incident) to choose the offline event
+order. Start with the report's selected current and the intent at the send. Match the original request and ticket
+before using any reply or Pause from the observation list.
+
+| Evidence in the report | Offline sequence to recreate |
+| --- | --- |
+| Saved reply `accepted`, authority publication false | Let the simulated charger reply Accepted. Kill the proxy after the reply commit and before the control decision commits. |
+| Send observed, journal `issued`, observed and saved replies unknown | Hold the simulated charger's matching reply after it receives Start. Kill the proxy while the reply is held. |
+| Observed reply `accepted`, journal `issued`, saved reply unknown | Let the matching reply reach the proxy. Kill it before the journal's reply commit finishes. |
+| `start_sent`, newer `pause_committed`, then `start_reply` | Hold the old Start reply while accepting the newer Pause. Send the reply and check that the newer intent and older saved reply both survive replacement. |
+
+The sequences reproduce the recorded evidence. A report may leave the original cause or exact crash boundary
+unknown. `tests/test_managed_incident.py` uses the report to select a sequence and rerun it with fresh simulated
+peers and a real journal. It also checks a genuine reply that arrives after a newer Pause.
+
 ### Home Assistant checks
 
 The Home Assistant layer tests need their own virtualenv. Pin the plugin to the Home Assistant version of the server you deploy to (the plugin release pins it):

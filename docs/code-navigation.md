@@ -19,7 +19,7 @@ their code is unused. This guide describes source relationships; it is not a liv
 
 | Component | Entry point and responsibility |
 | --- | --- |
-| Standalone service | [`tools/managed_proxy.py`](../tools/managed_proxy.py), `serve()`: owns the persistent session, supervision, management listener and status publication. `check` validates files offline; `health` reads saved status. |
+| Standalone service | [`tools/managed_proxy.py`](../tools/managed_proxy.py) owns the persistent session, supervision, management listener and status publication. `check` validates files offline. `health` reads saved status. `incident` reads the journal and optional Start observations. |
 | Shared-core loader | [`tools/trial_proxy.py`](../tools/trial_proxy.py), `load_core()`: loads `custom_components/ocpp_hub/core/` as **`ocpp_hub_core`**, preserving relative imports without running the older HA integration. |
 | Protocol/native engine | [`core/prototype/`](../custom_components/ocpp_hub/core/prototype/): the iCS implementation, plus its imports from shared `core/`. |
 | Current HA client | [`custom_components/ics_proxy/`](../custom_components/ics_proxy/), `async_setup_entry()`: polls management and exposes controls, entities, notifications and diagnostics. It does not open the OCPP journal or own the charger connection. |

@@ -19,7 +19,10 @@ from ocpp_hub_core.prototype.security import SecurityError
 def software(root: Path) -> dict[str, Any]:
     try:
         names = sorted((root / "custom_components/ocpp_hub/core").rglob("*.py"))
-        names += [root / "tools" / name for name in ("managed_proxy.py", "managed_reporting.py", "trial_proxy.py")]
+        names += [
+            root / "tools" / name
+            for name in ("managed_proxy.py", "managed_reporting.py", "managed_incident.py", "trial_proxy.py")
+        ]
         digest = hashlib.sha256()
         for path in names:
             digest.update(str(path.relative_to(root)).encode() + b"\0" + path.read_bytes() + b"\0")

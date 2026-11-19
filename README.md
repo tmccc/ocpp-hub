@@ -539,6 +539,28 @@ holds zero. A rejected or unanswered Stop can settle after its same Pause has in
 session closure and zero. Local authorization uses the existing bounded tag/cache policy while cloud registration
 is incomplete; once registered, an actual cloud denial or unanswered authorization cannot fall back to approval.
 
+### Read an interrupted Start incident
+
+On the proxy host, use the service's Python and configuration.
+
+```bash
+python -B tools/managed_proxy.py incident --config "$PROXY_CONFIG"
+```
+
+The command reads local files and prints one JSON report for the most recent local Start retained by the proxy.
+The report correlates the request and control ticket using opaque references. It shows the current saved intent,
+the send and matching reply when observed, and the outcome and lifecycle in a read-only journal snapshot.
+`authority_published` records whether the Start's separate control decision committed. Pending lifecycle and cloud
+evidence is listed for the exact Start when it can be identified. The latest service status is a separate sample.
+
+`issued` is saved before the send. `send_returned` records that the transport finished sending.
+`observed_reply` comes from the optional timeline when the request handler received its matching result.
+`saved_reply` comes from the journal and survives a restart even if the optional record is missing.
+An `unknown` or null field marks missing evidence. A process-start entry identifies a new run of the recorder.
+The report omits private configuration, raw charger messages, tags and original identifiers. Optional observations
+are bounded and written separately from charging and recovery.
+See [recreating a reported interruption](docs/developer.md#recreating-a-reported-interruption).
+
 ## Historical service commissioning — 9–10 November 2026
 
 A bounded managed service was installed on 2026-11-09 in an isolated runtime with immutable code, private durable

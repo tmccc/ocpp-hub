@@ -149,14 +149,20 @@ class ManagedController:
         if action == "app_control" and self.requests.intent().mode != "paused":
             raise RecoveryRequiredError("return requires a current paused intent")
 
+        controls = self.session.gateway.controls
+        ticket = None
+
         # This claim shares the intent transaction, so no accepted Pause can leave old shared authority committed.
         def claim() -> None:
-            _, ticket = self.session.gateway.controls._claim(True, stopping=True)
+            nonlocal ticket
+            _, ticket = controls._claim(True, stopping=True)
             self.requests.record_pause_claim(self.requests.intent(), ticket)
             record_release_pause(self, identifier)
 
         receipt = self.requests.accept(identifier, action, revision, claim)
         if action == "pause":
+            if ticket is not None:
+                controls.observe_incident("pause_committed", identifier, ticket)
             if self.pause_task is None or self.pause_task.done():
                 self.pause_task = asyncio.create_task(self._stop_requested())
         return receipt

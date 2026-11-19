@@ -225,8 +225,11 @@ class Peer:
         *,
         on_dispatch: Callable[[str], None] | None = None,
         on_reply: Callable[[str, Frame], None] | None = None,
+        on_sent: Callable[[str], None] | None = None,
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
-        async with self.sequence_results(priority, check, on_dispatch=on_dispatch, on_reply=on_reply) as result_call:
+        async with self.sequence_results(
+            priority, check, on_dispatch=on_dispatch, on_reply=on_reply, on_sent=on_sent
+        ) as result_call:
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
                 return require_reply(await result_call(action, payload))
@@ -242,11 +245,14 @@ class Peer:
         *,
         on_dispatch: Callable[[str], None] | None = None,
         on_reply: Callable[[str, Frame], None] | None = None,
+        on_sent: Callable[[str], None] | None = None,
     ) -> AsyncIterator[ResultCall]:
         async with self.gate.enter(priority):
             # Each call revalidates after native waits and before recording any resource intent.
             async def call(action: str, payload: dict[str, Any]) -> CallResult:
-                return await self._call_locked(action, payload, check, None, None, on_dispatch, priority > 0, on_reply)
+                return await self._call_locked(
+                    action, payload, check, None, None, on_dispatch, priority > 0, on_reply, on_sent
+                )
 
             yield call
 
@@ -313,6 +319,7 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         preemptible: bool = True,
         on_reply: Callable[[str, Frame], None] | None = None,
+        on_sent: Callable[[str], None] | None = None,
     ) -> CallResult:
         if check is not None:
             decision = check()
@@ -353,6 +360,8 @@ class Peer:
             async with asyncio.timeout(self.timeout):
                 dispatched = True
                 await sender(message)
+                if on_sent is not None:
+                    on_sent(action)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 if on_reply is not None:

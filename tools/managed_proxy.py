@@ -12,6 +12,7 @@ import socket
 import sqlite3
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_private  # noqa: E402
 
+from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, incident_report  # noqa: E402
 from tools.managed_reporting import Reporting  # noqa: E402
 from tools.trial_proxy import native_spec  # noqa: E402
 
@@ -60,25 +62,13 @@ async def watchdog(stopped: asyncio.Event) -> None:
 
 # The extra mode input cannot alias any file the service writes or rotates.
 def check_spec_path(config: TrialConfig, path: Path) -> None:
-    outputs = (
-        config.journal,
-        Path(str(config.journal) + ".lock"),
-        Path(str(config.journal) + "-wal"),
-        Path(str(config.journal) + "-shm"),
-        config.journal.with_suffix(".status.json"),
-        config.journal.with_suffix(".events.jsonl"),
-        config.journal.with_suffix(".events.jsonl.1"),
-        config.baseline,
-        config.baseline.with_suffix(".original-config.json"),
-        config.evidence,
-    )
-    if path.resolve(strict=False) in {output.resolve(strict=False) for output in outputs}:
+    if path.resolve(strict=False) in {output.resolve(strict=False) for output in config.output_paths()}:
         raise SecurityError("managed specification must not alias service outputs")
 
 
 # Keep bounded durable fault/state transitions beside the journal without storing private native bodies in logs.
-def event(path: Path, value: dict[str, Any]) -> None:
-    if path.exists() and path.stat().st_size > 2 * 1024 * 1024:
+def event(path: Path, value: dict[str, Any], *, maximum: int = 2 * 1024 * 1024) -> None:
+    if path.exists() and path.stat().st_size > maximum:
         path.replace(path.with_suffix(path.suffix + ".1"))
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "a") as stream:
@@ -132,9 +122,16 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     reporting = Reporting(ROOT)
     published: dict[str, Any] = {"running": True, "state": "starting"}
     api: ManagementServer | None = None
+    incident: IncidentRecorder | None = None
     try:
         await session.start()
         controller = ManagedController(session)
+        try:
+            incident = IncidentRecorder(prepared.config.incident_events, partial(event, maximum=MAX_EVENT_BYTES))
+        except OSError, RuntimeError:
+            pass  # Local evidence recording is optional even when its worker cannot start.
+        if incident is not None:
+            session.gateway.controls.incident_observer = incident.observe
         if management is not None:
             api = ManagementServer(management, controller, lambda: dict(published))
             await api.start()
@@ -165,6 +162,8 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
                     await asyncio.gather(controller.pause_task, return_exceptions=True)
             await session.close()
         finally:
+            if incident is not None:
+                incident.close()
             try:
                 save_private(
                     status_path, {"running": False, "state": "stopped", "checked_at": time.time(), "pid": os.getpid()}
@@ -176,16 +175,20 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     return 0
 
 
-# Explicit serve is the only networking action; check/health remain safe for deployment and monitoring tools.
+# Explicit serve is the only networking action; other actions read local files.
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("check", "serve", "health"))
+    parser.add_argument("action", choices=("check", "serve", "health", "incident"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--native-bounded-spec", type=Path)
     parser.add_argument("--management-config", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.action == "incident":
+            config = TrialConfig.load(args.config)
+            print(json.dumps(incident_report(config.journal, config.incident_events), sort_keys=True))
+            return 0
         if args.action == "health":
             config = TrialConfig.load(args.config)
             result = health(config.journal.with_suffix(".status.json"))

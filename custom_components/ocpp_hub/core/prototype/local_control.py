@@ -17,6 +17,8 @@ from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .composite import FutureScheduleError, verify_composite
 from .connection_scope import CloudAttemptScope
+from .incident_observation import IncidentObservation, ObservationKind, ObservedReply
+from .managed_intent import decode_intent, read_pause_claim
 from .policy import DeniedError, Policy, number
 from .recovery_contracts import (
     ALLOW,
@@ -137,6 +139,28 @@ class LocalControl:
         self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
         self.prepare_station: Callable[[ResultCall, int], Awaitable[StationChoice | NotSent]] | None = None
+        self.incident_observer: Callable[[IncidentObservation], None] | None = None
+
+    # Offer small facts to optional reporting and keep its reads and failures outside control decisions.
+    def observe_incident(
+        self, kind: ObservationKind, request: str | None, ticket: str, reply: ObservedReply | None = None
+    ) -> None:
+        observer = self.incident_observer
+        if observer is None or request is None:
+            return
+        pause_ticket = None
+        try:
+            intent = decode_intent(self.journal.get("managed_control_intent"))
+            if intent.mode == "paused":
+                claim = read_pause_claim(self.journal)
+                if claim.complete and claim.revision == intent.revision:
+                    pause_ticket = claim.ticket
+        except OSError, ValueError, TypeError, RecursionError, sqlite3.Error, SecurityError:
+            intent = None
+        try:
+            observer(IncidentObservation(kind, request, ticket, intent, pause_ticket, reply))
+        except Exception:
+            pass  # The observer can fail independently while the owned charger sequence must continue.
 
     # Client cancellation cannot abandon a safety sequence halfway through its physical effects.
     async def _owned[T](self, operation: Coroutine[Any, Any, T]) -> T:
@@ -623,12 +647,30 @@ class LocalControl:
                 if attempt is not None:
                     attempt.remote_start_dispatched = True
 
+        # This boundary follows actual transport send completion, which is later than the durable issued marker.
+        def sent(action: str) -> None:
+            if action == "RemoteStartTransaction":
+                self.observe_incident("start_sent", request_id, ticket)
+
         # Receipt recording precedes fallible resource/result publication and never claims observed charging.
         def received(action: str, frame: Frame) -> None:
-            if attempt is not None and action == "RemoteStartTransaction":
+            if action != "RemoteStartTransaction":
+                return
+            if attempt is not None:
                 attempt.answer = frame
+            if self.incident_observer is None or request_id is None:
+                return
+            if frame[0] == 4:
+                reply: ObservedReply = "call_error"
+            elif frame[2].get("status") == "Accepted":
+                reply = "accepted"
+            elif frame[2].get("status") == "Rejected":
+                reply = "rejected"
+            else:
+                reply = "other"
+            self.observe_incident("start_reply", request_id, ticket, reply)
 
-        async with self.peer.sequence(1, check, on_dispatch=dispatch, on_reply=received) as call:
+        async with self.peer.sequence(1, check, on_dispatch=dispatch, on_reply=received, on_sent=sent) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
