@@ -21,7 +21,7 @@ from .auth_info import InfoBook, expiry, validate_info
 from .authorisation import VendorAuthorisation
 from .connection_scope import control_scope_matches, current_control_scope
 from .delivery_reply import DeliveryReply
-from .events import validate_observation
+from .events import OBSERVATION_ACTIONS, validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, known_write
 from .local_control import LocalControl
@@ -519,12 +519,7 @@ class Gateway:
                     info = None
             response = {"idTagInfo": info} if info is not None else None
             return self.journal.stop(token, payload, self.authorisation.retire, response)
-        if action in (
-            "StatusNotification",
-            "MeterValues",
-            "FirmwareStatusNotification",
-            "DiagnosticsStatusNotification",
-        ):
+        if action in OBSERVATION_ACTIONS:
             validate_observation(action, payload, self.journal, check_history=False)
             with self.journal.atomic():
                 published = self._observations.accept(self._charger_epoch, token.partition(":")[2], action, payload)
@@ -1260,12 +1255,7 @@ class Gateway:
     # Apply only a real correlated reply; storage failures leave its single bounded receipt available for retry.
     def _record_delivery_reply(self, item: Delivery, answer: Frame) -> str:
         if answer[0] != 3:
-            if item.action in (
-                "StatusNotification",
-                "MeterValues",
-                "FirmwareStatusNotification",
-                "DiagnosticsStatusNotification",
-            ):
+            if item.action in OBSERVATION_ACTIONS:
                 self.journal.reject_observation(item, str(answer[2]))
                 return "acknowledged"
             if item.action == "StopTransaction":

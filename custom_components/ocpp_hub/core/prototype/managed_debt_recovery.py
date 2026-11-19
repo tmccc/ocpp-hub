@@ -9,12 +9,18 @@ import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
+from .events import OBSERVATION_ACTIONS as REPORTS
 from .local_control import local_start_receipt
 from .managed_combined_start_recovery import KIND as COMBINED_KIND
 from .managed_combined_start_recovery import combined_candidate, combined_resolution
 from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
-from .managed_denial_faults import current_operator_proof, proof_headers_match
+from .managed_denial_faults import (
+    current_operator_proof,
+    operator_wire_settled,
+    pending_mapping_headers,
+    proof_headers_match,
+)
 from .managed_recovery_zero import require_original_zero
 from .managed_start_delivery import KIND as START_KIND
 from .managed_start_delivery import RETRIES, start_resolution
@@ -31,13 +37,13 @@ if TYPE_CHECKING:
 
 KEY = "managed_operator_debt_reconciliations"
 FAULT = "operator_debt_reconciled_at_zero"
-REPORTS = ("StatusNotification", "MeterValues", "FirmwareStatusNotification", "DiagnosticsStatusNotification")
 
 
 # Preserve exact private preimages in the durable proof without publishing raw tags, native bodies or credentials.
 def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, Any]:
     grant = j.get("vendor_start_grant")
     row = j.db.execute("SELECT * FROM mutations WHERE token=?", ((grant or {}).get("mutation"),)).fetchone()
+    mappings = pending_mapping_headers(j)
     return {
         "anchor": delivery_anchor(j, spec),
         "intent": j.get("managed_control_intent"),
@@ -65,6 +71,7 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         "outbox": [dict(row) for row in j.db.execute("SELECT * FROM outbox ORDER BY seq")],
         "transactions": [dict(row) for row in j.db.execute("SELECT * FROM transactions ORDER BY local")],
         "kind": kind,
+        **({"delivery_mappings": mappings} if mappings else {}),
         **({"storage_resolution": storage_resolution(j)} if kind == "storage-fault" else {}),
     }
 
@@ -596,10 +603,7 @@ def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> d
     if proof["kind"] == COMBINED_KIND and proof["prior"].get("fault") != fault:
         return None
     if (
-        proof["kind"] in (*STOP_KINDS, COMBINED_KIND)
-        and proof.get("wire_ack") is None
-        or proof["kind"] == START_KIND
-        and (proof.get("start_wire_ack") is None or proof.get("stop_wire_ack") is None)
+        not operator_wire_settled(proof)
         or proof["installed_fault"] != fault
         or proof["anchor"] != delivery_anchor(j, c.native.spec)
         or proof["resolved"] != resolved_debt(j, proof["kind"], proof)

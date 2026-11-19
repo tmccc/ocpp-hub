@@ -266,6 +266,17 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
             await operator.run("reconcile-start", config, strategy, evidence_path, native_port)
         save_private(evidence_path, evidence)
         assert await operator.run("reconcile-start", config, strategy, evidence_path, native_port) == 0
+        legacy_proof = None
+        if ceiling == 32 and not local_owner:
+            journal = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
+            try:
+                records = journal.get(KEY)
+                proof = records[str(local)]["proof"]
+                legacy_proof = {key: value for key, value in proof.items() if key != "stop_wire_ack"} | {"version": 1}
+                records[str(local)]["proof"] = legacy_proof
+                journal.put(KEY, records)
+            finally:
+                journal.close()
         replacement = managed_session(rig)
         await replacement.start()
         recovered = ManagedController(replacement)
@@ -299,6 +310,9 @@ async def test_operator_delivery_recovery_retains_zero_until_separate_return(
             status = await healthy(recovered)
             assert status["local_hold_verified"] and rig.bench.firmware.effective_limit() == 0
             assert not j.get("managed_control_fault") and j.get(KEY)[str(local)]["completed"]["pause"] == new_pause
+            if legacy_proof is not None:
+                assert j.get(KEY)[str(local)]["proof"] == legacy_proof
+                assert j.get("managed_release_reconciliation")["delivery_reconciliation"] == fingerprint(legacy_proof)
             assert j.get("next_transaction") == counter and j.get("trial_binding") == binding
             assert recovered.current.selected() == selected
             returning = uuid.uuid4().hex

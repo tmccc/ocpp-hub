@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Recover a vendor-confirmed Start whose reply went missing while later charge reports are queued. Keep the
+  charger at zero until the entire queue is delivered and a fresh Pause completes.
 - Show when the vendor reconnects while an earlier charge report remains unconfirmed.
 - Retry restoration of app/schedule control when an expired Start has closed and its cloud Stop reply is pending.
 - Keep verified zero visible while lifecycle delivery is blocked, and refresh control availability when the

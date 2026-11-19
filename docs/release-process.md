@@ -119,6 +119,10 @@ an unproved build or layout, unresolved request, undelivered lifecycle, or uncer
 the check itself. A passing result establishes eligibility for that stopped journal. Verify a fresh Pause and zero
 after starting the previous build on the same journal, before considering Return.
 
+Finish any pending Start mapping recovery on the build that recorded it before rolling back. Earlier builds
+understand a single version 1 mapping. The current workflow can record several mappings and stores a separate
+Stop acknowledgement for each one.
+
 To reproduce the offline rehearsal, extract the two exact commits to new directories under task scratch.
 
 ```bash

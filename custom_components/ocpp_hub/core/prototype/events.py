@@ -9,6 +9,13 @@ from typing import Any
 from .policy import DeniedError, integer
 from .store import ConflictError, Journal, RecoveryRequiredError
 
+OBSERVATION_ACTIONS = (
+    "StatusNotification",
+    "MeterValues",
+    "FirmwareStatusNotification",
+    "DiagnosticsStatusNotification",
+)
+
 STATUSES = frozenset(
     {
         "Available",

@@ -2,13 +2,18 @@
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from ocpp_hub_core.prototype.gateway import decode
+from ocpp_hub_core.prototype.managed_delivery_recovery import KEY as MAPPINGS
+from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
+from ocpp_hub_core.prototype.trial_session import save_private
 
 from tests.cloud_start_helpers import StartReplyBench
 from tests.managed_rig import starts
@@ -17,6 +22,8 @@ from tests.process_helpers import process_rig
 from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
+from tools import reconcile_managed_debt as debt_tool
+from tools import reconcile_managed_delivery as delivery_tool
 
 REPORTS = ("StartTransaction", "MeterValues", "StopTransaction")
 
@@ -28,6 +35,7 @@ class LostVendorReply:
     def __init__(self, bench, connection):
         self.bench, self.connection = bench, connection
         self.pending_token = None
+        self.paused_token = None
 
     # Preserve every incoming report, including actual retries, and select the one to interrupt.
     async def __aiter__(self):
@@ -36,6 +44,8 @@ class LostVendorReply:
             wanted = self.bench.interrupt
             if wanted is not None and frame[0] == 2 and (frame[2], frame[3].get("timestamp")) == wanted:
                 self.pending_token = frame[1]
+            if frame[0] == 2 and frame[2] == "StopTransaction" and frame[3]["timestamp"] == self.bench.hold_stop:
+                self.paused_token = frame[1]
             yield raw
 
     # The vendor's existing ledger has processed the report before attempting to send the reply.
@@ -47,6 +57,9 @@ class LostVendorReply:
             await self.connection.close(code=1011)
             self.bench.interrupted.set()
             return
+        if frame[0] == 3 and frame[1] == self.paused_token:
+            self.bench.stop_waiting.set()
+            await self.bench.release_stop.wait()
         await self.connection.send(raw)
 
 
@@ -60,6 +73,9 @@ class CatchupBench(StartReplyBench):
         self.refused = asyncio.Event()
         self.interrupted = asyncio.Event()
         self.interrupt = None
+        self.hold_stop = None
+        self.stop_waiting = asyncio.Event()
+        self.release_stop = asyncio.Event()
 
     # Keep one vendor ledger across every socket and both proxy processes.
     async def vendor(self, connection):
@@ -226,7 +242,10 @@ async def backlog(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
             "StopTransaction",
         ] * 3
         await check_owner_history(child, charges, 0)
-        yield child, charges, offline
+        try:
+            yield child, charges, offline
+        finally:
+            bench.release_stop.set()
 
 
 # Restore the vendor until it processes the exact report, then wait for the peer to drop the reply and close.
@@ -248,6 +267,129 @@ def check_pending_tail(before, after, action, local):
 def accepted_boots(bench):
     accepted = {frame[1] for frame in bench.sent_vendor_replies if frame[2].get("status") == "Accepted"}
     return sum(frame[0] == 2 and frame[2] == "BootNotification" and frame[1] in accepted for frame in bench.calls)
+
+
+# Accept an explicit Pause through the service even when delivery is still pending.
+async def request_pause(child, status):
+    identifier = uuid.uuid4().hex
+    result = await child.request("pause", id=identifier, revision=status["control_revision"])
+    assert result["ok"]
+    await child.status(lambda value: value.get("desired_control") == "paused")
+    return identifier
+
+
+# Use SQLite only to inject a named failure or inspect a retained reply in the test journal.
+def journal_sql(child, statement, args=()):
+    with closing(sqlite3.connect(child.rig.prepared.config.journal)) as db, db:
+        return db.execute(statement, args).fetchall()
+
+
+# Keep negative cases at the real operator entry point and restore the exact original queued row after each refusal.
+async def reject_unsafe_tail(child, args, port, before):
+    head, *tail = before["outbox"]
+    later_start = next(row for row in tail if row["action"] == "StartTransaction")
+    later_meter = next(row for row in tail if row["action"] == "MeterValues" and row["local"] == later_start["local"])
+    wrong = json.loads(later_meter["payload"]) | {"transactionId": head["local"]}
+    for column, row, changed in (
+        ("state", later_start, "ambiguous"),
+        ("payload", later_meter, json.dumps(wrong)),
+        ("seq", later_start, tail[-1]["seq"] + 1),
+    ):
+        statement = f"UPDATE outbox SET {column}=? WHERE token=?"
+        journal_sql(child, statement, (changed, row["token"]))
+        corrupted = child.durable()
+        try:
+            with pytest.raises(RecoveryRequiredError):
+                await delivery_tool.run("inspect", *args, None, port)
+            assert child.durable() == corrupted
+        finally:
+            journal_sql(child, statement, (row[column], row["token"]))
+    (record,) = [entry for entry in child.rig.bench.backend_starts if entry["token"] == head["token"]]
+    reply = json.dumps([3, record["token"], record["answer"]])
+    journal_sql(
+        child,
+        "INSERT INTO delivery_replies VALUES(?,?,?,?,?)",
+        (head["token"], head["action"], head["payload"], head["local"], reply),
+    )
+    try:
+        with pytest.raises(RecoveryRequiredError, match="unresolved delivery"):
+            await delivery_tool.run("inspect", *args, None, port)
+        assert journal_sql(child, "SELECT token FROM delivery_replies") == [(head["token"],)]
+    finally:
+        journal_sql(child, "DELETE FROM delivery_replies WHERE token=?", (head["token"],))
+    assert child.durable() == before
+
+
+# Use the public offline tool and the independent vendor ledger while the service has released the journal.
+async def map_accepted_start(child, charge, capsys, *, check_invalid_tail=False):
+    directory = child.directory
+    bench = child.rig.bench
+    (vendor_record,) = [record for record in bench.backend_starts if record["body"] == charge.start]
+    assert vendor_record["answer"]["idTagInfo"]["status"] == "Accepted"
+    args = (
+        directory / "trial.json",
+        directory / "process-strategy.json",
+    )
+    port = child.rig.prepared.observer.port
+    before, commands = child.durable(), list(bench.device_calls)
+    if check_invalid_tail:
+        await reject_unsafe_tail(child, args, port, before)
+    assert await delivery_tool.run("inspect", *args, None, port) == 0
+    candidate = json.loads(capsys.readouterr().out)["candidate"]
+    assert candidate["local"] == charge.local and candidate["start_token"] == vendor_record["token"]
+    assert candidate["start_digest"] == fingerprint(charge.start)
+    assert candidate["stop_digest"] == fingerprint(charge.stop)
+    evidence = directory / f"independent-vendor-record-{charge.local}.json"
+    save_private(
+        evidence,
+        candidate
+        | {
+            "vendor": vendor_record["answer"]["transactionId"],
+            "evidence_sha256": fingerprint(vendor_record),
+            "verified_at_epoch": time.time(),
+        },
+    )
+    assert await delivery_tool.run("reconcile-start", *args, evidence, port) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["mapping_recorded"] is True and first["already_recorded"] is False
+    after = child.durable()
+    assert after["outbox"] == before["outbox"][1:]
+    assert after["transactions"] == [
+        row | {"vendor": vendor_record["answer"]["transactionId"]} if row["local"] == charge.local else row
+        for row in before["transactions"]
+    ]
+    assert await delivery_tool.run("reconcile-start", *args, evidence, port) == 0
+    assert json.loads(capsys.readouterr().out)["already_recorded"] is True
+    assert child.durable() == after
+    assert bench.device_calls == commands and bench.firmware.effective_limit() == 0
+
+
+# When a later Stop was actually rejected, use its existing operator tool and let the real wire retry settle it.
+async def approve_rejected_stop(child, charge, capsys):
+    directory, bench = child.directory, child.rig.bench
+    args = (directory / "trial.json", directory / "process-strategy.json")
+    port = child.rig.prepared.observer.port
+    (record,) = [entry for entry in bench.backend_starts if entry["body"] == charge.start]
+    assert not record["closed"]
+    assert await debt_tool.run("inspect", *args, None, port, kind="stop-delivery") == 0
+    candidate = json.loads(capsys.readouterr().out)["candidate"]
+    assert candidate["local_transaction_id"] == charge.local
+    assert candidate["vendor_transaction_id"] == record["answer"]["transactionId"]
+    assert candidate["stop_digest"] == fingerprint(charge.stop)
+    evidence = directory / "independent-vendor-stop-review.json"
+    save_private(
+        evidence,
+        candidate
+        | {
+            "evidence_sha256": fingerprint(record),
+            "verified_at_epoch": time.time(),
+            "cloud_stop_independently_verified": True,
+            "fault_origin_independently_verified": True,
+            "original_state_independently_verified": True,
+        },
+    )
+    assert await debt_tool.run("reconcile", *args, evidence, port, kind="stop-delivery") == 0
+    assert json.loads(capsys.readouterr().out)["zero_hold_retained"] is True
 
 
 # Intent: preserve three scheduled charges and their readings through two vendor outages and a service replacement.
@@ -280,22 +422,25 @@ async def test_scheduled_charge_backlog_survives_interrupted_catchup(backlog):
 
 # Intent: retain a vendor-accepted Start and the later reports when the proxy loses the vendor's answer.
 # Why: retrying an unknown Start can duplicate it, and skipping it can send later readings under the wrong number.
-async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlog):
+@pytest.mark.parametrize("later_reply", ["accepted", "lost-start", "rejected-stop", "rejected-stop-then-lost-start"])
+async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlog, capsys, later_reply):
     child, charges, offline = backlog
     bench = child.rig.bench
-    await interrupt_catchup(child, "StartTransaction", charges[1].start)
-    await check_vendor_charge(child, charges[0])
+    combined = later_reply == "rejected-stop-then-lost-start"
+    first_index = 0 if combined else 1
+    uncertain = charges[first_index]
+    await interrupt_catchup(child, "StartTransaction", uncertain.start)
+    for charge in charges[:first_index]:
+        await check_vendor_charge(child, charge)
     await until(lambda: child.durable()["outbox"][0]["state"] == "ambiguous")
     interrupted = child.durable()
-    check_pending_tail(offline, interrupted, "StartTransaction", charges[1].local)
-    first_start, second_start = bench.backend_starts
-    assert first_start["closed"] and not second_start["closed"]
-    assert second_start["body"] == charges[1].start
-    assert [row["vendor"] for row in interrupted["transactions"]] == [
-        first_start["answer"]["transactionId"],
-        None,
-        None,
-    ]
+    check_pending_tail(offline, interrupted, "StartTransaction", uncertain.local)
+    *delivered, unconfirmed = bench.backend_starts
+    assert len(delivered) == first_index and all(record["closed"] for record in delivered)
+    assert not unconfirmed["closed"] and unconfirmed["body"] == uncertain.start
+    assert [row["vendor"] for row in interrupted["transactions"]] == (
+        [record["answer"]["transactionId"] for record in delivered] + [None] * (len(charges) - first_index)
+    )
     wire = list(bench.lifecycle_wires)
     boot_count = accepted_boots(bench)
     await child.kill()
@@ -307,7 +452,7 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
         lambda state: (
             state["checked_at"] >= registered_at
             and state.get("fault") == "owner_control_or_delivery_uncertain"
-            and state.get("pending_lifecycle_events") == 4
+            and state.get("pending_lifecycle_events") == 2 * (len(charges) - first_index)
             and bench.firmware.effective_limit() == 0
         )
     )
@@ -316,8 +461,101 @@ async def test_scheduled_charge_backlog_waits_when_start_reply_is_missing(backlo
     assert held["healthy"] is False and held["can_return"] is False
     assert child.durable()["outbox"] == interrupted["outbox"]
     assert child.durable()["transactions"] == interrupted["transactions"]
-    await check_owner_history(child, charges, 1)
+    await check_owner_history(child, charges, first_index)
     assert bench.lifecycle_wires == wire and not starts(child.rig)
     await bench.vendor_outage()
     disconnected = await child.status(lambda state: state.get("cloud_connected") is False)
     assert disconnected["fault"] == held["fault"] and bench.firmware.effective_limit() == 0
+
+    await request_pause(child, disconnected)
+    await child.close()
+    assert child.process.returncode == 0
+    await map_accepted_start(child, uncertain, capsys, check_invalid_tail=later_reply == "accepted")
+    bench.hold_stop = charges[2].stop["timestamp"]
+    if later_reply == "lost-start":
+        bench.interrupted.clear()
+        bench.interrupt = ("StartTransaction", charges[2].start["timestamp"])
+    elif later_reply.startswith("rejected-stop"):
+        bench.stop_replies = ["accepted", "error"]
+
+    if later_reply == "accepted":
+        journal_sql(
+            child,
+            "CREATE TRIGGER refuse_mapped_stop AFTER DELETE ON outbox "
+            f"WHEN OLD.action='StopTransaction' AND OLD.local={charges[1].local} "
+            "BEGIN SELECT RAISE(ABORT,'synthetic failed Stop commit'); END",
+        )
+    bench.vendor_available = True
+    await child.start()
+    if later_reply == "accepted":
+        await until(lambda: journal_sql(child, "SELECT 1 FROM delivery_replies WHERE action='StopTransaction'"), 15)
+        proof = child.durable()["metadata"][MAPPINGS][str(charges[1].local)]["proof"]
+        assert proof["stop_wire_ack"] is None
+        assert child.durable()["outbox"][0]["token"] == proof["stop_token"]
+        journal_sql(child, "DROP TRIGGER refuse_mapped_stop")
+    elif later_reply == "lost-start":
+        await asyncio.wait_for(bench.interrupted.wait(), 15)
+        await until(lambda: child.durable()["outbox"][0]["state"] == "ambiguous")
+        await child.close()
+        await map_accepted_start(child, charges[2], capsys)
+        bench.vendor_available = True
+        await child.start()
+    else:
+        rejected_charge = charges[first_index + 1]
+        await until(lambda: child.durable()["outbox"][0]["state"] == "rejected")
+        await child.close()
+        await approve_rejected_stop(child, rejected_charge, capsys)
+        if combined:
+            bench.interrupted.clear()
+            bench.interrupt = ("StartTransaction", charges[2].start["timestamp"])
+        await child.start()
+        if combined:
+            await asyncio.wait_for(bench.interrupted.wait(), 15)
+            await until(lambda: child.durable()["outbox"][0]["state"] == "ambiguous")
+            await child.close()
+            await map_accepted_start(child, charges[2], capsys)
+            bench.vendor_available = True
+            await child.start()
+
+    await asyncio.wait_for(bench.stop_waiting.wait(), 15)
+    waiting = await child.status(lambda state: state.get("pending_lifecycle_events") == 1)
+    fault = waiting["fault"]
+    assert waiting["can_return"] is False and bench.firmware.effective_limit() == 0
+    early = await request_pause(child, waiting)
+    await check_owner_history(child, charges, 2)
+    bench.release_stop.set()
+    await until(lambda: not child.durable()["outbox"], timeout=23)
+    for index, charge in enumerate(charges):
+        retried = later_reply.startswith("rejected-stop") and index == first_index + 1
+        await check_vendor_charge(child, charge, stop_attempts=2 if retried else 1)
+    await check_owner_history(child, charges, 3)
+    drained = await child.status(lambda state: state.get("pending_lifecycle_events") == 0)
+    assert drained["fault"] == fault and drained["can_return"] is False
+    assert bench.firmware.effective_limit() == 0
+    replay = await child.request("pause", id=early, revision=waiting["control_revision"])
+    assert replay["ok"]
+    assert (await child.status(lambda value: value.get("control_revision") == drained["control_revision"]))[
+        "fault"
+    ] == fault
+    fresh = await request_pause(child, drained)
+    await child.completed_control(fresh)
+    paused = await child.status(lambda state: state.get("can_return") is True)
+    assert paused["local_hold_verified"] and bench.firmware.effective_limit() == 0
+    proofs = child.durable()["metadata"][MAPPINGS]
+    mapped = [uncertain, charges[2]] if later_reply == "lost-start" or combined else [uncertain]
+    assert set(proofs) == {str(charge.local) for charge in mapped}
+    for entry in proofs.values():
+        proof = entry["proof"]
+        assert entry["completed"]["pause"] == fresh
+        assert proof["stop_wire_ack"]["delivery_token"] == proof["stop_token"]
+    if combined:
+        recovered = child.durable()["metadata"]["managed_operator_debt_reconciliations"]
+        parent = proofs[str(charges[2].local)]["proof"]["operator_parent"]
+        assert recovered[parent]["completed"]["pause"] == fresh
+    resumed = await child.request("app_control", revision=paused["control_revision"])
+    assert resumed["ok"]
+    await child.completed_control(resumed["result"]["id"])
+    await child.status()
+    final = await scheduled_charge(child, 3, 360)
+    await check_vendor_charge(child, final)
+    assert not starts(child.rig)

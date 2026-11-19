@@ -128,6 +128,9 @@ goes missing, the simulator recognises the exact retry by its original message I
 reach the vendor ledger once, the readings keep their assigned session, and a later timer session works. When a
 Start reply goes missing after the vendor accepts it, the proxy retains the first unconfirmed report and the rest
 of the queue, shows that delivery is uncertain, and keeps the charger at zero across restart and reconnection.
+The tests then use the offline repair tool and the simulated vendor's independent record to confirm that exact Start.
+They cover a second lost Start reply, a later rejected Stop, and both during the same catch-up. The charger stays at
+zero until all reports have been acknowledged, a fresh Pause has completed and the owner chooses Return.
 
 ## Typed recovery boundary contracts
 

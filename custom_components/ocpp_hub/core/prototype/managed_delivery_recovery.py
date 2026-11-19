@@ -11,18 +11,25 @@ from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
+from .events import OBSERVATION_ACTIONS
 from .managed_current import managed_current_ceiling
+from .managed_denial_faults import DELIVERY_MAPPINGS as KEY
+from .managed_denial_faults import (
+    archived_start_matches,
+    current_operator_proof,
+    operator_mapping_members_match,
+    operator_wire_settled,
+)
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, fingerprint
+from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
 
 if TYPE_CHECKING:
     from .managed import ManagedController
 
-KEY = "managed_delivery_reconciliations"
 FAULT = "owner_control_or_delivery_uncertain"
 
 
@@ -153,38 +160,84 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
         raise RecoveryRequiredError("delivery reconciliation requires independently confirmed owned station zero")
 
 
+# Check that the ambiguous head owns an exact closed pair and later reports have no separate delivery uncertainty.
+def require_queued_backlog(j: Journal, head: Delivery) -> None:
+    unmapped = {row["local"] for row in j.db.execute("SELECT local FROM transactions WHERE vendor IS NULL")}
+    started: set[int] = set()
+    active: int | None = None
+    for row in j.db.execute(
+        "SELECT q.*, t.local AS known_local, t.start, t.stop, t.vendor, r.token AS reply "
+        "FROM outbox q LEFT JOIN transactions t ON t.local=q.local "
+        "LEFT JOIN delivery_replies r ON r.token=q.token ORDER BY q.seq"
+    ):
+        local, action = row["local"], row["action"]
+        if row["reply"] is not None or (row["token"] != head.token and row["state"] != "queued"):
+            raise RecoveryRequiredError("another report has an unresolved delivery outcome")
+        if action == "StartTransaction":
+            if active is not None or local not in unmapped or local in started or row["payload"] != row["start"]:
+                raise RecoveryRequiredError("delivery reconciliation needs exact saved Start and Stop pairs in order")
+            started.add(local)
+            active = local
+        elif action == "StopTransaction":
+            if (
+                active is None
+                or local != active
+                or local not in unmapped
+                or row["payload"] != row["stop"]
+                or json.loads(row["payload"]).get("transactionId") != local
+            ):
+                raise RecoveryRequiredError("delivery reconciliation needs exact saved Start and Stop pairs in order")
+            unmapped.remove(local)
+            active = None
+        elif action == "MeterValues":
+            report = json.loads(row["payload"])
+            if (
+                not isinstance(report, dict)
+                or local is None
+                and "transactionId" in report
+                or local is not None
+                and (
+                    type(report.get("transactionId")) is not int
+                    or report["transactionId"] != row["known_local"]
+                    or row["vendor"] is None
+                    and local not in started
+                )
+            ):
+                raise RecoveryRequiredError("queued meter reading does not identify its saved session")
+        elif action not in OBSERVATION_ACTIONS or (local is not None and row["known_local"] is None):
+            raise RecoveryRequiredError("delivery reconciliation found an unsupported queued report")
+    if unmapped or head.transaction not in started:
+        raise RecoveryRequiredError("delivery reconciliation needs all genuine closed Start and Stop pairs")
+
+
+# A later Start may be reconciled alongside an already wire-settled operator recovery for an earlier session.
+def delivery_source(j: Journal, fault: dict[str, Any], head: Delivery) -> tuple[dict[str, Any], str | None]:
+    if fault.get("classification") == FAULT:
+        return fault, None
+    operator = current_operator_proof(j, fault)
+    if (
+        operator is not None
+        and operator["kind"] in ("start-delivery", "stop-delivery")
+        and operator_wire_settled(operator)
+        and operator_mapping_members_match(j, operator)
+        and archived_start_matches(operator, head.token, head.transaction, fingerprint(head.payload), queued_only=True)
+        and (source := operator["prior"].get("fault") or {}).get("classification") == FAULT
+    ):
+        return source, fault["proof"]
+    raise RecoveryRequiredError("the Start belongs to a different or unfinished operator recovery")
+
+
 # Inspection reveals opaque journal correlation/digests, never credentials, raw tags or private native bodies.
 def delivery_candidate(j: Journal, book: ResourceBook, spec: NativeBoundedSpec, n: HandoverEvidence) -> dict[str, Any]:
     require_delivery_zero(j, book, spec, n)
     fault, head = j.fault.read({}), j.next_delivery()
-    if (
-        fault.get("classification") != FAULT
-        or head is None
-        or head.action != "StartTransaction"
-        or head.state not in ("ambiguous", "rejected")
-    ):
+    if head is None or head.action != "StartTransaction" or head.state not in ("ambiguous", "rejected"):
         raise RecoveryRequiredError("the delivery head is not one ambiguous managed Start")
-    row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (head.transaction,)).fetchone()
-    stop = j.db.execute(
-        "SELECT token,payload,state FROM outbox WHERE local=? AND action='StopTransaction'", (head.transaction,)
-    ).fetchone()
-    if (
-        row is None
-        or row["vendor"] is not None
-        or row["stop"] is None
-        or row["start"] != json.dumps(head.payload, sort_keys=True, separators=(",", ":"))
-        or stop is None
-        or stop["state"] != "queued"
-        or stop["payload"] != row["stop"]
-        or j.db.execute(
-            "SELECT 1 FROM transactions WHERE vendor IS NULL AND local!=? LIMIT 1", (head.transaction,)
-        ).fetchone()
-        or j.db.execute(
-            "SELECT 1 FROM outbox WHERE action IN ('StartTransaction','StopTransaction') AND local!=? LIMIT 1",
-            (head.transaction,),
-        ).fetchone()
-    ):
-        raise RecoveryRequiredError("delivery reconciliation needs the exact genuine closed Start/Stop pair")
+    source, _ = delivery_source(j, fault, head)
+    if any(proof["prior_fault"] != source for proof in pending_delivery_proofs(j)):
+        raise RecoveryRequiredError("earlier Start mappings belong to a different recovery")
+    require_queued_backlog(j, head)
+    row = j.db.execute("SELECT stop FROM transactions WHERE local=?", (head.transaction,)).fetchone()
     return {
         "identity_digest": fingerprint(j.identity),
         "spec_digest": spec.digest,
@@ -222,15 +275,20 @@ def reconcile_delivery_start(
         "SELECT token FROM outbox WHERE local=? AND action='StopTransaction'", (evidence.local,)
     ).fetchone()
     anchor, fault = delivery_anchor(j, spec), j.fault.read()
+    head = j.next_delivery()
+    assert head is not None
+    source, parent = delivery_source(j, fault, head)
     normal = j.get("managed_test_charge") if closed_normal_delivery(j) else None
     proof = {
-        "version": 1,
+        "version": 2,
         "input_digest": fingerprint(asdict(evidence)),
         "attestation": asdict(evidence),
         "anchor": anchor,
-        "prior_fault": fault,
+        "prior_fault": source,
+        **({"operator_parent": parent} if parent is not None else {}),
         "prior_intent": j.get("managed_control_intent"),
         "stop_token": stop["token"],
+        "stop_wire_ack": None,
         "native_digest": n.digest,
         "native_observed_at": n.physical.observed_at,
         "recorded_at": time.time(),
@@ -274,33 +332,53 @@ def matching_delivery_row(j: Journal, proof: dict[str, Any]) -> bool:
     )
 
 
-# A new Pause may acknowledge this proof only after actual delivery has removed its retained genuine Stop.
-def delivery_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
+# Keep every outstanding mapping together so a new Pause cannot acknowledge a subset.
+def pending_delivery_proofs(j: Journal) -> list[dict[str, Any]]:
+    return [entry["proof"] for _, entry in sorted(j.get(KEY, {}).items()) if entry.get("completed") is None]
+
+
+# A new Pause may acknowledge every mapping only after the real Stops and the rest of the queue have drained.
+def delivery_recovery_evidence(
+    c: ManagedController, fault: dict[str, Any], operator: dict[str, Any] | None = None
+) -> list[dict[str, Any]] | None:
     j = c.session.journal
-    matches = [
-        entry
-        for entry in j.get(KEY, {}).values()
-        if entry.get("completed") is None and entry["proof"].get("prior_fault") == fault
-    ]
-    if fault.get("classification") != FAULT or len(matches) != 1:
+    proofs = pending_delivery_proofs(j)
+    if not proofs or j.next_delivery() is not None or j.get("managed_control_intent", {}).get("mode") != "paused":
         return None
-    proof: dict[str, Any] = matches[0]["proof"]
-    if (
-        proof.get("version") != 1
-        or proof.get("anchor") != delivery_anchor(j, c.native.spec)
+    source = fault
+    if fault.get("classification") != FAULT:
+        prior = operator["prior"] if operator is not None else {}
+        if operator is None or not operator_mapping_members_match(j, operator):
+            return None
+        source = prior.get("fault") or {}
+        if source.get("classification") != FAULT:
+            return None
+    anchor = delivery_anchor(j, c.native.spec)
+    if any(
+        proof.get("prior_fault") != source
+        or proof.get("anchor") != anchor
         or not matching_delivery_row(j, proof)
-        or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-        or j.db.execute("SELECT 1 FROM outbox WHERE token=?", (proof["stop_token"],)).fetchone()
-        or j.get("managed_control_intent", {}).get("mode") != "paused"
+        or proof.get("version") not in (1, 2)
+        or proof["version"] == 2
+        and (proof.get("stop_wire_ack") or {}).get("delivery_token") != proof["stop_token"]
+        for proof in proofs
     ):
         return None
-    return proof
+    return proofs
 
 
-# Consume only this exact audit in the same commit that clears its acknowledged managed fault.
-def complete_delivery_recovery(j: Journal, proof: dict[str, Any], pause: str) -> None:
+# Preserve the acknowledgement digest of older, single-mapping Pause receipts.
+def delivery_recovery_digest(proofs: list[dict[str, Any]]) -> str:
+    return fingerprint(proofs[0] if len(proofs) == 1 else proofs)
+
+
+# Consume every exact audit in the same commit that clears the acknowledged managed fault.
+def complete_delivery_recovery(j: Journal, proofs: list[dict[str, Any]], pause: str) -> None:
     records = j.get(KEY)
-    key = str(proof["attestation"]["local"])
-    if records[key] != {"proof": proof, "completed": None}:
-        raise RecoveryRequiredError("delivery acknowledgement was already consumed")
-    j.put(KEY, {**records, key: {"proof": proof, "completed": {"pause": pause, "at_epoch": time.time()}}})
+    completed = {"pause": pause, "at_epoch": time.time()}
+    for proof in proofs:
+        key = str(proof["attestation"]["local"])
+        if records.get(key) != {"proof": proof, "completed": None}:
+            raise RecoveryRequiredError("delivery acknowledgement was already consumed")
+        records[key] = {"proof": proof, "completed": completed}
+    j.put(KEY, records)

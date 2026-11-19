@@ -12,7 +12,12 @@ from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
-from .managed_delivery_recovery import complete_delivery_recovery, delivery_recovery_evidence
+from .managed_delivery_recovery import (
+    complete_delivery_recovery,
+    delivery_recovery_digest,
+    delivery_recovery_evidence,
+    pending_delivery_proofs,
+)
 from .managed_native_repair import repair_pending, repair_revoked
 from .managed_settlement import charge_test_candidate, complete_record, current_candidate, require_record
 from .managed_start_delivery import DENIALS, complete_denied_start, denial_faults, denied_start_evidence
@@ -44,6 +49,11 @@ def release_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, A
     ]
     if active and (len(active) != 1 or operator is None):
         return None
+    delivery = delivery_recovery_evidence(c, fault, operator)
+    if pending_delivery_proofs(c.session.journal) and delivery is None:
+        return None
+    if delivery is not None:
+        evidence["delivery_reconciliation"] = delivery_recovery_digest(delivery)
     denied = denied_start_evidence(c, fault)
     sources = denial_faults(c.session.journal, fault)
     if denied is None and any(
@@ -55,7 +65,6 @@ def release_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, A
     if current is not None:
         evidence["current_failure_evidence"] = current
     for key, proof in (
-        ("delivery_reconciliation", delivery_recovery_evidence(c, fault)),
         ("operator_reconciliation", operator),
         ("denied_start_reconciliation", denied),
     ):
@@ -153,8 +162,8 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     terminal_current = current_candidate(c) if current is None else None
     terminal_test = charge_test_candidate(c)
     terminal = [record for record in (terminal_current, terminal_test) if record is not None]
-    delivery = delivery_recovery_evidence(c, fault)
     operator = operator_recovery_evidence(c, fault)
+    delivery = delivery_recovery_evidence(c, fault, operator)
     denied = denied_start_evidence(c, fault)
 
     # Any newer Pause, Boot, local operation, request or unrelated write debt revokes this snapshot.
@@ -268,7 +277,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 "prior_fault": fault,
                 "prior_native_failure": ack.get("native_failure"),
                 "prior_current_failure": current,
-                "delivery_reconciliation": fingerprint(delivery) if delivery is not None else None,
+                "delivery_reconciliation": delivery_recovery_digest(delivery) if delivery is not None else None,
                 "operator_reconciliation": fingerprint(operator) if operator is not None else None,
                 "denied_start_reconciliation": fingerprint(denied) if denied is not None else None,
                 "pause_request": ack["pause_request"],

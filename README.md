@@ -1122,9 +1122,9 @@ the exact associated sessions, after every required Stop has been acknowledged. 
 mapping or operator proof; changed, added or removed evidence requires a new Pause. Historical denial records with
 no fault association do not acquire a new fault or fabricated completion merely because the queue is empty.
 
-An ambiguous cloud Start remains quarantined because resending it could create a duplicate transaction. Managed
-mode applies its existing zero hold even if the owner's session is open; this can interrupt that charge. For one
-independently verified cloud-accepted Start, `tools/reconcile_managed_delivery.py` provides an operator workflow.
+An ambiguous cloud Start stays at the front of the queue because resending it could create a duplicate charge record.
+Managed mode applies its zero hold even if the owner's session is still open. The operator can use
+`tools/reconcile_managed_delivery.py` when independent vendor records confirm the first queued Start.
 Its default `check` validates private inputs without opening the journal or contacting the charger. Ordinary HA
 management credentials do not grant transaction-mapping authority.
 
@@ -1136,16 +1136,18 @@ management credentials do not grant transaction-mapping authority.
 3. Put those fields in a private owned evidence JSON file, adding `vendor`, `evidence_sha256` and
    `verified_at_epoch`. Verification must be recent. The evidence hash records provenance; it does not authenticate
    the cloud record. The operator must independently verify the mapping. Run `reconcile-start --evidence` with the
-   same private inputs. Only the mapped Start is dequeued; its immutable audit and mapping commit together.
-4. Restart the service and wait for the existing genuine Stop to receive its actual cloud acknowledgement. The fault
-   and zero hold remain. A new Pause can then clear only that audit-bound fault after fresh Boot, resource, native-zero
-   and settled-history checks. Replaying an older Pause does not acknowledge later operator evidence. Return remains
-   a separate explicit action to resume the previous selected offer.
+   same private inputs. The transaction mapping and its evidence commit together. The tool removes the matched Start
+   and leaves the later Start, meter and Stop reports in their existing order.
+4. Restart the service and wait for the entire queue to empty. Each mapped charge needs its own genuine Stop
+   acknowledgement. If a later Start reply goes missing during catch-up, use fresh independent evidence for that Start
+   and repeat the same steps. Once all reports are delivered, issue a new Pause to acknowledge the completed recovery.
+   The proxy checks the current Boot, original resources and fresh zero before completing that Pause. Use Return
+   separately to restore the previous current setting.
 
-The workflow refuses unrelated faults, ambiguous additional transactions, missing genuine closure, unresolved
-commands, changed configuration/history, and unconfirmed station zero. Unfinished retired one-off obligations
-refuse journal startup before this workflow can run. It never guesses a
-vendor ID, replays Start, invents a Stop, clears unrelated debts or automatically raises current.
+Each later unmapped charge must have its exact saved Start and Stop in the queue, and meter readings must name their
+own session. The tool refuses separately uncertain reports, missing closure, unresolved commands, changed configuration
+or history, and unconfirmed station zero. Unfinished retired one-off obligations refuse journal startup before this
+workflow can run.
 
 `tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for nine specific debts:
 

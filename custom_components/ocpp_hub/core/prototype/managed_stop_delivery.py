@@ -9,7 +9,7 @@ from typing import Any
 
 from .managed_combined_start_recovery import KIND as COMBINED_KIND
 from .managed_combined_start_recovery import combined_stop_matches, record_combined_stop_ack
-from .managed_denial_faults import retained_denial_fault
+from .managed_denial_faults import DELIVERY_MAPPINGS, retained_denial_fault
 from .store import Delivery, Journal, RecoveryRequiredError, fingerprint
 
 REJECTION = "managed_stop_reply_rejection"
@@ -151,6 +151,28 @@ def stop_resolution(j: Journal, evidence: dict[str, Any], wire_ack: dict[str, An
     }
 
 
+# A mapped Start keeps its own real Stop acknowledgement, even if more Starts are later mapped.
+def record_mapped_stop_ack(j: Journal, identity: dict[str, Any], response: dict[str, Any]) -> None:
+    records = j.get(DELIVERY_MAPPINGS, {})
+    key = str(identity["local_transaction_id"])
+    entry = records.get(key)
+    if entry is None or entry.get("completed") is not None or entry["proof"].get("version") != 2:
+        return
+    proof = entry["proof"]
+    evidence = proof["attestation"]
+    if (
+        proof.get("stop_wire_ack") is not None
+        or proof["stop_token"] != identity["delivery_token"]
+        or evidence["vendor"] != identity["vendor_transaction_id"]
+        or evidence["start_digest"] != identity["start_digest"]
+        or evidence["stop_digest"] != identity["stop_digest"]
+    ):
+        raise RecoveryRequiredError("mapped Stop does not match the independently confirmed Start and Stop pair")
+    ack = {"delivery_token": identity["delivery_token"], "reply_digest": fingerprint(response), "at_epoch": time.time()}
+    records[key] = {**entry, "proof": {**proof, "stop_wire_ack": ack}}
+    j.put(DELIVERY_MAPPINGS, records)
+
+
 # Called inside Journal.acknowledge: proof and actual dequeue commit together or both roll back.
 def record_stop_ack(j: Journal, item: Delivery, response: dict[str, Any]) -> None:
     if item.action != "StopTransaction":
@@ -158,6 +180,7 @@ def record_stop_ack(j: Journal, item: Delivery, response: dict[str, Any]) -> Non
     if not j.db.in_transaction:
         raise RecoveryRequiredError("Stop wire acknowledgment must share its actual journal commit")
     identity = stop_identity(j, item)
+    record_mapped_stop_ack(j, identity, response)
     record_combined_stop_ack(j, item, response, identity)
     denials = j.get("managed_start_denials", {})
     denial = denials.get(str(item.transaction))

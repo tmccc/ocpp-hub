@@ -17,6 +17,9 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 - [x] Three timer sessions catch up after a vendor outage, interrupted delivery and a proxy restart. The
   [tests](recovery-coverage.md#risk-matrix) also cover the case where the vendor accepts a Start but its reply goes
   missing. The proxy retains the reports and keeps the charger at zero while the outcome is uncertain.
+- [x] The offline repair tool confirms a vendor-accepted Start while preserving later queued charge reports.
+  In the simulator, a second lost Start reply and a later rejected Stop can each be resolved with their own
+  evidence. Delivery, a fresh Pause and an explicit Return precede the next scheduled charge.
 
 ## Current iCS implementation — 18 November 2026
 
