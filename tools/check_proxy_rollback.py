@@ -47,6 +47,7 @@ class Build:
     commit: str
     digest: str
     incident: bool
+    migrated_only: bool = False
 
 
 CURRENT = Build(
@@ -54,10 +55,19 @@ CURRENT = Build(
     "f459f45dc2375fdb373e53d13aa5a5e3334b908d96e1704874d22821b1455ea0",
     True,
 )
-MIGRATED_CURRENT = Build(
-    "051500f16ca3915ba50db32bb8aef6fcad0556da",
-    "d6bf540b51441b528200be4e373067c93f40857edb9238160d9a80b07c09fc9e",
-    True,
+MIGRATED_RELEASES = (
+    Build(
+        "051500f16ca3915ba50db32bb8aef6fcad0556da",
+        "d6bf540b51441b528200be4e373067c93f40857edb9238160d9a80b07c09fc9e",
+        True,
+        migrated_only=True,
+    ),
+    Build(
+        "3fdace88bbfb7e8f0802b9e295915eb8a4492ce1",
+        "2c21808bd8345d9f623b7d459d2ef763176ee78e8f48b1cf2876401f35c7f8cb",
+        True,
+        migrated_only=True,
+    ),
 )
 PREVIOUS = Build(
     "7a08f2ade3b9e597099aaece2aef2f8542852a41",
@@ -432,10 +442,10 @@ def check_snapshot(db: sqlite3.Connection, config: TrialConfig, *, migrated_only
 def check_rollback(config: TrialConfig, current: Path, previous: Path) -> RollbackCheck:
     build = None
     try:
-        build = next((build for build in (CURRENT, MIGRATED_CURRENT) if build_matches(current, build)), None)
+        build = next((build for build in (CURRENT, *MIGRATED_RELEASES) if build_matches(current, build)), None)
         require(build is not None and build_matches(previous, PREVIOUS), "build_pair_unrehearsed")
         with stopped_journal(config.journal) as db:
-            revision = check_snapshot(db, config, migrated_only=build == MIGRATED_CURRENT)
+            revision = check_snapshot(db, config, migrated_only=build.migrated_only)
         return RollbackCheck(True, "rehearsed_stopped_journal", current_commit=build.commit, pause_revision=revision)
     except RollbackRefusedError as error:
         reason = str(error)
