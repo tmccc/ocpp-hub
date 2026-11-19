@@ -1,7 +1,6 @@
 """Controlled scheduler loss before an owned Start task runs cannot create false issued-command provenance."""
 
 import asyncio
-import sqlite3
 import uuid
 
 import pytest
@@ -80,25 +79,39 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
         try:
             async with rig.charger(replacement) as sock:
                 await introduced(rig, replacement, sock, "scheduled-start-loss-replacement")
+                pause = uuid.uuid4().hex
                 if loss.startswith("retirement-"):
                     if loss == "retirement-request":
                         sql = "BEFORE UPDATE ON managed_requests WHEN NEW.id='" + identifier + "'"
                     else:
                         sql = "BEFORE INSERT ON meta WHEN NEW.key='managed_test_charge' AND "
                         sql += "json_extract(NEW.value,'$.state')='completed'"
+                    attempts = []
+
+                    # Witness the real write before SQLite rejects it.
+                    def observe_attempt():
+                        attempts.append(True)
+                        return 0
+
+                    replacement.journal.db.create_function("observe_retirement_attempt", 0, observe_attempt)
                     replacement.journal.db.execute(
                         "CREATE TRIGGER fail_unsent_retire "
                         + sql
-                        + " BEGIN SELECT RAISE(ABORT,'synthetic unsent retirement failure'); END"
+                        + " BEGIN SELECT observe_retirement_attempt(); "
+                        "SELECT RAISE(ABORT,'synthetic unsent retirement failure'); END"
                     )
-                    c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
-                    with pytest.raises(sqlite3.IntegrityError, match="synthetic unsent retirement failure"):
+                c.command(pause, "pause", c.requests.intent().revision)
+                if loss.startswith("retirement-"):
+                    try:
                         await c.pause_task
-                    assert c.requests.receipt(identifier)["state"] == "uncertain"
-                    assert c.charging.state()["state"] == "interrupted" and rig.bench.firmware.effective_limit() == 0
-                    replacement.journal.db.execute("DROP TRIGGER fail_unsent_retire")
-                c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                        assert attempts and c.requests.receipt(pause)["state"] == "accepted"
+                        assert c.requests.receipt(identifier)["state"] == "uncertain"
+                        assert c.charging.state()["state"] == "interrupted"
+                        assert rig.bench.firmware.effective_limit() == 0
+                    finally:
+                        replacement.journal.db.execute("DROP TRIGGER fail_unsent_retire")
                 assert (await healthy(c))["local_hold_verified"]
+                assert c.requests.receipt(pause)["state"] == "completed"
                 assert c.charging.state()["state"] == "completed"
                 assert c.requests.receipt(identifier)["state"] == "failed"
                 c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
