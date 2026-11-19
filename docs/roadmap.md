@@ -12,14 +12,20 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 - [x] Archived charger, proxy and Home Assistant histories agree for three midnight sessions on November 10, 12
   and 13. The sessions used 5.614, 0.000 and 32.508 kWh. On two nights the car stopped drawing power before the
-  session closed. The zero-energy session stayed open until the scheduled end. The offline catch-up test
-  covers early zero and zero throughout a scheduled session. The reason for the early drops remains unknown.
+  session closed. The zero-energy session stayed open until the scheduled end. Charger records show a positive
+  offer during zero draw. The offline tests cover zero throughout a session, a brief zero followed by resumed draw,
+  and lower reported offer before the scheduled Stop. The cause of the drops remains unknown.
 - [x] Three timer sessions catch up after a vendor outage, interrupted delivery and a proxy restart. The
   [tests](recovery-coverage.md#risk-matrix) also cover the case where the vendor accepts a Start but its reply goes
   missing. The proxy retains the reports and keeps the charger at zero while the outcome is uncertain.
 - [x] The offline repair tool confirms a vendor-accepted Start while preserving later queued charge reports.
   In the simulator, a second lost Start reply and a later rejected Stop can each be resolved with their own
   evidence. Delivery, a fresh Pause and an explicit Return precede the next scheduled charge.
+- [x] Actual Home Assistant tests cover delayed Return, interrupted current selection and a newer Pause across proxy
+  replacement. They also check both sides of Return's final saved result at an applied 16 A ceiling.
+- [x] The [rollback check](release-process.md#rehearsed-standalone-software-rollback) accepts the settled migrated
+  journal used in the offline rehearsal. The older build kept its history, saved current and latest Pause. A
+  separate Return allowed the next scheduled charge to complete.
 
 ## Current iCS implementation — 18 November 2026
 

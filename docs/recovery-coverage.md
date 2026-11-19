@@ -122,6 +122,10 @@ in either order using the same saved config entry and journal. It verifies that 
 unknown outcome, the original Pause completes and remains in force, and the charger stays at zero without a
 second Pause request. Return from Home Assistant allows two later scheduled charges to finish.
 
+The [overlapping owner controls](../tests_ha_proxy/test_owner_overlap.py) verify that a delayed Return fails
+during current selection and a newer Pause survives proxy replacement at zero. They also check both sides of
+Return's success commit after the charger has applied the selected 16 A ceiling and Home Assistant loses confirmation.
+
 The [vendor catch-up tests](../tests/test_managed_vendor_catchup.py) queue three timer sessions and their meter
 readings over three simulated nights, then interrupt delivery and restart the standalone proxy. When a Stop reply
 goes missing, the simulator recognises the exact retry by its original message ID and body. All three sessions
@@ -131,6 +135,8 @@ of the queue, shows that delivery is uncertain, and keeps the charger at zero ac
 The tests then use the offline repair tool and the simulated vendor's independent record to confirm that exact Start.
 They cover a second lost Start reply, a later rejected Stop, and both during the same catch-up. The charger stays at
 zero until all reports have been acknowledged, a fresh Pause has completed and the owner chooses Return.
+The overnight case varies the charger's reported offer independently of draw. It verifies that draw can stop,
+resume and stay at zero before the same scheduled Stop, with the meter readings attached to the same session.
 
 ## Typed recovery boundary contracts
 

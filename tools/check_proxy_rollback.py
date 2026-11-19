@@ -25,7 +25,10 @@ load_core()
 from ocpp_hub_core.control import HUB_PROFILE_ID  # noqa: E402
 from ocpp_hub_core.prototype.control_state import ControlState  # noqa: E402
 from ocpp_hub_core.prototype.managed_intent import decode_intent, decode_pause_claim  # noqa: E402
+from ocpp_hub_core.prototype.native_history import indexed  # noqa: E402
+from ocpp_hub_core.prototype.native_start_attempts import split_attempts  # noqa: E402
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
+from ocpp_hub_core.prototype.retired_schedules import schedule_history  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.station import StationChoice  # noqa: E402
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint  # noqa: E402
@@ -35,7 +38,7 @@ from ocpp_hub_core.prototype.trial_evidence import profile_projection  # noqa: E
 
 @dataclass(frozen=True)
 class Build:
-    """A source fingerprint for exactly one side of the tested transition."""
+    """A source fingerprint for one side of a tested transition."""
 
     commit: str
     digest: str
@@ -47,6 +50,11 @@ CURRENT = Build(
     "f459f45dc2375fdb373e53d13aa5a5e3334b908d96e1704874d22821b1455ea0",
     True,
 )
+MIGRATED_CURRENT = Build(
+    "051500f16ca3915ba50db32bb8aef6fcad0556da",
+    "d6bf540b51441b528200be4e373067c93f40857edb9238160d9a80b07c09fc9e",
+    True,
+)
 PREVIOUS = Build(
     "7a08f2ade3b9e597099aaece2aef2f8542852a41",
     "71141220fceddd3dc0349a84e430a65d56dc908e43fee2d20327b6ba93b42c7d",
@@ -54,6 +62,7 @@ PREVIOUS = Build(
 )
 REQUIREMENTS = "2773b4a9f9b16cfe90626e328db61ff281810c3f53d9a86f3178c0b54455586d"
 REHEARSED_SCHEMA = "1b3d8757ddca8f860ff1d69e9d092839efcf948bda9a70524e04aa361bd9c8a4"
+MIGRATED_SCHEMA = "0b08c43048c89c897d8224d2335e43294652dd9ba58fd940030a61437c776f0d"
 
 # These include the inactive history labels and markers the two rehearsed builds can retain.
 SUPPORTED_METADATA = frozenset(
@@ -66,11 +75,18 @@ SUPPORTED_METADATA = frozenset(
     trial_allocation trial_baseline trial_binding trial_phase trial_starting vendor_profile_transactions vendor_profiles
     """.split()
 )
+MIGRATED_METADATA = SUPPORTED_METADATA | frozenset(
+    """
+    last_status managed_release_operator_acknowledgement managed_temporary_occurrences managed_temporary_schedule
+    managed_temporary_schedule_head native_history_archive_binding native_history_policy
+    native_history_policy_acknowledgement native_history_summary native_start_attempt_recovery vendor_start_grant
+    """.split()
+)
 
 
 @dataclass(frozen=True)
 class RollbackCheck:
-    """A classified snapshot of eligibility for the one rehearsed build pair."""
+    """A classified snapshot of eligibility for a rehearsed rollback."""
 
     allowed: bool
     reason: str
@@ -233,25 +249,178 @@ def require_installation(db: sqlite3.Connection, meta: dict[str, Any]) -> None:
     )
 
 
+# Match the selected ceiling the older build will read after the rollback.
+def require_current_preparation(meta: dict[str, Any]) -> int:
+    preparation = meta.get("managed_current_prepare_intent", {})
+    capability = meta.get("managed_current_capability")
+    require(isinstance(preparation, dict), "unresolved_current_preparation")
+    if capability is None:
+        require(not preparation, "unresolved_current_preparation")
+        return 6
+    handover = meta.get("native_bounded_handover")
+    spec_digest = meta["managed_mode"]["spec_digest"]
+    expected = {
+        "version": 1,
+        "identity_digest": fingerprint(meta.get("identity")),
+        "spec_digest": spec_digest,
+        "native_ceiling_a": 32,
+        "max_current_a": 32,
+    }
+    require(
+        preparation.get("stage") == "complete"
+        and preparation.get("capability") == capability == expected
+        and isinstance(handover, dict)
+        and handover.get("stage") == "admitted"
+        and fingerprint(handover.get("spec")) == spec_digest,
+        "unresolved_current_preparation",
+    )
+    return 32
+
+
+# Verify the admitted archive policy and the original bodies retained in the stopped journal.
+def require_migrated_history(db: sqlite3.Connection, meta: dict[str, Any]) -> None:
+    schedule_history(db)
+    schedule = meta.get("managed_temporary_schedule", {})
+    head = meta.get("managed_temporary_schedule_head")
+    occurrences = meta.get("managed_temporary_occurrences", {})
+    require(
+        meta.get("vendor_start_grant", {}) == {}
+        and (not schedule or schedule.get("timer_present") is False)
+        and (head is None or isinstance(head, str) and head == schedule.get("id") and head in occurrences),
+        "unresolved_migrated_control",
+    )
+
+    handover = meta.get("native_bounded_handover")
+    acknowledgement = meta.get("native_history_policy_acknowledgement")
+    require(isinstance(handover, dict) and isinstance(acknowledgement, dict), "native_history_unverified")
+    original = handover.get("original_history")
+    spec_digest = meta["managed_mode"]["spec_digest"]
+    binding = {"identity": fingerprint(meta["identity"]), "original": fingerprint(original)}
+    policy = {
+        "version": 1,
+        "mode": "archive_missing",
+        "identity_digest": binding["identity"],
+        "spec_digest": spec_digest,
+        "original_history_digest": binding["original"],
+    }
+    at = acknowledgement.get("at_epoch")
+    native_digest = acknowledgement.get("native_digest")
+    require(
+        handover.get("stage") == "admitted"
+        and fingerprint(handover.get("spec")) == spec_digest
+        and meta.get("native_history_archive_binding") == binding
+        and fingerprint(meta.get("native_history_policy")) == fingerprint(policy)
+        and fingerprint(acknowledgement.get("policy")) == fingerprint(policy)
+        and acknowledgement.get("charging_started") is False
+        and type(at) in (int, float)
+        and 0 < at <= time.time() + 2
+        and isinstance(native_digest, str)
+        and re.fullmatch(r"[a-f0-9]{64}", native_digest) is not None,
+        "native_history_unverified",
+    )
+    numbered, attempts = split_attempts(original)
+    archived_originals = set()
+    for identifier, digest, body, admitted in db.execute(
+        "SELECT transaction_id,digest,body,original FROM native_history_records"
+    ):
+        record = json.loads(body)
+        require(
+            isinstance(record, dict)
+            and record.get("transactionId") == identifier
+            and fingerprint(record) == digest
+            and admitted in (0, 1),
+            "native_history_unverified",
+        )
+        if admitted:
+            archived_originals.add((identifier, digest))
+    require(
+        archived_originals == {(identifier, fingerprint(body)) for identifier, body in indexed(numbered).items()},
+        "native_history_unverified",
+    )
+    archived_attempts = set()
+    for digest, body in db.execute("SELECT digest,body FROM native_start_attempts"):
+        require(fingerprint(json.loads(body)) == digest, "native_history_unverified")
+        archived_attempts.add(digest)
+    require({fingerprint(body) for body in attempts.values()} <= archived_attempts, "native_history_unverified")
+
+
+# Admit only old timed Starts whose exact later verified Pause is in the saved reconciliation proof.
+def require_settled_requests(db: sqlite3.Connection, meta: dict[str, Any], *, migrated: bool, revision: int) -> None:
+    pending = db.execute(
+        "SELECT rowid,id,action,revision,state,result FROM managed_requests WHERE state NOT IN ('completed','failed')"
+    ).fetchall()
+    if not pending:
+        return
+    proof = meta.get("native_start_attempt_recovery")
+    require(migrated and isinstance(proof, dict), "unresolved_request")
+    prior = decode_intent(proof.get("prior_intent"))
+    fault = proof.get("prior_fault")
+    entries = proof.get("superseded_test_proofs")
+    require(
+        isinstance(fault, dict) and isinstance(entries, list) and len(entries) == len(pending), "unresolved_request"
+    )
+    fault_at, recovered_at = fault.get("at_epoch"), proof.get("at_epoch")
+    require(
+        fault.get("classification") == "native_authority_or_preservation_failed"
+        and type(fault_at) in (int, float)
+        and type(recovered_at) in (int, float)
+        and 0 < fault_at <= recovered_at <= time.time() + 2
+        and prior.revision < revision
+        and all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("request_id"), str)
+            and isinstance(entry.get("verified_pause_id"), str)
+            for entry in entries
+        ),
+        "unresolved_request",
+    )
+    pauses = {entry["request_id"]: entry["verified_pause_id"] for entry in entries}
+    active_test = meta.get("managed_test_charge", {})
+    for rowid, identifier, action, request_revision, state, result in pending:
+        require(
+            action == "start_test"
+            and state == "uncertain"
+            and identifier != active_test.get("id")
+            and identifier in pauses
+            and json.loads(result) == {"classification": "start_not_confirmed"},
+            "unresolved_request",
+        )
+        pause = db.execute(
+            "SELECT rowid,revision,result FROM managed_requests WHERE id=? AND action='pause' AND state='completed'",
+            (pauses[identifier],),
+        ).fetchone()
+        require(pause is not None, "unresolved_request")
+        pause_order, pause_revision, raw_pause = pause
+        pause_result = json.loads(raw_pause)
+        require(isinstance(pause_result, dict), "unresolved_request")
+        completed = pause_result.get("completed_at")
+        require(
+            rowid < pause_order
+            and 0 <= request_revision < pause_revision < prior.revision
+            and pause_result.get("pause_verified") is True
+            and type(completed) in (int, float)
+            and 0 < completed <= fault_at,
+            "unresolved_request",
+        )
+
+
 # Evaluate only the paused, settled journal variant proved by the cross-build rehearsal.
-def check_snapshot(db: sqlite3.Connection, config: TrialConfig) -> int:
-    require(schema_digest(db) == REHEARSED_SCHEMA, "journal_schema_unrehearsed")
+def check_snapshot(db: sqlite3.Connection, config: TrialConfig, *, migrated_only: bool = False) -> int:
+    schema = schema_digest(db)
+    migrated = schema == MIGRATED_SCHEMA
+    require(migrated or not migrated_only and schema == REHEARSED_SCHEMA, "journal_schema_unrehearsed")
     require(
         db.execute("PRAGMA quick_check(1)").fetchone() == ("ok",)
         and db.execute("PRAGMA foreign_key_check").fetchone() is None,
         "journal_integrity_unverified",
     )
     raw = db.execute("SELECT key,value FROM meta").fetchall()
-    require(all(key in SUPPORTED_METADATA for key, _ in raw), "unrehearsed_journal_metadata")
+    supported = MIGRATED_METADATA if migrated else SUPPORTED_METADATA
+    require(all(key in supported for key, _ in raw), "unrehearsed_journal_metadata")
     meta = {key: json.loads(value) for key, value in raw}
     control = meta.get("control")
     require(isinstance(control, dict), "unrehearsed_journal_state")
     require_settled_start(db, meta, control)
-    require(
-        db.execute("SELECT 1 FROM managed_requests WHERE state NOT IN ('completed','failed') LIMIT 1").fetchone()
-        is None,
-        "unresolved_request",
-    )
     require(
         db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone() is None
         and db.execute("SELECT 1 FROM delivery_replies LIMIT 1").fetchone() is None
@@ -273,21 +442,8 @@ def check_snapshot(db: sqlite3.Connection, config: TrialConfig) -> int:
     ):
         value = meta.get(key, {})
         require(isinstance(value, dict) and (not value or value.get("state") in states), "unrehearsed_journal_state")
-    preparation = meta.get("managed_current_prepare_intent", {})
-    capability = meta.get("managed_current_capability")
-    require(
-        isinstance(preparation, dict)
-        and (
-            not preparation
-            and capability is None
-            or preparation.get("stage") == "complete"
-            and isinstance(capability, dict)
-            and bool(capability)
-            and preparation.get("capability") == capability
-        ),
-        "unresolved_current_preparation",
-    )
     require_installation(db, meta)
+    ceiling = require_current_preparation(meta)
     intent = decode_intent(meta.get("managed_control_intent"))
     pause = decode_pause_claim(meta.get("managed_owner_pause"))
     resume, stop_epoch, ticket = (control.get(key) for key in ("resume_limit", "stop_epoch", "ticket"))
@@ -300,25 +456,31 @@ def check_snapshot(db: sqlite3.Connection, config: TrialConfig) -> int:
         and isinstance(ticket, str)
         and re.fullmatch(r"[0-9a-f]{32}", ticket) is not None
         and type(resume) in (int, float)
-        and 6 <= resume <= 32
+        and 6 <= resume <= ceiling
+        and int(resume) == resume
         and pause.owns(intent, pause.ticket)
         and isinstance(pause.ticket, str)
         and re.fullmatch(r"[0-9a-f]{32}", pause.ticket) is not None,
         "settled_owner_pause_required",
     )
     require_allocation(db, config, meta)
+    require_settled_requests(db, meta, migrated=migrated, revision=intent.revision)
+    if migrated:
+        require_migrated_history(db, meta)
     return intent.revision
 
 
 # Give a classified read-only result. The check never launches either build or changes a configuration.
 def check_rollback(config: TrialConfig, current: Path, previous: Path) -> RollbackCheck:
+    build = None
     try:
-        require(build_matches(current, CURRENT) and build_matches(previous, PREVIOUS), "build_pair_unrehearsed")
+        build = next((build for build in (CURRENT, MIGRATED_CURRENT) if build_matches(current, build)), None)
+        require(build is not None and build_matches(previous, PREVIOUS), "build_pair_unrehearsed")
         with stopped_journal(config.journal) as db:
-            revision = check_snapshot(db, config)
-        return RollbackCheck(True, "rehearsed_stopped_journal", pause_revision=revision)
+            revision = check_snapshot(db, config, migrated_only=build == MIGRATED_CURRENT)
+        return RollbackCheck(True, "rehearsed_stopped_journal", current_commit=build.commit, pause_revision=revision)
     except RollbackRefusedError as error:
-        return RollbackCheck(False, str(error))
+        reason = str(error)
     except (
         OSError,
         sqlite3.Error,
@@ -329,7 +491,8 @@ def check_rollback(config: TrialConfig, current: Path, previous: Path) -> Rollba
         RecoveryRequiredError,
         SecurityError,
     ):
-        return RollbackCheck(False, "journal_unavailable_or_malformed")
+        reason = "journal_unavailable_or_malformed"
+    return RollbackCheck(False, reason, current_commit=(build or CURRENT).commit)
 
 
 # Load the private configuration locally and print a result that contains no file paths, IDs or saved payloads.

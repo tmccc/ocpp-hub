@@ -102,8 +102,8 @@ class ChargeReports:
     stop: dict
 
 
-# Drive an ordinary firmware timer and its meter reports with no external Start command.
-async def scheduled_charge(child, day_number, demand_minutes):
+# Start one session from the charger timer and retain its actual scheduled end.
+async def begin_scheduled_charge(child, day_number):
     bench, peer = child.rig.bench, child.rig.peer
     plan = bench.firmware.plans[9]
     day = datetime(2026, 1, 5, tzinfo=ZONE) + timedelta(days=day_number)
@@ -121,8 +121,15 @@ async def scheduled_charge(child, day_number, demand_minutes):
     peer.plan_session = (local, plan["planId"])
     peer.paused = False
     bench.firmware.fire_plan(plan["planId"])
-    amperes = bench.firmware.effective_limit()
-    assert amperes == 16
+    return local, start_report, started, ended
+
+
+# Drive ordinary readings at the selected ceiling with no external Start command.
+async def scheduled_charge(child, day_number, demand_minutes, amperes=16):
+    bench, peer = child.rig.bench, child.rig.peer
+    local, start_report, started, ended = await begin_scheduled_charge(child, day_number)
+    assert bench.firmware.effective_limit() == amperes
+    meter_start = start_report["meterStart"]
     reports = []
     for minute in (30, 240):
         drawing = minute < demand_minutes
@@ -202,6 +209,90 @@ async def check_owner_history(child, charges, acknowledged_count):
         }
         for index, charge in reversed(list(enumerate(charges)))
     ]
+
+
+# Intent: draw can stall, resume and reach zero before the timer closes the same session.
+# Why: archived overnight samples showed positive offered current throughout zero draw, with one lower later offer.
+async def test_scheduled_charge_keeps_one_session_through_zero_draw(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    port = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path,
+        tls,
+        port(),
+        port(),
+        monkeypatch,
+        32,
+        bench_type=CatchupBench,
+        native_peer=SchedulePeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        ready = await child.status()
+        bench, peer = child.rig.bench, child.rig.peer
+        reported_offer = 320
+        read_native = peer.native
+
+        # Keep the independent firmware profile and measured draw while varying the separate native offer.
+        def native(key):
+            value = read_native(key)
+            if key == "CONNECTOR":
+                value[0]["offerCur"] = reported_offer
+            return value
+
+        monkeypatch.setattr(peer, "native", native)
+        local, start, started, ended = await begin_scheduled_charge(child, 0)
+        peer.permission_enabled = True
+        bench.cp, bench.connection = "C", "Charging"
+        reports = []
+        # The last two meter values of each zero span agree before the timer sends its actual Stop.
+        for minute, draw, reported_offer, energy in (
+            (30, 32, 320, 13_840),
+            (31, 0, 320, 13_840),
+            (32, 0, 320, 13_840),
+            (60, 32, 320, 17_424),
+            (240, 6, 320, 40_464),
+            (270, 0, 61, 41_184),
+            (359, 0, 61, 41_184),
+        ):
+            bench.firmware.requested_current = draw
+            power = draw * 240
+            status = await child.status(lambda state: state["charging_session_open"] and state["power_w"] == power)
+            assert status["current_a"] == draw and status["station_ceiling_a"] == 32
+            assert status["requested_current_a"] == 32 and status["control_revision"] == ready["control_revision"]
+            assert bench.firmware.active == local and bench.firmware.effective_limit() == 32
+            assert not any(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls)
+            assert not any(frame[2] == "StopTransaction" for frame in bench.lifecycle_wires)
+            reading = {
+                "connectorId": 1,
+                "transactionId": local,
+                "meterValue": [
+                    {
+                        "timestamp": (started + timedelta(minutes=minute)).isoformat(),
+                        "sampledValue": [
+                            {"measurand": "Energy.Active.Import.Register", "unit": "Wh", "value": str(energy)},
+                            {"measurand": "Current.Offered", "unit": "A", "value": str(reported_offer / 10)},
+                            {"measurand": "Power.Active.Import", "unit": "W", "value": str(power)},
+                        ],
+                    }
+                ],
+            }
+            assert (await bench.call(child.socket, uuid.uuid4().hex, "MeterValues", reading))[0] == 3
+            reports.append(reading)
+
+        stop = {"transactionId": local, "timestamp": ended.isoformat(), "meterStop": 41_184}
+        assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        peer.plan_session, peer.permission_enabled = None, False
+        first = ChargeReports(local, start, tuple(reports), stop)
+        await check_vendor_charge(child, first)
+        await check_owner_history(child, [first], 1)
+
+        reported_offer = 320
+        later = await scheduled_charge(child, 1, 360, amperes=32)
+        await check_vendor_charge(child, later)
+        await check_owner_history(child, [first, later], 2)
+        assert later.local != local and not starts(child.rig)
 
 
 # Verify that only transmission state can change when a replacement opens the same pending queue.

@@ -101,9 +101,10 @@ routine updates do not require another dedicated charging trial when the owner h
 
 ### Rehearsed standalone software rollback
 
-The first rehearsal goes from `fc2dc0a` to `7a08f2a` over one advancing SQLite journal. It covers the fresh journal
-layout exercised by the simulator. A different layout, including a migrated one, needs its own compatibility
-evidence. Keep the verified configuration, native specification and pinned runtime with the two immutable builds.
+The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and from `051500f` on a saved copy of
+the migrated journal. Each rehearsal used one advancing SQLite journal. The migrated rehearsal preserved the
+saved 32 A selection, the archive and original receipts. The older build kept the newer Pause and completed the
+next simulated scheduled charge after Return.
 
 For a stopped installation, the read-only check reports whether the two supplied builds and the retained journal
 match the rehearsed conditions. Use the actual stopped service build as the current root.
@@ -119,9 +120,8 @@ an unproved build or layout, unresolved request, undelivered lifecycle, or uncer
 the check itself. A passing result establishes eligibility for that stopped journal. Verify a fresh Pause and zero
 after starting the previous build on the same journal, before considering Return.
 
-Finish any pending Start mapping recovery on the build that recorded it before rolling back. Earlier builds
-understand a single version 1 mapping. The current workflow can record several mappings and stores a separate
-Stop acknowledgement for each one.
+Finish pending Start mapping recovery on the build that recorded it. The checker refuses journals that contain
+the newer mapping records, including completed mappings. Those journals still need their own rollback rehearsal.
 
 To reproduce the offline rehearsal, extract the two exact commits to new directories under task scratch.
 
@@ -138,10 +138,9 @@ managed charge and its delivery, the original newer Pause after the switch, and 
 Separate cases prove refusal before the previous process starts. The cross-build rehearsal takes explicit source
 snapshots alongside the usual release qualification.
 
-The [one-week installation rehearsal](developer.md#one-week-installation-rehearsal) uses the same build pair
-with synthetic records in the audited migrated layout. It verifies the ordinary delivery records and a retained
-older schedule entry on the same journal. The operator check above still covers the fresh layout. The installed
-history policies require their own rehearsal before using it for an installed rollback.
+The [one-week installation rehearsal](developer.md#one-week-installation-rehearsal) uses synthetic records in the
+same migrated layout. Its week of ordinary delivery is separate from the saved journal check, which reads the
+archived records and the verified Pause that resolved a historical timed Start.
 
 ## Older integration and HACS releases
 

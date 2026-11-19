@@ -7,8 +7,6 @@ from pathlib import Path
 
 from tools.offline_ha_validate import network_guard
 
-sys.addaudithook(network_guard)
-
 
 # Read actual entity states after a fresh poll and identify which saved entry this process loaded.
 async def view(hass, entry):
@@ -68,5 +66,6 @@ async def run(config, port, restore):
 
 
 if __name__ == "__main__":
+    sys.addaudithook(network_guard)
     config_dir, port, generation = sys.argv[1:]
     asyncio.run(run(Path(config_dir), int(port), generation != "1"))
