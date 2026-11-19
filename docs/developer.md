@@ -54,6 +54,35 @@ Verify that it fails on the faulty code at the relevant assertion and passes on 
 request and independent charger observations before any new Pause or other command can repair the outcome. Keep
 this development run under three minutes on the controller and retain the complete engine run for release.
 
+### Search overlapping recovery histories
+
+The offline discovery run varies a held Start reply, two newer Pauses, an intervening Return, an actual SQLite
+write refusal, and process replacement. It checks the saved intent, exact receipts and actual charger messages
+after each step. The successful suffix settles the original reported lifecycle, then verifies a later charge after
+Return.
+
+```bash
+timeout --kill-after=5s 295s .venv/bin/python -B tools/offline_validate.py tests_discovery \
+  --discovery-output="$TMPDIR/discovery-19" --discovery-seed=19
+```
+
+Use an absolute task scratch directory for `TMPDIR` and a new output directory for each run. The default search
+selects 20 histories. Use `--discovery-cases=4` for a quick sample or a different seed for more orders.
+`summary.json` records the orders and the boundaries reached. A rule failure saves `failure.json` and attempts to
+shorten it by removing one action at a time. Each kept deletion reproduces the same rule and event with fresh peers.
+`reduced.json` keeps the last confirmed sequence if shortening runs out of time or a candidate cannot run.
+
+```bash
+timeout --kill-after=5s 295s .venv/bin/python -B tools/offline_validate.py tests_discovery \
+  --discovery-output="$TMPDIR/discovery-replay" \
+  --discovery-replay="$TMPDIR/discovery-19/reduced.json"
+```
+
+Use `failure.json` to replay the original sequence. A replay that finds a rule failure exits with a failing test.
+The replay summary records whether the rule and event matched the saved ones. Confirm any real defect against
+the independent evidence and add its shortest useful sequence to the fast recovery replays. The discovery run
+is an explicit test target alongside release qualification.
+
 ### Recreating a reported interruption
 
 Use the [local Start incident report](../README.md#read-an-interrupted-start-incident) to choose the offline event
