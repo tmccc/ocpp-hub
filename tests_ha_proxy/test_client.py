@@ -333,10 +333,13 @@ async def test_pending_operation_label_does_not_invent_pause(actual_hass, peer, 
         power_w=None,
         station_ceiling_a=None,
     )
-    await setup(actual_hass, peer)
+    entry = await setup(actual_hass, peer)
     assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == label
     assert actual_hass.states.get("button.ics_proxy_start").state == "unavailable"
     assert actual_hass.states.get("sensor.ics_proxy_current").state == "unavailable"
+    peer["state"]["control_mode"] = "waiting"
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
 
 
 # Intent: the config flow rejects invalid credentials without sending controls or printing their content.

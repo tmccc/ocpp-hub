@@ -884,6 +884,9 @@ awaited write. Unconfirmed or interrupted updates retain a pause. The independen
 station limit and paused zero hold remain distinct, and measured current above the selected tolerance blocks health
 and positive controls while leaving zero/Stop recovery available. Legacy cleanup refuses the new capability.
 
+The proxy reports which control is pending and selects the completed native session used for **Last session energy**.
+Home Assistant displays those results and expires stale readings.
+
 Normal local Start also works during a cloud outage on an already introduced, active service. It still requires
 fresh full native evidence, a known closed session, the exact owned zero hold, a current approved static tag and no
 ambiguous mutation, unbound grant or outstanding Start/Stop lifecycle debt. Ordinary queued observations do not

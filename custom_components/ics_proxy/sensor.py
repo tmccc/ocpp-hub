@@ -92,7 +92,7 @@ class ProxySensor(ProxyEntity, SensorEntity):
             if not isinstance(mode, str):
                 mode = "waiting"
             if mode in NATIVE_CONTROL_MODES and not self.native_fresh:
-                mode = "pause_requested" if mode == "paused" else "waiting"
+                mode = "waiting"
             return CONTROL_MODE_LABELS.get(mode, CONTROL_MODE_LABELS["waiting"])
         if self.key == "last_session_energy":
             return data.get("last_session_energy_kwh")

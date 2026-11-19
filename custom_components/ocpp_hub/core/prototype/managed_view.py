@@ -394,22 +394,27 @@ def control_mode(status: dict[str, Any], pending_fault: str | None, *, fresh: bo
     if pending_fault == "start_operation_pending":
         return "start_pending"
     local = status.get("local_charge")
-    if local and local["state"] in ("starting", "awaiting_session", "running", "stopping"):
+    if isinstance(local, dict) and local.get("state") in ("starting", "awaiting_session", "running", "stopping"):
         if not fresh or not status["local_healthy"]:
             return "waiting"
         if local["state"] in ("starting", "awaiting_session"):
             return "starting_locally"
         if local["state"] == "stopping":
             return "stopping_locally"
-        return "local_charging" if local["charging"] else "local_session"
+        return "local_charging" if local.get("charging") is True else "local_session"
     test = status.get("test_charge")
-    if test and test["state"] in ("armed", "starting", "awaiting_power", "charging", "stopping"):
+    if (
+        isinstance(test, dict)
+        and test.get("source") in ("local", "cloud")
+        and test.get("state") in ("armed", "starting", "awaiting_power", "charging", "stopping")
+    ):
         if not fresh or not status["healthy"]:
             return "waiting"
         return "local_test" if test["source"] == "local" else "app_test"
     if paused:
-        return "paused" if fresh and status["local_hold_verified"] else "pause_requested"
-    if fresh and status["local_healthy"] and status["owner_control_enabled"]:
+        if fresh and status["local_hold_verified"]:
+            return "paused"
+    elif fresh and status["local_healthy"] and status["owner_control_enabled"]:
         return "app_offline" if status.get("cloud_connected") is False else "app"
     return "attention" if status["state"] in ("attention", "degraded") else "waiting"
 
