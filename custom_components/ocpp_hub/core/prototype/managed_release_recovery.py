@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import time
 from typing import TYPE_CHECKING, Any
@@ -10,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
-from .managed_current_recovery import INTERRUPTED, legacy_current_evidence
+from .managed_current_recovery import legacy_current_evidence
 from .managed_debt_recovery import complete_operator_recovery, operator_recovery_evidence
 from .managed_delivery_recovery import (
     complete_delivery_recovery,
@@ -299,30 +298,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             complete_denied_start(j, denied, ack["pause_request"])
         if current is not None:
             control = {**control, "resume_limit": current["previous_a"]}
-            j.current_change.replace(
-                {
-                    **current["change"],
-                    "state": "cancelled",
-                    "previous_a": current["previous_a"],
-                    "recovery_reason": "explicit_pause_verified_zero",
-                },
-            )
-            # This outcome confirms only reconciliation at zero; the requested target was never completed.
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND state='uncertain'",
-                (
-                    json.dumps(
-                        {
-                            "classification": "current_unconfirmed",
-                            "reconciled_at_zero": True,
-                            "requested_current_a": current["change"]["current_a"],
-                            "previous_current_a": current["previous_a"],
-                        }
-                    ),
-                    current["change"]["id"],
-                ),
-            )
-            j.db.execute("DELETE FROM meta WHERE key=?", (INTERRUPTED,))
+            j.current_change.reconcile_at_zero(current["change"], current["previous_a"])
         j.phase.recover_introduced(control)
     # fault() invalidated the old revision. This complete closed proof re-establishes only current zero introduction.
     # Never assign a newer revision before every binding/Boot/debt/closed-zero check and the durable commit succeed.

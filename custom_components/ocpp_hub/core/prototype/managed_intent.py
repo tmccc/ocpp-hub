@@ -49,6 +49,14 @@ def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesc
     return intent
 
 
+# Finish only the original live request and keep an already settled receipt intact.
+def finish_request(journal: Journal, identifier: str, state: str, result: dict[str, Any]) -> None:
+    journal.db.execute(
+        "UPDATE managed_requests SET state=?,result=? WHERE id=? AND state IN ('accepted','running')",
+        (state, json.dumps(result, sort_keys=True), identifier),
+    )
+
+
 # Recognise an old timed Start only when the saved history repair proves its exact later, verified Pause.
 def resolved_timed_starts(
     db: sqlite3.Connection, proof: object, revision: int, active_test_id: object
@@ -377,10 +385,7 @@ class ManagedRequests:
 
     # Make a single operation's final outcome durable without overwriting a newer superseding receipt.
     def finish(self, identifier: str, state: str, result: dict[str, Any]) -> None:
-        self.journal.db.execute(
-            "UPDATE managed_requests SET state=?,result=? WHERE id=? AND state IN ('accepted','running')",
-            (state, json.dumps(result, sort_keys=True), identifier),
-        )
+        finish_request(self.journal, identifier, state, result)
 
     # A fresh physical zero proof may complete every accepted Pause without reissuing its Stop effect.
     def confirm_pauses(self) -> None:

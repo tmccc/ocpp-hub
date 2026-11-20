@@ -120,6 +120,8 @@ changes rather than a cumulative total. Further simplification remains open.
 - [ ] Continue broader control/persistence simplification where it removes overlapping responsibilities. Native
   admission, current-selection authority, connection and task lifetimes, cloud delivery and physical evidence remain
   separate duties.
+- [x] Give current selection one owner for acceptance, completion and recovery outcomes. The command worker, Pause
+  and Return pass their evidence to that owner. The current record and its receipt stay in the same transactions.
 - [x] Centralize physical control writes in `Journal.control`, replacing 27 sites across 11 modules with named
   transitions. Share authority predicates and the pure health decision; make the live poll's stages explicit and
   name its production charging owner `ManagedCharging`. Preserve raw stored formats, public status and actual

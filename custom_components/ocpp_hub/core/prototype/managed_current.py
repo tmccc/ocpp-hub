@@ -15,6 +15,7 @@ from .gateway import NativeStartReport
 from .local_control import local_start_receipt
 from .managed_facts import ManagedFacts
 from .managed_intent import ControlIntent, write_intent
+from .managed_records import CurrentFailure
 from .managed_settlement import claim_internal_pause
 from .managed_sources import recorded_station_profile
 from .native_bounded import NativeBoundedSpec
@@ -114,37 +115,6 @@ def current_session_decision(g: Gateway, n: HandoverEvidence, local: int) -> Gat
     return ALLOW
 
 
-# Prefer the exact modern request's cause; a malformed binding cannot borrow an older global diagnostic.
-def current_failure(j: Journal, change: dict[str, Any]) -> dict[str, Any] | None:
-    if "failure" not in change:
-        legacy = j.get("managed_current_failure")
-        return legacy if isinstance(legacy, dict) else None
-    cause = change["failure"]
-    if not isinstance(cause, dict) or set(cause) != {"id", "revision", "current_a", "type", "detail"}:
-        return None
-    row = j.db.execute(
-        "SELECT r.action,r.revision,c.current_a FROM managed_requests r "
-        "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
-        (change.get("id"),),
-    ).fetchone()
-    if (
-        row is None
-        or row["action"] != "set_current"
-        or cause["id"] != change.get("id")
-        or type(cause["revision"]) is not int
-        or cause["revision"] != row["revision"]
-        or type(cause["current_a"]) is not int
-        or cause["current_a"] != row["current_a"]
-        or cause["current_a"] != change.get("current_a")
-        or not isinstance(cause["type"], str)
-        or not 1 <= len(cause["type"]) <= 128
-        or not isinstance(cause["detail"], str)
-        or len(cause["detail"]) > 1024
-    ):
-        return None
-    return dict(cause)
-
-
 class ManagedCurrentLimits:
     """A current request persists its generation before a guarded profile write; Pause always takes precedence."""
 
@@ -156,8 +126,9 @@ class ManagedCurrentLimits:
         self.journal.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_current_requests(id TEXT PRIMARY KEY,current_a INTEGER)"
         )
-        change = self.journal.current_change.read().value
-        if change.get("state") == "pending":
+        pending = self.journal.current_change.read()
+        if pending.selecting:
+            change = pending.value
             previous = change.get("previous_a")
             if previous is None:
                 # Earlier pending receipts stored the target only. Recover the most recent completed selection.
@@ -170,13 +141,14 @@ class ManagedCurrentLimits:
             change = {**change, "previous_a": previous}
             ownership = controller.requests.pause_ownership()
             intent = ownership.intent
-            if intent.mode == "paused" and (change.get("mode") == "app" or ownership.requested):
+            outcome = pending.replacement_state(intent, ownership.requested)
+            if outcome == "cancelled":
                 # Current admission advances intent, so a matching owner Pause was accepted after this selection.
                 with self.journal.atomic():
                     self.journal.control.project(self.journal.get("control"), resume_limit=previous)
                     self.journal.current_change.cancel(change)
                 return
-            if intent.mode == "app":
+            if outcome == "recovering":
                 self.cancel_overlap(change["id"], previous, "process_replaced")
                 return
             with self.journal.atomic():
@@ -184,8 +156,7 @@ class ManagedCurrentLimits:
                 claim_internal_pause(controller, "current", change["id"])
                 control = self.journal.get("control")
                 self.journal.control.project(control, resume_limit=previous)
-                state = "uncertain" if change.get("mode") == "paused" else "interrupted"
-                self.journal.current_change.replace({**change, "state": state})
+                self.journal.current_change.replace({**change, "state": outcome})
 
     # All current receipts and authority use the session's existing exclusive journal owner.
     @property
@@ -225,17 +196,12 @@ class ManagedCurrentLimits:
             and change.get("native_open") is False
             and change.get("observed_open") is False
             and "failure" in change
-            and current_failure(j, change) is not None
+            and j.current_change.failure(change) is not None
             and row is not None
             and row["action"] == "set_current"
             and row["state"] == "uncertain"
             and row["current_a"] == change.get("current_a")
-            and json.loads(row["result"])
-            == {
-                "classification": "current_unconfirmed",
-                "requested_current_a": change.get("current_a"),
-                "previous_current_a": change.get("previous_a"),
-            }
+            and json.loads(row["result"]) == j.current_change.unconfirmed(change["current_a"], change.get("previous_a"))
             and j.get("managed_control_intent") == {"mode": "paused", "revision": row["revision"] + 2}
             and type(change.get("previous_a")) is int
             and change["previous_a"] == self.selected() == control.get("resume_limit")
@@ -269,65 +235,8 @@ class ManagedCurrentLimits:
 
     # Verified restoration retires only its exact abandoned target, in the caller's authority transaction.
     def returned_to_previous(self, *, recovery: dict[str, Any] | None = None) -> None:
-        j = self.journal
-        change = j.current_change.read().value
-        row = j.db.execute(
-            "SELECT r.action,r.state,r.revision,r.result,c.current_a FROM managed_requests r "
-            "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
-            (change.get("id"),),
-        ).fetchone()
-        automatic = recovery is not None
-        eligible = change.get("state") in ("uncertain", "interrupted", "cancelled")
-        if recovery is not None:
-            # Native observations may refresh during awaits; only immutable request/authority fields are compared.
-            keys = ("id", "current_a", "previous_a", "mode", "recovery_revision")
-            eligible = (
-                change.get("state") == "recovering"
-                and all(change.get(key) == recovery.get(key) for key in keys)
-                and change.get("mode") == "app"
-                and not self.controller.stopping
-                and self.controller.requests.intent().mode == "app"
-                and self.controller.requests.intent().revision == change.get("recovery_revision")
-                and row is not None
-                and row["revision"] + 1 == change.get("recovery_revision")
-                and (row["state"] != "uncertain" or json.loads(row["result"]) == {"classification": "process_replaced"})
-            )
-        if (
-            eligible
-            and change.get("previous_a") == self.selected()
-            and row is not None
-            and row["action"] == "set_current"
-            and row["state"] in ("failed", "uncertain")
-            and row["current_a"] == change.get("current_a")
-        ):
-            j.current_change.replace(
-                {
-                    **change,
-                    "state": "cancelled",
-                    "recovery_reason": "verified_overlap_recovery"
-                    if automatic
-                    else "explicit_return_previous_selection",
-                },
-            )
-            # Preserve terminal failed results byte for byte; only this exact uncertain request can be retired.
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? "
-                "WHERE id=? AND action='set_current' AND revision=? AND state='uncertain'",
-                (
-                    json.dumps(
-                        {
-                            "classification": (
-                                "superseded_by_verified_overlap_recovery"
-                                if automatic
-                                else "superseded_by_verified_return"
-                            ),
-                            "current_a": self.selected(),
-                        }
-                    ),
-                    change["id"],
-                    row["revision"],
-                ),
-            )
+        c = self.controller
+        self.journal.current_change.restore_previous(self.selected, c.stopping, recovery)
 
     # A correlated live current worker owns native verification until its accepted revision reaches an outcome.
     def applying(self) -> bool:
@@ -432,12 +341,7 @@ class ManagedCurrentLimits:
         previous_value = self.selected()
         with j.atomic():
             expected = write_intent(j, intent, intent.mode)
-            j.current_change.begin(identifier, value, previous_value, intent.mode, j.get("next_transaction"))
-            j.db.execute("INSERT INTO managed_current_requests VALUES(?,?)", (identifier, value))
-            j.db.execute(
-                "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
-                (identifier, "set_current", revision, json.dumps({"accepted_at": time.time()})),
-            )
+            j.current_change.accept(identifier, value, previous_value, intent, j.get("next_transaction"))
             control = j.get("control", {})
             j.control.select(control, value, app=intent.mode == "app")
         self.worker = asyncio.create_task(self._apply(identifier, value, previous_value, expected))
@@ -484,7 +388,6 @@ class ManagedCurrentLimits:
             with j.atomic():
                 guard()
                 j.current_change.complete(identifier, value)
-                c.requests.finish(identifier, "completed", {"current_a": value, "charging_started": False})
         except (
             DeniedError,
             SecurityError,
@@ -509,14 +412,12 @@ class ManagedCurrentLimits:
         }
         while not self._closing and not c.stopping:
             try:
-                change = j.current_change.read().value
-                if change.get("id") != identifier or change.get("state") != "pending":
+                change = j.current_change.read()
+                if change.identifier != identifier or not change.selecting:
                     return
                 intent = c.requests.intent()
-                superseded = intent != expected
-                active = j.active()
-                overlap = active is not None or j.current_change.read().value.get("observed_open")
-                if not superseded and expected.mode == "app" and overlap:
+                outcome = change.failure_outcome(expected, intent, j.active() is not None)
+                if outcome is CurrentFailure.PROTECT_OPEN_SESSION:
                     self.cancel_overlap(identifier, previous_value, "session_opened", failure=cause)
                     try:
                         await self.protect_overlap()
@@ -525,32 +426,13 @@ class ManagedCurrentLimits:
                     self.record_failure_diagnostic(cause)
                     return
                 with j.atomic():
-                    if not superseded:
+                    if outcome is CurrentFailure.HOLD_IDLE:
                         write_intent(j, intent, "paused")
                         claim_internal_pause(c, "current", identifier)
                     control = j.get("control", {})
                     if control.get("inhibit") is True and j.current_change.read().identifier == identifier:
                         j.control.project(control, resume_limit=previous_value)
-                    j.current_change.replace(
-                        {
-                            **j.current_change.read().value,
-                            "id": identifier,
-                            "current_a": value,
-                            "previous_a": previous_value,
-                            "mode": expected.mode,
-                            "state": "uncertain",
-                            "failure": cause,
-                        },
-                    )
-                    c.requests.finish(
-                        identifier,
-                        "failed" if superseded else "uncertain",
-                        {
-                            "classification": "current_unconfirmed",
-                            "requested_current_a": value,
-                            "previous_current_a": previous_value,
-                        },
-                    )
+                    j.current_change.fail(identifier, value, previous_value, expected.mode, cause, outcome)
                 try:
                     await c.ensure_pause_zero()
                 except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
@@ -575,22 +457,17 @@ class ManagedCurrentLimits:
         self, identifier: str, previous: int, reason: str, *, failure: dict[str, Any] | None = None
     ) -> None:
         c, j = self.controller, self.journal
-        with j.atomic():
-            change = cast("dict[str, Any]", j.current_change.stored())
-            j.current_change.replace(
-                {
-                    **change,
-                    "state": "recovering",
-                    "previous_a": previous,
-                    "recovery_revision": c.requests.intent().revision,
-                    "recovery_reason": reason,
-                    **({"failure": failure} if failure is not None else {}),
-                },
-            )
+
+        # Keep the zero ticket and current outcome in the same transaction.
+        def claim_hold() -> None:
             j.control.project(j.get("control", {}), resume_limit=previous)
             c.session.gateway.controls._claim(True, stopping=True)
             c.released_epoch = None
-            c.requests.finish(identifier, "failed", {"classification": reason})
+
+        with j.atomic():
+            j.current_change.recover_overlap(
+                identifier, previous, reason, c.requests.intent().revision, claim_hold, failure
+            )
 
     # Apply only the already owned station zero, including before native source identification or reintroduction.
     async def protect_overlap(self) -> None:

@@ -2,77 +2,23 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .local_control import local_start_receipt
+from .managed_records import TerminalCurrent
 from .start_settlement import RetirementCandidate, RetirementRule
-from .store import RecoveryRequiredError, encoded
+from .store import RecoveryRequiredError
 
 if TYPE_CHECKING:
     from .managed import ManagedController
-    from .start_settlement import RetirementCandidate, RetirementRule
-from .store import Journal
 
 
-@dataclass(frozen=True)
-class TerminalCurrent:
-    """Immutable metadata, receipt and lifecycle snapshots grant no physical authority by themselves."""
-
-    body: str
-    request: tuple[Any, ...]
-    current_target: int
-
-    # Bind the only request this candidate may exempt from the pending-request fence.
-    @property
-    def identifier(self) -> str:
-        return str(self.request[0])
-
-
-# Read all durable request fields, including the original result that must survive terminal metadata cleanup.
-def request_snapshot(j: Journal, identifier: Any) -> tuple[Any, ...] | None:
-    row = j.db.execute("SELECT * FROM managed_requests WHERE id=?", (identifier,)).fetchone()
-    return tuple(row) if row is not None else None
-
-
-# A failed selection retains the previous verified current and its truthful original failure receipt.
+# The current outcome owner checks the saved selection and its original receipt.
 def current_candidate(c: ManagedController) -> TerminalCurrent | None:
-    from .managed_current import current_failure
-
-    j = c.session.journal
-    change = j.current_change.read().value
-    request = request_snapshot(j, change.get("id"))
-    target = j.db.execute("SELECT current_a FROM managed_current_requests WHERE id=?", (change.get("id"),)).fetchone()
-    if (
-        c.current.worker is not None
-        and not c.current.worker.done()
-        or change.get("state") not in ("uncertain", "interrupted", "cancelled")
-        or change.get("mode") not in ("app", "paused")
-        or type(change.get("previous_a")) is not int
-        or change["previous_a"] != c.current.selected()
-        or change["previous_a"] != j.get("control", {}).get("resume_limit")
-        or request is None
-        or request[1] != "set_current"
-        or request[3] not in ("uncertain", "failed")
-        or (change.get("state") == "cancelled" and request[3] != "uncertain")
-        or request[2] >= c.requests.intent().revision
-        or target is None
-        or type(change.get("current_a")) is not int
-        or target[0] != change["current_a"]
-    ):
-        return None
-    result = json.loads(request[4])
-    if "failure" in change:
-        if current_failure(j, change) is None or result != {
-            "classification": "current_unconfirmed",
-            "requested_current_a": change["current_a"],
-            "previous_current_a": change["previous_a"],
-        }:
-            return None
-    elif result != {"classification": "process_replaced"}:
-        return None
-    return TerminalCurrent(encoded(change), request, current_target=target[0])
+    worker = c.current.worker
+    return c.session.journal.current_change.terminal(
+        worker_pending=worker is not None and not worker.done(), selected=c.current.selected
+    )
 
 
 # Closed lifecycle or exact known-unsent provenance distinguishes obsolete test metadata from unbound Start debt.
@@ -88,15 +34,7 @@ def require_record(c: ManagedController, record: TerminalCurrent | RetirementCan
     if isinstance(record, RetirementCandidate):
         c.session.journal.starts.require(record)
         return
-    j = c.session.journal
-    if (
-        encoded(j.current_change.read().value) != record.body
-        or request_snapshot(j, record.identifier) != record.request
-    ):
-        raise RecoveryRequiredError("terminal record changed before settlement")
-    target = j.db.execute("SELECT current_a FROM managed_current_requests WHERE id=?", (record.identifier,)).fetchone()
-    if target is None or target[0] != record.current_target:
-        raise RecoveryRequiredError("terminal current target changed before settlement")
+    c.session.journal.current_change.require_terminal(record)
 
 
 # The caller owns the fresh physical proof and atomic transaction. Keep the original reported failure.
@@ -104,15 +42,7 @@ def complete_record(c: ManagedController, record: TerminalCurrent | RetirementCa
     if isinstance(record, RetirementCandidate):
         c.session.journal.starts.retire(record)
         return
-    require_record(c, record)
-    j, state = c.session.journal, json.loads(record.body)
-    if state["previous_a"] != c.current.selected() or state["previous_a"] != j.get("control", {}).get("resume_limit"):
-        raise RecoveryRequiredError("previous current selection changed before settlement")
-    j.current_change.cancel(state, recovery_reason="previous_selection_at_verified_zero")
-    j.db.execute(
-        "UPDATE managed_requests SET state='failed' WHERE id=? AND state='uncertain'",
-        (record.identifier,),
-    )
+    c.session.journal.current_change.settle_terminal(record, c.current.selected)
 
 
 # Only closed ordinary charging debt permits automatic metadata retirement or internal Pause completion.

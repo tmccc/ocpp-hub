@@ -6,8 +6,9 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from .control_state import ControlState
-from .managed_current import current_failure, managed_current_ceiling
+from .managed_current import managed_current_ceiling
 from .managed_intent import read_pause_claim
+from .managed_records import INTERRUPTED_CURRENT
 from .native_bounded import NativeBoundedSpec
 from .store import Journal
 
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
     from .managed import ManagedController
 
 FAULT = "owner_control_or_delivery_uncertain"
-INTERRUPTED = "managed_current_interrupted_fault"
+INTERRUPTED = INTERRUPTED_CURRENT
 
 
 # Preserve a real accepted app update before startup replaces its receipt and pending-operation metadata.
@@ -87,7 +88,7 @@ def interrupted_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[st
         return None
     return {
         "change": change,
-        "failure": current_failure(j, change),
+        "failure": j.current_change.failure(change),
         "request": dict(row),
         "previous_a": saved["previous_a"],
         "interrupted": saved,
@@ -101,7 +102,7 @@ def legacy_current_evidence(c: ManagedController, fault: dict[str, Any]) -> dict
         if saved := interrupted_evidence(c, fault):
             return saved
     change = j.current_change.read().value
-    failure = current_failure(j, change)
+    failure = j.current_change.failure(change)
     if (
         fault.get("classification") != FAULT
         or failure is None
