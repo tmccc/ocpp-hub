@@ -81,6 +81,7 @@ async def test_prototype_completed_offline_charge_survives_restart(tmp_path: Pat
     await rig.charger("stop", "StopTransaction", stop)
     await rig.close()
     recovered = Rig(path)
+    recovered.vendor_result = {}
     await recovered.cloud()
     events = [frame for frame in recovered.vendor_frames if frame[0] == 2]
     assert [frame[2] for frame in events] == ["BootNotification", "StartTransaction", "MeterValues", "StopTransaction"]

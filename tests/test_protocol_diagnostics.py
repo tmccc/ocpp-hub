@@ -83,7 +83,9 @@ async def test_new_clock_replies_keep_format_sensitive_simulated_cloud_online(
             runtime = await bench.start(cloud.sockets[0].getsockname()[1])
             async with bench.charger() as charger:
                 await charger.send(build_call("boot", "BootNotification", BOOT))
-                response = decode(await charger.recv())[2]
+                boot = decode(await charger.recv())
+                assert boot[:2] == [3, "boot"]
+                response = boot[2]
                 clock_reply(response["currentTime"])
                 await accept_cap(charger, decode(await charger.recv()), bench.firmware)
                 await until(lambda: bench.gateway.controls.ready)

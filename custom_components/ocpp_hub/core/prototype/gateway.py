@@ -177,6 +177,7 @@ class Gateway:
         self._boot_charger_epoch = -1
         self.boot_metadata_revision = 0
         self.boot_observation: str | None = None
+        self._pending_boot: str | None = None
         self._boot_seen = asyncio.Event()
         self._boot_retry = asyncio.Event()
         self._vendor_epoch = 0
@@ -198,9 +199,8 @@ class Gateway:
         epoch = self.journal.connection_epoch()
         self.charger.detach()
         self._charger_epoch = epoch
-        self._boot_seen.clear()
+        self._retire_boot_proof()
         self._boot_retry.clear()
-        self.boot_observation = None
         self._inbound.retire("charger", epoch)
         self.charger.sender = sender
         return epoch
@@ -219,8 +219,7 @@ class Gateway:
     def detach_charger(self, epoch: int) -> None:
         if epoch == self._charger_epoch:
             self.charger.detach()
-            self.boot_observation = None
-            self._boot_seen.clear()
+            self._retire_boot_proof()
             self._boot_charger_epoch = -1
             self.controls.invalidate()
             self._charger_epoch = epoch + 1
@@ -260,6 +259,7 @@ class Gateway:
     # A new Boot withdraws earlier permission even if it cannot be saved or admitted to the work queue.
     def _retire_boot_proof(self) -> None:
         self.boot_observation = None
+        self._pending_boot = None
         self._boot_seen.clear()
 
     # Stop pending work without delivering another command or discarding durable events.
@@ -305,14 +305,16 @@ class Gateway:
             if boot:
                 self._boot_retry.set()
             if peer.sender:
-                await peer.sender(build_call_error(frame[1], "OccurrenceConstraintViolation", "request queue is full"))
+                text = build_call_error(frame[1], "OccurrenceConstraintViolation", "request queue is full")
+                if boot:
+                    await self._send_boot_response(peer.sender, text)
+                else:
+                    await peer.sender(text)
             return
         if boot:
-            # Admit Boot in wire order. Only its response needs an asynchronous task.
-            text = self._boot_reply(str(frame[1]), frame[3])
-            task = asyncio.create_task(self._send_reply(side, current_epoch, text))
-        else:
-            task = asyncio.create_task(self._answer(side, current_epoch, frame, current_control_scope(self)))
+            await self._answer_boot(current_epoch, str(frame[1]), frame[3])
+            return
+        task = asyncio.create_task(self._answer(side, current_epoch, frame, current_control_scope(self)))
         self._tasks.add(task)
         if reserved:
             self._reserved_stops[side] = task
@@ -356,6 +358,33 @@ class Gateway:
         peer = self.charger if side == "charger" else self.vendor
         if epoch == current and peer.sender:
             await peer.sender(text)
+
+    # A blocked Boot response cannot hold the serial charger reader indefinitely.
+    async def _send_boot_response(self, sender: Sender, text: str) -> None:
+        try:
+            async with asyncio.timeout(self.charger.timeout):
+                await sender(text)
+        except TimeoutError:
+            raise UnavailableError("charger Boot reply could not be sent") from None
+
+    # Make a durable Boot usable only after sending its reply, on the exact connection that received it.
+    async def _answer_boot(self, epoch: int, token: str, payload: dict[str, Any]) -> None:
+        sender = self.charger.sender
+        text = self._boot_reply(token, payload)
+        observation = self._pending_boot
+        if sender is None:
+            return
+        await self._send_boot_response(sender, text)
+        if (
+            observation is not None
+            and observation == self._pending_boot
+            and epoch == self._charger_epoch
+            and self.charger.sender is sender
+        ):
+            self._boot_charger_epoch = epoch
+            self.boot_observation = observation
+            self._pending_boot = None
+            self._boot_seen.set()
 
     # A retired connection cannot execute queued work on a replacement transport.
     def _require_epoch(self, side: str, epoch: int) -> None:
@@ -566,11 +595,9 @@ class Gateway:
             if previous_boot != payload:
                 # A later return to the same body cannot erase an intervening introduction revocation.
                 self.boot_metadata_revision += 1
-            self._boot_charger_epoch = self._charger_epoch
-            self.boot_observation = uuid.uuid4().hex
+            self._pending_boot = uuid.uuid4().hex
             self.controls.forget_stop_ack()
             self._boot_retry.clear()
-            self._boot_seen.set()
         except DeniedError, ConflictError:
             return build_call_error(
                 token, "PropertyConstraintViolation", "request conflicts with local policy or state"
