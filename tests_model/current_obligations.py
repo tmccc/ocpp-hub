@@ -79,8 +79,15 @@ def require_transport_summary(old, target, intent, observed):
 # Successful choices converge before recovery: previous input survives only in terminal historical receipts.
 def require_completed_current(b, identifier, revision, target, mode):
     c, j, gateway = b.controller, b.session.journal, b.session.gateway
-    assert j.get("managed_current_change") == {"id": identifier, "current_a": target, "state": "completed"}
     control = j.get("control")
+    assert gateway.boot_observation is not None
+    assert j.get("managed_current_change") == {
+        "id": identifier,
+        "current_a": target,
+        "state": "completed",
+        "ticket": control["ticket"],
+        "boot": gateway.boot_observation,
+    }
     assert control["resume_limit"] == target and control["inhibit"] is (mode == "paused")
     assert control["uncertain"] is False and not j.get("managed_control_fault")
     assert c.current.selected() == target
