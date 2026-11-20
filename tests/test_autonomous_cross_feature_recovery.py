@@ -55,6 +55,12 @@ async def receipt(child, identifier):
     return result["result"]
 
 
+# Read the outcome independently of the private binding that recovery retains in the journal.
+def public_return_result(row):
+    result = json.loads(row["result"])
+    return {key: value for key, value in result.items() if key not in ("_return", "_await_cloud")}
+
+
 # The independent charger reports the genuine closure only after actually receiving the known-session Stop command.
 async def close_after_wire_stop(child, local):
     rig = child.rig
@@ -217,8 +223,9 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                     assert replaced_return == {
                         "id": return_id,
                         "action": "app_control",
+                        "revision": early_return_revision,
                         "state": "uncertain",
-                        "result": json.loads(interrupted["result"])
+                        "result": public_return_result(interrupted)
                         if interrupted["state"] == "uncertain"
                         else {"classification": "process_replaced"},
                     }
@@ -229,8 +236,8 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
             before_pause = child.durable()
             row = next(item for item in before_pause["requests"] if item["id"] == return_id)
             assert row["revision"] == early_return_revision
-            old_return = {key: row[key] for key in ("id", "action", "state")}
-            old_return["result"] = json.loads(row["result"])
+            old_return = {key: row[key] for key in ("id", "action", "revision", "state")}
+            old_return["result"] = public_return_result(row)
             assert old_return["id"] == return_id and old_return["action"] == "app_control"
             if replaced_return is not None:
                 assert old_return == replaced_return
