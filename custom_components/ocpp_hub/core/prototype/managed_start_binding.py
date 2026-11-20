@@ -174,6 +174,7 @@ class ManagedStartReports:
     async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None:
         return await self.charging.prepare_native_report(payload)
 
+    # Check the owned station ceiling before accepting a Start report with no assigned transaction number.
     async def verify_station(self) -> None:
         await self.charging.controller.native.require_reported_start_ceiling()
 

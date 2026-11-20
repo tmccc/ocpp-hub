@@ -569,6 +569,7 @@ class TrialSession:
 
         # Give the zero write its own authority. A Stop must still belong to the original live Boot.
         async def prove(local: int, ceiling_failed: bool) -> Callable[[], None]:
+            # Bind shutdown Stop to the commissioned Boot and the same active transaction.
             def require_scope() -> None:
                 if (
                     not control_scope_matches(g, connection)
@@ -593,6 +594,7 @@ class TrialSession:
             native.require_known_session(sample)
             sequence = native.last_resolved_read
 
+            # Recheck the independent session proof before sending Stop without a confirmed zero.
             def guard() -> None:
                 require_scope()
                 sample.physical.require_fresh(j.identity, 5)
@@ -634,6 +636,7 @@ class TrialSession:
         if current.get("id") == attempt:
             self.journal.put("trial_shutdown_attempt", {**current, "state": state})
 
+    # Wait for closure and verified zero, or return a late Start so shutdown can Stop it explicitly.
     async def _wait_for_shutdown_reports(self, *, accept_late_start: bool) -> int | None:
         async with asyncio.timeout(5):
             while True:

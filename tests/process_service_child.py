@@ -68,7 +68,10 @@ class ObservedConnection(sqlite3.Connection):
             and request is not None
             and request[0] == "pause"
             and request[1] in ("accepted", "uncertain")
-            and operation.startswith("UPDATE MANAGED_REQUESTS SET STATE='COMPLETED',RESULT=? WHERE ACTION='PAUSE'")
+            and operation
+            == "UPDATE MANAGED_REQUESTS SET STATE='COMPLETED',RESULT=? WHERE ID=? AND STATE IN ('ACCEPTED','UNCERTAIN')"
+            and len(parameters) == 2
+            and parameters[1] == Gate.identifier
         ):
             Gate.freeze(self, "before-pause-completion-sql")
         if before and operation.startswith("INSERT OR REPLACE INTO META") and parameters:

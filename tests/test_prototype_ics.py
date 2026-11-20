@@ -146,8 +146,11 @@ async def test_ics_completed_transaction_query_preserves_control_boundary(tmp_pa
     await rig.boot()
     await rig.charger("start", "StartTransaction", STARTS[0])
     await rig.cloud()
-    stop = next(row["frame"][3] for row in CALLS if row["frame"][2] == "StopTransaction")
-    await rig.charger("stop", "StopTransaction", {**stop, "transactionId": 1001})
+    stop = next(row for row in CALLS if row["frame"][2] == "StopTransaction")
+    await rig.charger("stop", "StopTransaction", {**stop["frame"][3], "transactionId": 1001})
+    reply = recorded_reply(stop)
+    assert reply is not None
+    rig.vendor_result = reply[2]
     await rig.gateway.flush()
     assert rig.store.local_id(6000001) is None
     assert rig.store.historical_local_id(6000001) == 1001

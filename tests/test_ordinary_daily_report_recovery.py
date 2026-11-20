@@ -16,6 +16,8 @@ from tests.test_ordinary_recovery import close_session
 from tests.tls_support import tls as tls
 
 
+# Intent: refuse a scheduled Start while the native station profile differs from the confirmed limit.
+# Why: a saved ceiling receipt cannot authorize charging after the actual profile changes.
 async def test_ordinary_timer_report_requires_the_confirmed_ceiling(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
         gateway, journal = b.session.gateway, b.session.journal
@@ -47,7 +49,8 @@ async def idle_outage(b):
     assert b.controller.ordinary.active() and b.session.journal.active() is None
 
 
-# Admit a later Boot before the event loop can run either queued Start handler.
+# Intent: reject both queued Starts when a later Boot arrives before either handler can run.
+# Why: a fresh Boot can authorize a fresh request and must leave buffered requests tied to their old Boot.
 async def test_buffered_daily_and_vendor_starts_cannot_inherit_later_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
         g, j = b.session.gateway, b.session.journal

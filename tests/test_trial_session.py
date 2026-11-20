@@ -21,6 +21,8 @@ from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
 
+# Intent: keep receiving the charger's actual Stop report when shutdown cannot confirm its protective write.
+# Why: a failed write or a changed native session cannot establish that the ledger's transaction has ended.
 @pytest.mark.parametrize("failure", ["write_intent", "write_reply", "different_native_session"])
 async def test_managed_shutdown_waits_for_genuine_stop_after_station_write_failure(
     tmp_path, tls, unused_tcp_port, monkeypatch, failure
@@ -41,6 +43,7 @@ async def test_managed_shutdown_waits_for_genuine_stop_after_station_write_failu
         if failure == "different_native_session":
             native = b.rig.peer.native
 
+            # Report a different physical transaction while retaining the original journal identity.
             def unrelated_session(key):
                 report = native(key)
                 if key == "SESSION" and b.rig.bench.firmware.active == local:
@@ -75,6 +78,8 @@ async def test_managed_shutdown_waits_for_genuine_stop_after_station_write_failu
             assert reader.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()[0] is not None
 
 
+# Intent: a fresh Boot invalidates a pending shutdown Stop before it can reach the charger.
+# Why: the same socket and identical Boot payload can describe a new charger session.
 async def test_managed_shutdown_does_not_stop_across_a_repeat_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
@@ -118,6 +123,8 @@ async def test_managed_shutdown_does_not_stop_across_a_repeat_boot(tmp_path, tls
         assert b.session.final_status["shutdown_attempt_uncertain"] is True
 
 
+# Intent: close a transaction that reports a previously issued owner Start during shutdown.
+# Why: denying new authorizations must still leave enough time to settle a Start already accepted by the charger.
 async def test_managed_shutdown_stops_late_transaction_for_already_issued_owner_start(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -149,6 +156,8 @@ async def test_managed_shutdown_stops_late_transaction_for_already_issued_owner_
         assert b.session.final_status["shutdown_attempt_uncertain"] is False
 
 
+# Intent: confirm shutdown from an actual Stop report and independent zero after a lost RPC reply.
+# Why: a missing reply leaves the command ambiguous, but the later physical evidence can settle the outcome.
 async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -158,6 +167,7 @@ async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(
         original_send = b.charger.send
         b.session.gateway.charger.timeout = 0.8
 
+        # Drop only the reply to RemoteStop; keep the charger's independently reported Stop on the wire.
         async def omit_stop_reply(raw):
             reply = json.loads(raw)
             if reply[0] == 3 and any(

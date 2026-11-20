@@ -518,6 +518,7 @@ class ResourceBook:
             is not None
         )
 
+    # Require the live profile to match its confirmed journal receipt and remain within the requested limit.
     def require_confirmed_station(self, resources: tuple[Resource, ...], maximum: float) -> None:
         key = f"profile:{HUB_PROFILE_ID}"
         receipt = self.journal.db.execute("SELECT * FROM trial_resources WHERE key=?", (key,)).fetchone()

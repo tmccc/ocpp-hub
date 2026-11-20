@@ -38,6 +38,8 @@ async def genuine_stop(b, local):
     await until(lambda: b.session.journal.active() is None and b.session.journal.next_delivery() is None)
 
 
+# Intent: the latest Pause sends the Stop as soon as the earlier one yields.
+# Why: an active charge should not wait for the next supervisor poll when the owner has already asked it to stop.
 async def test_second_pause_sends_its_stop_without_waiting_for_poll(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c = b.c
@@ -46,6 +48,7 @@ async def test_second_pause_sends_its_stop_without_waiting_for_poll(tmp_path, tl
         entered, release = asyncio.Event(), asyncio.Event()
         read = c.native.read
 
+        # Keep the first Pause's physical read open until the second Pause has been accepted.
         async def delay_first_stop(*args, **kwargs):
             if kwargs.get("stop_only") and not entered.is_set():
                 entered.set()

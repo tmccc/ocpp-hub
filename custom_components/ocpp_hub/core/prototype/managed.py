@@ -1079,15 +1079,21 @@ class ManagedController:
     def _assess_observation(self, observed: Observation) -> HealthVerdict | PollStatus:
         s, g, j = self.session, self.session.gateway, self.session.journal
         control = j.control.read()
-        vendor_uncertain = (
-            bool(j.get("uncertain_vendor_command"))
-            or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state='uncertain' LIMIT 1").fetchone()
-            is not None
-        )
+
+        # Check both the recorded vendor fault and the mutation ledger when the verdict needs vendor evidence.
+        def vendor_uncertain() -> bool:
+            return (
+                bool(j.get("uncertain_vendor_command"))
+                or j.db.execute(
+                    "SELECT 1 FROM mutations WHERE origin='vendor' AND state='uncertain' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+
         if (
             self.current.applying()
             and not s.runtime.status.delivery_blocked
-            and not vendor_uncertain
+            and not vendor_uncertain()
             and not j.fault.latched()
             and not j.get("trial_preservation_fault")
             and not j.get("trial_inventory_fault")
@@ -1102,7 +1108,8 @@ class ManagedController:
         delivery_uncertain = delivery_blocked and (
             s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain
         )
-        if (not proof.available or delivery_uncertain or vendor_uncertain) and not self.stopping:
+        # Publish a known fault even if the saved vendor marker cannot be read.
+        if not self.stopping and (not proof.available or delivery_uncertain or vendor_uncertain()):
             self.fault("owner_control_or_delivery_uncertain")
         if (proof.available and j.fault.latched()) or self.stopping:
             proof = ControlProof()

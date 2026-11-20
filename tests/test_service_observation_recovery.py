@@ -49,7 +49,8 @@ async def test_failed_poll_projection_keeps_observing_charge(tmp_path, tls, unus
         await service.published(observed["checked_at"], state="healthy", power=True)
 
 
-# A failed source-record write cannot stop a verified ordinary charge or renew its continuation proof.
+# Intent: a failed source-record write keeps an existing verified charge running.
+# Why: failing to renew observation evidence must preserve both the earlier proof and the physical session.
 async def test_failed_source_publication_keeps_existing_charge(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
     async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
         b = service.charge

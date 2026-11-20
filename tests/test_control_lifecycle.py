@@ -47,10 +47,13 @@ def owner(tmp_path):
         journal.close()
 
 
+# Intent: let the done callback remove a finished task from either pool during retirement.
+# Why: gathering an already finished task can return before the event loop runs its callback.
 @pytest.mark.parametrize("pool", ["_operations", "_completions"])
 async def test_retirement_yields_to_callbacks_for_already_finished_tasks(owner, monkeypatch, pool):
     controls = Gateway(owner.journal).controls
 
+    # Complete without suspension so the done callback is still queued when retirement starts.
     async def finish():
         return None
 

@@ -14,14 +14,14 @@ from ocpp_hub_core.prototype.security import SecurityError
 from websockets.asyncio.client import connect
 
 from tests import managed_rig as mp
-from tests.charge_rig import actual_stop, positive_flow, ready
+from tests.charge_rig import positive_flow, ready, report_actual_stop
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.current_rig import commissioned
 from tests.handover_helpers import crash
 from tests.management_peer import TOKEN, call
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import BOOT, START
-from tests.recovery_barriers import completed_control
+from tests.recovery_barriers import completed_control, require_zero_held
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
@@ -113,13 +113,23 @@ async def test_measurement_excess_retains_restrictive_startup(
                     for frame in b.rig.bench.device_calls[mark:]
                     if frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction")
                 ]
-                c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                pause_id, revision = uuid.uuid4().hex, c.requests.intent().revision
+                zero_boundary = len(b.rig.bench.device_calls)
+                c.command(pause_id, "pause", revision)
                 async with asyncio.timeout(8):
                     while not b.rig.bench.remote_stop.is_set():
                         await c.tick()
                         await asyncio.sleep(0.02)
                 recovered = replace(b, session=session, controller=c, charger=charger)
-                assert (await actual_stop(recovered, local))["local_hold_verified"]
+                await report_actual_stop(recovered, local)
+                async with asyncio.timeout(8):
+                    while session.journal.fault.latched():
+                        assert session.journal.fault.classification() == MEASURED_FAULT
+                        await c.tick()
+                        require_zero_held(b.rig, zero_boundary)
+                        await asyncio.sleep(0.02)
+                paused = await completed_control(recovered, pause_id, mode="paused", revision=revision + 1, ceiling=0)
+                assert paused["local_hold_verified"]
                 assert not session.journal.fault.latched()
                 c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
                 assert (await mp.healthy(c))["station_ceiling_a"] == selected

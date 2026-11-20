@@ -115,7 +115,7 @@ async def positive_flow(
 
 
 # A real StopTransaction closes the independent peer only after the physical Stop command has arrived.
-async def actual_stop(test: ChargeRig, local: int) -> dict[str, Any]:
+async def report_actual_stop(test: ChargeRig, local: int) -> None:
     await asyncio.wait_for(test.rig.bench.remote_stop.wait(), 3)
     assert test.rig.bench.firmware.current == 0
     reply = await test.rig.bench.call(
@@ -127,6 +127,11 @@ async def actual_stop(test: ChargeRig, local: int) -> dict[str, Any]:
     assert reply[0] == 3
     test.rig.peer.permission_enabled = False
     await until(lambda: test.session.journal.active() is None and test.session.journal.next_delivery() is None)
+
+
+# Use the ordinary healthy barrier for tests that have no latched fault to clear.
+async def actual_stop(test: ChargeRig, local: int) -> dict[str, Any]:
+    await report_actual_stop(test, local)
     return await healthy(test.controller)
 
 

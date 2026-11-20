@@ -149,6 +149,7 @@ async def test_current_pause_protects_post_child_matching_boot_return(
         # Hold the real completed Start outcome at its parent until the matching Boot and newer owner requests arrive.
         execute_start = g.start_managed_result
 
+        # Acknowledge a new Boot and accept newer requests before the Start outcome reaches its parent.
         async def boot_after_success(*args, **kwargs):
             try:
                 outcome = await execute_start(*args, **kwargs)

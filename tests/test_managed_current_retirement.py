@@ -47,6 +47,8 @@ def settlement_bytes(j):
     )
 
 
+# Intent: preserve the existing owner intent when current recovery resumes after shutdown begins.
+# Why: a failed shutdown hold write must leave the service retiring and preserve the recovery record.
 async def test_retiring_service_cannot_publish_a_new_pause_from_current_recovery(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):

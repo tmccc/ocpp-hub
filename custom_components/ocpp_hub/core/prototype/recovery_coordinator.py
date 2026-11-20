@@ -259,6 +259,7 @@ class RecoveryCoordinator:
         g, j = c.session.gateway, c.session.journal
         vendor_epoch = g._vendor_epoch
 
+        # A replacement vendor connection cannot authorize a release prepared under the previous one.
         def cloud_current() -> bool:
             return (
                 g._vendor_epoch == vendor_epoch

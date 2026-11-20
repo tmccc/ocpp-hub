@@ -134,6 +134,7 @@ class ProxyClient:
         supplied_id = "id" in fields
         identifier = fields.pop("id", uuid.uuid4().hex)
 
+        # Match each reply to this command and require full binding when looking up a caller-supplied ID.
         def matches(receipt: dict[str, Any], *, lookup: bool = False) -> bool:
             returned_id = receipt.get("id")
             if not isinstance(returned_id, str) or not re.fullmatch(r"[a-f0-9]{32}", returned_id):

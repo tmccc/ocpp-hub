@@ -20,6 +20,8 @@ from tests.tls_support import tls as tls
 from tests.trial_peer import Bench
 
 
+# Intent: keep the same Return waiting at zero if the cloud disconnects during either native read.
+# Why: fresh native evidence cannot replace the cloud connection required to restore app control.
 @pytest.mark.parametrize("closing_read", [False, True], ids=["initial-read", "closed-zero-read"])
 async def test_return_waits_for_replaced_cloud_before_positive_send(
     tmp_path, tls, unused_tcp_port, monkeypatch, closing_read
@@ -35,6 +37,7 @@ async def test_return_waits_for_replaced_cloud_before_positive_send(
         before = list(b.rig.bench.received_limits)
         native_reads = []
 
+        # Close the accepted cloud connection just after the selected native read returns.
         async def disconnect_after_read(*, closed=False):
             result = await read(closed=closed)
             native_reads.append(closed)

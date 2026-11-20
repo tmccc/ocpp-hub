@@ -310,6 +310,7 @@ def native_profiles(smart: Any) -> tuple[Resource, ...]:
     return tuple(resources)
 
 
+# Validate the single-connector inventory and combine its meter, session and optional history into one snapshot.
 def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> Evidence:
     try:
         identity = config["Id"]
