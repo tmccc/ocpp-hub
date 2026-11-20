@@ -303,7 +303,7 @@ def native_profiles(smart: Any) -> tuple[Resource, ...]:
                         raise ValueError
                     canonical = native_profile_projection(profile, connector, purpose, time.time())
                     resources.append(Resource("profile", identifier, profile, canonical))
-    except (ValueError, KeyError, TypeError, IndexError):
+    except ValueError, KeyError, TypeError, IndexError:
         raise NativeContentError("content", "complete native trial inventory could not be validated") from None
     if len({resource.key for resource in resources}) != len(resources):
         raise NativeContentError("resources", "native inventory contains duplicate resource identifiers")

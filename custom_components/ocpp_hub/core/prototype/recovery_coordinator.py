@@ -276,8 +276,10 @@ class RecoveryCoordinator:
             if c.stopping or not c.requests.return_current(return_request, expected_intent):
                 return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
             if not cloud_current():
-                reason = Prerequisite.CLOUD if return_request is None else (
-                    Prerequisite.CLOUD_ACK if can_wait_for_cloud else Prerequisite.ZERO_PROOF
+                reason = (
+                    Prerequisite.CLOUD
+                    if return_request is None
+                    else (Prerequisite.CLOUD_ACK if can_wait_for_cloud else Prerequisite.ZERO_PROOF)
                 )
                 return Pending(reason, "release awaits its current registered cloud connection")
             if c.ordinary.active():

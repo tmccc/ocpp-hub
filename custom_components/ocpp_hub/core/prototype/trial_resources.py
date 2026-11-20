@@ -528,7 +528,8 @@ class ResourceBook:
             or receipt["state"] != "confirmed"
             or receipt["confirmed"] is None
             or json.loads(receipt["confirmed"]) != station.canonical
-            or receipt["observed_digest"] is not None and receipt["observed_digest"] != station.digest
+            or receipt["observed_digest"] is not None
+            and receipt["observed_digest"] != station.digest
             or station.canonical.get("limit", float("inf")) > maximum
         ):
             raise DeniedError("the fresh native station ceiling does not match its confirmed limit")
