@@ -709,6 +709,9 @@ def vendor_history_recovery_scope(
     require_common_debt_idle(j, kind, snapshot)
     if snapshot["requests"]:
         raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
+    if write and any(row["state"] == "pending" for row in snapshot["mutations"]):
+        # Journal startup marks interrupted recorded dispatches uncertain. A bare intent has no such evidence.
+        raise RecoveryRequiredError("history repair requires a recorded uncertain vendor outcome")
     if proof is not None:
         return {"kind": kind, "proof": identifier}
     candidate = vendor_candidate(snapshot) if write else vendor_start_candidate(snapshot)
