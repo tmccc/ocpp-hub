@@ -9,7 +9,6 @@ import time
 import uuid
 
 import pytest
-from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.local_control import LocalControl
 
@@ -44,10 +43,9 @@ async def test_current_pause_protects_post_child_matching_boot_return(
         scope_a, revision = current_scope(g), g.controls._revision
         assert scope_a is not None
         identifier, new_pause, returning = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
-        loop = asyncio.get_running_loop()
         original_send = b.charger.send
-        boot_reply, boot_id = loop.create_future(), uuid.uuid4().hex
-        burst, observations, scheduled, callback_errors, witness = {}, [], [], [], {}
+        boot_id = uuid.uuid4().hex
+        burst, observations, callback_errors, witness = {}, [], [], {}
         wire_replies, zero_writers = [], []
         injected = asyncio.Event()
         installed = True
@@ -148,47 +146,24 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                 observed_at=time.monotonic(),
             )
 
-        # Success has no await after COMMIT; the adjacent Boot is handled before this callback and the parent resumes.
-        def after_successful_child_commit():
-            j.db.set_trace_callback(None)
+        # Hold the real completed Start outcome at its parent until the matching Boot and newer owner requests arrive.
+        execute_start = g.start_managed_result
+
+        async def boot_after_success(*args, **kwargs):
             try:
-                observe_completed_child(scheduled[0]["child"], require_parent_pending=True)
+                outcome = await execute_start(*args, **kwargs)
+                assert outcome.failure is None and outcome.publication is not None
+                boot = await rig.bench.call(b.charger, boot_id, "BootNotification", BOOT)
+                assert boot[0] == 3 and boot[2]["status"] == "Accepted"
+                (observed,) = observations
+                observe_completed_child(observed["child"], require_parent_pending=True)
                 admit_new_owner_requests()
-            except Exception as error:
-                callback_errors.append(repr(error))  # The test asserts callback errors before any outcome oracle.
+                return outcome
             finally:
                 injected.set()
 
-        # Observe only the actual final shared-control INSERT and queue the independent owner action afterwards.
-        def trace(statement):
-            if storage_failure != "none" or scheduled or not statement.startswith("INSERT OR REPLACE INTO meta "):
-                return
-            frame = sys._getframe(1)
-            completion, starting, attempt = {}, {}, None
-            try:
-                while frame is not None:
-                    if frame.f_code is LocalControl._complete.__code__:
-                        completion = dict(frame.f_locals)
-                    elif frame.f_code is LocalControl._start.__code__:
-                        starting = dict(frame.f_locals)
-                    elif frame.f_code is LocalControl._start_owned.__code__:
-                        attempt = frame.f_locals.get("attempt")
-                    frame = frame.f_back
-            finally:
-                del frame
-            if (
-                completion.get("self") is g.controls
-                and completion.get("changes") == {"uncertain": False, "owner": "shared"}
-                and starting.get("self") is g.controls
-                and starting.get("request_id") == identifier
-                and starting.get("shared") is True
-                and completion.get("ticket") == starting.get("ticket")
-            ):
-                scheduled.append({"child": asyncio.current_task(), "attempt": attempt, "ticket": starting["ticket"]})
-                loop.call_soon(after_successful_child_commit)
-
-        # Preserve actual ACK bytes; only success appends Boot immediately, since failed publication must finish zero A.
-        async def send_reply_then_boot(raw):
+        # Keep the actual peer traffic and zero-profile timing available to the assertions.
+        async def observe_send(raw):
             reply = json.loads(raw)
             command = next((item for item in rig.bench.device_calls if item[1] == reply[1]), None)
             first_start = not burst and reply[0] == 3 and command is not None and command[2] == "RemoteStartTransaction"
@@ -211,17 +186,15 @@ async def test_current_pause_protects_post_child_matching_boot_return(
             await original_send(raw)
             if reply[0] in (3, 4):
                 wire_replies.append(copy.deepcopy(reply))
-            if first_start and storage_failure == "none":
-                rig.bench.replies[boot_id] = boot_reply
-                await original_send(build_call(boot_id, "BootNotification", BOOT))
 
-        monkeypatch.setattr(b.charger, "send", send_reply_then_boot)
-        j.db.set_trace_callback(trace)
+        monkeypatch.setattr(b.charger, "send", observe_send)
+        if storage_failure == "none":
+            monkeypatch.setattr(g, "start_managed_result", boot_after_success)
         try:
             assert c.command(identifier, "start", initial_intent.revision)["state"] == "accepted"
             if storage_failure == "none":
                 await asyncio.wait_for(injected.wait(), 5)
-                assert not callback_errors and len(scheduled) == 1 and len(observations) == 1, callback_errors
+                assert not callback_errors and len(observations) == 1, callback_errors
                 assert witness["child_done"] and witness["worker_pending"]
                 assert not witness["child_cancelled"] and witness["child_error"] == "None"
                 assert not witness["in_transaction"] and witness["lease_deadline"] > witness["observed_at"]
@@ -235,7 +208,6 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                 assert witness["control"]["owner"] == "shared"
                 assert not witness["control"]["inhibit"] and not witness["control"]["uncertain"]
                 assert witness["owner_pause"] == initial_owner_pause
-                assert (await asyncio.wait_for(asyncio.shield(boot_reply), 3))[2]["status"] == "Accepted"
                 assert not [item for item in zero_writers if not item["after_new_owner"]]
             else:
                 # Do not inject Boot during rollback: the genuine failed child first verifies zero under its own A.
@@ -395,7 +367,6 @@ async def test_current_pause_protects_post_child_matching_boot_return(
             assert current_scope(g) == current and rig.bench.firmware.plans == plans
             assert rig.peer.configuration == configuration
         finally:
-            j.db.set_trace_callback(None)
             clear_publication_cut()
             monkeypatch.setattr(b.charger, "send", original_send)
             rig.peer.unavailable = False
@@ -403,6 +374,3 @@ async def test_current_pause_protects_post_child_matching_boot_return(
                 await asyncio.gather(c.charging.worker, return_exceptions=True)
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
-            if not boot_reply.done():
-                boot_reply.cancel()
-            await asyncio.gather(boot_reply, return_exceptions=True)
