@@ -17,12 +17,14 @@ from .managed_debt_evidence import ATTESTATIONS, DebtAttestation
 from .managed_delivery_recovery import closed_normal_delivery, delivery_anchor
 from .managed_denial_faults import (
     current_operator_proof,
-    operator_for_queued_start,
+    observation_resolution,
+    operator_for_queued_lifecycle,
     operator_wire_settled,
     pending_mapping_headers,
     proof_headers_match,
 )
 from .managed_intent import unfinished_owner_requests
+from .managed_native_repair import repair_pending, repair_revoked
 from .managed_recovery_zero import require_original_zero
 from .managed_start_delivery import KIND as START_KIND
 from .managed_start_delivery import RETRIES, start_resolution
@@ -39,14 +41,21 @@ if TYPE_CHECKING:
 
 KEY = "managed_operator_debt_reconciliations"
 FAULT = "operator_debt_reconciled_at_zero"
+VENDOR_KINDS = ("vendor-write", "vendor-start")
+LATER_VENDOR_DEBT = "later_vendor_debt"
 
 
-# A later Start may take over only after the earlier proof's own wire work genuinely settled.
-def start_retry_predecessor(j: Journal, spec: NativeBoundedSpec) -> dict[str, Any] | None:
+# A later lifecycle may take over only after the earlier proof's own work settled.
+def retry_predecessor(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, Any] | None:
     head = j.next_delivery()
-    if head is None or head.action != "StartTransaction" or head.state not in ("ambiguous", "rejected"):
+    if head is None:
         return None
-    previous = operator_for_queued_start(j, j.fault.read({}), head)
+    if kind == START_KIND:
+        if head.action != "StartTransaction" or head.state not in ("ambiguous", "rejected"):
+            return None
+    elif head.action != "StopTransaction" or head.state != "rejected":
+        return None
+    previous = operator_for_queued_lifecycle(j, j.fault.read({}), head)
     if (
         previous is None
         or previous["anchor"] != delivery_anchor(j, spec)
@@ -61,16 +70,22 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
     grant = j.get("vendor_start_grant")
     row = j.db.execute("SELECT * FROM mutations WHERE token=?", ((grant or {}).get("mutation"),)).fetchone()
     mappings = pending_mapping_headers(j)
-    previous = start_retry_predecessor(j, spec) if kind == START_KIND else None
-    return {
+    if kind in VENDOR_KINDS:
+        previous = vendor_predecessor(j, spec)
+    else:
+        previous = retry_predecessor(j, spec, kind) if kind in (START_KIND, "stop-delivery") else None
+    order = "rowid" if kind == "vendor-write" else "token"
+    mutations = [dict(r) for r in j.db.execute("SELECT * FROM mutations WHERE state!='confirmed' ORDER BY " + order)]
+    separate_grant = kind == "vendor-write" and row is not None and row["state"] == "confirmed"
+    snapshot = {
         "anchor": delivery_anchor(j, spec),
         "intent": j.get("managed_control_intent"),
         "control": j.get("control"),
         "fault": previous["prior"]["fault"] if previous is not None else j.fault.read(),
-        "mutations": [dict(r) for r in j.db.execute("SELECT * FROM mutations WHERE state!='confirmed' ORDER BY token")],
+        "mutations": mutations,
         "marker": j.get("uncertain_vendor_command"),
         "grant": grant,
-        "grant_mutation": dict(row) if kind == "vendor-start" and row is not None else None,
+        "grant_mutation": dict(row) if row is not None and (kind == "vendor-start" or separate_grant) else None,
         "stop_rejection": j.get(REJECTION),
         "stop_wire_ack": j.get(WIRE_ACK),
         "start_retries": j.get(RETRIES),
@@ -91,11 +106,89 @@ def debt_snapshot(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, A
         **({"delivery_mappings": mappings} if mappings else {}),
         **({"storage_resolution": storage_resolution(j)} if kind == "storage-fault" else {}),
     }
+    if kind == "vendor-write" and (len(mutations) > 1 or previous is not None):
+        snapshot["vendor_command_scopes"] = [
+            dict(scope)
+            for mutation in mutations
+            if (
+                scope := j.db.execute(
+                    "SELECT * FROM vendor_command_scope WHERE mutation=?", (mutation["token"],)
+                ).fetchone()
+            )
+            is not None
+        ]
+    if kind == "local-start" and len(snapshot["mutations"]) == 1:
+        scope = j.db.execute(
+            "SELECT * FROM vendor_command_scope WHERE mutation=?", (snapshot["mutations"][0]["token"],)
+        ).fetchone()
+        if scope is not None:
+            snapshot["vendor_stop_scope"] = dict(scope)
+        if stop := closed_vendor_stop(snapshot):
+            snapshot["closed_vendor_stop"] = stop
+    return snapshot
+
+
+# A genuine closed mapped Stop with a drained lifecycle leaves no target for the exact restrictive command.
+def closed_vendor_stop(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    mutations, marker = snapshot["mutations"], snapshot["marker"]
+    if (
+        len(mutations) != 1
+        or snapshot["outbox"]
+        or snapshot["grant"]
+        or snapshot["start_retries"]
+        or snapshot.get("delivery_mappings")
+        or any(entry.get("completed") is None for entry in (snapshot["denials"] or {}).values())
+    ):
+        return None
+    mutation = mutations[0]
+    if (
+        mutation["origin"] != "vendor"
+        or mutation["action"] != "RemoteStopTransaction"
+        or mutation["state"] not in ("pending", "uncertain")
+        or marker
+        and (
+            not isinstance(marker, dict)
+            or marker.get("action") != mutation["action"]
+            or marker.get("digest") != mutation["digest"]
+            or marker.get("mutation", mutation["token"]) != mutation["token"]
+        )
+    ):
+        return None
+    scope = snapshot.get("vendor_stop_scope")
+    if scope is not None and (
+        type(scope["local"]) is not int
+        or scope["local"] < 0
+        or scope["wire_result"] not in ("dispatched", "call_error")
+    ):
+        return None
+    matches = [
+        row
+        for row in snapshot["transactions"]
+        if row["vendor"] is not None
+        and (scope is None or row["local"] == scope["local"])
+        and fingerprint({"transactionId": row["vendor"]}) == mutation["digest"]
+    ]
+    if len(matches) != 1 or matches[0]["stop"] is None:
+        return None
+    transaction = matches[0]
+    stop = json.loads(transaction["stop"])
+    if not isinstance(stop, dict) or stop.get("transactionId") != transaction["local"]:
+        return None
+    # Journal.stop enqueues this lifecycle atomically. Only a real cloud acknowledgment can drain it.
+    return {
+        "mutation_token": mutation["token"],
+        "local_transaction_id": transaction["local"],
+        "vendor_transaction_id": transaction["vendor"],
+        "stop_digest": fingerprint(stop),
+        "cloud_stop_acknowledged": True,
+        "command_reply": "unknown",
+    }
 
 
 # Current work, other owner requests and original-session uncertainty cannot be waived by another debt's proof.
 def require_common_debt_idle(j: Journal, kind: str, snapshot: dict[str, Any]) -> None:
     predecessor = snapshot.get("previous_operator")
+    closed_stop = kind == "local-start" and snapshot.get("closed_vendor_stop") is not None
     if (
         any(
             entry.get("completed") is None
@@ -117,10 +210,12 @@ def require_common_debt_idle(j: Journal, kind: str, snapshot: dict[str, Any]) ->
         or kind not in ("observation", "stop-delivery", START_KIND, COMBINED_KIND)
         and j.next_delivery() is not None
         or kind not in ("vendor-write", COMBINED_KIND)
+        and not closed_stop
         and j.get("uncertain_vendor_command")
         or kind not in ("vendor-write", "vendor-start")
         and j.get("vendor_start_grant")
         or kind not in ("vendor-write", COMBINED_KIND)
+        and not closed_stop
         and j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
     ):
         raise RecoveryRequiredError("operator reconciliation cannot waive another unsettled operation")
@@ -150,25 +245,64 @@ def require_observation_tail(j: Journal) -> None:
         raise RecoveryRequiredError("legacy report recovery retains ambiguous or rejected lifecycle quarantine")
 
 
-# Only one exact vendor-origin write and its own optional unbound RemoteStart grant may be attested here.
-def vendor_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any]:
-    rows = snapshot["mutations"]
-    if len(rows) != 1 or rows[0]["origin"] != "vendor" or rows[0]["state"] not in ("pending", "uncertain"):
-        raise RecoveryRequiredError("operator reconciliation requires exactly one unresolved vendor write")
-    row, marker, grant = rows[0], snapshot["marker"], snapshot["grant"]
-    if marker and (
-        marker.get("action") != row["action"]
-        or marker.get("digest") != row["digest"]
-        or marker.get("mutation", row["token"]) != row["token"]
-    ):
+# The visibility marker can belong to a later command. A legacy digest must identify just one retained row.
+def vendor_marker_token(snapshot: dict[str, Any]) -> str | None:
+    marker = snapshot["marker"]
+    if not marker:
+        return None
+    matches = [
+        row["token"]
+        for row in snapshot["mutations"]
+        if isinstance(marker, dict)
+        and marker.get("action") == row["action"]
+        and marker.get("digest") == row["digest"]
+        and marker.get("mutation", row["token"]) == row["token"]
+    ]
+    if len(matches) != 1:
         raise RecoveryRequiredError("vendor visibility marker belongs to another write")
-    if grant and (
-        row["action"] != "RemoteStartTransaction"
-        or grant.get("mutation") != row["token"]
-        or grant.get("local") is not None
-    ):
-        raise RecoveryRequiredError("a bound or unrelated vendor Start grant cannot be retired")
+    return str(matches[0])
+
+
+# Attest one exact vendor write at a time, in the order in which its durable command was recorded.
+def vendor_candidate(snapshot: dict[str, Any]) -> dict[str, Any]:
+    rows = snapshot["mutations"]
+    if not rows or any(row["origin"] != "vendor" or row["state"] not in ("pending", "uncertain") for row in rows):
+        raise RecoveryRequiredError("operator reconciliation requires unresolved vendor writes only")
+    vendor_marker_token(snapshot)
+    grant = snapshot["grant"]
+    if grant:
+        starts = [row for row in rows if row["token"] == grant.get("mutation")]
+        if not starts and snapshot["grant_mutation"] is not None:
+            starts = [snapshot["grant_mutation"]]
+        if (
+            grant.get("local") is not None
+            or len(starts) != 1
+            or starts[0]["origin"] != "vendor"
+            or starts[0]["action"] != "RemoteStartTransaction"
+        ):
+            raise RecoveryRequiredError("a bound or unrelated vendor Start grant cannot be retired")
+    row = rows[0]
     return {"mutation_token": row["token"], "action": row["action"], "payload_digest": row["digest"]}
+
+
+# A closed mapped session can no longer consume this exact cloud grant through its deferred binding.
+def closed_vendor_start_binding(snapshot: dict[str, Any], grant: dict[str, Any]) -> bool:
+    deferred = snapshot["deferred"]
+    if (
+        not isinstance(deferred, dict)
+        or deferred.get("owner") is not False
+        or deferred.get("vendor") != grant["token"]
+        or type(deferred.get("local")) is not int
+    ):
+        return False
+    for transaction in snapshot["transactions"]:
+        if transaction["local"] != deferred["local"]:
+            continue
+        if transaction["stop"] is None or transaction["vendor"] is None:
+            return False
+        tag = json.loads(transaction["start"]).get("idTag")
+        return isinstance(tag, str) and fingerprint(tag.casefold()) == grant["digest"]
+    return False
 
 
 # Confirmed delivery is not command consumption; pin its actual still-unbound grant and mutation separately.
@@ -190,6 +324,7 @@ def vendor_start_candidate(snapshot: dict[str, Any]) -> dict[str, Any]:
         or snapshot["mutations"]
         or snapshot["marker"]
         or snapshot["deferred"]
+        and not closed_vendor_start_binding(snapshot, grant)
     ):
         raise RecoveryRequiredError("vendor Start requires its exact accepted, unbound command and no other debt")
     return {
@@ -328,6 +463,7 @@ def local_start_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
         or j.get("control", {}).get("start_pending") is not True
         or snapshot["grant"]
         or snapshot["mutations"]
+        and snapshot.get("closed_vendor_stop") is None
     ):
         raise RecoveryRequiredError("owner Start needs its exact accepted, unbound and expired command receipts")
     deferred = snapshot["deferred"]
@@ -426,7 +562,7 @@ def debt_candidate(
         if snapshot["requests"]:
             raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
         if kind == "vendor-write":
-            specific = vendor_candidate(j, snapshot)
+            specific = vendor_candidate(snapshot)
         elif kind == "vendor-start":
             specific = vendor_start_candidate(snapshot)
         elif kind in STOP_KINDS:
@@ -467,25 +603,116 @@ def resolved_debt(j: Journal, kind: str, proof: dict[str, Any]) -> dict[str, Any
         return start_resolution(j, e)
     if kind in ("vendor-write", "vendor-start"):
         row = j.db.execute("SELECT * FROM mutations WHERE token=?", (e["mutation_token"],)).fetchone()
-        return {
+        resolution = {
             "mutation": dict(row) if row is not None else None,
             "marker": j.get("uncertain_vendor_command"),
             "grant": j.get("vendor_start_grant"),
         }
+        if kind == "vendor-start" and proof["prior"].get("deferred"):
+            resolution["deferred"] = j.get("managed_deferred_start")
+        return resolution
     if kind == "local-start":
         row = j.db.execute("SELECT * FROM managed_requests WHERE id=?", (e["request_id"],)).fetchone()
-        return {
+        resolution = {
             "request": dict(row) if row is not None else None,
             "test": j.get("managed_test_charge"),
             "receipt": j.get("local_start_receipt"),
             "deferred": j.get("managed_deferred_start"),
         }
-    row = j.db.execute("SELECT * FROM rejected_observations WHERE token=?", (e["observation_token"],)).fetchone()
-    return {
-        "rejection": dict(row) if row is not None else None,
-        "retained": j.db.execute("SELECT 1 FROM outbox WHERE token=?", (e["observation_token"],)).fetchone()
-        is not None,
-    }
+        if stop := proof["prior"].get("closed_vendor_stop"):
+            # Confirmed rows may be pruned, but a surviving unresolved row would contradict this proof.
+            resolution["closed_vendor_stop_pending"] = (
+                j.db.execute(
+                    "SELECT 1 FROM mutations WHERE token=? AND state!='confirmed'", (stop["mutation_token"],)
+                ).fetchone()
+                is not None
+            )
+        return resolution
+    return observation_resolution(j, e["observation_token"])
+
+
+# The exact command row stays immutable even after later steps change the visibility marker or Start grant.
+def settled_vendor_write(j: Journal, proof: dict[str, Any], identifier: str) -> bool:
+    if proof.get("kind") != "vendor-write" or not proof_headers_match(proof, identifier):
+        return False
+    token = proof["attestation"]["mutation_token"]
+    row = j.db.execute("SELECT * FROM mutations WHERE token=? AND state='confirmed'", (token,)).fetchone()
+    return row is not None and dict(row) == proof["resolved"]["mutation"]
+
+
+# Follow only linked, still-retained vendor attestations back to the first command.
+def vendor_predecessors(j: Journal, proof: dict[str, Any], records: dict[str, Any]) -> list[str] | None:
+    seen: list[str] = []
+    anchor = proof["anchor"]
+    while (link := proof["prior"].get("previous_operator")) is not None:
+        prior_id = link["id"]
+        entry = records.get(prior_id, {})
+        prior = entry.get("proof")
+        marker = entry.get("superseded", {})
+        if (
+            prior_id in seen
+            or prior is None
+            or prior["anchor"] != anchor
+            or link["digest"] != fingerprint(prior)
+            or marker.get("reason") != LATER_VENDOR_DEBT
+            or marker.get("proof") != fingerprint(proof["attestation"])
+            or not settled_vendor_write(j, prior, prior_id)
+        ):
+            return None
+        seen.append(prior_id)
+        proof = prior
+    return seen
+
+
+# Take over only after the current proof and all earlier command outcomes still agree with the stopped journal.
+def vendor_predecessor(j: Journal, spec: NativeBoundedSpec) -> dict[str, Any] | None:
+    fault = j.fault.read({})
+    proof = current_operator_proof(j, fault)
+    if (
+        proof is None
+        or proof["kind"] != "vendor-write"
+        or proof["anchor"] != delivery_anchor(j, spec)
+        or repair_pending(j, fault)
+        or repair_revoked(j, fault)
+        or proof["resolved"] != resolved_debt(j, proof["kind"], proof)
+        or vendor_predecessors(j, proof, j.get(KEY, {})) is None
+    ):
+        return None
+    return proof
+
+
+# Identify the exact next vendor debt, or its still-unacknowledged proof, without auditing or changing history.
+def vendor_history_recovery_scope(
+    j: Journal, spec: NativeBoundedSpec, *, retiring_history_fault: bool
+) -> dict[str, Any] | None:
+    fault = j.fault.read({})
+    write = j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed' LIMIT 1").fetchone()
+    grant = j.get("vendor_start_grant")
+    if not write and not grant:
+        proof = settled_operator_recovery(j, spec, fault)
+        if proof is None or proof["kind"] not in VENDOR_KINDS:
+            return None
+        kind = proof["kind"]
+    else:
+        proof = None
+        kind = "vendor-write" if write else "vendor-start"
+    if fault and (repair_pending(j, fault) or repair_revoked(j, fault)):
+        raise RecoveryRequiredError("vendor history recovery requires settled native repair evidence")
+    snapshot = debt_snapshot(j, spec, kind)
+    if proof is not None:
+        identifier = fingerprint(proof["attestation"])
+        snapshot["previous_operator"] = {"id": identifier}
+        snapshot["fault"] = proof["prior"]["fault"]
+    elif retiring_history_fault:
+        # The history owner may retire its own exact fault in the same transaction as the archive.
+        snapshot["fault"] = None
+    require_common_debt_idle(j, kind, snapshot)
+    if snapshot["requests"]:
+        raise RecoveryRequiredError("an unrelated management request still requires reconciliation")
+    if proof is not None:
+        return {"kind": kind, "proof": identifier}
+    candidate = vendor_candidate(snapshot) if write else vendor_start_candidate(snapshot)
+    return {"kind": kind, **candidate}
 
 
 # Reconciliation records an operator-verified resolution, never successful execution, replay, Start, Stop or Return.
@@ -499,9 +726,16 @@ def reconcile_debt(
     require_original_zero(j, book, spec, n)
     records, identifier = j.get(KEY, {}), fingerprint(e)
     if identifier in records:
-        if records[identifier].get("superseded"):
-            raise RecoveryRequiredError("operator proof was superseded by later delivery recovery")
         proof = records[identifier]["proof"]
+        if records[identifier].get("superseded"):
+            if (
+                kind == "vendor-write"
+                and records[identifier]["superseded"].get("reason") == LATER_VENDOR_DEBT
+                and proof["anchor"] == delivery_anchor(j, spec)
+                and settled_vendor_write(j, proof, identifier)
+            ):
+                return {"already_recorded": True, "zero_hold_retained": True, "charging_started": False}
+            raise RecoveryRequiredError("operator proof was superseded by later delivery recovery")
         if (
             proof["kind"] != kind
             or proof["anchor"] != delivery_anchor(j, spec)
@@ -548,11 +782,14 @@ def reconcile_debt(
             proof["wire_ack"] = None
         elif kind == "vendor-write":
             j.reconcile_mutation(e["mutation_token"])
-            j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
-            if snapshot["grant"]:
+            if vendor_marker_token(snapshot) == e["mutation_token"]:
+                j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
+            if (snapshot["grant"] or {}).get("mutation") == e["mutation_token"]:
                 j.db.execute("DELETE FROM meta WHERE key='vendor_start_grant'")
         elif kind == "vendor-start":
             j.db.execute("DELETE FROM meta WHERE key='vendor_start_grant'")
+            if snapshot["deferred"]:
+                j.put("managed_deferred_start", {})
         elif kind == "stop-delivery":
             j.db.execute("UPDATE outbox SET state='queued' WHERE token=?", (e["delivery_token"],))
             proof["wire_ack"] = None
@@ -580,6 +817,9 @@ def reconcile_debt(
             j.starts.operator_no_pending(snapshot["receipt"], snapshot["test"], identifier, e["request_id"])
             if snapshot["deferred"]:
                 j.put("managed_deferred_start", {})
+            if stop := snapshot.get("closed_vendor_stop"):
+                j.reconcile_mutation(stop["mutation_token"])
+                j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
         elif kind != "storage-fault":
             assert head is not None
             j.db.execute(
@@ -591,9 +831,18 @@ def reconcile_debt(
         j.starts.operator_control(control)
         if predecessor := snapshot.get("previous_operator"):
             key = predecessor["id"]
+            reason = (
+                LATER_VENDOR_DEBT
+                if kind in VENDOR_KINDS
+                else ("later_start_retry" if kind == START_KIND else "later_stop_retry")
+            )
             records[key] = {
                 **records[key],
-                "superseded": {"reason": "later_start_retry", "proof": identifier, "at_epoch": time.time()},
+                "superseded": {
+                    "reason": reason,
+                    "proof": identifier,
+                    "at_epoch": time.time(),
+                },
             }
         j.fault.replace(fault)
         proof["resolved"] = resolved_debt(j, kind, proof)
@@ -603,7 +852,11 @@ def reconcile_debt(
 
 # A new Pause can acknowledge one exact proof only after its retained lifecycle and all unrelated debts settle.
 def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
-    j = c.session.journal
+    return settled_operator_recovery(c.session.journal, c.native.spec, fault)
+
+
+# Read the durable outcome independently of the running service or the Pause that will acknowledge it.
+def settled_operator_recovery(j: Journal, spec: NativeBoundedSpec, fault: dict[str, Any]) -> dict[str, Any] | None:
     records = j.get(KEY, {})
     if fault.get("classification") == "owner_control_or_delivery_uncertain":
         matches = [
@@ -631,10 +884,16 @@ def operator_recovery_evidence(c: ManagedController, fault: dict[str, Any]) -> d
         return None
     if proof["kind"] == COMBINED_KIND and proof["prior"].get("fault") != fault:
         return None
+    if proof["kind"] in VENDOR_KINDS and (
+        j.get("uncertain_vendor_command")
+        or j.get("vendor_start_grant")
+        or vendor_predecessors(j, proof, records) is None
+    ):
+        return None
     if (
         not operator_wire_settled(proof)
         or proof["installed_fault"] != fault
-        or proof["anchor"] != delivery_anchor(j, c.native.spec)
+        or proof["anchor"] != delivery_anchor(j, spec)
         or proof["resolved"] != resolved_debt(j, proof["kind"], proof)
         or j.next_delivery() is not None
         or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
@@ -651,4 +910,11 @@ def complete_operator_recovery(j: Journal, proof: dict[str, Any], pause: str) ->
     identifier = fingerprint(proof["attestation"])
     if records[identifier] != {"proof": proof, "completed": None}:
         raise RecoveryRequiredError("operator reconciliation acknowledgement was already consumed")
-    j.put(KEY, {**records, identifier: {"proof": proof, "completed": {"pause": pause, "at_epoch": time.time()}}})
+    completed = {"pause": pause, "at_epoch": time.time()}
+    if proof["kind"] in VENDOR_KINDS:
+        predecessors = vendor_predecessors(j, proof, records)
+        if predecessors is None:
+            raise RecoveryRequiredError("vendor command acknowledgement no longer matches its earlier outcomes")
+        for previous in predecessors:
+            records[previous] = {**records[previous], "completed": completed}
+    j.put(KEY, {**records, identifier: {"proof": proof, "completed": completed}})

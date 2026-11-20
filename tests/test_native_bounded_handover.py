@@ -223,8 +223,9 @@ async def test_unknown_native_transaction_is_not_adopted_or_stopped(
 
 # Intent: a real known charging session remains open after RemoteStop Accepted and clears only after its actual Stop.
 # Why: cleanup must retain actual Start/Stop history and cloud acknowledgements rather than manufacture closure.
+@pytest.mark.parametrize("first_report", ["together", "native", "ocpp"])
 async def test_native_cleanup_waits_for_actual_known_stop_and_preserves_its_history(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, first_report: str
 ) -> None:
     async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
         await session.command({"command": "release"})
@@ -242,6 +243,14 @@ async def test_native_cleanup_waits_for_actual_known_stop_and_preserves_its_hist
             assert not cleanup.done() and session.journal.active() == actual
             assert not any(frame[2] == "ClearChargingProfile" for frame in rig.bench.device_calls)
             stopped = {"transactionId": actual, "timestamp": START["timestamp"], "meterStop": 2000}
+            if first_report == "ocpp":
+                assert (await rig.bench.call(charger, "native-real-stop", "StopTransaction", stopped))[0] == 3
+                rig.bench.firmware.active = actual
+                for row in rig.bench.history:
+                    if row["transactionId"] == actual:
+                        row.pop("stop", None)
+                await asyncio.sleep(0.3)
+                assert not cleanup.done() and session.journal.active() is None
             rig.bench.firmware.active = None
             rig.bench.firmware.requested_current = 0
             rig.bench.cp, rig.bench.connection = "B", "Plug"
@@ -249,7 +258,12 @@ async def test_native_cleanup_waits_for_actual_known_stop_and_preserves_its_hist
             for row in rig.bench.history:
                 if row["transactionId"] == actual:
                     row["stop"] = copy.deepcopy(stopped)
-            assert (await rig.bench.call(charger, "native-real-stop", "StopTransaction", stopped))[0] == 3
+            if first_report == "native":
+                await asyncio.sleep(0.3)
+                assert not cleanup.done() and session.journal.active() == actual
+            assert not any(frame[2] == "ClearChargingProfile" for frame in rig.bench.device_calls)
+            if first_report != "ocpp":
+                assert (await rig.bench.call(charger, "native-real-stop", "StopTransaction", stopped))[0] == 3
             assert (await cleanup)["profiles_restored"]
             assert session.journal.active() is None and session.journal.next_delivery() is None
             assert any(row["transactionId"] == actual and row.get("stop") == stopped for row in rig.bench.history)

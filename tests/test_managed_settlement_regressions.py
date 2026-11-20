@@ -348,9 +348,12 @@ async def test_internal_pause_recovers_after_first_read_failure(tmp_path, tls, u
         assert not any(f[2] == "RemoteStopTransaction" for f in b.rig.bench.device_calls)
 
 
-# Intent: an explicit device Rejected result can settle only its exact existing Start ticket after fresh zero.
-# Why: a rejected Start is known not to have created a session, but a failed follow-up read must not strand it.
-async def test_explicit_rejected_start_settles_its_current_ticket(tmp_path, tls, unused_tcp_port, monkeypatch):
+# Intent: a genuine Start rejection settles under its original hold or the newer Pause's verified closed zero.
+# Why: an unavailable follow-up read or a newer Pause must not strand a known rejection as a possible Start.
+@pytest.mark.parametrize("newer_pause", [False, True], ids=["current-ticket", "superseded-ticket"])
+async def test_explicit_rejected_start_settles_its_current_ticket(
+    tmp_path, tls, unused_tcp_port, monkeypatch, newer_pause
+):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, startup=60, native_peer=InterruptedNativePeer) as b:
         c, j = b.controller, b.session.journal
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
@@ -361,33 +364,54 @@ async def test_explicit_rejected_start_settles_its_current_ticket(tmp_path, tls,
         def rejected(action, payload):
             return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
 
-        # The actual response is delivered, then all immediate native follow-up requests genuinely return HTTP503.
+        rejected_on_wire, release_reply = asyncio.Event(), asyncio.Event()
+
+        # Hold the genuine reply while Pause commits. Immediate native follow-ups genuinely return HTTP503.
         async def fail_follow_up(action, payload):
             if action == "RemoteStartTransaction":
                 b.rig.peer.unavailable = True
+                rejected_on_wire.set()
+                if newer_pause:
+                    await release_reply.wait()
 
         monkeypatch.setattr(b.rig.bench.firmware, "answer", rejected)
         b.rig.bench.before_reply = fail_follow_up
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
+        pause = uuid.uuid4().hex if newer_pause else None
+        try:
+            if pause is not None:
+                await asyncio.wait_for(rejected_on_wire.wait(), 3)
+                issued = j.get("local_start_receipt")
+                assert issued["stage"] == "issued" and j.get("control")["start_pending"] is True
+                c.command(pause, "pause", c.requests.intent().revision)
+                assert j.get("control")["ticket"] != issued["ticket"]
+        finally:
+            release_reply.set()
         await c.charging.settle()
         if c.pause_task is not None:
             await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
         assert j.get("local_start_receipt")["stage"] == "rejected"
         assert j.get("local_start_receipt")["local"] is None
-        assert j.get("control")["start_pending"] is False and j.get("control")["uncertain"]
+        assert j.get("control")["start_pending"] is newer_pause and j.get("control")["uncertain"]
         ticket, intent = j.get("control")["ticket"], c.requests.intent()
         mark = len(b.rig.bench.device_calls)
         b.rig.bench.before_reply = None
         b.rig.peer.unavailable = False
         assert (await settled_without_another_command(c))["local_hold_verified"]
         assert j.get("control")["ticket"] == ticket and c.requests.intent() == intent
-        assert j.get("control")["uncertain"] is False
+        assert j.get("control")["uncertain"] is False and j.get("control")["start_pending"] is False
         assert j.get("local_start_receipt")["settled_ticket"] == ticket
         assert len(starts(b.rig)) == 1 and j.active() is None
         assert all(
             f[2] not in ("RemoteStartTransaction", "RemoteStopTransaction") for f in b.rig.bench.device_calls[mark:]
         )
+        if pause is not None:
+            assert c.requests.receipt(pause)["state"] == "completed"
+            returning = uuid.uuid4().hex
+            c.command(returning, "app_control", intent.revision)
+            assert (await healthy(c))["owner_control_enabled"]
+            assert c.requests.receipt(returning)["state"] == "completed" and len(starts(b.rig)) == 1
 
 
 # Intent: an exact terminal candidate is revoked if its durable target or request changes during real native I/O.

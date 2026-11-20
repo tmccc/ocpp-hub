@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .managed_facts import ManagedFacts
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
+from .native_faults import STATION_CEILING_LOST
 from .native_history import latest_completion_available
 from .store import Journal
 from .supervision import ControlProof, HealthVerdict, PollStatus
@@ -30,6 +32,28 @@ NATIVE_SAMPLE_FIELDS = (
     "charging_session_open",
     "vehicle_drawing_power",
 )
+
+
+# The control poll has already finished. A failed projection withdraws displayed authority only.
+def render_poll(
+    c: ManagedController, outcome: PollStatus | tuple[HandoverEvidence, HealthVerdict], *, pending: bool = False
+) -> dict[str, Any]:
+    try:
+        if isinstance(outcome, PollStatus):
+            return poll_status(c, outcome, pending=pending)
+        native, verdict = outcome
+        return observed_status(c, poll_base(c), native, verdict)
+    except sqlite3.Error:
+        c.status_authority = None
+        c.status_latest_closed = None
+        c.status_vendor_epoch = None
+        return {
+            "state": "degraded",
+            "fault": "status_unavailable",
+            "checked_at": time.time(),
+            "owner_control_enabled": False,
+            "local_hold_verified": False,
+        }
 
 
 # An unavailable native sample leaves the independently saved proxy history intact.
@@ -144,26 +168,31 @@ class ChargerHistorySummary:
     sessions: list[dict[str, Any]]
     complete: bool
     completed: dict[int, int]
+    energy: dict[int, float]
     latest_completion_known: bool
 
 
-# An unreadable record can hide the latest completion only if its start is unknown or may be as recent.
-def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHistorySummary:
+# Use the known transaction order for managed charges, even when the charger clock moves backwards.
+def summarize_charger_history(
+    records: tuple[dict[str, Any], ...], latest_closed: int | None = None
+) -> ChargerHistorySummary:
     summaries: list[dict[str, Any]] = []
     completed: dict[int, int] = {}
+    energy: dict[int, float] = {}
     newest_unreadable_start = 0.0
+    unreadable_recent = False
     latest_time = time.time() + 30
     for record in records:
         identifier = record.get("transactionId")
         if identifier == -1:
             continue
-        start, stop = record.get("startTime"), record.get("stopTime", 0)
+        raw_start, stop = record.get("startTime"), record.get("stopTime", 0)
+        start = raw_start if type(raw_start) is int else 0
         first, last = record.get("meterStart"), record.get("meterStop", 0)
-        if type(start) is not int or not 0 < start <= latest_time:
-            newest_unreadable_start = math.inf
-            continue
+        start_valid = 0 < start <= latest_time
         if (
-            type(identifier) is not int
+            not start_valid
+            or type(identifier) is not int
             or type(stop) is not int
             or type(first) is not int
             or type(last) is not int
@@ -173,23 +202,31 @@ def summarize_charger_history(records: tuple[dict[str, Any], ...]) -> ChargerHis
             or stop != 0
             and (stop < start or last < first)
         ):
-            newest_unreadable_start = max(newest_unreadable_start, start)
+            newest_unreadable_start = max(newest_unreadable_start, start if start_valid else math.inf)
+            if latest_closed is not None and (type(identifier) is not int or identifier >= latest_closed):
+                unreadable_recent = True
             continue
         if stop:
             completed[identifier] = start
+            energy[identifier] = (last - first) / 1000
         summaries.append(
             {
                 "started_at": datetime.fromtimestamp(start, UTC).isoformat(),
                 "stopped_at": datetime.fromtimestamp(stop, UTC).isoformat() if stop else None,
-                "energy_kwh": (last - first) / 1000 if stop else None,
+                "energy_kwh": energy[identifier] if stop else None,
             }
         )
     complete = newest_unreadable_start == 0
+    if latest_closed is None:
+        latest_known = complete or max(completed.values(), default=0) > newest_unreadable_start
+    else:
+        latest_known = not unreadable_recent and max(completed, default=None) == latest_closed
     return ChargerHistorySummary(
         sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20],
         complete,
         completed,
-        complete or max(completed.values(), default=0) > newest_unreadable_start,
+        energy,
+        latest_known,
     )
 
 
@@ -219,22 +256,29 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
         value.update(dict.fromkeys((*NATIVE_SAMPLE_FIELDS, "station_ceiling_a")))
     else:
         j = c.session.journal
-        value.update(
-            phase=j.phase.read().value,
-            pending_lifecycle_events=j.db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
-            ).fetchone()[0],
-            pending_observations=j.db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
-            ).fetchone()[0],
-            automatic_charge_restart=False,
-            vendor_write_uncertain=j.db.execute(
-                "SELECT COUNT(*) FROM mutations WHERE origin='vendor' AND state!='confirmed'"
-            ).fetchone()[0],
-            operator_reconciliation_required=bool(j.get("uncertain_vendor_command"))
-            or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed'").fetchone()
-            is not None,
-        )
+        value.update(phase=j.phase.read().value, automatic_charge_restart=False)
+        try:
+            value.update(
+                pending_lifecycle_events=j.db.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
+                ).fetchone()[0],
+                pending_observations=j.db.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
+                ).fetchone()[0],
+                vendor_write_uncertain=j.db.execute(
+                    "SELECT COUNT(*) FROM mutations WHERE origin='vendor' AND state!='confirmed'"
+                ).fetchone()[0],
+                operator_reconciliation_required=bool(j.get("uncertain_vendor_command"))
+                or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed'").fetchone()
+                is not None,
+            )
+        except sqlite3.Error:
+            value.update(
+                pending_lifecycle_events=None,
+                pending_observations=None,
+                vendor_write_uncertain=None,
+                operator_reconciliation_required=None,
+            )
     return value
 
 
@@ -258,6 +302,21 @@ def poll_status(
     return value
 
 
+# The newest accepted closure survives charger clock changes between sessions.
+def latest_closed_transaction(journal: Journal) -> int | None:
+    row = journal.db.execute("SELECT local FROM transactions WHERE stop IS NOT NULL ORDER BY local DESC LIMIT 1")
+    closed = row.fetchone()
+    return int(closed[0]) if closed is not None else None
+
+
+# A cache read failure leaves this status hint unknown without interrupting supervision.
+def _reported_start_authorization(c: ManagedController) -> str | None:
+    try:
+        return c.charging.authorization_status()
+    except sqlite3.Error:
+        return None
+
+
 # Render the complete fresh observation using the single health verdict; readiness retains its domain guards.
 def observed_status(
     c: ManagedController, base: dict[str, Any], native: HandoverEvidence, verdict: HealthVerdict
@@ -265,8 +324,17 @@ def observed_status(
     from .managed_current import managed_current_ceiling
 
     j, g = c.session.journal, c.session.gateway
-    history = summarize_charger_history(native.history)
-    archive = j.get("native_history_summary")
+    try:
+        closed = latest_closed_transaction(j)
+        archive = j.get("native_history_summary")
+        if archive is not None and not isinstance(archive, dict):
+            archive = None
+            history_read = False
+        else:
+            history_read = True
+    except sqlite3.Error:
+        closed, archive, history_read = None, None, False
+    history = summarize_charger_history(native.history, closed)
     records_missing = bool(archive and archive.get("missing_records", 0))
     # A previously completed charge can come back damaged or open under the same transaction ID.
     check_archive = archive and (
@@ -274,20 +342,29 @@ def observed_status(
         or not history.complete
         or any(row.get("transactionId") != -1 and row.get("stopTime", 0) == 0 for row in native.history)
     )
-    latest_known = history.latest_completion_known and (
-        not check_archive or latest_completion_available(j, history.completed)
+    latest_known = (
+        history_read
+        and history.latest_completion_known
+        and (not check_archive or latest_completion_available(j, history.completed, closed))
     )
     # A delivered Stop can reach the journal before the charger includes that same assigned ID in its history.
-    newest_closed = j.db.execute("SELECT local FROM transactions WHERE stop IS NOT NULL ORDER BY local DESC LIMIT 1")
-    closed = newest_closed.fetchone()
-    if closed is not None and closed[0] > max(history.completed, default=-1):
-        latest_known = False
-    last_energy = next((row["energy_kwh"] for row in history.sessions if row["stopped_at"] is not None), None)
+    if closed is None:
+        last_energy = next((row["energy_kwh"] for row in history.sessions if row["stopped_at"] is not None), None)
+    else:
+        last_energy = history.energy.get(closed)
+    try:
+        can_set_current = c.current.available(native)
+        test_start_ready = c.charging.available(native)
+        normal_start_ready = c.charging.available(native, normal=True)
+    except sqlite3.Error:
+        # Availability hints are optional. A command still checks its own prerequisites at admission.
+        can_set_current = test_start_ready = normal_start_ready = False
+    c.status_latest_closed = closed
     c.status_authority = c.authority()
     c.status_vendor_epoch = g._vendor_epoch
     return {
         **base,
-        "start_authorization": c.charging.authorization_status(),
+        "start_authorization": _reported_start_authorization(c),
         "local_healthy": verdict.local_healthy,
         "checked_at": time.time(),
         "phase": j.phase.read().value,
@@ -301,7 +378,7 @@ def observed_status(
         "native_limit_a": native.runtime_user_a,
         "requested_current_a": c.current.selected(),
         "current_capability": managed_current_ceiling(j, c.native.spec) == 32,
-        "can_set_current": c.current.available(native),
+        "can_set_current": can_set_current,
         "station_ceiling_a": g.controls.desired(),
         "current_a": native.physical.current_a,
         "power_w": native.physical.power_w,
@@ -309,9 +386,9 @@ def observed_status(
         "vehicle_connected": native.physical.connection != "Unplug",
         "history_records": len(native.history),
         "test_charge": c.charging.summary(),
-        "test_start_ready": c.charging.available(native),
-        "local_charge": c.charging.normal_summary(),
-        "normal_start_ready": c.charging.available(native, normal=True),
+        "test_start_ready": test_start_ready,
+        "local_charge": c.charging.normal_summary(native),
+        "normal_start_ready": normal_start_ready,
         "history_archive": archive,
         "history_warning": "records_absent_from_charger" if records_missing else None,
         "charger_sessions": history.sessions,
@@ -457,6 +534,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     elif c.recovery.pending():
         pending_fault = "owner_release_pending"
     pause_pending = c.requests.pending_pause()
+    station_lost = c.session.book.station_ceiling_lost()
     # A pending Pause can still show the last measured app reading with its original age.
     sample_available = (
         result.get("charger_connected") is True
@@ -466,23 +544,39 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and (current == observed or pause_pending and observed.intent.mode == "app")
         and c.latest_native is not None
         and pending_fault is None
+        and not station_lost
     )
     if not sample_available:
         clear_native_sample(result)
     result.setdefault("last_session_energy_kwh", None)
-    supervising = not c.stopping and not j.fault.latched()
+    supervising = not c.stopping and not j.fault.latched() and not station_lost
     scope_current = sample_available and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):
         result.update(station_ceiling_a=None, local_charge=None, test_charge=None)
-    if pending_fault is not None and supervising:
+    published_fault = result.get("fault")
+    published_pending = published_fault in (
+        "current_update_pending",
+        "start_operation_pending",
+        "owner_release_pending",
+    )
+    # Only supervision can tell whether a cancelled Start still owns work that it must retire.
+    cancelled_start = (
+        published_fault == "start_operation_pending" and start_worker is not None and start_worker.cancelled()
+    )
+    # Retire a sampled command label once its live command has settled.
+    if published_pending and "control_revision" in published and not cancelled_start:
+        result.pop("fault")
+    if station_lost and not c.stopping:
+        result.update(
+            state="attention",
+            fault=j.fault.classification() if j.fault.latched() else STATION_CEILING_LOST,
+            normal_start_ready=False,
+            test_start_ready=False,
+        )
+    elif pending_fault is not None and supervising:
         result.update(state="reconciling", fault=pending_fault)
     elif not intent_current:
-        published_pending = result.get("fault") in (
-            "current_update_pending",
-            "start_operation_pending",
-            "owner_release_pending",
-        )
         result["state"] = "pausing" if intent.mode == "paused" and not published_pending else "reconciling"
     proof = ControlProof(
         shared=result.get("owner_control_enabled") is True,
@@ -507,14 +601,34 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     )
     if not fresh:
         result["last_session_energy_kwh"] = None
+    elif result.get("charger_latest_completion_known") is True:
+        try:
+            same_closure = latest_closed_transaction(j) == c.status_latest_closed
+        except sqlite3.Error:
+            same_closure = False
+        if not same_closure:
+            result.update(
+                last_session_energy_kwh=None, charger_latest_completion_known=False, charger_history_complete=False
+            )
     if result["state"] in ("healthy", "local_only") and not result["healthy"]:
         result["state"] = "local_only" if result["local_healthy"] else "degraded"
     result["can_pause"] = not c.stopping
-    result["can_start_test"] = result["healthy"] and c.charging.available(c.latest_native)
-    result["can_start"] = result["local_healthy"] and c.charging.available(c.latest_native, normal=True)
-    result["start_authorization"] = c.charging.authorization_status()
-    result["can_set_current"] = result["local_healthy"] and c.current.available(c.latest_native)
-    result["can_return"] = _return_refusal(c, intent.mode, result) is None
+    try:
+        result.update(
+            can_start_test=result["healthy"] and c.charging.available(c.latest_native),
+            can_start=result["local_healthy"] and c.charging.available(c.latest_native, normal=True),
+            can_set_current=result["local_healthy"] and c.current.available(c.latest_native),
+            can_return=_return_refusal(c, intent.mode, result) is None,
+        )
+    except sqlite3.Error:
+        result.update(can_start_test=False, can_start=False, can_set_current=False, can_return=False)
+    result["start_authorization"] = _reported_start_authorization(c)
     result["control_mode"] = control_mode(result, pending_fault if supervising else None, fresh=fresh)
     result["sessions"] = session_history(c.session.journal)
+    # Refresh active diagnostics from the same live view and keep the poll's recorded reporting history.
+    reported = published.get("diagnostics")
+    if isinstance(reported, dict):
+        result["diagnostics"] = diagnostic_snapshot(c, result) | {
+            key: reported[key] for key in ("timeline", "timeline_scope", "reporting_errors") if key in reported
+        }
     return result

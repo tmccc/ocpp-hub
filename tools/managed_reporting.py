@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import platform
+import threading
 from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -100,7 +104,7 @@ class Reporting:
             self.previous = signature
         return ReportDetails(dict(self.software), list(self.timeline), self.output_errors)
 
-    # A failed optional file/stdout write cannot escape into required supervision or settle a command as successful.
+    # Only the output owner writes files. Its signature comes from this report, rather than the latest live poll.
     def write(
         self,
         status: dict[str, Any],
@@ -109,21 +113,71 @@ class Reporting:
         save: Callable[[Path, dict[str, Any]], None],
         event: Callable[[Path, dict[str, Any]], None],
     ) -> bool:
+        diagnostics = status.get("diagnostics")
+        if diagnostics is not None:
+            diagnostics["reporting_errors"] = self.output_errors
         try:
             save(status_path, status)
         except OSError, SecurityError:
             self.output_errors += 1
-        changed = self.previous != self.persisted
-        if changed and self.timeline:
+        if diagnostics is None:
+            return False
+        timeline = diagnostics.get("timeline", [])
+        transition = timeline[-1] if timeline else None
+        signature = (
+            json.dumps({key: value for key, value in transition.items() if key != "at_epoch"}, sort_keys=True)
+            if transition is not None
+            else None
+        )
+        changed = transition is not None and signature != self.persisted
+        if changed:
             try:
-                event(events_path, self.timeline[-1])
-            except OSError:
+                event(events_path, transition)
+            except OSError, SecurityError:
                 self.output_errors += 1
             else:
-                self.persisted = self.previous
-                try:
-                    print(json.dumps(self.timeline[-1], sort_keys=True), flush=True)
-                except OSError:
-                    self.output_errors += 1
-        status["diagnostics"]["reporting_errors"] = self.output_errors
+                self.persisted = signature
+        diagnostics["reporting_errors"] = self.output_errors
         return changed
+
+
+class ReportWriter:
+    """Keep optional disk writes off the charger event loop with a bounded backlog."""
+
+    # The worker receives only redacted snapshots and owns all writes, including the final stopped status.
+    def __init__(self, write: Callable[[dict[str, Any]], object]) -> None:
+        self.write = write
+        self.pending: deque[dict[str, Any]] = deque(maxlen=20)
+        self.changed = threading.Condition()
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name="ics-status-writer", daemon=True)
+        self.thread.start()
+
+    # Copy each published report so reporting errors cannot mutate what the management API is reading.
+    def submit(self, status: dict[str, Any]) -> None:
+        snapshot = deepcopy(status)
+        with self.changed:
+            self.pending.append(snapshot)
+            self.changed.notify()
+
+    # Disk delay may discard the oldest queued reports, but it never holds the producer's lock.
+    def _run(self) -> None:
+        while True:
+            with self.changed:
+                self.changed.wait_for(lambda: bool(self.pending) or self.closed)
+                if not self.pending:
+                    return
+                status = self.pending.popleft()
+            self.write(status)
+
+    # A responsive sink records the final status in order. Shutdown can finish even if the sink is stalled.
+    async def close(self, status: dict[str, Any]) -> None:
+        with self.changed:
+            self.pending.clear()
+            self.pending.append(status)
+            self.closed = True
+            self.changed.notify()
+        with suppress(TimeoutError):
+            async with asyncio.timeout(1):
+                while self.thread.is_alive():
+                    await asyncio.sleep(0.01)

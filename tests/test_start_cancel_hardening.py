@@ -115,38 +115,6 @@ async def test_cancelled_unprepared_retirement_sql_wait_preserves_daily(
         assert len(rig.bench.backend_starts) == 3 and all(row["closed"] for row in rig.bench.backend_starts)
 
 
-# Cancel the next outer coroutine without assuming that a genuine earlier closed owner receipt is absent.
-async def cancel_outer_with_old_receipt(b, prior_receipt):
-    c, j = b.controller, b.session.journal
-    loop, factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
-    identifier, victims = uuid.uuid4().hex, []
-    original_intent, original_calls = c.requests.intent(), copy.deepcopy(b.rig.bench.device_calls)
-
-    # Select only this exact outer managed task and preserve normal scheduling of all real control children.
-    def cancel_outer(loop, coroutine, **kwargs):
-        from ocpp_hub_core.prototype.managed_charging import ManagedCharging
-
-        task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
-        if (
-            getattr(coroutine, "cr_code", None) is ManagedCharging._start.__code__
-            and coroutine.cr_frame.f_locals.get("self") is c.charging
-        ):
-            task.cancel()
-            victims.append(task)
-        return task
-
-    try:
-        loop.set_task_factory(cancel_outer)
-        c.command(identifier, "start", original_intent.revision)
-        await asyncio.gather(c.charging.worker, return_exceptions=True)
-    finally:
-        loop.set_task_factory(factory)
-    assert victims == [c.charging.worker] and c.charging.worker.cancelled()
-    assert c.charging.state()["start_attempted"] is False and not c.charging.state()["start_rpc_accepted"]
-    assert j.get("local_start_receipt") == prior_receipt and b.rig.bench.device_calls == original_calls
-    return identifier, original_intent
-
-
 # Intent: exact retirement of a later cancelled Start preserves the earlier genuinely accepted and closed receipt.
 # Why: a blanket old-receipt veto strands this request, while deleting the receipt destroys real transaction provenance.
 @pytest.mark.parametrize("current", [6, 32])
@@ -167,7 +135,7 @@ async def test_cancelled_unprepared_preserves_genuine_older_owner_receipt(
         assert old_receipt["request_id"] == previous and old_receipt["local"] == owner
         assert old_receipt["stage"] == "accepted" and old_transaction["stop"] is not None
         assert old_result["state"] == "completed" and len(mp.starts(rig)) == 1
-        identifier, intent = await cancel_outer_with_old_receipt(b, old_receipt)
+        identifier, intent = await cancel_outer_before_execution(b, old_receipt)
         local, stop_time, stop_meter = await daily_after_history(b)
         assert (await mp.healthy(c))["station_ceiling_a"] == current
         await until(lambda: c.charging.timer.done())

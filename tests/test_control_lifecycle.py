@@ -1,9 +1,11 @@
 """Stored control transitions preserve UUID history, explicit publication and replacement without physical I/O."""
 
+import asyncio
 import json
 import sqlite3
 
 import pytest
+from ocpp_hub_core.prototype.gateway import Gateway
 from ocpp_hub_core.prototype.managed_intent import ControlIntent, ManagedRequests
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
@@ -45,6 +47,34 @@ def owner(tmp_path):
         journal.close()
 
 
+@pytest.mark.parametrize("pool", ["_operations", "_completions"])
+async def test_retirement_yields_to_callbacks_for_already_finished_tasks(owner, monkeypatch, pool):
+    controls = Gateway(owner.journal).controls
+
+    async def finish():
+        return None
+
+    task = asyncio.create_task(finish(), eager_start=True)
+    tasks = getattr(controls, pool)
+    tasks.add(task)
+    task.add_done_callback(controls._finished)
+    assert task.done() and tasks
+    gather = asyncio.gather
+    already_gathered = False
+
+    # A regression fails immediately instead of spinning the event loop forever.
+    def guarded_gather(*pending, **kwargs):
+        nonlocal already_gathered
+        assert not already_gathered
+        already_gathered = True
+        return gather(*pending, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(asyncio, "gather", guarded_gather)
+        await controls._retire()
+    assert not tasks
+
+
 # Seed an existing row without running admission or predicting its production transition.
 def seed(owner, identifier="a" * 32, action="app_control", revision=7, state="accepted"):
     owner.journal.db.execute(
@@ -58,6 +88,22 @@ def raw(owner, identifier):
     return tuple(
         owner.journal.db.execute("SELECT state,result FROM managed_requests WHERE id=?", (identifier,)).fetchone()
     )
+
+
+# Intent: accepting Pause can return the durable result when receipt projection is unavailable.
+# Why: the controller starts the immediate Stop worker only after acceptance returns.
+def test_new_pause_does_not_reread_receipt_after_commit(owner, monkeypatch):
+    identifier = "e" * 32
+
+    # Refuse the optional lookup without replacing the real acceptance transaction.
+    def unavailable(_identifier):
+        raise sqlite3.OperationalError("simulated receipt read failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "receipt", unavailable)
+        result = owner.accept(identifier, "pause", 0)
+    assert result == owner.receipt(identifier)
+    assert result["state"] == "accepted"
 
 
 # Intent: durable precedence uses the accepted generation, with separate tickets for Pause and its Stop.
@@ -198,7 +244,8 @@ def test_current_return_identity(owner, state, action, revision):
 @pytest.mark.parametrize("state", STATES)
 def test_owned_return_begin_keeps_terminal_bytes(owner, state):
     identifier = seed(owner, state=state)
-    owner.return_started(identifier)
+    owner.journal.put("managed_control_intent", {"mode": "paused", "revision": 7})
+    owner.return_started(identifier, owner.intent())
     assert raw(owner, identifier) == ("running" if state == "accepted" else state, ORIGINAL)
 
 

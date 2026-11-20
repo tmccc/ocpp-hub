@@ -16,6 +16,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, closing
 from dataclasses import dataclass
 
 import pytest
+from ocpp_hub_core.frames import build_call_result
 from ocpp_hub_core.prototype.delivery_reply import DeliveryReply
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
@@ -79,8 +80,12 @@ class ReplyGate:
     # Hold the correlated cloud reply until the test has installed its real SQLite failure.
     async def send(self, raw):
         frame = decode(raw)
+        action = self.actions.get(frame[1])
+        if frame[0] == 3 and (info := self.bench.reply_authorization.get(action)) is not None:
+            frame[2]["idTagInfo"] = info
+            raw = build_call_result(frame[1], frame[2])
         held = self.bench.held_reply
-        if held is not None and frame[0] in (3, 4) and self.actions.get(frame[1]) == held.action:
+        if held is not None and frame[0] in (3, 4) and action == held.action:
             self.bench.held_reply = None
             held.answer, held.token = frame, frame[1]
             held.arrived.set()
@@ -95,6 +100,7 @@ class StorageBench(StartReplyBench):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.held_reply = None
+        self.reply_authorization = {}
 
     # Run the independent backend through its actual reply gate.
     async def vendor(self, connection):
@@ -185,25 +191,28 @@ def assert_retained(j, held, *, saved):
 
 
 # Publish the independent charger closure through its actual TLS socket.
-async def close_local(b, local, minute):
+async def close_local(b, local, minute, *, id_tag=None):
     b.rig.peer.permission_enabled = False
     b.rig.bench.firmware.requested_current = 0
+    payload = {
+        "transactionId": local,
+        "timestamp": f"2026-01-01T00:{minute:02d}:00Z",
+        "meterStop": 1800 + minute,
+    }
+    if id_tag is not None:
+        payload["idTag"] = id_tag
     answer = await b.rig.bench.call(
         b.charger,
         uuid.uuid4().hex,
         "StopTransaction",
-        {
-            "transactionId": local,
-            "timestamp": f"2026-01-01T00:{minute:02d}:00Z",
-            "meterStop": 1800 + minute,
-        },
+        payload,
     )
     assert answer[0] == 3
     b.rig.peer.plan_session = None
 
 
 # Create the selected real delivery head and hold only its independent cloud reply.
-async def enqueue(b, action, cycle):
+async def enqueue(b, action, cycle, *, tagged_stop=False):
     minute = 2 + cycle * 3
     local = None
     if action in ("MeterValues", "StopTransaction"):
@@ -227,7 +236,7 @@ async def enqueue(b, action, cycle):
         # This admits the supported mapping tool after a replacement loses reply certainty.
         await close_local(b, local, minute + 1)
     elif action == "StopTransaction":
-        await close_local(b, local, minute + 1)
+        await close_local(b, local, minute + 1, id_tag="NATIVE_TIMER" if tagged_stop else None)
     else:
         payload = {
             "StatusNotification": {"connectorId": 1, "status": "Preparing", "errorCode": "NoError"},
@@ -397,6 +406,48 @@ async def storage_recovery_case(
         assert b.session.journal.db.execute("SELECT COUNT(*) FROM delivery_replies").fetchone()[0] == 0
         assert all(row["closed"] for row in b.rig.bench.backend_starts)
         assert not b.session.journal.db.execute("PRAGMA foreign_key_check").fetchall()
+
+
+# Intent: a saved Start or tagged Stop ACK settles its event without reversing a newer real authorization.
+# Why: an event-specific local write failure can retain cloud metadata across a later revocation and restart.
+@pytest.mark.parametrize("action", ["StartTransaction", "StopTransaction"])
+@pytest.mark.parametrize("recovery", ["same-process", "replacement", "legacy"])
+async def test_saved_lifecycle_ack_preserves_newer_cloud_denial(
+    tmp_path, tls, unused_tcp_port, monkeypatch, action, recovery
+):
+    async with AsyncExitStack() as stack:
+        b = await stack.enter_async_context(
+            commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 6, bench_type=StorageBench)
+        )
+        b.rig.bench.reply_authorization[action] = {"status": "Accepted"}
+        held, local = await enqueue(b, action, 0, tagged_stop=True)
+        b.rig.bench.reply_authorization["Authorize"] = {"status": "Blocked"}
+        j = b.session.journal
+        fault = SqlFault("delete", held.token)
+        fault.install(j.db)
+        held.release.set()
+        await until(lambda: b.session.runtime.status.delivery_blocked)
+        assert_retained(j, held, saved=True)
+        assert held.answer[2]["idTagInfo"]["status"] == "Accepted"
+        auth = await b.rig.bench.call(b.charger, uuid.uuid4().hex, "Authorize", {"idTag": "native_timer"})
+        assert auth[0] == 3 and auth[2] == {"idTagInfo": {"status": "Blocked"}}
+        assert b.session.gateway.auth_info.stored("NATIVE_TIMER") == {"status": "Blocked"}
+        if recovery == "legacy":
+            j.db.execute("DELETE FROM delivery_reply_authorization WHERE token=?", (held.token,))
+        if recovery != "same-process":
+            await b.controller.charging.close()
+            await crash(b.session)
+            b = await stack.enter_async_context(replacement(b, "storage-replaced-after-revocation"))
+            j = b.session.journal
+            assert_retained(j, held, saved=True)
+        fault.remove(j.db)
+        await until(lambda: j.next_delivery() is None)
+
+        assert wire_count(b.rig, held.token) == 1
+        assert j.vendor_id(local) is not None
+        assert b.rig.bench.backend_starts[-1]["closed"]
+        assert b.session.gateway.auth_info.stored("NATIVE_TIMER") == {"status": "Blocked"}
+        assert not j.db.execute("SELECT 1 FROM delivery_reply_authorization").fetchone()
 
 
 # Intent: known negative lifecycle replies remain restrictive after their exact persistence retry.

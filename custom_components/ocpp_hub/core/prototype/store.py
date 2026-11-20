@@ -29,6 +29,10 @@ class ConflictError(ValueError):
     """A retry contradicts an already accepted fact."""
 
 
+class StationZeroStorageError(sqlite3.Error):
+    """Storing the reserved station-zero profile intent or reply failed."""
+
+
 # Encode deterministically and reject non-finite JSON before anything is accepted.
 def encoded(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -54,7 +58,14 @@ class Journal:
     """A private SQLite WAL journal; failures propagate before any successful charger reply."""
 
     # Open one exclusive prototype owner and recover interrupted sends conservatively.
-    def __init__(self, path: Path, identity: str, capacity: int = 10000) -> None:
+    def __init__(
+        self,
+        path: Path,
+        identity: str,
+        capacity: int = 10000,
+        *,
+        check_existing: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
         import fcntl
 
         self.path = path
@@ -80,6 +91,8 @@ class Journal:
             if path.exists():
                 # Inspect under the same exclusive lock before opening a writable connection or normalizing rows.
                 with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as existing:
+                    if check_existing is not None:
+                        check_existing(existing)
                     self.retired_plan_ids = schedule_history(existing)
             self.db = sqlite3.connect(path, isolation_level=None)
             cleanup.callback(self.db.close)
@@ -118,11 +131,18 @@ class Journal:
             CREATE TABLE IF NOT EXISTS delivery_replies(
                 token TEXT PRIMARY KEY REFERENCES outbox(token) ON DELETE CASCADE,
                 action TEXT NOT NULL, payload TEXT NOT NULL, local INTEGER, answer TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS delivery_reply_authorization(
+                token TEXT PRIMARY KEY REFERENCES delivery_replies(token) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL, observed REAL NOT NULL);
             CREATE TRIGGER IF NOT EXISTS retire_delivery_reply AFTER UPDATE OF state ON outbox
                 WHEN NEW.state!='inflight' BEGIN DELETE FROM delivery_replies WHERE token=NEW.token; END;
             CREATE TABLE IF NOT EXISTS mutations(
                 token TEXT PRIMARY KEY, origin TEXT NOT NULL, action TEXT NOT NULL,
                 digest TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS vendor_command_scope(
+                mutation TEXT PRIMARY KEY REFERENCES mutations(token) ON DELETE CASCADE,
+                request TEXT NOT NULL, vendor_epoch INTEGER NOT NULL, charger_boot TEXT,
+                wire_request TEXT NOT NULL, local INTEGER, profile INTEGER, wire_result TEXT);
             CREATE TABLE IF NOT EXISTS transaction_clock_discontinuities(
                 local INTEGER PRIMARY KEY REFERENCES transactions(local),
                 start_timestamp TEXT NOT NULL,stop_timestamp TEXT NOT NULL,observed_at_epoch REAL NOT NULL);
@@ -141,6 +161,24 @@ class Journal:
             if old is not None and old != identity:
                 raise ConflictError("journal belongs to another charger")
             self.put("identity", identity)
+            # A prepared command never crossed dispatch. Leave legacy and dispatched records unresolved.
+            grant = self.get("vendor_start_grant", {})
+            if (
+                grant.get("prepared") is True
+                and self.db.execute(
+                    "SELECT 1 FROM vendor_command_scope WHERE mutation=? AND wire_result='prepared'",
+                    (grant.get("mutation"),),
+                ).fetchone()
+            ):
+                self.put("vendor_start_grant", {})
+            self.db.execute(
+                "DELETE FROM mutations WHERE state='pending' AND token IN "
+                "(SELECT mutation FROM vendor_command_scope WHERE wire_result='prepared')"
+            )
+            self.db.execute(
+                "UPDATE mutations SET state='uncertain' WHERE state='pending' AND token IN "
+                "(SELECT mutation FROM vendor_command_scope WHERE wire_result='dispatched')"
+            )
             # An upstream Start may have been accepted before its response was lost.
             self.db.execute(
                 "UPDATE outbox SET state='ambiguous' WHERE state='inflight' AND action='StartTransaction' "
@@ -156,7 +194,11 @@ class Journal:
                 # The same exact proof normalization is used after a live timeout and an interrupted process.
                 from .managed_start_delivery import supersede_unknown_start_retry
 
-                supersede_unknown_start_retry(self, head)
+                supersede_unknown_start_retry(self, head, restarting=True)
+            elif head is not None and head.action == "StopTransaction" and head.state == "rejected":
+                from .managed_stop_delivery import latch_rejected_stop
+
+                latch_rejected_stop(self, head)
 
     # Preserve history while allowing a cloud ID to recur only after its previous lifecycle has drained.
     def _migrate_vendor_ids(self) -> None:
@@ -339,6 +381,27 @@ class Journal:
         self.db.execute(
             "UPDATE mutations SET state=? WHERE token=?", ("confirmed" if confirmed else "uncertain", token)
         )
+
+    # Save exact request and channel correlation with the mutation's existing write-ahead transaction.
+    def bind_vendor_command(
+        self,
+        token: str,
+        *,
+        request: str,
+        vendor_epoch: int,
+        boot: str | None,
+        wire: str,
+        local: int | None,
+        profile: int | None,
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO vendor_command_scope VALUES(?,?,?,?,?,?,?,'prepared')",
+            (token, request, vendor_epoch, boot, wire, local, profile),
+        )
+
+    # Record a classified wire response without storing raw messages or claiming lifecycle closure.
+    def record_vendor_result(self, token: str, result: str) -> None:
+        self.db.execute("UPDATE vendor_command_scope SET wire_result=? WHERE mutation=?", (result, token))
 
     # An explicit operator decision can release a quarantined digest after independently checking the peer.
     def reconcile_mutation(self, token: str) -> None:
@@ -566,6 +629,9 @@ class Journal:
                 self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
             except sqlite3.IntegrityError:
                 raise ConflictError("cloud transaction already belongs to another local session") from None
+            from .managed_start_delivery import retire_start_retry
+
+            retire_start_retry(self, item.token, item.transaction, fingerprint(item.payload))
         if acknowledged is not None:
             acknowledged()
         self.db.execute("DELETE FROM outbox WHERE token=?", (item.token,))

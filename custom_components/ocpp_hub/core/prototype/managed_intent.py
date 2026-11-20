@@ -17,6 +17,26 @@ OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
 
 
+# Use the same durable receipt format for each command; the domain owner supplies its acceptance evidence.
+def insert_request(
+    journal: Journal, identifier: str, action: str, revision: int, result: dict[str, Any], *, state: str = "accepted"
+) -> None:
+    journal.db.execute(
+        "INSERT INTO managed_requests VALUES(?,?,?,?,?)", (identifier, action, revision, state, json.dumps(result))
+    )
+
+
+# A worker may act only for the original outstanding command and caller revision.
+def request_pending(journal: Journal, identifier: str, action: str, revision: int) -> bool:
+    return (
+        journal.db.execute(
+            "SELECT 1 FROM managed_requests WHERE id=? AND action=? AND revision=? AND state IN ('accepted','running')",
+            (identifier, action, revision),
+        ).fetchone()
+        is not None
+    )
+
+
 @dataclass(frozen=True)
 class ControlIntent:
     """A monotonic choice survives runtime replacement and invalidates older positive operations."""
@@ -182,6 +202,16 @@ class PauseOwnership:
         return self.pause.owns(self.intent, ticket)
 
 
+@dataclass(frozen=True)
+class PauseRequest:
+    """The exact operator request behind a persistent Pause."""
+
+    identifier: str
+    revision: int
+    local: int | None
+    hold: str
+
+
 class ManagedRequests:
     """A paused intent is recorded before its effect; a return remains paused until physically confirmed."""
 
@@ -247,7 +277,8 @@ class ManagedRequests:
             raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
         if action == "app_control" and (current.revision != revision or self.return_in_progress()):
             raise RecoveryRequiredError("return requires the current revision and no pending return")
-        result = {"accepted_at": time.time()}
+        accepted_at = time.time()
+        result: dict[str, Any] = {"accepted_at": accepted_at}
         with self.journal.atomic():
             if action == "pause":
                 # One newest restrictive receipt survives even a legacy full ordinary pool; all prior UUID rows remain.
@@ -259,6 +290,13 @@ class ManagedRequests:
                 write_intent(self.journal, current, "paused")
                 if on_pause is not None:
                     on_pause()
+                    hold = read_pause_claim(self.journal)
+                    if hold.complete and hold.revision == current.revision + 1:
+                        result["_pause"] = {
+                            "revision": hold.revision,
+                            "local": self.journal.active(),
+                            "hold": hold.ticket,
+                        }
                 # A new restrictive intent revokes an old Return, including one whose reply was lost at replacement.
                 self.journal.db.execute(
                     "UPDATE managed_requests SET state='failed',result=? "
@@ -266,18 +304,62 @@ class ManagedRequests:
                     "OR state='uncertain' AND revision<=?)",
                     (json.dumps({"classification": "superseded_by_pause"}), current.revision),
                 )
-            self.journal.db.execute(
-                "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
-                (identifier, action, revision, json.dumps(result)),
-            )
-        return {"id": identifier, "action": action, "state": "accepted", "result": result}
+            insert_request(self.journal, identifier, action, revision, result)
+        # Acceptance is already durable. An unrelated read must not prevent the command worker from launching.
+        return {"id": identifier, "action": action, "state": "accepted", "result": {"accepted_at": accepted_at}}
 
     # Expose a redacted receipt rather than any protocol payload, identity or database row.
-    def receipt(self, identifier: str) -> dict[str, Any]:
+    def receipt(self, identifier: str, *, include_binding: bool = False) -> dict[str, Any]:
         row = self.journal.db.execute("SELECT * FROM managed_requests WHERE id=?", (identifier,)).fetchone()
         if row is None:
             return {"id": identifier, "state": "not_found"}
-        return {"id": identifier, "action": row["action"], "state": row["state"], "result": json.loads(row["result"])}
+        result = json.loads(row["result"])
+        if row["action"] == "pause" and isinstance(result, dict):
+            result.pop("_pause", None)
+            result.pop("_stop", None)
+        if row["action"] == "app_control" and isinstance(result, dict):
+            result.pop("_return", None)
+            result.pop("_await_cloud", None)
+        receipt = {"id": identifier, "action": row["action"], "state": row["state"], "result": result}
+        if include_binding:
+            receipt["revision"] = row["revision"]
+            if row["action"] == "set_current":
+                bound = self.journal.db.execute(
+                    "SELECT current_a FROM managed_current_requests WHERE id=?", (identifier,)
+                ).fetchone()
+                receipt["current_a"] = bound["current_a"] if bound is not None else None
+        return receipt
+
+    # Read the current request independently of the latest physical Stop it owns.
+    def pause_request(self) -> PauseRequest | None:
+        row = self.journal.db.execute(
+            "SELECT id,result FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is None or (saved := json.loads(row["result"]).get("_pause")) is None:
+            return None  # Compatibility receipts predate the request-to-hold binding.
+        revision, local, hold = saved.get("revision"), saved.get("local"), saved.get("hold")
+        if type(revision) is not int or (local is not None and type(local) is not int) or not isinstance(hold, str):
+            raise SecurityError("saved Pause command binding is malformed")
+        return PauseRequest(row["id"], revision, local, hold)
+
+    # The wire owner records the exact known session under the current Pause in its hold transaction.
+    def bind_pause_stop(
+        self, intent: ControlIntent, ticket: str, request: PauseRequest | None, local: int | None, boot: str
+    ) -> None:
+        if self.pause_request() != request:
+            raise RecoveryRequiredError("the Pause request changed before claiming Stop")
+        self.record_pause_claim(intent, ticket, stopping=True)
+        if request is None:
+            return
+        row = self.journal.db.execute(
+            "SELECT result FROM managed_requests WHERE id=?", (request.identifier,)
+        ).fetchone()
+        result = json.loads(row["result"])
+        result["_stop"] = {"ticket": ticket, "local": local, "boot": boot}
+        self.journal.db.execute(
+            "UPDATE managed_requests SET result=? WHERE id=?", (json.dumps(result), request.identifier)
+        )
 
     # Select one accepted return; a recovered running/uncertain request is never executed a second time.
     def pending_return(self) -> tuple[str, int] | None:
@@ -338,44 +420,101 @@ class ManagedRequests:
             (json.dumps({"classification": "superseded_by_test_stop"}),),
         )
 
+    # Reject a stale accepted Return before the caller checks or dispatches release work.
+    def check_return_revision(self, identifier: str, revision: int) -> ControlIntent | None:
+        intent = self.intent()
+        if intent.revision == revision:
+            return intent
+        self.finish(identifier, "failed", {"classification": "stale_revision"})
+        return None
+
     # A paused release belongs to its exact current Return; automatic app release has no Return request.
     def return_current(self, identifier: str | None, expected: ControlIntent) -> bool:
         if self.intent() != expected:
             return False
         if expected.mode != "paused":
             return identifier is None
-        row = self.journal.db.execute(
-            "SELECT action,revision,state FROM managed_requests WHERE id=?", (identifier,)
-        ).fetchone()
-        return row is not None and tuple(row) in (
-            ("app_control", expected.revision, "accepted"),
-            ("app_control", expected.revision, "running"),
-        )
+        return identifier is not None and request_pending(self.journal, identifier, "app_control", expected.revision)
 
     # The owner claims Return immediately before launch; busy or stopping polls leave it accepted.
-    def return_started(self, identifier: str) -> None:
-        self.journal.db.execute(
-            "UPDATE managed_requests SET state='running' WHERE id=? AND state='accepted'", (identifier,)
+    def return_started(self, identifier: str, expected: ControlIntent) -> bool:
+        return (
+            self.intent() == expected
+            and self.journal.db.execute(
+                "UPDATE managed_requests SET state='running' WHERE id=? AND action='app_control' "
+                "AND revision=? AND state='accepted'",
+                (identifier, expected.revision),
+            ).rowcount
+            == 1
+        )
+
+    # A release is bound to the exact verified idle hold before its wire worker can replace it.
+    def bind_return(self, identifier: str, expected: ControlIntent, ticket: str, boot: str) -> None:
+        if not self.return_current(identifier, expected):
+            raise RecoveryRequiredError("Return no longer owns its verified idle hold")
+        row = self.journal.db.execute("SELECT result FROM managed_requests WHERE id=?", (identifier,)).fetchone()
+        result = json.loads(row["result"])
+        result["_return"] = {"ticket": ticket, "boot": boot, "local": None}
+        self.journal.db.execute("UPDATE managed_requests SET result=? WHERE id=?", (json.dumps(result), identifier))
+
+    # A pre-send cloud wait belongs to this exact receipt across later supervision passes.
+    def return_awaiting_cloud(self, identifier: str, expected: ControlIntent) -> bool:
+        return (
+            self.journal.db.execute(
+                "SELECT 1 FROM managed_requests WHERE id=? AND action='app_control' AND revision=? "
+                "AND state IN ('accepted','running') AND json_extract(result,'$._await_cloud')=1",
+                (identifier, expected.revision),
+            ).fetchone()
+            is not None
         )
 
     # Waiting never replays a claimed positive attempt or changes a newer superseding receipt.
-    def return_waiting(self, identifier: str, expected: ControlIntent, *, unconfirmed: bool = False) -> None:
+    def return_waiting(
+        self, identifier: str, expected: ControlIntent, *, unconfirmed: bool = False, await_cloud: bool = False
+    ) -> None:
         if unconfirmed:
             self.finish(identifier, "uncertain", {"classification": "return_not_confirmed"})
         elif self.intent() == expected:
             self.journal.db.execute(
-                "UPDATE managed_requests SET state='accepted' WHERE id=? AND state='running'", (identifier,)
+                "UPDATE managed_requests SET state='accepted', "
+                "result=CASE WHEN ? THEN json_set(result,'$._await_cloud',1) ELSE result END "
+                "WHERE id=? AND action='app_control' AND revision=? AND state='running'",
+                (await_cloud, identifier, expected.revision),
             )
+
+    # Healthy app observation can close the oldest accepted legacy receipt with no authority change.
+    def complete_legacy_return(self) -> None:
+        pending = self.pending_return()
+        if pending is not None:
+            self.returned(pending[0])
 
     # Actual release publishes app intent in its child transaction; legacy healthy completion changes no intent.
     def returned(
         self, identifier: str, expected: ControlIntent | None = None, before_finish: Callable[[], None] | None = None
     ) -> None:
         if expected is not None:
+            if not self.return_current(identifier, expected):
+                raise RecoveryRequiredError("Return publication no longer owns its accepted request")
             self._publish_app(expected)
         if before_finish is not None:
             before_finish()
-        self.finish(identifier, "completed", {"app_control_enabled": True, "charging_started": False})
+        result: dict[str, Any] = {"app_control_enabled": True, "charging_started": False}
+        if expected is None:
+            self.finish(identifier, "completed", result)
+            return
+        row = self.journal.db.execute("SELECT result FROM managed_requests WHERE id=?", (identifier,)).fetchone()
+        binding = json.loads(row["result"]).get("_return")
+        if binding is not None:
+            result["_return"] = binding
+        if (
+            self.journal.db.execute(
+                "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action='app_control' "
+                "AND revision=? AND state IN ('accepted','running')",
+                (json.dumps(result, sort_keys=True), identifier, expected.revision),
+            ).rowcount
+            != 1
+        ):
+            raise RecoveryRequiredError("Return receipt changed before atomic publication")
 
     # Positive intent publication joins the exact current owner's transaction and grants nothing across an await.
     def _publish_app(self, expected: ControlIntent) -> None:
@@ -387,10 +526,59 @@ class ManagedRequests:
     def finish(self, identifier: str, state: str, result: dict[str, Any]) -> None:
         finish_request(self.journal, identifier, state, result)
 
-    # A fresh physical zero proof may complete every accepted Pause without reissuing its Stop effect.
+    # After verified closed zero, save the matching hold and Start evidence before publishing Pause success.
+    def complete_verified_pause(self) -> None:
+        j = self.journal
+        control, receipt = j.get("control", {}), j.starts.receipt()
+        ownership = self.pause_ownership()
+        ticket = control.get("ticket")
+        if control.get("uncertain") and (
+            ownership.owns_ticket(ticket)
+            or self.stop_owns_ticket(ticket)
+            or receipt.get("stage") in ("unsent", "rejected")
+            and receipt.get("settled_ticket") == ticket
+            or receipt.get("bound_ticket") == ticket
+            and j.db.execute(
+                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (receipt.get("local"),)
+            ).fetchone()
+        ):
+            j.control.complete(control["ticket"], uncertain=False)
+        pause_revision = self.intent().revision
+        if receipt.get("pause_revision") == pause_revision and receipt.get("verified_pause_revision") != pause_revision:
+            j.starts.pause_verified(receipt, pause_revision)
+        try:
+            self.confirm_pauses()
+        except sqlite3.Error as error:
+            # The saved hold lets the next poll verify zero and retry the receipt without another Stop.
+            raise RecoveryRequiredError("verified Pause awaits receipt publication") from error
+
+    # A fresh physical zero proof completes the current Pause. Old unbound receipts keep their historical behavior.
     def confirm_pauses(self) -> None:
+        request = self.pause_request()
+        result = {"pause_verified": True, "completed_at": time.time()}
+        if request is not None:
+            intent, claim = self.intent(), read_pause_claim(self.journal)
+            if (
+                intent.mode != "paused"
+                or not claim.complete
+                or claim.ticket != request.hold
+                or claim.revision != request.revision
+                or request.revision > intent.revision
+            ):
+                raise RecoveryRequiredError("verified zero no longer belongs to the accepted Pause request")
+            row = self.journal.db.execute(
+                "SELECT result FROM managed_requests WHERE id=?", (request.identifier,)
+            ).fetchone()
+            prior = json.loads(row["result"])
+            result.update({key: prior[key] for key in ("_pause", "_stop") if key in prior})
+            self.journal.db.execute(
+                "UPDATE managed_requests SET state='completed',result=? "
+                "WHERE id=? AND state IN ('accepted','uncertain')",
+                (json.dumps(result), request.identifier),
+            )
+            return
         self.journal.db.execute(
             "UPDATE managed_requests SET state='completed',result=? "
-            "WHERE action='pause' AND state IN ('accepted','uncertain')",
-            (json.dumps({"pause_verified": True, "completed_at": time.time()}),),
+            "WHERE action='pause' AND state IN ('accepted','uncertain') AND json_extract(result,'$._pause') IS NULL",
+            (json.dumps(result),),
         )

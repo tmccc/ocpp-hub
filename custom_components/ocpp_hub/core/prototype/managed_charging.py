@@ -9,12 +9,13 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .command_processor import CommandPriority
 from .connection_scope import CloudAttemptScope, control_scope_matches, current_scope
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt, retire_unsent_local_start
 from .managed_facts import ManagedFacts
-from .managed_intent import ControlIntent, write_intent
+from .managed_intent import ControlIntent, request_pending, write_intent
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
 from .managed_sources import confirmed_vendor_start, recorded_station_profile
 from .managed_start_binding import known_plan_source
@@ -73,6 +74,7 @@ class ChargeLease:
     initial_zero_stop_epoch: int | None = None
     start_scope: CloudAttemptScope | None = None
     first_flow: TestFlow | None = None
+    accepted_boot: str | None = None
 
 
 class ManagedCharging:
@@ -316,17 +318,19 @@ class ManagedCharging:
             mode=c.requests.intent().mode,
             normal=action == "start",
             current_a=c.current.selected(),
+            accepted_boot=g.boot_observation,
         )
         j.starts.admit(lease, action, STARTUP_BUDGET, DURATION)
         self.timer = asyncio.create_task(self._deadline(lease))
         if source == "local":
-            self.worker = asyncio.create_task(self._start(lease))
+            self.worker = c.commands.start(lambda: self._start(lease))
         return c.requests.receipt(identifier)
 
     # Pause, deadline, shutdown, introduction, permission changes and a replaced request all revoke positive sends.
     def guard(self, lease: ChargeLease, *, stopping: bool = False) -> None:
         c, j = self.controller, self.journal
         g = c.session.gateway
+        state = self.state()
         if (
             self.lease is not lease
             or c.stopping
@@ -335,6 +339,8 @@ class ManagedCharging:
             or g._charger_epoch != lease.epoch
             or g.controls._revision != lease.control_revision
             or not g.current_boot_seen(lease.epoch)
+            or lease.accepted_boot is not None
+            and g.boot_observation != lease.accepted_boot
             or fingerprint(j.identity) != lease.identity
             or c.native.spec.digest != lease.spec
             or g.policy.allow_local_start
@@ -343,9 +349,12 @@ class ManagedCharging:
             or c.current.pending()
             or j.fault.latched()
             or not j.phase.read().active
-            or self.state().get("id") != lease.identifier
-            or self.state().get("state") not in ACTIVE
-            or self.state().get("state") == "stopping"
+            or state.get("id") != lease.identifier
+            or state.get("state") not in ACTIVE
+            or state.get("state") == "stopping"
+            or lease.source == "local"
+            and state.get("state") == "starting"
+            and not request_pending(j, lease.identifier, "start" if lease.normal else "start_test", lease.revision)
             or c.requests.return_in_progress()
             or not stopping
             and j.get("control", {}).get("stop_epoch", 0) != lease.stop_epoch
@@ -722,8 +731,7 @@ class ManagedCharging:
         c, j = self.controller, self.journal
         g = c.session.gateway
         return bool(
-            not c.stopping
-            and g.current_boot_seen(g._charger_epoch)
+            g.current_boot_seen(g._charger_epoch)
             and fingerprint(j.get("boot")) == c.native.spec.boot_digest
             and c.native.introduced_epoch == g._charger_epoch
             and c.native.introduced_revision == g.controls._revision
@@ -734,6 +742,14 @@ class ManagedCharging:
         c, j = self.controller, self.journal
         g, tag = c.session.gateway, payload.get("idTag")
         if j.active() is not None or not isinstance(tag, str) or not self.matches_pending_start(tag):
+            return
+        if c.stopping:
+            # Join the retiring service's zero attempt. This report cannot acquire new positive authority.
+            stopping = g.controls._stopping
+            if stopping is not None and not stopping.done():
+                await asyncio.wait((stopping,), timeout=min(1.0, g.charger.timeout))
+            if not self.can_record_owner(tag):
+                raise UnavailableError("the already issued Start report awaits verified shutdown zero")
             return
         if self.scoped_normal_stop() and c.requests.intent().mode == "app":
             await self.hold_expired()
@@ -754,10 +770,14 @@ class ManagedCharging:
     def can_record_owner(self, tag: str) -> bool:
         c, g = self.controller, self.controller.session.gateway
         return bool(
-            (c.requests.intent().mode == "paused" or self.scoped_normal_stop() and c.requests.intent().mode == "app")
+            (
+                c.stopping
+                or c.requests.intent().mode == "paused"
+                or self.scoped_normal_stop()
+                and c.requests.intent().mode == "app"
+            )
             and self.matches_pending_start(tag)
             and self.journal.active() is None
-            and not c.stopping
             and not self.journal.fault.latched()
             and g.controls.ready
             and g.controls.desired() == 0
@@ -766,7 +786,7 @@ class ManagedCharging:
 
     # Reconcile expired authority independently of the short lease and retain the original Start reporting debt.
     async def reconcile_expired(self) -> bool:
-        if not self.scoped_normal_stop():
+        if self.controller.stopping or not self.scoped_normal_stop():
             return False
         c, j, state = self.controller, self.journal, self.state()
         g, expected = c.session.gateway, c.requests.intent()
@@ -820,7 +840,8 @@ class ManagedCharging:
                 # Recheck receipt, lifecycle and intent after every awaited native or profile verification.
                 def guard() -> None:
                     if (
-                        c.requests.intent() != expected
+                        c.stopping
+                        or c.requests.intent() != expected
                         or not self.scoped_normal_stop()
                         or g._charger_epoch != epoch
                         or g.boot_observation != boot
@@ -908,12 +929,13 @@ class ManagedCharging:
             self.changed.set()
             return
         if state.get("state") != "charging" and native.physical.power_w > 10:
-            if self.journal.active() is None or native.physical.native_transaction_id != self.journal.active():
+            active = self.journal.active()
+            if active is None or native.physical.native_transaction_id != active:
                 self.stop(lease, "unknown_session")
                 return
             grant = self.journal.get("vendor_start_grant", {})
             cloud = (
-                grant.get("local") == self.journal.active()
+                grant.get("local") == active
                 and self.journal.db.execute(
                     "SELECT 1 FROM mutations WHERE rowid>? AND token=? AND origin='vendor' "
                     "AND action='RemoteStartTransaction' AND state='confirmed' LIMIT 1",
@@ -923,7 +945,7 @@ class ManagedCharging:
             local = local_start_receipt(self.journal)
             if (
                 lease.source == "local"
-                and (cloud or not state.get("start_rpc_accepted") or local.get("local") != self.journal.active())
+                and (cloud or not state.get("start_rpc_accepted") or local.get("local") != active)
             ) or (lease.source == "cloud" and not cloud):
                 return
             if lease.first_flow is None:
@@ -931,18 +953,13 @@ class ManagedCharging:
             flow = lease.first_flow
             try:
                 with self.journal.atomic():
-                    self.journal.starts.project_test(
-                        {
-                            **state,
-                            "state": "charging",
-                            "flow_started_at": flow.observed_at,
-                            "stop_deadline_epoch": flow.observed_at + DURATION,
-                            "local_transaction": self.journal.active(),
-                            "start_source_verified": True,
-                        }
-                    )
-                    c.requests.finish(
-                        lease.identifier, "completed", {"positive_power_verified": True, "duration_seconds": DURATION}
+                    self.journal.starts.confirm_test_flow(
+                        lease,
+                        state,
+                        active,
+                        flow.observed_at,
+                        DURATION,
+                        cloud_start=(grant["token"], grant["mutation"]) if cloud else None,
                     )
             except sqlite3.Error as error:
                 if self.journal.db.in_transaction:
@@ -986,12 +1003,69 @@ class ManagedCharging:
             and not c.stopping
         )
 
-    # Normal expiry retains separate reporting debt; only an explicit Pause can Stop an independent daily.
+    # Resolve the exact timed test transaction, including a genuine report received before first power.
+    def timed_stop_target(self, state: dict[str, Any]) -> int | None:
+        for key in ("stop_local", "local_transaction"):
+            recorded = state.get(key)
+            if isinstance(recorded, int) and not isinstance(recorded, bool):
+                return recorded
+        j = self.journal
+        if state.get("source") == "local":
+            receipt = local_start_receipt(j)
+            local = receipt.get("local")
+            if receipt.get("request_id") == state.get("id") and type(local) is int:
+                return local
+        elif type(state.get("mutation_floor")) is int:
+            grant = j.get("vendor_start_grant", {})
+            local = grant.get("local")
+            if (
+                type(local) is int
+                and j.db.execute(
+                    "SELECT 1 FROM mutations WHERE rowid>? AND token=? AND origin='vendor' "
+                    "AND action='RemoteStartTransaction' AND state='confirmed'",
+                    (state["mutation_floor"], grant.get("mutation")),
+                ).fetchone()
+            ):
+                return local
+        return None
+
+    # An independently identified daily remains with the app when an unrelated test expires.
+    def retire_test_beside_daily(self, lease: ChargeLease, state: dict[str, Any], target: int | None) -> bool:
+        c, j = self.controller, self.journal
+        active, current = j.active(), self.source
+        if (
+            lease.normal
+            or active is None
+            or active == target
+            or current is None
+            or c.requests.intent() != ControlIntent("app", lease.revision)
+            or j.get("control", {}).get("start_pending")
+            or j.get("vendor_start_grant")
+        ):
+            return False
+        native, boot, revision = current
+        g = c.session.gateway
+        if (
+            (boot, revision) != (g.boot_observation, g.controls._revision)
+            or not 0 <= time.time() - native.physical.observed_at <= 15
+            or (c.ordinary.source(native) or {}).get("kind") != "daily"
+        ):
+            return False
+        j.starts.retire_independent_test(lease, state)
+        j.starts.set_lease(None)
+        self.changed.set()
+        return True
+
+    # Retire only the timed test's target, or the matching normal Start's own pending evidence.
     def stop(self, lease: ChargeLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
-        if self.lease is not lease or self.state().get("state") == "stopping":
+        state = self.state()
+        if self.lease is not lease or state.get("state") == "stopping":
             return
         c, j = self.controller, self.journal
         if c.stopping:
+            return
+        target = None if lease.normal else self.timed_stop_target(state)
+        if self.retire_test_beside_daily(lease, state, target):
             return
         with j.atomic():
             intent = c.requests.intent()
@@ -1007,11 +1081,10 @@ class ManagedCharging:
                 c.requests.charge_stopped()
             elif self.failed_start_zero_needed(lease, reason, failure):
                 c.session.gateway.controls._claim(True)
-            j.starts.expire(lease, reason, preserve, failure)
+            j.starts.expire(lease, reason, preserve, failure, target=target)
         if lease.normal:
             self.journal.starts.set_lease(None)
-        if c.pause_task is None or c.pause_task.done():
-            c.pause_task = asyncio.create_task(c._stop_requested())
+        c.schedule_pause()
         self.changed.set()
 
     # A monotonic deadline owns Stop independently of HA, the initiating socket, native reads and service polling.
@@ -1023,22 +1096,29 @@ class ManagedCharging:
                 self.changed.clear()
                 remaining = lease.deadline - time.monotonic()
                 if remaining <= 0:
-                    cancellation = retire_cancelled_start(self, lease)
-                    if cancellation is CancellationRetirement.RETIRED:
+                    if await self.controller.commands.run(
+                        lambda: self._expire(lease), priority=CommandPriority.RESTRICT
+                    ):
                         return
-                    if cancellation is CancellationRetirement.PENDING:
-                        await asyncio.sleep(0.1)
-                        continue
-                    if self.finish_closed_normal(lease):
-                        return
-                    self.stop(lease, "deadline")
-                    return
+                    await asyncio.sleep(0.1)
+                    continue
                 await asyncio.wait_for(self.changed.wait(), remaining)
             except TimeoutError:
                 continue
             except sqlite3.Error, RecoveryRequiredError, DeniedError:
                 # Failed no-dispatch settlement and restrictive claims retry without inventing another outcome.
                 await asyncio.sleep(0.1)
+
+    # Decide expiry in one restrictive turn and keep the existing work bound to the same lease.
+    def _expire(self, lease: ChargeLease) -> bool:
+        if self.lease is not lease or self.state().get("state") == "stopping":
+            return True
+        cancellation = retire_cancelled_start(self, lease)
+        if cancellation is CancellationRetirement.PENDING:
+            return False
+        if cancellation is not CancellationRetirement.RETIRED and not self.finish_closed_normal(lease):
+            self.stop(lease, "deadline")
+        return True
 
     # Public timing is descriptive and redacted; it is never authority to repeat a historical Start.
     def summary(self) -> dict[str, Any] | None:
@@ -1059,12 +1139,19 @@ class ManagedCharging:
         }
 
     # Ordinary sessions separate measured charging from known transaction existence, without a countdown.
-    def normal_summary(self) -> dict[str, Any] | None:
+    def normal_summary(self, native: HandoverEvidence | None = None) -> dict[str, Any] | None:
         state = self.state()
         if state.get("kind") != "normal":
             return None
         name = "awaiting_session" if state.get("state") == "awaiting_power" else state.get("state")
-        return {"state": name, "charging": name == "running" and state.get("charging") is True}
+        charging = bool(
+            name == "running"
+            and native is not None
+            and native.physical.transaction_open
+            and native.physical.native_transaction_id == state.get("local_transaction")
+            and native.physical.power_w > 10
+        )
+        return {"state": name, "charging": charging}
 
     # Shutdown retires timers and awaits owned workers before their journal can be closed.
     async def close(self) -> None:

@@ -2,9 +2,11 @@
 
 import asyncio
 import uuid
+from pathlib import Path
 
 import pytest
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
+from ocpp_hub_core.prototype.managed_view import publish_poll
 from websockets.asyncio.client import connect
 
 from tests.current_rig import adjustable
@@ -14,6 +16,80 @@ from tests.test_managed_current_tick_race import OneNativeResponseGate
 from tests.test_worker_storage_recovery import fail_boundary
 from tests.test_worker_storage_supersession import current_settlement_unavailable
 from tests.tls_support import tls as tls
+from tools.managed_reporting import Reporting
+
+
+# Intent: a completed current receipt and the status read agree before the next charger observation.
+# Why: retiring a pending label cannot certify readings or enable controls from the previous poll.
+async def test_completed_current_status_retires_pending_before_next_poll(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    async with adjustable(
+        tmp_path, tls, unused_tcp_port_factory(), monkeypatch, native_peer=OneNativeResponseGate
+    ) as b:
+        c, peer = b.controller, b.rig.peer
+        reporter = Reporting(Path(__file__).resolve().parents[1])
+        before = await healthy(c)
+        started = before["checked_at"]
+        expires = started + 86400
+        published = publish_poll(c, before, pid=1, started=started, expires=expires, observe=reporter.observe)
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused-token", TOKEN), c, lambda: published)
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+            ) as socket:
+                peer.arm = True
+                request = await call(socket, "set_current", revision=before["control_revision"], current_a=16)
+                receipt = request["result"]
+                assert receipt["state"] == "accepted"
+                await asyncio.wait_for(peer.entered.wait(), 3)
+                poll = await asyncio.wait_for(c.tick(), 3)
+                assert poll["fault"] == "current_update_pending"
+                published = publish_poll(c, poll, pid=1, started=started, expires=expires, observe=reporter.observe)
+                pending = (await call(socket, "status"))["result"]
+                assert pending["control_mode"] == "updating_current"
+                assert pending["diagnostics"]["pending_command_count"] == 1
+                assert pending["diagnostics"]["pending_commands"][0]["action"] == "set_current"
+                assert pending["diagnostics"]["current_fault"] == "current_update_pending"
+                assert pending["diagnostics"]["workers"]["current"] == "running"
+
+                peer.release.set()
+                await asyncio.wait_for(c.current.settle(), 5)
+                outcome = (await call(socket, "receipt", request_id=receipt["id"]))["result"]
+                assert outcome["state"] == "completed"
+                assert outcome["result"] == {"current_a": 16, "charging_started": False}
+                database = c.session.journal.db
+                counts = (database.total_changes, len(peer.requests), len(b.rig.bench.device_calls))
+                completed = (await call(socket, "status"))["result"]
+                assert counts == (database.total_changes, len(peer.requests), len(b.rig.bench.device_calls))
+                assert completed["control_mode"] == "waiting" and completed["requested_current_a"] == 16
+                assert completed["checked_at"] == poll["checked_at"]
+                assert all(completed[key] is None for key in ("native_observed_at", "power_w", "station_ceiling_a"))
+                assert completed.get("fault") is None
+                assert not any(
+                    completed[key] for key in ("can_start", "can_start_test", "can_return", "can_set_current")
+                )
+                diagnostic = completed["diagnostics"]
+                assert diagnostic["current_fault"] is None and "current_update_pending" not in diagnostic["blockers"]
+                assert diagnostic["pending_command_count"] == 0 and diagnostic["pending_commands"] == []
+                assert diagnostic["workers"]["current"] == "done"
+                assert diagnostic["timeline"] == pending["diagnostics"]["timeline"]
+                assert diagnostic["timeline"][-1]["fault"] == "current_update_pending"
+                assert published["fault"] == "current_update_pending"
+                assert published["diagnostics"]["pending_command_count"] == 1
+
+                observed = await healthy(c)
+                published = publish_poll(c, observed, pid=1, started=started, expires=expires, observe=reporter.observe)
+                verified = (await call(socket, "status"))["result"]
+                assert verified["control_mode"] == "app" and verified["station_ceiling_a"] == 16
+                assert verified["can_set_current"] and b.rig.bench.firmware.effective_limit() == 16
+        finally:
+            peer.release.set()
+            await api.close()
 
 
 # Intent: a pending physical response or refused restrictive transaction cannot freeze status or invent zero proof.

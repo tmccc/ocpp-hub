@@ -1,11 +1,12 @@
 """Retired vehicle-pause state cannot enter either remaining commissioning mode."""
 
 import copy
+import sqlite3
 from contextlib import closing
 
 import pytest
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import Journal
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 
 from tests.connected_rig import connected_bench
 from tests.tls_support import tls as tls
@@ -35,6 +36,31 @@ async def test_incomplete_retired_handover_refuses_startup(tmp_path, tls, unused
         with closing(Journal(rig.prepared.config.journal, rig.prepared.config.identity)) as journal:
             assert [tuple(row) for row in journal.db.execute("SELECT * FROM meta ORDER BY key")] == before
             assert journal.get("connected_handover") == record
+
+
+# Intent: refusing an older installation leaves its interrupted delivery and lifecycle evidence intact.
+# Why: merely opening the normal writable journal used to normalize these rows before the refusal.
+@pytest.mark.parametrize("retired", ["plain", "vehicle_pause"])
+async def test_refused_retired_journal_preserves_wire_state(tmp_path, tls, unused_tcp_port, retired):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        path = rig.prepared.config.journal
+        with closing(Journal(path, rig.prepared.config.identity)) as journal:
+            if retired == "plain":
+                journal.put("trial_phase", "active")
+            else:
+                journal.put("connected_handover", {"stage": "clearing"})
+            journal.db.execute("INSERT INTO transactions(local,connector,start,live) VALUES(1001,1,'{}',1)")
+            journal.db.execute(
+                "INSERT INTO outbox(token,action,payload,local,state) "
+                "VALUES('saved','StartTransaction','{}',1001,'inflight')"
+            )
+        error = RecoveryRequiredError if retired == "plain" else SecurityError
+        with pytest.raises(error):
+            rig.session(bounded=True)
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            assert db.execute("SELECT action,state FROM outbox").fetchall() == [("StartTransaction", "inflight")]
+            assert db.execute("SELECT local,live FROM transactions").fetchall() == [(1001, 1)]
+        assert not rig.bench.device_calls
 
 
 # Intent: a completed historical record remains byte-for-byte evidence in either remaining mode.

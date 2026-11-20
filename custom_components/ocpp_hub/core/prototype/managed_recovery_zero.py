@@ -8,12 +8,28 @@ from .managed_current import managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .store import Journal, RecoveryRequiredError, fingerprint
+from .trial_evidence import Resource
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
 
 
 # Software debt predicates stay with each typed recovery; this helper never exempts or edits a pending command.
 def require_original_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpec, n: HandoverEvidence) -> None:
+    require_paused_original(j, spec, n)
+    audit_history(j, spec.digest, list(n.history), False)
+    require_station_zero(j, book, book.owned_present(n.physical))
+
+
+# History repair must independently verify the same original installation and zero before accepting missing records.
+def require_paused_owned_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpec, n: HandoverEvidence) -> None:
+    require_paused_original(j, spec, n)
+    if conflict := book.native_conflict(n.physical, owned=True):
+        raise conflict
+    require_station_zero(j, book, list(n.physical.resources))
+
+
+# Validate the installed configuration, the owner's paused intent and the live physical zero observation.
+def require_paused_original(j: Journal, spec: NativeBoundedSpec, n: HandoverEvidence) -> None:
     ceiling = managed_current_ceiling(j, spec)
     if ceiling == 32:
         spec.require_managed(n, j.identity, closed=True, allow_unplugged=True)
@@ -46,8 +62,11 @@ def require_original_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
         or any(v != 0 for v in n.currents_a + n.powers_w)
     ):
         raise RecoveryRequiredError("operator reconciliation requires the existing paused original closed zero hold")
-    audit_history(j, spec.digest, list(n.history), False)
-    station = [r for r in book.owned_present(n.physical) if r.kind == "profile" and r.identifier == HUB_PROFILE_ID]
+
+
+# Match the actual station profile to its exact confirmed journal receipt.
+def require_station_zero(j: Journal, book: ResourceBook, resources: list[Resource]) -> None:
+    station = [r for r in resources if r.kind == "profile" and r.identifier == HUB_PROFILE_ID]
     row = j.db.execute(
         "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
     ).fetchone()

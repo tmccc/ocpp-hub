@@ -104,8 +104,24 @@ async def test_regular_start_confirms_known_zero_power_session_without_invented_
         status = await healthy(test.controller)
         receipt = test.controller.requests.receipt(identifier)
         assert status["charging_session_open"] and status["power_w"] == status["current_a"] == 0
+        assert status["local_charge"] == {"state": "running", "charging": False}
         assert receipt["state"] == "completed" and not receipt["result"].get("positive_power_verified", False)
         assert test.controller.charging.lease is None
+
+        # A changing measurement is displayed directly, even if the stored Start cannot be updated.
+        journal = test.session.journal
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_charge_label BEFORE INSERT ON meta WHEN NEW.key='managed_test_charge' "
+            "BEGIN SELECT RAISE(ABORT,'charge metadata is unavailable'); END"
+        )
+        try:
+            test.rig.peer.paused = False
+            test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
+            status = await healthy(test.controller)
+            assert status["local_charge"] == {"state": "running", "charging": True}
+            assert journal.active() == local and not test.rig.bench.remote_stop.is_set()
+        finally:
+            journal.db.execute("DROP TRIGGER refuse_charge_label")
         test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
         assert (await actual_stop(test, local))["local_hold_verified"]
 

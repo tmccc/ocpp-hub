@@ -220,6 +220,21 @@ class NativeObserver:
     async def observe_with_history(self) -> Evidence:
         return await self._observe(True)
 
+    # A new Start needs the actual reserved profile before it has a native transaction number.
+    async def observe_profiles(self) -> tuple[Resource, ...]:
+        async with asyncio.timeout(5):
+            config = await self._read("getConfig")
+            if (
+                not isinstance(config, dict)
+                or config.get("Id") != self.config.identity
+                or config.get("bPSN") != self.config.hardware_identity
+            ):
+                raise NativeContentError("identity", "native profile identities do not match the configured charger")
+            profiles = native_profiles(await self._read("statistics", "SMART"))
+            if await self._read("getConfig") != config:
+                raise NativeContentError("configuration", "native configuration changed during the profile read")
+            return profiles
+
     # The separate connected path needs the actual native USER/HW limits and full history, not desired OCPP state.
     async def observe_handover(self) -> HandoverEvidence:
         from .trial_handover_evidence import handover_evidence
@@ -270,13 +285,9 @@ class NativeObserver:
 
 
 # Preserve full native bodies, projecting only profile fields whose scaling was observed in actual iCS captures.
-def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> Evidence:
+def native_profiles(smart: Any) -> tuple[Resource, ...]:
     try:
-        identity = config["Id"]
-        if not isinstance(identity, str) or not identity:
-            raise ValueError
         resources = []
-        smart = values["SMART"]
         if set(smart) != {"conn0", "conn1"}:
             raise ValueError
         for connector in (0, 1):
@@ -292,6 +303,19 @@ def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> 
                         raise ValueError
                     canonical = native_profile_projection(profile, connector, purpose, time.time())
                     resources.append(Resource("profile", identifier, profile, canonical))
+    except (ValueError, KeyError, TypeError, IndexError):
+        raise NativeContentError("content", "complete native trial inventory could not be validated") from None
+    if len({resource.key for resource in resources}) != len(resources):
+        raise NativeContentError("resources", "native inventory contains duplicate resource identifiers")
+    return tuple(resources)
+
+
+def native_evidence(config: Any, values: dict[str, Any], observed_at: float) -> Evidence:
+    try:
+        identity = config["Id"]
+        if not isinstance(identity, str) or not identity:
+            raise ValueError
+        resources = list(native_profiles(values["SMART"]))
         plans = values["SETPLAN"]["planList"]
         if not isinstance(plans, list):
             raise ValueError

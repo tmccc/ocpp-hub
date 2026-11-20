@@ -10,12 +10,14 @@ from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
-from .composite import FutureScheduleError, verify_composite
+from .command_processor import CommandPriority, CommandProcessor
+from .composite import ExcessiveCompositeError, FutureScheduleError, verify_composite
 from .connection_scope import CloudAttemptScope
 from .incident_observation import IncidentObservation, ObservationKind, ObservedReply
 from .managed_intent import decode_intent, read_pause_claim
@@ -37,7 +39,7 @@ from .recovery_contracts import (
     require_allowed,
 )
 from .release_attempt import ReleaseAttempt
-from .rpc import Peer, UnavailableError, ValidationPreemptedError
+from .rpc import Peer, UnavailableError, ValidationPreemptedError, profile_status
 from .security import SecurityError
 from .start_handoff import (
     OwnedStartResult,
@@ -46,13 +48,18 @@ from .start_handoff import (
     StartHandoffContext,
 )
 from .station import StationChoice
-from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, fingerprint
+from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, StationZeroStorageError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
+type StopProof = Callable[[int, bool], Awaitable[Callable[[], None]]]
 
 
 class ControlSupersededError(DeniedError):
     """A specific newer durable control ticket retired this operation's ownership."""
+
+
+class StopReplyUnconfirmedError(UnavailableError):
+    """The station confirmed zero but the transaction Stop reply did not establish acceptance."""
 
 
 # Translate genuine technical failures once at the executor boundary; ordinary prerequisites never enter here.
@@ -122,23 +129,30 @@ def recover_unreported_local_start(j: Journal) -> None:
 class LocalControl:
     """A stopped software session cannot be restarted by an already installed native timer."""
 
-    # Confirmation belongs to a socket generation; only the desired limit and hold survive restart.
-    def __init__(self, journal: Journal, peer: Peer, policy: Policy, epoch: Callable[[], int]) -> None:
+    # Confirmation belongs to an exact Boot; only the desired limit and hold survive restart.
+    def __init__(
+        self, journal: Journal, peer: Peer, policy: Policy, epoch: Callable[[], int], boot: Callable[[], str | None]
+    ) -> None:
         self.journal, self.peer, self.policy, self.epoch = journal, peer, policy, epoch
-        self._confirmed_epoch = -1
-        self._confirmed_limit: float | None = None
+        self.boot = boot
+        self.command_processor: CommandProcessor | None = None
+        self._confirmed: tuple[int, str | None, float] | None = None
         self._revision = 0
         self._operations: set[asyncio.Task[Any]] = set()
         self._completions: set[asyncio.Task[Any]] = set()
         self._retirement: asyncio.Task[None] | None = None
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
+        self._stop_owner: tuple[object, ...] | None = None
         self._release_ticket: str | None = None
         self.release_attempt: ReleaseAttempt | None = None
         self._stop_ack: StopAcknowledgement | None = None
         self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
         self.prepare_station: Callable[[ResultCall, int], Awaitable[StationChoice | NotSent]] | None = None
+        self.require_retained_station: Callable[[float], Awaitable[None]] | None = None
+        self.retained_ceiling_exceeded: Callable[[], None] | None = None
+        self.station_missing: Callable[[], bool] = lambda: False
         self.incident_observer: Callable[[IncidentObservation], None] | None = None
 
     # Offer small facts to optional reporting and keep its reads and failures outside control decisions.
@@ -201,10 +215,11 @@ class LocalControl:
 
     # Each owned action already bounds its native/RPC work; never close its store merely because a waiter expired.
     async def _retire(self) -> None:
-        while self._completions:
-            await asyncio.gather(*tuple(self._completions), return_exceptions=True)
-        while self._operations:
-            await asyncio.gather(*tuple(self._operations), return_exceptions=True)
+        for tasks in (self._completions, self._operations):
+            while tasks:
+                await asyncio.gather(*tuple(tasks), return_exceptions=True)
+                # An already-completed gather can return before the task-done callbacks run.
+                await asyncio.sleep(0)
 
     # Return the persisted bounded ceiling without ever raising a previous lower local limit on start.
     def desired(self) -> float:
@@ -225,16 +240,23 @@ class LocalControl:
             if receipt is None or receipt["state"] != "confirmed":
                 return False
         return (
-            not self.journal.get("trial_preservation_fault")
+            not self.station_missing()
+            and not self.journal.get("trial_preservation_fault")
             and not self.journal.get("trial_inventory_fault")
-            and self._confirmed_epoch == self.epoch()
-            and self._confirmed_limit == self.desired()
+            and self._confirmed == (self.epoch(), self.boot(), self.desired())
         )
+
+    # A newer Boot on the same transport needs a fresh read of the existing profile and effective schedule.
+    def ceiling_needs_recheck(self) -> bool:
+        if self._confirmed is None:
+            return False
+        epoch, boot, limit = self._confirmed
+        return epoch == self.epoch() and boot != self.boot() and limit == self.desired()
 
     # A changed device introduction cannot inherit a confirmation or complete an older in-flight verification.
     def invalidate(self) -> None:
         self._revision += 1
-        self._confirmed_epoch, self._confirmed_limit = -1, None
+        self._confirmed = None
 
     # Validate both transport generation and a newer stop/operation before every RPC in a sequence.
     def _check(self, epoch: int, ticket: str | None = None) -> None:
@@ -282,9 +304,12 @@ class LocalControl:
     async def _cap_result(
         self, call: ResultCall, limit: float, epoch: int, *, guard: Guard | None = None
     ) -> Reply | CapPending:
+        boot = self.boot()
         if limit > 0 and self.journal.phase.starting:
             raise DeniedError("initial native admission has not completed")
-        self._confirmed_epoch = -1
+        if limit > 0 and boot is None and self.journal.phase.read().supervised:
+            raise UnavailableError("positive station verification awaits a saved Boot")
+        self._confirmed = None
         revision = self._revision
         ticket = self.journal.get("control", {}).get("ticket")
         desired = self.desired()
@@ -296,17 +321,22 @@ class LocalControl:
                 decision = guard()
                 if isinstance(decision, Pending):
                     return decision
-            if revision != self._revision:
+            if boot != self.boot() or revision != self._revision:
                 raise UnavailableError("device introduction changed during station verification")
             if self.journal.get("control", {}).get("ticket") != ticket or self.desired() != desired:
                 raise DeniedError("a newer local operation superseded station verification")
             return ALLOW
 
-        choice = (
-            await self.prepare_station(call, epoch)
-            if self.prepare_station is not None
-            else StationChoice("Relative", self.policy.local_stack_level)
-        )
+        try:
+            choice = (
+                await self.prepare_station(call, epoch)
+                if self.prepare_station is not None
+                else StationChoice("Relative", self.policy.local_stack_level)
+            )
+        except UnavailableError as error:
+            if boot != self.boot() and revision != self._revision:
+                raise RecoveryRequiredError("device introduction changed during capability discovery") from error
+            raise
         if isinstance(choice, NotSent):
             return CapPending(choice.pending)
         decision = check()
@@ -321,13 +351,15 @@ class LocalControl:
         decision = check()
         if isinstance(decision, Pending):
             return CapPending(decision)
-        if answer.frame[0] != 3 or answer.frame[2].get("status") != "Accepted":
-            self._confirmed_epoch = -1
+        accepted = answer.frame[0] == 3 and answer.frame[2].get("status") == "Accepted"
+        if not accepted or (
+            self.journal.phase.read().supervised and profile_status("SetChargingProfile", answer.frame) != "Accepted"
+        ):
             raise UnavailableError("charger did not confirm the station ceiling")
         verification = await self._verify_ceiling_result(call, limit, check)
         if verification is not None:
             return CapPending(verification)
-        self._confirmed_epoch, self._confirmed_limit = epoch, limit
+        self._confirmed = (epoch, boot, limit)
         return answer
 
     # Each composite and retry revalidates current ownership and may return an ordinary prerequisite as data.
@@ -386,19 +418,42 @@ class LocalControl:
         if self.ready:
             return
         epoch = self.epoch()
+        boot = self.boot()
         limit = self.desired()
+        if boot is None and phase.supervised:
+            raise UnavailableError("station verification awaits a saved Boot")
+        ticket = self.journal.get("control", {}).get("ticket")
 
         # Capability reads may await a peer; a newer Stop or lower desired limit must win before the eventual write.
-        def check() -> None:
+        def check() -> GateDecision:
             self._check(epoch)
             if guard is not None:
                 guard()
-            if self.desired() != limit:
+            if boot != self.boot():
+                raise UnavailableError("station verification belongs to an earlier Boot")
+            if self.desired() != limit or self.journal.get("control", {}).get("ticket") != ticket:
                 raise DeniedError("desired ceiling changed during preparation")
+            return ALLOW
 
-        async with self.peer.sequence(0 if limit == 0 else 1, check) as call:
-            if not self.ready:
-                await self._cap(call, limit, epoch, guard=check)
+        async with self.peer.sequence_results(0 if limit == 0 else 1, check) as call:
+            check()
+            if self.ready:
+                return
+            if self.ceiling_needs_recheck() and self.require_retained_station is not None:
+                await self.require_retained_station(limit)
+                try:
+                    pending = await self._verify_ceiling_result(call, limit, check)
+                except ExcessiveCompositeError:
+                    if self.retained_ceiling_exceeded is not None:
+                        self.retained_ceiling_exceeded()
+                    raise
+                if pending is not None:
+                    require_allowed(pending)
+                self._confirmed = (epoch, boot, limit)
+            else:
+                result = await self._cap_result(call, limit, epoch, guard=check)
+                if isinstance(result, CapPending):
+                    require_allowed(result.pending)
 
     # A positive slider update cannot silently release an explicit zero-current hold.
     async def set_limit(
@@ -408,9 +463,12 @@ class LocalControl:
         guard: Callable[[], None] | None = None,
         shared: bool = False,
         on_restrictive_claim: Callable[[str | None, str], None] | None = None,
+        on_claim: Callable[[str], None] | None = None,
     ) -> Frame:
         return await self._owned(
-            self._set_limit(value, guard=guard, shared=shared, on_restrictive_claim=on_restrictive_claim)
+            self._set_limit(
+                value, guard=guard, shared=shared, on_restrictive_claim=on_restrictive_claim, on_claim=on_claim
+            )
         )
 
     # Keep the complete claimed slider operation alive independently of an individual API client.
@@ -421,6 +479,7 @@ class LocalControl:
         guard: Callable[[], None] | None = None,
         shared: bool = False,
         on_restrictive_claim: Callable[[str | None, str], None] | None = None,
+        on_claim: Callable[[str], None] | None = None,
     ) -> Frame:
         if guard is not None:
             guard()
@@ -431,11 +490,14 @@ class LocalControl:
         previous = self.journal.get("control", {})
         if previous.get("inhibit") and limit > 0:
             raise DeniedError("resume or release explicitly before raising a stopped limit")
-        epoch, ticket = self._claim(previous.get("inhibit", False) or limit == 0)
-        if limit == 0 and on_restrictive_claim is not None:
-            on_restrictive_claim(previous.get("ticket"), ticket)
-        if limit > 0:
-            self._complete(ticket, resume_limit=limit)
+        with self.journal.atomic() if on_claim is not None else nullcontext():
+            epoch, ticket = self._claim(previous.get("inhibit", False) or limit == 0)
+            if on_claim is not None:
+                on_claim(ticket)
+            if limit == 0 and on_restrictive_claim is not None:
+                on_restrictive_claim(previous.get("ticket"), ticket)
+            if limit > 0:
+                self._complete(ticket, resume_limit=limit)
 
         # The managed selector retains app authority only while its durable request generation still matches.
         def check() -> None:
@@ -468,29 +530,71 @@ class LocalControl:
         )
 
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
-    async def stop(self, *, expected_local: int | None = None, guard: Callable[[], None] | None = None) -> Frame:
+    async def stop(
+        self,
+        *,
+        expected_local: int | None = None,
+        guard: Callable[[], None] | None = None,
+        station_absent: bool = False,
+        prove_stop: StopProof | None = None,
+        on_claim: Callable[[str], None] | None = None,
+        owner: tuple[object, ...] | None = None,
+        priority: CommandPriority = CommandPriority.RESTRICT,
+    ) -> Frame:
+        claim = partial(self._claim_stop, expected_local, guard, station_absent, prove_stop, on_claim, owner)
+        task = claim() if self.command_processor is None else await self.command_processor.run(claim, priority=priority)
+        return await asyncio.shield(task)
+
+    # Reserve the exact Stop and its child together before yielding to another command or a charger report.
+    def _claim_stop(
+        self,
+        expected_local: int | None,
+        guard: Callable[[], None] | None,
+        station_absent: bool,
+        prove_stop: StopProof | None,
+        on_claim: Callable[[str], None] | None,
+        owner: tuple[object, ...] | None,
+    ) -> asyncio.Task[Frame]:
+        if station_absent and (expected_local is None or guard is None):
+            raise RecoveryRequiredError("an absent station ceiling permits only an independently guarded Stop")
         if guard is not None:
             guard()
         if expected_local is not None and self.journal.active() not in (None, expected_local):
             raise RecoveryRequiredError("scheduled Stop no longer owns the active transaction")
         previous = self.journal.get("control", {})
-        if self._stopping is None or self._stopping.done() or previous.get("ticket") != self._stop_ticket:
+        if (
+            self._stopping is None
+            or self._stopping.done()
+            or previous.get("ticket") != self._stop_ticket
+            or owner != self._stop_owner
+        ):
             previous_stop_ticket, committed = self._stop_ticket, False
             try:
                 # Synchronous guards may bind the claim; both durable facts must commit before a child can send.
                 with self.journal.atomic():
                     epoch, ticket = self._claim(True, stopping=True)
                     self._stop_ticket = ticket
+                    if on_claim is not None:
+                        on_claim(ticket)
                     if guard is not None:
                         guard()
                 committed = True
             finally:
                 if not committed:
                     self._stop_ticket = previous_stop_ticket
+            self._stop_owner = owner
             self._stopping = self._launch(
-                self._stop(epoch, ticket, previous.get("start_pending", False), expected_local, guard)
+                self._stop(
+                    epoch,
+                    ticket,
+                    previous.get("start_pending", False),
+                    expected_local,
+                    guard,
+                    station_absent,
+                    prove_stop,
+                )
             )
-        return await asyncio.shield(self._stopping)
+        return self._stopping
 
     # Finish the zero-current hold and known-session stop even if the initiating client disconnects.
     async def _stop(
@@ -500,35 +604,63 @@ class LocalControl:
         pending_start: bool,
         expected_local: int | None = None,
         guard: Callable[[], None] | None = None,
+        station_absent: bool = False,
+        prove_stop: StopProof | None = None,
     ) -> Frame:
         revision, generation = self._revision, self._stop_generation
+        stop_guard: Callable[[], None] | None = None
 
         # Recheck generation and optional scoped authority at each physical RPC.
         def check() -> None:
             self._check(epoch, ticket)
             if guard is not None:
                 guard()
+            if stop_guard is not None:
+                stop_guard()
 
-        cap_error: UnavailableError | None = None
+        cap_error: UnavailableError | StationZeroStorageError | None = None
+        answer: Frame | None = None
         async with self.peer.sequence(0, check) as call:
-            try:
-                answer = await self._cap(call, 0, epoch)
-            except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
-                self._check(epoch, ticket)
-                cap_error = (
-                    error
-                    if isinstance(error, UnavailableError)
-                    else UnavailableError("station hold could not be confirmed")
-                )
+            if station_absent:
+                cap_error = UnavailableError("the missing station ceiling cannot establish a zero hold")
+            else:
+                try:
+                    answer = await self._cap(call, 0, epoch)
+                except StationZeroStorageError as error:
+                    # The station write can fail separately from the committed, independently proved Stop.
+                    if expected_local is None or self.journal.db.in_transaction or guard is None and prove_stop is None:
+                        raise
+                    check()
+                    cap_error = error
+                except (UnavailableError, DeniedError, RecoveryRequiredError) as error:
+                    self._check(epoch, ticket)
+                    cap_error = (
+                        error
+                        if isinstance(error, UnavailableError)
+                        else UnavailableError("station hold could not be confirmed")
+                    )
             local = self.journal.active()
-            if local is not None and expected_local in (None, local):
-                answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
+            # Managed shutdown pins the first attempt's transaction, then handles any newly reported Start.
+            if local is not None and (local == expected_local or expected_local is None and prove_stop is None):
+                if prove_stop is not None:
+                    stop_guard = await prove_stop(local, cap_error is not None)
+                try:
+                    answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
+                except UnavailableError as error:
+                    if cap_error is not None:
+                        raise cap_error from error
+                    raise StopReplyUnconfirmedError("transaction stop reply was unavailable") from error
                 if answer[0] != 3 or answer[2].get("status") != "Accepted":
-                    raise UnavailableError("transaction stop was not confirmed")
-                check()
+                    if cap_error is not None:
+                        raise cap_error
+                    raise StopReplyUnconfirmedError("transaction stop was not confirmed")
                 self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
+                # The actual StopTransaction may already have retired the live session while its reply was in flight.
+                stop_guard = None
+                check()
             if cap_error is not None:
                 raise cap_error
+        assert answer is not None
         self._complete(ticket, uncertain=bool(pending_start))
         return answer
 

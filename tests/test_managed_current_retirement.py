@@ -1,5 +1,6 @@
 """Stored-state correlation and actual SQLite failures at the narrow automatic receipt settlement boundary."""
 
+import asyncio
 import copy
 import json
 import sqlite3
@@ -8,6 +9,7 @@ import uuid
 import pytest
 
 from tests.current_rig import adjustable
+from tests.test_managed_current_tick_race import OneNativeResponseGate
 from tests.tls_support import tls as tls
 
 
@@ -43,6 +45,37 @@ def settlement_bytes(j):
         [tuple(row) for row in j.db.execute("SELECT * FROM managed_requests ORDER BY id")],
         j.db.execute("SELECT value FROM meta WHERE key='managed_current_change'").fetchone()[0],
     )
+
+
+async def test_retiring_service_cannot_publish_a_new_pause_from_current_recovery(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
+        c, j, peer = b.controller, b.session.journal, b.rig.peer
+        original = retirement_state(b) | {"observed_open": False}
+        j.current_change.replace(original)
+        expected = c.requests.intent()
+        controls = b.session.gateway.controls
+        controls._claim(True, stopping=True)
+        await controls.ensure_ceiling()
+        peer.arm = True
+        recovery = asyncio.create_task(c.current.recover_overlap())
+        try:
+            await asyncio.wait_for(peer.entered.wait(), 2)
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_retirement_hold BEFORE INSERT ON meta WHEN NEW.key='control' "
+                "BEGIN SELECT RAISE(ABORT,'simulated retirement storage refusal'); END"
+            )
+            try:
+                with pytest.raises(sqlite3.IntegrityError):
+                    c.request_stop()
+            finally:
+                j.db.execute("DROP TRIGGER refuse_retirement_hold")
+        finally:
+            peer.release.set()
+            await recovery
+        assert c.stopping and c.requests.intent() == expected
+        assert j.current_change.read().recovering and b.rig.bench.firmware.effective_limit() == 0
 
 
 # Intent: automatic settlement requires every immutable request, binding and current authority field.

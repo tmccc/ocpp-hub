@@ -70,10 +70,10 @@ async def test_same_connection_outage_hold_preserves_app_authority(tmp_path, tls
 
 
 # Close only the fake device's real reported session after the behavior under test has been observed.
-async def close_session(rig, session, charger, local):
+async def close_session(rig, session, charger, local, *, delivered=True):
     rig.peer.permission_enabled = False
     rig.bench.firmware.requested_current = 0
-    await rig.bench.call(
+    reply = await rig.bench.call(
         charger,
         uuid.uuid4().hex,
         "StopTransaction",
@@ -83,7 +83,98 @@ async def close_session(rig, session, charger, local):
             "meterStop": 1100,
         },
     )
-    await until(lambda: session.journal.active() is None and session.journal.next_delivery() is None)
+    assert reply[0] == 3
+    await until(lambda: session.journal.active() is None and (not delivered or session.journal.next_delivery() is None))
+
+
+# Intent: a genuine OCPP Stop followed by late native closure holds an ordinary mapped session at zero.
+# Why: a matched closure gap must not become a persistent authority fault or grant positive current early.
+@pytest.mark.parametrize("connection", ["plugged", "unplugged"])
+@pytest.mark.parametrize("current", [6, 32])
+async def test_ocpp_first_mapped_closure_recovers_only_after_native_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, connection, current
+):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, current) as b:
+        c, j, rig = b.controller, b.session.journal, b.rig
+        intent = c.requests.intent()
+        local = await positive_flow(b, "daily")
+        assert (await healthy(c))["current_a"] == current
+        open_session = rig.peer.native("SESSION")
+        command_count = len(rig.bench.device_calls)
+        limit_count = len(rig.bench.received_limits)
+        await close_session(rig, b.session, b.charger, local)
+        assert j.vendor_id(local) is not None
+        rig.bench.cp, rig.bench.connection = ("B", "Plug") if connection == "plugged" else ("A", "Unplug")
+        native = rig.peer.native
+
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
+            for _ in range(4):
+                status = await c.tick()
+                assert status["state"] == "reconciling"
+                assert not status.get("owner_control_enabled") and not j.fault.latched()
+                assert rig.bench.firmware.effective_limit() == 0
+                assert c.requests.intent() == intent
+            assert rig.bench.received_limits[limit_count:] == [0]
+
+        status = await healthy(c)
+        assert status["owner_control_enabled"] and status["station_ceiling_a"] == current
+        assert status["charging_session_open"] is False and c.requests.intent() == intent
+        assert rig.bench.received_limits[limit_count:] == [0, current]
+        assert not any(
+            f[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for f in rig.bench.device_calls[command_count:]
+        )
+
+
+# Intent: unrelated, unmapped and nonzero native reports remain strict refusals after OCPP closure.
+# Why: only zero flow from the latest exact mapped lifecycle can enter the ordinary closure wait.
+@pytest.mark.parametrize("sample", ["unknown", "older", "unmapped", "nonzero"])
+async def test_ocpp_first_closure_does_not_adopt_other_native_sessions(
+    tmp_path, tls, unused_tcp_port, monkeypatch, sample
+):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        c, j, rig = b.controller, b.session.journal, b.rig
+        older = None
+        if sample == "older":
+            older = await positive_flow(b, "daily")
+            await close_session(rig, b.session, b.charger, older)
+            rig.bench.cp, rig.bench.connection = "B", "Plug"
+        if sample == "unmapped":
+            monkeypatch.setattr(b.session.runtime, "vendor_enabled", lambda: False)
+            await rig.bench.cloud.close()
+            await until(lambda: not b.session.runtime.status.vendor_connected)
+            start = await rig.bench.call(
+                b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            assert start[0] == 3 and start[2]["idTagInfo"]["status"] == "Accepted"
+            local = start[2]["transactionId"]
+            assert j.vendor_id(local) is None
+        else:
+            local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex, meter_start=1001)
+            assert j.vendor_id(local) is not None
+        await close_session(rig, b.session, b.charger, local, delivered=sample != "unmapped")
+        rig.bench.cp, rig.bench.connection = "C", "Charging"
+        native = rig.peer.native
+        reported_local = older if older is not None else local
+        if sample == "unknown":
+            reported_local += 1
+
+        # Keep independent native observations coherent while varying only the session identity or actual draw.
+        def open_native(key):
+            value = native(key)
+            if key == "SESSION":
+                value["saveData"]["sessionList"][0]["_transactionId"] = reported_local
+            elif key == "METER" and sample == "nonzero":
+                value[0]["meterData"].update(cur=[2, 0, 0], power=[48, 0, 0, 48])
+            return value
+
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.peer, "native", open_native)
+            status = await c.tick()
+            assert status["state"] == "degraded" and status["fault"] == "native_authority_or_preservation_failed"
+            assert not status.get("owner_control_enabled") and j.active() is None
+            assert j.get("managed_ordinary_recovery", {}).get("state") != "holding"
+        rig.bench.cp, rig.bench.connection = "B", "Plug"
 
 
 # Intent: ordinary app/daily known sessions continue at their original6/32 cap after reconnect/replacement.

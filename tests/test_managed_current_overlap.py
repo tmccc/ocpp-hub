@@ -19,6 +19,7 @@ from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, timer_bench
 from tests.prototype_rig import START
 from tests.runtime_rig import until
+from tests.test_managed_schedule_unnumbered import unnumbered
 from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
@@ -96,6 +97,72 @@ async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeyp
         await assert_daily_recovery(b, local, original, demand)
 
 
+# Intent: a cloud Start waits until the already applied current has been independently verified.
+# Why: the charger ceiling acknowledgement alone does not settle the current command.
+async def test_cloud_start_cannot_overtake_current_verification(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        payload = {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+        async with interrupted_increase(b, True) as (request, _):
+            before = list(b.rig.bench.device_calls)
+            reply = await b.rig.bench.cloud_call("start-during-current", "RemoteStartTransaction", payload)
+            assert reply[0] == 4 and b.rig.bench.device_calls == before
+            assert b.c.requests.receipt(request)["state"] == "accepted"
+        assert b.c.requests.receipt(request)["state"] == "completed"
+        reply = await b.rig.bench.cloud_call("start-after-current", "RemoteStartTransaction", payload)
+        assert reply[0] == 3 and reply[2] == {"status": "Accepted"}
+        assert len(starts(b.rig)) == 1 and b.device.effective_limit() == 32
+
+
+# Intent: neither a fresh Start nor an already validated positive profile can win after shutdown.
+# Why: the live process has already retired positive permission while its charger link is closing.
+async def test_fresh_starts_wait_during_shutdown_storage_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        j, g = b.session.journal, b.session.gateway
+        native_start = START | {"idTag": "NATIVE_TIMER"}
+        tag = {"idTag": native_start["idTag"]}
+        before_shutdown = await b.rig.bench.call(b.sock, "authorize-before-shutdown", "Authorize", tag)
+        assert before_shutdown[0] == 3 and before_shutdown[2]["idTagInfo"]["status"] == "Accepted"
+        validate = g.charger.validate_send
+        validated, finish = asyncio.Event(), asyncio.Event()
+
+        # Let the real positive profile pass native validation before requesting retirement.
+        async def delay_dispatch(action, payload):
+            result = await validate(action, payload)
+            if action == "SetChargingProfile" and not validated.is_set():
+                assert result is None
+                validated.set()
+                await finish.wait()
+            return result
+
+        monkeypatch.setattr(g.charger, "validate_send", delay_dispatch)
+        g.controls.invalidate()
+        waiting = asyncio.create_task(b.rig.bench.call(b.sock, "authorize-already-waiting", "Authorize", tag))
+        try:
+            await asyncio.wait_for(validated.wait(), 3)
+            before = list(b.rig.bench.device_calls)
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_hold BEFORE INSERT ON meta WHEN NEW.key='control' "
+                "BEGIN SELECT RAISE(ABORT,'shutdown hold storage temporarily unavailable'); END"
+            )
+            try:
+                with pytest.raises(sqlite3.Error):
+                    b.c.request_stop()
+            finally:
+                j.db.execute("DROP TRIGGER refuse_hold")
+        finally:
+            finish.set()
+            earlier = await waiting
+        assert earlier[0] == 3 and earlier[2]["idTagInfo"]["status"] == "Invalid"
+        reply = await b.rig.bench.cloud_call(
+            "start-during-shutdown", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+        )
+        assert reply[0] == 4
+        authorized = await b.rig.bench.call(b.sock, "authorize-during-shutdown", "Authorize", tag)
+        assert authorized[0] == 3 and authorized[2]["idTagInfo"]["status"] == "Invalid"
+        reported = await b.rig.bench.call(b.sock, "native-start-during-shutdown", "StartTransaction", native_start)
+        assert reported[0] == 4 and j.active() is None and b.rig.bench.device_calls == before
+
+
 # Intent: native-first original activity remains at zero until its genuine OCPP Start and positive plan identification.
 # Why: native activity alone is neither a local transaction nor permission to Stop or restore a positive ceiling.
 @pytest.mark.parametrize("applied", [False, True])
@@ -142,6 +209,59 @@ async def test_native_first_awaits_real_daily_report(
             local = reply[2]["transactionId"]
             b.rig.peer.plan_session = (local, 9)
             await assert_daily_recovery(b, local, original, demand)
+
+
+# Intent: current recovery allocates a genuine daily report before the charger knows its OCPP number.
+# Why: current recovery must keep its zero hold until the independent native source has the allocated number.
+@pytest.mark.parametrize("restart", [False, True])
+async def test_unnumbered_daily_interrupts_current_selection(tmp_path, tls, unused_tcp_port, restart):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        original = copy.deepcopy(b.device.plans[9])
+        async with interrupted_increase(b, False) as (request, release):
+            midnight = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
+            body, attempt = unnumbered(b, midnight, "current-recovery-unnumbered.json")
+            b.device.requested_current = 0
+            await b.c.native.read()
+            if restart:
+                b.c.current.worker.cancel()
+                await asyncio.gather(b.c.current.worker, return_exceptions=True)
+            release.set()
+        if restart:
+            await crash(b.session)
+            b.session = managed_session(b.rig)
+            await b.session.start()
+            b.c = ManagedController(b.session)
+
+        async with b.rig.charger(b.session) if restart else nullcontext(b.sock) as b.sock:
+            if restart:
+                await introduced(b.rig, b.session, b.sock, "current-unnumbered-after-replacement")
+            await b.c.tick()
+            j = b.session.journal
+            assert j.current_change.read().recovering and b.c.requests.intent().mode == "app"
+            assert j.active() is None and b.device.effective_limit() == 0
+
+            for rejected in (body | {"meterStart": body["meterStart"] + 1}, body | {"idTag": "CLOUD_OWNER"}):
+                reply = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", rejected)
+                assert reply[0] == 4 and j.active() is None and b.device.effective_limit() == 0
+            b.rig.bench.history.append(attempt | {"filename": "another-attempt.json", "startMs": 175})
+            ambiguous = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+            assert ambiguous[0] == 4 and j.active() is None
+            b.rig.bench.history.pop()
+
+            reply = await b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body)
+            assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+            local = reply[2]["transactionId"]
+            assert j.active() == local and j.current_change.read().value["reported_local"] == local
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops() and not starts(b.rig)
+
+            b.device.active = local
+            b.rig.peer.plan_session = (local, 987655)
+            await b.c.tick()
+            assert b.device.effective_limit() == 0 and not b.stops() and not starts(b.rig)
+            b.rig.peer.plan_session = (local, 9)
+            await assert_daily_recovery(b, local, original, demand=False)
+            assert b.c.requests.receipt(request)["state"] == "failed"
 
 
 # Intent: process loss before a pending increase completes cannot turn it into Pause or Stop an independent daily.
@@ -210,12 +330,15 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
                 )
                 effect = "SELECT RAISE(ABORT,'synthetic overlap settlement refusal')"
             j.db.execute(f"CREATE TRIGGER refuse_overlap {trigger} BEGIN {effect}; END")
-            with pytest.raises(sqlite3.IntegrityError):
-                await b.c.current.recover_overlap()
+            assert (await b.c.tick())["state"] == "reconciling"
             assert not j.db.in_transaction
             assert j.get("managed_current_change")["state"] == "recovering"
             assert b.c.requests.receipt(identifier) == before
             assert b.device.effective_limit() == 6 and not b.stops()
+            wire = len(b.rig.bench.device_calls)
+            assert (await b.c.tick())["state"] == "reconciling"
+            assert not any(frame[2] == "SetChargingProfile" for frame in b.rig.bench.device_calls[wire:])
+            assert b.c.requests.receipt(identifier) == before and b.device.effective_limit() == 6
             j.db.execute("DROP TRIGGER refuse_overlap")
             if failure == "new-pause":
                 b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
@@ -263,9 +386,10 @@ async def test_automatic_overlap_caller_atomic_rollback(tmp_path, tls, unused_tc
                 for frame in b.rig.bench.device_calls[trace:]
                 if frame[2] == "SetChargingProfile"
             ]
-            assert limits and limits[-1] == 6
-            if failure != "unknown-source":
-                assert limits[0] == 0
+            if failure == "unknown-source":
+                assert limits and limits[-1] == 6
+            else:
+                assert not limits
             assert j.get("managed_current_change")["state"] == "cancelled"
             assert b.c.requests.receipt(identifier)["state"] == "failed"
             assert j.active() == local and b.device.effective_limit() == 6 and not b.stops()

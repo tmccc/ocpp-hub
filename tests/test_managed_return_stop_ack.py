@@ -9,17 +9,61 @@ from datetime import UTC, datetime
 import pytest
 from ocpp_hub_core.frames import build_call_error
 
+from tests.charge_rig import ChargeRig
+from tests.current_rig import release_bench
 from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import timer_bench
 from tests.prototype_rig import START
+from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests.trial_peer import Bench
 
 
+@pytest.mark.parametrize("closing_read", [False, True], ids=["initial-read", "closed-zero-read"])
+async def test_return_waits_for_replaced_cloud_before_positive_send(
+    tmp_path, tls, unused_tcp_port, monkeypatch, closing_read
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        c, runtime = b.c, b.session.runtime
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        identifier = uuid.uuid4().hex
+        revision = c.requests.intent().revision
+        c.command(identifier, "app_control", revision)
+        read = c.native.read_result
+        before = list(b.rig.bench.received_limits)
+        native_reads = []
+
+        async def disconnect_after_read(*, closed=False):
+            result = await read(closed=closed)
+            native_reads.append(closed)
+            if closed == closing_read:
+                assert runtime.status.vendor_connected and b.session.gateway.vendor_registration == "Accepted"
+                await b.rig.bench.cloud.close()
+                await until(lambda: not runtime.status.vendor_connected)
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime, "vendor_enabled", lambda: False)
+            patch.setattr(c.native, "read_result", disconnect_after_read)
+            await c.return_requested(identifier, revision)
+            assert native_reads == ([False, True] if closing_read else [False])
+            assert c.requests.receipt(identifier)["state"] == "accepted"
+            await c.return_requested(identifier, revision)
+            assert c.requests.receipt(identifier)["state"] == "accepted"
+            assert native_reads == ([False, True] if closing_read else [False])
+            assert b.rig.bench.received_limits == before and b.rig.bench.firmware.effective_limit() == 0
+            assert not b.session.journal.fault.latched()
+
+        test = ChargeRig(b.rig, b.session, c, b.charger)
+        await completed_control(test, identifier, mode="app", revision=revision + 1, ceiling=6)
+        assert c.requests.receipt(identifier)["state"] == "completed"
+
+
 # Intent: one accepted Return waits at zero for a known Stop ACK and completes without a new UUID.
 # Why: pending delivery of an already closed mapped session does not imply an ambiguous positive write.
-@pytest.mark.parametrize("outcome", ["fast", "delayed", "new_pause", "rejected"])
+@pytest.mark.parametrize("outcome", ["fast", "delayed", "with_observation", "new_pause", "rejected"])
 async def test_return_with_pending_stop_ack(tmp_path, tls, unused_tcp_port, monkeypatch, outcome):
     delayed = outcome != "fast"
     stop_seen, release_ack = asyncio.Event(), asyncio.Event()
@@ -91,6 +135,10 @@ async def test_return_with_pending_stop_ack(tmp_path, tls, unused_tcp_port, monk
             b.c.command(returning, "app_control", b.c.requests.intent().revision)
             await b.close_transaction(local)
             await asyncio.wait_for(stop_seen.wait(), 3)
+            if outcome == "with_observation":
+                observation = {"connectorId": 1, "errorCode": "NoError", "status": "Finishing"}
+                assert (await b.rig.bench.call(b.sock, "status-after-stop", "StatusNotification", observation))[0] == 3
+                assert j.db.execute("SELECT 1 FROM outbox WHERE action='StatusNotification'").fetchone()
             if not delayed:
                 await until(lambda: j.next_delivery() is None and not g.vendor._pending)
 

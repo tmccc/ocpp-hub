@@ -146,6 +146,8 @@ async def test_service_history_commit_failure_allows_zero_stop_and_uncertainty(
                 assert len(zeros) >= 1
                 assert len(stops) == 1 and stops[0][3] == {"transactionId": local}
                 assert rig.bench.firmware.effective_limit() == 0 and rig.bench.firmware.current == 0
+                final = json.loads(status_path.read_text())
+                assert final["state"] == "stopped" and final["shutdown_uncertain"] is True
                 # The peer intentionally withholds StopTransaction; command acceptance cannot prove physical closure.
                 with closing(sqlite3.connect(session.journal.path.as_uri() + "?mode=ro", uri=True)) as reader:
                     value = reader.execute("SELECT value FROM meta WHERE key='trial_shutdown_uncertain'").fetchone()

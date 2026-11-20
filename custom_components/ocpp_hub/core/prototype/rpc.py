@@ -6,6 +6,7 @@ import asyncio
 import heapq
 import sqlite3
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -53,24 +54,46 @@ class InboundCache:
         )
         self.db.execute("DELETE FROM inbound_receipts")
         self._items: dict[tuple[str, int, str], tuple[str, asyncio.Future[str]]] = {}
+        self._reads: OrderedDict[tuple[str, int, str], tuple[str, str]] = OrderedDict()
+        self._epochs: dict[str, int] = {}
 
     # An interrupted handler may have transmitted a mutation; its duplicate receives failure and never replays it.
     @staticmethod
     def unavailable(token: str) -> str:
         return build_call_error(token, "InternalError", "request outcome unavailable; request was not replayed")
 
-    # Commit a terminal result before waking duplicates; a failed commit leaves the durable pending no-replay marker.
-    def complete(self, key: tuple[str, int, str], future: asyncio.Future[str], text: str) -> str:
-        try:
-            self.db.execute("UPDATE inbound_receipts SET response=? WHERE side=? AND epoch=? AND token=?", (text, *key))
-        except sqlite3.Error:
-            text = self.unavailable(key[2])  # The protocol boundary must still answer without repeating physical work.
+    # Commit mutations before waking duplicates and retain only a bounded window of completed read replies.
+    def complete(
+        self, key: tuple[str, int, str], digest: str, future: asyncio.Future[str], text: str, read: bool
+    ) -> str:
+        if read:
+            side, epoch, _ = key
+            if self._epochs.get(side, epoch) == epoch:
+                self._reads[key] = (digest, text)
+                if len(self._reads) > self.capacity:
+                    self._reads.popitem(last=False)
+        else:
+            try:
+                self.db.execute(
+                    "UPDATE inbound_receipts SET response=? WHERE side=? AND epoch=? AND token=?", (text, *key)
+                )
+            except sqlite3.Error:
+                text = self.unavailable(key[2])  # A durable pending receipt still prevents replay.
         future.set_result(text)
         self._items.pop(key, None)
         return text
 
-    # Share live work and persist completed replies so old harmless reads cannot exhaust the Stop acceptance path.
-    async def response(self, side: str, epoch: int, frame: Frame, handler: Callable[[], Awaitable[str]]) -> str:
+    # Preserve mutation receipts for the whole connection; an evicted read can safely run again.
+    async def response(
+        self,
+        side: str,
+        epoch: int,
+        frame: Frame,
+        handler: Callable[[], Awaitable[str]],
+        *,
+        stop: bool = False,
+        read: bool = False,
+    ) -> str:
         key = side, epoch, frame[1]
         digest = fingerprint(frame[2:])
         previous = self._items.get(key)
@@ -78,6 +101,11 @@ class InboundCache:
             if previous[0] != digest:
                 return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
             return await asyncio.shield(previous[1])
+        recent = self._reads.get(key)
+        if recent is not None:
+            if recent[0] != digest:
+                return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
+            return recent[1]
         try:
             stored = self.db.execute(
                 "SELECT digest,response FROM inbound_receipts WHERE side=? AND epoch=? AND token=?", key
@@ -86,9 +114,10 @@ class InboundCache:
                 if stored[0] != digest:
                     return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
                 return stored[1] if isinstance(stored[1], str) else self.unavailable(frame[1])
-            if len(self._items) >= self.capacity:
+            if len(self._items) >= self.capacity + int(stop):
                 return build_call_error(frame[1], "OccurrenceConstraintViolation", "request queue is full")
-            self.db.execute("INSERT INTO inbound_receipts VALUES(?,?,?,?,NULL)", (*key, digest))
+            if not read:
+                self.db.execute("INSERT INTO inbound_receipts VALUES(?,?,?,?,NULL)", (*key, digest))
         except sqlite3.Error:
             # Without a durable pre-handler receipt, no command may execute or be silently replayed.
             return self.unavailable(frame[1])
@@ -98,13 +127,17 @@ class InboundCache:
             text = await handler()
         except BaseException:
             # Preserve a bounded terminal answer even on cancellation after a possibly dispatched command.
-            self.complete(key, future, self.unavailable(frame[1]))
+            self.complete(key, digest, future, self.unavailable(frame[1]), read)
             raise
-        return self.complete(key, future, text)
+        return self.complete(key, digest, future, text, read)
 
     # Replacement connections retire their own old results; in-flight old handlers cannot insert them again.
     def retire(self, side: str, epoch: int) -> None:
         self.db.execute("DELETE FROM inbound_receipts WHERE side=? AND epoch!=?", (side, epoch))
+        self._epochs[side] = epoch
+        self._reads = OrderedDict(
+            (key, value) for key, value in self._reads.items() if key[0] != side or key[1] == epoch
+        )
 
 
 # Preserve the actual peer's result or error while restoring the original requester id.
@@ -114,6 +147,16 @@ def reply_as(frame: Frame, unique_id: str) -> str:
     else:
         text = build_call_result(unique_id, frame[2])
     return text
+
+
+# Resource confirmation and command replies use the same supported response for each profile action.
+def profile_status(action: str, answer: Frame) -> str | None:
+    if answer[0] != 3:
+        return None
+    supported = (
+        ("Accepted", "Unknown") if action == "ClearChargingProfile" else ("Accepted", "Rejected", "NotSupported")
+    )
+    return next((status for status in supported if answer[2] == {"status": status}), None)
 
 
 class PriorityGate:
@@ -199,8 +242,12 @@ class Peer:
         token: str | None = None,
         before_send: Callable[[], None] | None = None,
         on_dispatch: Callable[[str], None] | None = None,
+        *,
+        on_reply: Callable[[str, Frame], None] | None = None,
     ) -> Frame:
-        return require_reply(await self.call_result(action, payload, priority, check, token, before_send, on_dispatch))
+        return require_reply(
+            await self.call_result(action, payload, priority, check, token, before_send, on_dispatch, on_reply=on_reply)
+        )
 
     # Managed operations consume an unsent prerequisite as data while sharing the sole send and cleanup path.
     async def call_result(
@@ -212,9 +259,13 @@ class Peer:
         token: str | None = None,
         before_send: Guard | None = None,
         on_dispatch: Callable[[str], None] | None = None,
+        *,
+        on_reply: Callable[[str, Frame], None] | None = None,
     ) -> CallResult:
         async with self.gate.enter(priority):
-            return await self._call_locked(action, payload, check, token, before_send, on_dispatch, priority > 0)
+            return await self._call_locked(
+                action, payload, check, token, before_send, on_dispatch, priority > 0, on_reply
+            )
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
     @asynccontextmanager

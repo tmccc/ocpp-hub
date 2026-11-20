@@ -171,31 +171,41 @@ async def test_raw_reply_failures_never_retry_and_later_recover(actual_hass, pee
         return malformed_reply(shape, request["id"], result) if command == position else None
 
     peer["raw_response"] = raw
+    looked_up = position == "receipt"
     if position == "status":
         await entry.runtime_data.async_refresh()
         assert not entry.runtime_data.last_update_success
         assert entry.runtime_data.problem_since is not None
         assert set(peer["commands"]) == {"status"}
     else:
-        if position == "receipt":
-            messages = ("The request was recorded; physical confirmation is still pending",)
-        elif shape == "recursive":
-            # The pinned decoders differ: depth refusal and a parsed invalid array are both valid refusals.
-            messages = (
-                "The request may have been sent; its outcome is unknown. Check the charger status",
-                "The local charger proxy could not confirm this request",
-            )
-        elif shape in ("empty", "truncated", "oversized"):
-            messages = ("The request may have been sent; its outcome is unknown. Check the charger status",)
-        else:
-            messages = ("The local charger proxy could not confirm this request",)
-        with pytest.raises(HomeAssistantError) as raised:
+        lost_first_reply = position == "pause" and shape in ("empty", "truncated", "oversized")
+        if lost_first_reply:
             await actual_hass.services.async_call(
                 "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
             )
-        assert str(raised.value) in messages
+            looked_up = True
+        elif position == "pause" and shape == "recursive":
+            # A decoder exception permits a receipt read; a parsed invalid envelope is still refused.
+            try:
+                await actual_hass.services.async_call(
+                    "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
+                )
+            except HomeAssistantError as error:
+                assert str(error) == "The local charger proxy could not confirm this request"
+            else:
+                looked_up = True
+        else:
+            message = (
+                "The request was recorded; physical confirmation is still pending"
+                if position == "receipt"
+                else "The local charger proxy could not confirm this request"
+            )
+            with pytest.raises(HomeAssistantError, match=message):
+                await actual_hass.services.async_call(
+                    "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
+                )
         assert peer["commands"].count("pause") == 1
-        assert peer["commands"].count("receipt") == int(position == "receipt")
+        assert peer["commands"].count("receipt") == int(looked_up)
         assert peer["state"]["desired_control"] == "paused"
         assert set(peer["commands"]) <= {"status", "pause", "receipt"}
     peer["raw_response"] = None
@@ -204,7 +214,7 @@ async def test_raw_reply_failures_never_retry_and_later_recover(actual_hass, pee
     assert entry.runtime_data.problem_since is None
     if position != "status":
         assert peer["commands"].count("pause") == 1
-        assert peer["commands"].count("receipt") == int(position == "receipt")
+        assert peer["commands"].count("receipt") == int(looked_up)
         assert peer["state"]["desired_control"] == "paused"
         assert peer["state"]["control_revision"] == revision + 1
         assert peer["state"]["station_ceiling_a"] == 0

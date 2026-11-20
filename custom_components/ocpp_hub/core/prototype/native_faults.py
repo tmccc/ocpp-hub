@@ -13,6 +13,11 @@ if TYPE_CHECKING:
 
 StrictStage = Literal["identity", "content", "configuration", "history", "resources"]
 MEASURED_FAULT = "measured_output_limit_exceeded"
+STATION_CEILING_LOST = "station_ceiling_lost"
+
+
+class StationCeilingLostError(SecurityError):
+    """A fresh native inventory confirmed loss of a previously owned ceiling during a known session."""
 
 
 class NativeContentError(SecurityError):

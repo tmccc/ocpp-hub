@@ -9,6 +9,7 @@ import uuid
 import pytest
 from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call_result
+from ocpp_hub_core.prototype.connection_scope import current_control_scope
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.rpc import Peer, UnavailableError
 
@@ -208,7 +209,7 @@ async def test_cancelled_native_validation_retires_unsent_vendor_work(tmp_path, 
         g, j, peer = test.session.gateway, test.session.journal, test.rig.peer
         peer.arm = "hold"
         frame = [2, "cancel-native-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}]
-        task = asyncio.create_task(g._vendor_call(frame, g._vendor_epoch))
+        task = asyncio.create_task(g._vendor_call(frame, g._vendor_epoch, current_control_scope(g)))
         try:
             await asyncio.wait_for(peer.entered.wait(), 2)
             assert j.get("vendor_start_grant") and not starts(test.rig)
@@ -237,7 +238,7 @@ async def test_retired_charger_cancels_native_validation_without_dispatch(tmp_pa
         epoch = g._charger_epoch
         peer.arm = "hold"
         frame = [2, "retired-native-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}]
-        task = asyncio.create_task(g._vendor_call(frame, g._vendor_epoch))
+        task = asyncio.create_task(g._vendor_call(frame, g._vendor_epoch, current_control_scope(g)))
         try:
             await asyncio.wait_for(peer.entered.wait(), 2)
             await test.charger.close()

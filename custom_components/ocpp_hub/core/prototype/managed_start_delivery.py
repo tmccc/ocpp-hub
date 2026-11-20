@@ -28,22 +28,25 @@ KIND = "start-delivery"
 
 
 # Quarantine must install its own recovery gate even when native reconciliation prevents a supervisor poll.
-def latch_start_delivery_fault(j: Journal) -> None:
+def latch_start_delivery_fault(j: Journal, fault: dict[str, Any] | None = None) -> None:
     if not j.db.in_transaction:
         raise RecoveryRequiredError("Start delivery fault must share its quarantine transaction")
     if j.get("managed_mode") is not None and not j.fault.latched():
         control = j.get("control", {})
         j.control.hold(control)
-        j.fault.replace({"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()})
+        j.fault.replace(fault or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()})
 
 
 # An interrupted approved retry needs new exact evidence; its old retry permission cannot block all later tooling.
-def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
+def supersede_unknown_start_retry(j: Journal, item: Delivery, *, restarting: bool = False) -> None:
     if not j.db.in_transaction:
         raise RecoveryRequiredError("unknown Start retry normalization must share its journal transition")
     if item.action != "StartTransaction" or item.state != "ambiguous":
         return
-    latch_start_delivery_fault(j)
+    # Inspection and reconciliation must derive the same identity from a stopped journal.
+    provenance = {"delivery_token": item.token} if restarting else {"at_epoch": time.time()}
+    fault = {"classification": "owner_control_or_delivery_uncertain", **provenance}
+    latch_start_delivery_fault(j, fault)
     records, changed = j.get(PROOFS, {}), False
     retained_fault = None
     for key, entry in records.items():
@@ -62,14 +65,12 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery) -> None:
             retained_fault = retained_denial_fault(j, proof) or retained_fault
             records[key] = {
                 **entry,
-                "superseded": {"reason": "approved_start_retry_outcome_unknown", "at_epoch": time.time()},
+                "superseded": {"reason": "approved_start_retry_outcome_unknown", **provenance},
             }
             changed = True
     if changed:
         j.put(PROOFS, records)
-        j.fault.replace(
-            retained_fault or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
-        )
+        j.fault.replace(retained_fault or fault)
 
 
 # Only the exact bound ordinary owner request may settle metadata alongside its denied closed lifecycle.
@@ -279,15 +280,19 @@ def start_resolution(j: Journal, evidence: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# An accepted mapping retires only the retry for this exact Start.
+def retire_start_retry(j: Journal, token: str, local: int | None, digest: str) -> None:
+    retries = j.get(RETRIES, {})
+    retry = retries.get(token)
+    if retry is not None and retry.get("local") == local and retry.get("payload_digest") == digest:
+        j.put(RETRIES, {key: value for key, value in retries.items() if key != token})
+
+
 # Repeated refusals or unknown replies cannot masquerade as actual successful Start and Stop delivery.
 def record_start_wire_ack(j: Journal, item: Delivery, response: dict[str, Any]) -> None:
     if item.action not in ("StartTransaction", "StopTransaction"):
         return
     records, changed = j.get(PROOFS, {}), False
-    if item.action == "StartTransaction":
-        retries = j.get(RETRIES, {})
-        if item.token in retries:
-            j.put(RETRIES, {key: value for key, value in retries.items() if key != item.token})
     for key, entry in records.items():
         proof = entry["proof"]
         if (

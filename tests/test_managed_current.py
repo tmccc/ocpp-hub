@@ -45,6 +45,10 @@ async def test_current_selection_confirms_real_profile_and_persists_revision(
             status = await healthy(test.controller)
             native = await test.controller.native.read()
             assert test.controller.requests.receipt(identifier)["state"] == "completed"
+            selection = test.session.journal.current_change.read().value
+            assert selection["id"] == identifier and selection["state"] == "completed"
+            assert selection["ticket"] == test.session.journal.get("control")["ticket"]
+            assert selection["boot"] == test.session.gateway.boot_observation
             assert test.controller.requests.intent().revision == revision + 1
             assert test.controller.requests.intent().mode == "app"
             assert test.controller.current.selected() == status["requested_current_a"] == current

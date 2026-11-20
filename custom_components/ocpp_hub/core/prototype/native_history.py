@@ -15,6 +15,14 @@ from .native_faults import NativeContentError
 from .native_start_attempts import split_attempts
 from .store import Journal, encoded, fingerprint
 
+ORIGINAL_HISTORY_REFUSAL = "native bounded handover must preserve every original history record"
+ORIGINAL_HISTORY_OMISSION = "original_history_omission"
+STARTUP_HISTORY_OMISSION = "startup_history_omission"
+
+
+class MissingOriginalHistoryError(NativeContentError):
+    """An admitted numbered record is absent and the retained originals still agree."""
+
 
 # Audits run both standalone and inside the operator's recovery transaction.
 @contextmanager
@@ -153,17 +161,17 @@ class NativeHistoryArchive:
 
 
 # The latest completed charge is unknown if an absent archive entry could be as recent as the displayed one.
-def latest_completion_available(journal: Journal, completed: dict[int, int]) -> bool:
+def latest_completion_available(journal: Journal, completed: dict[int, int], closed: int | None = None) -> bool:
     latest = max(completed.values(), default=0)
     try:
         for identifier, body in journal.db.execute("SELECT transaction_id,body FROM native_history_records"):
-            if identifier in completed:
+            if identifier in completed or (closed is not None and identifier < closed):
                 continue
             record = json.loads(body)
             if not isinstance(record, dict) or type(stop := record.get("stopTime")) is not int:
                 return False
             start = record.get("startTime")
-            if stop > 0 and (type(start) is not int or not 0 < start < latest):
+            if stop > 0 and (closed is not None or type(start) is not int or not 0 < start < latest):
                 return False
     except sqlite3.Error, ValueError:
         # A failed display check must not interrupt charger supervision or present a plausible older value.
@@ -207,16 +215,20 @@ def inspect_history(journal: Journal, spec_digest: str, current: list[dict[str, 
             raise NativeContentError("history", "native history retention policy changed or local Start is enabled")
         _archive_view(journal, original, current, True)
         return
-    original, admitted_attempts = split_attempts(original)
-    current, attempts = split_attempts(current)
-    if any(name not in attempts or encoded(attempts[name]) != encoded(row) for name, row in admitted_attempts.items()):
-        raise NativeContentError("history", "native bounded handover must preserve every original history record")
-    present = {row["transactionId"]: row for row in current}
+    originals, admitted_attempts = split_attempts(original)
+    current_rows, attempts = split_attempts(current)
+    if any(name in attempts and encoded(attempts[name]) != encoded(row) for name, row in admitted_attempts.items()):
+        raise NativeContentError("history", ORIGINAL_HISTORY_REFUSAL)
+    present = {row["transactionId"]: row for row in current_rows}
     if any(
-        row["transactionId"] not in present or encoded(present[row["transactionId"]]) != encoded(row)
-        for row in original
+        row["transactionId"] in present and encoded(present[row["transactionId"]]) != encoded(row) for row in originals
     ):
-        raise NativeContentError("history", "native bounded handover must preserve every original history record")
+        raise NativeContentError("history", ORIGINAL_HISTORY_REFUSAL)
+    if any(row["transactionId"] not in present for row in originals):
+        _archive_view(journal, original, current, True)
+        raise MissingOriginalHistoryError("history", ORIGINAL_HISTORY_REFUSAL)
+    if admitted_attempts.keys() - attempts.keys():
+        raise NativeContentError("history", ORIGINAL_HISTORY_REFUSAL)
 
 
 # An explicit persisted operator decision changes retention handling without changing any electrical authority.

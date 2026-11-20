@@ -9,23 +9,36 @@ import sqlite3
 import stat
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..control import HUB_PROFILE_ID
+from .command_processor import CommandPriority
+from .connection_scope import control_scope_matches, current_control_scope
 from .gateway import Gateway
-from .local_control import join_retirement, recover_unreported_local_start
+from .local_control import StopReplyUnconfirmedError, join_retirement, recover_unreported_local_start
 from .managed_current import managed_current_ceiling
 from .managed_faults import ManagedRefusal, latch_managed_fault
-from .native_bounded import NativeBoundedSpec
+from .native_bounded import NativeBoundedSpec, NativeReadinessError, readiness_decision
 from .native_bounded_handover import NativeBoundedHandover
-from .native_faults import diagnostic_type
+from .native_faults import (
+    MEASURED_FAULT,
+    STATION_CEILING_LOST,
+    MeasuredOutputLimitError,
+    _NativeMeasurementError,
+    diagnostic_type,
+)
+from .native_history import ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION, MissingOriginalHistoryError
+from .native_history_recovery import history_recovery_idle
 from .policy import Policy
+from .recovery_contracts import require_allowed
 from .rpc import IntroductionDeferredError, UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
 from .security import SecurityError
 from .station import StationChoice, StationDiscovery
-from .store import Journal, RecoveryRequiredError, fingerprint
+from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
 from .trial_evidence import NativeObserver
 from .trial_handover_evidence import ObserveHandover
@@ -71,13 +84,19 @@ def save_private(path: Path, value: Any) -> None:
 
 
 @dataclass(repr=False)
-class PreparedTrial:
-    """Prepared objects remain dormant: certificate parsing and private file reads do not establish live admission."""
+class PreparedNative:
+    """Private configuration and the native observer used without an OCPP transport."""
 
     config: TrialConfig
-    tls: PreparedTLS
     baseline: Baseline
     observer: NativeObserver
+
+
+@dataclass(repr=False)
+class PreparedTrial(PreparedNative):
+    """Full service preparation includes the TLS identities of both OCPP peers."""
+
+    tls: PreparedTLS
 
     # Return only readiness classifications, never endpoints, identities, tag values or file contents.
     def summary(self) -> dict[str, Any]:
@@ -98,16 +117,37 @@ class PreparedTrial:
         }
 
 
-# Fully validate files, TLS and baseline before constructing a listener, journal or network connector.
-def preflight(path: Path) -> PreparedTrial:
+# Validate the files used by native operations without requiring an unused OCPP certificate.
+def preflight_native(path: Path) -> PreparedNative:
     config = TrialConfig.load(path)
     validate_state_path(config.journal)
     baseline = Baseline.parse(private_json(config.baseline))
     if baseline.identity_digest != fingerprint(config.identity):
         raise SecurityError("trial baseline identity does not match configuration")
-    tls = prepare_tls(config)
-    observer = NativeObserver(config)
-    return PreparedTrial(config, tls, baseline, observer)
+    return PreparedNative(config, baseline, NativeObserver(config))
+
+
+# Fully validate both OCPP endpoints before constructing a listener or journal.
+def preflight(path: Path) -> PreparedTrial:
+    native = preflight_native(path)
+    return PreparedTrial(native.config, native.baseline, native.observer, prepare_tls(native.config))
+
+
+# Refuse retired installations under the journal lock before normalizing interrupted operations.
+def require_supported_installation(db: sqlite3.Connection) -> None:
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+        return
+    metadata = {
+        key: json.loads(value)
+        for key, value in db.execute(
+            "SELECT key,value FROM meta WHERE key IN ('connected_handover','native_bounded_handover','trial_phase')"
+        )
+    }
+    retired = metadata.get("connected_handover")
+    if retired is not None and (not isinstance(retired, dict) or retired.get("stage") != "complete"):
+        raise SecurityError("retired vehicle-pause handover requires its original recovery implementation")
+    if not metadata.get("native_bounded_handover") and metadata.get("trial_phase") not in (None, "prepared"):
+        raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
 
 
 class TrialSession:
@@ -130,16 +170,8 @@ class TrialSession:
             raise SecurityError("unplugged native monitoring requires bounded mode and disabled local Start")
         self.prepared = prepared
         config = prepared.config
-        self.journal = Journal(config.journal, config.identity)
+        self.journal = Journal(config.journal, config.identity, check_existing=require_supported_installation)
         try:
-            retired = self.journal.get("connected_handover")
-            if retired is not None and (not isinstance(retired, dict) or retired.get("stage") != "complete"):
-                raise SecurityError("retired vehicle-pause handover requires its original recovery implementation")
-            if not self.journal.get("native_bounded_handover") and self.journal.phase.read().value not in (
-                None,
-                "prepared",
-            ):
-                raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
             managed = self.journal.get("managed_mode")
             if managed is not None and (
                 managed.get("mode") != "app_schedule" or managed.get("local_start") is not False or allow_local_start
@@ -170,13 +202,21 @@ class TrialSession:
                 lambda: self._station_inventory,
             )
             self.gateway.controls.prepare_station = self.station.prepare_result
+            self.gateway.controls.station_missing = self.book.station_ceiling_lost
             self.gateway.charger.before_send = self.book.before_send
             self.gateway.charger.after_result = self.book.after_result
             actual_settings = settings or RuntimeSettings(boot_probe_after=10)
             transport = TrialTransport(config, prepared.tls, actual_settings)
             self.runtime = ConnectionRuntime(self.gateway, transport, actual_settings, self._before_ceiling)
             self.runtime.vendor_enabled = lambda: (
-                self.journal.phase.read().active or (self.journal.phase.read().held and self.gateway.controls.ready)
+                self.journal.phase.read().active
+                or self.journal.phase.read().held
+                and (
+                    self.gateway.controls.ready
+                    or self.book.station_ceiling_lost()
+                    and self.journal.get("managed_mode")
+                    and fingerprint(self.journal.get("boot")) == native_bounded.boot_digest
+                )
             )
             # Reconfirming zero can briefly invalidate readiness without revoking an established lifecycle channel.
             self.runtime.vendor_session_enabled = lambda: self.journal.phase.read().supervised
@@ -186,9 +226,11 @@ class TrialSession:
                 handover_observe or prepared.observer.observe_handover,
                 native_bounded,
                 StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
+                observe_profiles=prepared.observer.observe_profiles,
                 allow_unplugged=allow_unplugged_native,
             )
             self.native_bounded.introduction_service_pending = lambda: self.runtime.introduction_pending
+            self.gateway.controls.require_retained_station = self.native_bounded.require_retained_station
             self.gateway.charger.validate_send = self.native_bounded.validate_send
             self.connected_cleanup_only = False
             self._introduction_refusal: ManagedRefusal | None = None
@@ -224,7 +266,21 @@ class TrialSession:
                 if not self.gateway.current_boot_seen(self.gateway._charger_epoch):
                     raise SecurityError("bounded cleanup introduction needs actual Boot")
                 return
-            native = await self.native_bounded.introduce()
+            try:
+                selected = self._commissioned_selection()
+            except sqlite3.Error as storage:
+                raise IntroductionDeferredError("selected current awaits required journal storage") from storage
+            try:
+                native = await self.native_bounded.introduce(selected_current=selected)
+            except _NativeMeasurementError as error:
+                try:
+                    refusal = self._measured_refusal(error, selected)
+                except sqlite3.Error as storage:
+                    raise IntroductionDeferredError("measurement proof awaits required journal storage") from storage
+                self._introduction_refused_epoch = self.gateway._charger_epoch
+                self._introduction_refusal = refusal
+                self._persist_introduction_refusal()
+                return
             self._station_inventory = (
                 sum(resource.kind == "profile" for resource in native.physical.resources),
                 any(resource.key == "profile:7001" for resource in native.physical.resources),
@@ -232,17 +288,21 @@ class TrialSession:
         except (SecurityError, RecoveryRequiredError) as error:
             if self.journal.get("managed_mode"):
                 self._introduction_refused_epoch = self.gateway._charger_epoch
-                self._introduction_refusal = ManagedRefusal(
-                    "native_authority_or_preservation_failed",
-                    {
-                        "type": diagnostic_type(error),
-                        "detail": str(error)[:1024],
-                        "at_epoch": time.time(),
-                    },
-                )
+                self._introduction_refusal = self._native_refusal(error)
                 self._persist_introduction_refusal()
             self.journal.phase.block_unless_cleanup()
             raise UnavailableError("native bounded introduction failed; positive controls remain blocked") from None
+
+    # Startup and charger introduction use the same persisted diagnostic for a strict native refusal.
+    @staticmethod
+    def _native_refusal(error: Exception) -> ManagedRefusal:
+        diagnostic = {"type": diagnostic_type(error), "detail": str(error)[:1024], "at_epoch": time.time()}
+        if isinstance(error, MissingOriginalHistoryError):
+            diagnostic["source"] = ORIGINAL_HISTORY_OMISSION
+        return ManagedRefusal(
+            "native_authority_or_preservation_failed",
+            diagnostic,
+        )
 
     # Retry only the failed atomic publication, retaining the proved refusal even if the device changes meanwhile.
     def _persist_introduction_refusal(self) -> None:
@@ -257,6 +317,67 @@ class TrialSession:
         self._introduction_refusal = None
         raise UnavailableError("native bounded introduction failed; positive controls remain blocked")
 
+    # Use the last settled current before ordinary recovery can hide an excessive measurement behind zero.
+    def _commissioned_selection(self) -> int | None:
+        j, spec = self.journal, self.native_bounded.spec
+        if not j.get("managed_mode") or not j.get("trial_binding") or j.phase.starting:
+            return None
+        change = j.current_change.read()
+        selected = (
+            change.value.get("previous_a", 6) if change.selecting else j.get("control", {}).get("resume_limit", 6)
+        )
+        if (
+            type(selected) not in (int, float)
+            or not 6 <= selected <= managed_current_ceiling(j, spec)
+            or int(selected) != selected
+        ):
+            raise SecurityError("persisted selected current is malformed")
+        return int(selected)
+
+    # A measured excess on this exact installation can open only the path to its existing protective zero.
+    def _measured_refusal(self, error: _NativeMeasurementError, selected: int | None) -> ManagedRefusal:
+        j, native = self.journal, self.native_bounded
+        sample, spec = error.native, native.spec
+        if selected != self._commissioned_selection():
+            raise IntroductionDeferredError("current selection changed during measurement proof")
+        if (
+            selected is None
+            or not native.commissioned_binding_matches(sample)
+            or error.authority != native.authority()
+            or error.sequence != native.last_resolved_read
+            or not sample.physical.transaction_open
+        ):
+            raise error
+        require_allowed(readiness_decision(sample, False, native.allow_unplugged))
+        native.require_known_session(sample)
+        present = self.book.owned_present(sample.physical)
+        if self.book.station_ceiling_lost():
+            # The listener can receive actual Boot and Stop evidence without recreating the missing profile.
+            return ManagedRefusal(STATION_CEILING_LOST, {"type": "StationCeilingLost", "at_epoch": time.time()})
+        station = j.db.execute(
+            "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
+        ).fetchone()
+        if (
+            station is None
+            or station["state"] != "confirmed"
+            or not any(
+                resource.identifier == HUB_PROFILE_ID and encoded(resource.canonical) == station["confirmed"]
+                for resource in present
+            )
+        ):
+            raise error
+        measured = error.measured.selected(selected) if managed_current_ceiling(j, spec) == 32 else error.measured
+        failure = MeasuredOutputLimitError(sample, measured, spec.digest, selected)
+        return ManagedRefusal(
+            MEASURED_FAULT,
+            {
+                "type": diagnostic_type(failure),
+                "detail": str(failure),
+                "at_epoch": time.time(),
+                "cause": failure.cause,
+            },
+        )
+
     # Verify native admission or recovery before the listener opens; actual Boot still establishes readiness.
     async def start(self) -> None:
         phase = self.journal.phase.read()
@@ -265,23 +386,39 @@ class TrialSession:
         if phase.value == "prepared":
             await self.native_bounded.admit()
         elif phase.supervised:
-            native = await self.native_bounded.read()
-            if self.journal.get("trial_binding") is None:
-                self.native_bounded.require_known_session(native)
+            selected = self._commissioned_selection()
+            try:
+                native = await self.native_bounded.read(selected_current=selected)
+            except _NativeMeasurementError as error:
+                refusal = self._measured_refusal(error, selected)
+                latch_managed_fault(self.gateway, refusal.classification, diagnostic=refusal.diagnostic)
+            except MissingOriginalHistoryError as error:
+                if (
+                    self.journal.get("managed_mode")
+                    and self.journal.get("trial_binding")
+                    and not self.journal.fault.latched()
+                    and history_recovery_idle(self.journal)
+                ):
+                    refusal = self._native_refusal(error)
+                    diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}
+                    latch_managed_fault(self.gateway, refusal.classification, diagnostic=diagnostic)
+                raise
             else:
-                self.native_bounded.require_recovery_session(native)
-            self.book.owned_present(native.physical)
-            control = self.journal.get("control", {})
-            self.journal.control.hold(control)
-            if self.journal.get("trial_binding") is None:
-                self.native_bounded.spec.require_admission(native, self.journal.identity)
-                if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
-                    raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
-                self.journal.require_allocation()
-                self.journal.phase.activate()
-                self.journal.phase.begin_introduction()
-            else:
-                self.journal.phase.recover()
+                if self.journal.get("trial_binding") is None:
+                    self.native_bounded.require_known_session(native)
+                else:
+                    self.native_bounded.require_recovery_session(native)
+                self.book.owned_present(native.physical)
+                self.journal.control.hold(self.journal.get("control", {}))
+                if self.journal.get("trial_binding") is None:
+                    self.native_bounded.spec.require_admission(native, self.journal.identity)
+                    if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
+                        raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
+                    self.journal.require_allocation()
+                    self.journal.phase.activate()
+                    self.journal.phase.begin_introduction()
+                else:
+                    self.journal.phase.recover()
         elif phase.value == "rollback":
             native = await self.native_bounded.read(closed=True)
             if not self.book.owned_present(native.physical):
@@ -362,6 +499,8 @@ class TrialSession:
             return
         self.closing = True
         uncertain = False
+        verified = False
+        attempt = uuid.uuid4().hex
         try:
             if self.started and self.journal.phase.read().supervised:
                 try:
@@ -369,14 +508,18 @@ class TrialSession:
                         control = self.journal.get("control", {})
                         self.journal.control.hold(control)
                         raise UnavailableError("charger disconnected before the final physical hold")
-                    await self.gateway.stop()
-                    async with asyncio.timeout(5):
-                        while self.journal.active() is not None or self.journal.get("control", {}).get("start_pending"):
-                            await asyncio.sleep(0.05)
+                    local = self.journal.active()
+                    try:
+                        await self._request_shutdown_stop(attempt, local)
+                    finally:
+                        await self._wait_for_shutdown_closure(attempt, stop_late_start=local is None)
+                    self._record_shutdown_outcome(attempt, "verified")
+                    verified = True
                 except Exception:
                     # This outer cleanup boundary records only uncertainty, never protocol bodies or exception text.
                     uncertain = True
                     try:
+                        self._record_shutdown_outcome(attempt, "uncertain")
                         self.journal.put("trial_shutdown_uncertain", True)
                     except Exception:
                         # Failed state storage cannot skip socket retirement or falsely establish a successful Stop.
@@ -389,10 +532,144 @@ class TrialSession:
                     self.final_status = await self.command({"command": "status"})
                     self.final_status.update(
                         running=False,
+                        shutdown_attempt_uncertain=not verified,
                         shutdown_uncertain=uncertain or bool(self.journal.get("trial_shutdown_uncertain")),
                     )
                 except Exception:
                     # Status must remain printable even if the private database became unavailable during shutdown.
-                    self.final_status = {"running": False, "phase": "unavailable", "shutdown_uncertain": True}
+                    self.final_status = {
+                        "running": False,
+                        "phase": "unavailable",
+                        "shutdown_uncertain": True,
+                        "shutdown_attempt_uncertain": True,
+                    }
                 self.journal.close()
                 self.closed = True
+
+    # Give final shutdown its own restrictive turn while the charger receiver is still open.
+    async def _request_shutdown_stop(self, attempt: str, local: int | None) -> None:
+        g, j, native = self.gateway, self.journal, self.native_bounded
+        if not j.get("managed_mode"):
+            await g.stop()
+            return
+        connection = current_control_scope(g)
+
+        # A shutdown never borrows another owner's Stop claim, including on the same socket.
+        def bind(ticket: str) -> None:
+            j.put(
+                "trial_shutdown_attempt",
+                {
+                    "id": attempt,
+                    "local": local,
+                    "ticket": ticket,
+                    "state": "pending",
+                    "boot": connection[0].boot if connection else None,
+                },
+            )
+
+        # Give the zero write its own authority. A Stop must still belong to the original live Boot.
+        async def prove(local: int, ceiling_failed: bool) -> Callable[[], None]:
+            def require_scope() -> None:
+                if (
+                    not control_scope_matches(g, connection)
+                    or j.active() != local
+                    or fingerprint(j.get("boot")) != native.spec.boot_digest
+                ):
+                    raise RecoveryRequiredError("shutdown Stop lost its original connection or transaction")
+
+            require_scope()
+            if not ceiling_failed:
+                return require_scope
+
+            # When zero cannot be confirmed, independently match the existing physical session.
+            try:
+                async with asyncio.timeout(5):
+                    sample = await native.read(closing_local=local, stop_only=True)
+            except _NativeMeasurementError as error:
+                if error.authority != native.authority() or error.sequence != native.last_resolved_read:
+                    raise
+                sample = error.native
+                require_allowed(readiness_decision(sample, False, native.allow_unplugged, local))
+            native.require_known_session(sample)
+            sequence = native.last_resolved_read
+
+            def guard() -> None:
+                require_scope()
+                sample.physical.require_fresh(j.identity, 5)
+                if (
+                    not sample.physical.transaction_open
+                    or sample.physical.history is None
+                    or native.last_resolved_read != sequence
+                    or not native.commissioned_binding_matches(sample)
+                ):
+                    raise RecoveryRequiredError("shutdown Stop awaits current proof of the known transaction")
+
+            return guard
+
+        try:
+            await g.controls.stop(
+                expected_local=local,
+                prove_stop=prove,
+                on_claim=bind,
+                owner=("shutdown", attempt, local, connection),
+                priority=CommandPriority.SHUTDOWN,
+            )
+        except StopReplyUnconfirmedError:
+            # Closure and an owned physical zero can still be confirmed by the independent final checks.
+            pass
+
+    # Keep the receiver alive to journal the real Stop, even if confirming zero failed.
+    async def _wait_for_shutdown_closure(self, attempt: str, *, stop_late_start: bool) -> None:
+        managed = bool(self.journal.get("managed_mode"))
+        late = await self._wait_for_shutdown_reports(accept_late_start=managed and stop_late_start)
+        if late is not None:
+            try:
+                await self._request_shutdown_stop(attempt, late)
+            finally:
+                await self._wait_for_shutdown_reports(accept_late_start=False)
+
+    # The final result records independent closure, never a guessed acknowledgement of the Stop RPC.
+    def _record_shutdown_outcome(self, attempt: str, state: str) -> None:
+        current = self.journal.get("trial_shutdown_attempt", {})
+        if current.get("id") == attempt:
+            self.journal.put("trial_shutdown_attempt", {**current, "state": state})
+
+    async def _wait_for_shutdown_reports(self, *, accept_late_start: bool) -> int | None:
+        async with asyncio.timeout(5):
+            while True:
+                local = self.journal.active()
+                if accept_late_start and local is not None:
+                    return local
+                if (
+                    local is None
+                    and not self.journal.get("control", {}).get("start_pending")
+                    and not self.gateway.authorisation.pending()
+                ):
+                    break
+                await asyncio.sleep(0.05)
+            if self.journal.get("managed_mode"):
+                await self._verify_shutdown_hold()
+        return None
+
+    # The charger can report Stop before its independent native session has closed.
+    async def _verify_shutdown_hold(self) -> None:
+        while True:
+            try:
+                native = await self.native_bounded.read(closed=True, owned=True)
+            except NativeReadinessError, _NativeMeasurementError:
+                await asyncio.sleep(0.05)
+                continue
+            self.native_bounded.require_known_session(native)
+            present = self.book.owned_present(native.physical)
+            station = [resource for resource in present if resource.identifier == HUB_PROFILE_ID]
+            receipt = self.journal.db.execute(
+                "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
+            ).fetchone()
+            if (
+                not self.gateway.current_boot_seen(self.gateway._charger_epoch)
+                or not self.gateway.controls.ready
+                or self.gateway.controls.desired() != 0
+                or not self.book.confirmed_station_zero(station, receipt)
+            ):
+                raise RecoveryRequiredError("shutdown awaits the independently verified station zero")
+            return

@@ -6,8 +6,10 @@ import asyncio
 import json
 import signal
 import socket
+import sqlite3
 import ssl
 import time
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,12 +20,14 @@ from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_native_repair import REVOCATIONS, repair_pending, repair_revoked
 from ocpp_hub_core.prototype.native_bounded import NativeBoundedSpec
 from ocpp_hub_core.prototype.policy import DeniedError
+from ocpp_hub_core.prototype.recovery_contracts import Prerequisite, RestoreState
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 from websockets.asyncio.client import connect
 
-from tests.connected_rig import connected_bench
+from tests.connected_rig import connected_bench, strategy_file
 from tests.management_peer import TOKEN, call
 from tests.prototype_rig import BOOT
 from tests.runtime_rig import FAST, until
@@ -31,7 +35,7 @@ from tests.test_native_repair_storage import refused_write
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
-from tools import managed_proxy
+from tools import managed_proxy, trial_proxy
 
 
 # A complete measured healthy status includes physical freshness and the service's local-Start restriction.
@@ -227,6 +231,77 @@ async def test_managed_check_is_dormant(
         assert not rig.bench.device_calls and not rig.bench.calls
 
 
+# Intent: the configured charger and management ports cannot claim the same local listener.
+# Why: a permanent configuration conflict must be reported before either service starts.
+async def test_managed_check_and_serve_refuse_matching_loopback_ports(tmp_path, tls, unused_tcp_port, capsys):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        value = rig.spec.value()
+        value["trial_route"].update(sURL="/charger/", sDomain=rig.prepared.config.listener_name)
+        config, spec = tmp_path / "trial.json", tmp_path / "native-spec.json"
+        save_private(spec, value)
+        management, token = tmp_path / "management.json", tmp_path / "management-token.json"
+        save_private(token, {"token": TOKEN})
+        assert rig.prepared.config.listener_host == "127.0.0.1"
+        save_private(
+            management, {"host": "127.0.0.1", "port": rig.prepared.config.listener_port, "token_file": str(token)}
+        )
+
+        assert (
+            managed_proxy.main(
+                [
+                    "check",
+                    "--config",
+                    str(config),
+                    "--native-bounded-spec",
+                    str(spec),
+                    "--management-config",
+                    str(management),
+                ]
+            )
+            == 2
+        )
+        assert json.loads(capsys.readouterr().out) == {"managed_action_failed": "SecurityError"}
+        with pytest.raises(SecurityError, match="separate ports"):
+            await managed_proxy.serve(config, spec, management)
+        assert not rig.prepared.config.journal.exists() and not rig.bench.device_calls
+
+
+# Intent: stopped inspection sees committed WAL data while leaving the original database and sidecars untouched.
+# Why: a crash can leave the exact current evidence in the WAL, and inspection must not change that evidence.
+async def test_operator_inspection_reads_a_stopped_wal_without_writing_it(tmp_path, tls, unused_tcp_port):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        config = rig.prepared.config
+        with closing(Journal(config.journal, config.identity)):
+            with pytest.raises(RecoveryRequiredError, match="active owner"):
+                with trial_proxy.operator_journal(config, inspect=True):
+                    pytest.fail("inspection bypassed the original lock")
+        original = config.journal
+        with closing(sqlite3.connect(original, isolation_level=None)) as writer:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("INSERT INTO meta VALUES('test_stopped_wal','true')")
+            files = tuple(Path(str(original) + suffix) for suffix in ("", ".lock", "-wal", "-shm"))
+            before = [path.read_bytes() for path in files]
+            with trial_proxy.operator_journal(config, inspect=True) as snapshot:
+                assert snapshot.get("test_stopped_wal") is True
+                snapshot.put("test_stopped_wal", False)
+            assert [path.read_bytes() for path in files] == before
+            assert writer.execute("SELECT value FROM meta WHERE key='test_stopped_wal'").fetchone()[0] == "true"
+
+
+# Intent: commissioning refuses a valid native strategy stored at its own status output path.
+# Why: starting from that alias would replace the owner's spec with a status report.
+async def test_commissioning_refuses_to_overwrite_its_native_spec(tmp_path, tls, unused_tcp_port):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        strategy = strategy_file(rig, tmp_path)
+        status = rig.prepared.config.journal.with_suffix(".status.json")
+        save_private(status, json.loads(strategy.read_text()))
+        before = status.read_bytes()
+        with pytest.raises(SecurityError, match="must not alias"):
+            await trial_proxy.run(tmp_path / "trial.json", 1, False, status)
+        assert status.read_bytes() == before
+        assert not rig.prepared.config.journal.exists() and not rig.bench.device_calls
+
+
 # Intent: a saved managed journal can never reopen with assistant-local Start enabled by an ordinary constructor.
 # Why: automatic restart must preserve the local-Start restriction even if the caller omits its explicit flag.
 async def test_saved_managed_mode_requires_local_start_restriction(
@@ -245,6 +320,49 @@ async def test_saved_managed_mode_requires_local_start_restriction(
         assert not second.gateway.policy.allow_local_start
         assert second.journal.get("managed_mode")["local_start"] is False
         await second.close()
+
+
+# Intent: a managed restart on an already cleared rollback journal must refuse readiness before opening management.
+# Why: commissioning deliberately leaves the charger listener closed in this phase while preserving the recovery data.
+async def test_managed_runner_rejects_rollback_without_charger_listener(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    unused_tcp_port_factory: Any,
+    monkeypatch: Any,
+) -> None:
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        spec_path = strategy_file(rig, tmp_path)
+        previous = rig.session()
+        await previous.start()
+        previous.journal.phase.begin_cleanup()
+        await previous.close()
+        rig.route_to_trial()
+
+        token_path = tmp_path / "management-token.json"
+        management_path = tmp_path / "management.json"
+        save_private(token_path, {"token": TOKEN})
+        save_private(
+            management_path, {"host": "127.0.0.1", "port": unused_tcp_port_factory(), "token_file": str(token_path)}
+        )
+        notifications = []
+
+        # Fail immediately if startup crosses the management listener boundary before detecting the missing charger.
+        async def unexpected_management_start(_server: Any) -> None:
+            raise AssertionError("management opened without a charger listener")
+
+        monkeypatch.setattr(managed_proxy, "preflight", lambda path: rig.prepared)
+        monkeypatch.setattr(managed_proxy, "notify", notifications.append)
+        monkeypatch.setattr(managed_proxy.ManagementServer, "start", unexpected_management_start)
+        with pytest.raises(RecoveryRequiredError, match="charger listener"):
+            await managed_proxy.serve(tmp_path / "trial.json", spec_path, management_path)
+
+        assert not any(value.startswith("READY=1") for value in notifications)
+        assert not rig.bench.device_calls and not rig.bench.calls
+        config = rig.prepared.config
+        with closing(Journal(config.journal, config.identity)) as journal:
+            assert journal.phase.read().value == "rollback"
+            assert journal.get("managed_mode") is None
 
 
 # Intent: a stop requested inside the actual positive-send native audit invalidates the release ticket.
@@ -297,11 +415,72 @@ async def test_stop_request_fences_inflight_release_before_positive_send(
                 await asyncio.gather(pending, return_exceptions=True)
 
 
+# Intent: automatic release remains at zero if its registered cloud connection ends during native send validation.
+# Why: the cloud accepted before starting the release does not establish authority to send a later positive profile.
+async def test_automatic_release_waits_at_zero_after_cloud_loss(
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int, monkeypatch: Any
+) -> None:
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = TrialSession(rig.prepared, FAST, native_bounded=rig.spec, allow_local_start=False)
+        rig.sessions.append(session)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            assert (await rig.bench.call(charger, "cloud-loss-boot", "BootNotification", BOOT))[0] == 3
+            g, j = session.gateway, session.journal
+            await until(lambda: g.controls.ready and g.vendor_registration == "Accepted")
+            await until(lambda: j.next_delivery() is None and not g.vendor._pending)
+            scope = controller.requests.intent()
+            assert scope.mode == "app" and g.controls.desired() == rig.bench.firmware.effective_limit() == 0
+            vendor_epoch = g._vendor_epoch
+            positive_audit, release_audit = asyncio.Event(), asyncio.Event()
+            observe = session.native_bounded.observe
+
+            # Hold only a genuine, completed native sample while the release owns the positive Set.
+            async def delay_positive_audit() -> Any:
+                native = await observe()
+                attempt = g.controls.release_attempt
+                if attempt is not None and attempt.ticket is not None and not positive_audit.is_set():
+                    assert attempt.purpose == "automatic" and not attempt.positive_may_have_dispatched
+                    positive_audit.set()
+                    await release_audit.wait()
+                return native
+
+            monkeypatch.setattr(session.native_bounded, "observe", delay_positive_audit)
+            pending = asyncio.create_task(controller.recovery.restore())
+            try:
+                await asyncio.wait_for(positive_audit.wait(), 5)
+                assert g.vendor_registration == "Accepted" and g._vendor_epoch == vendor_epoch
+                await session.runtime.stop_vendor()
+                assert g._vendor_epoch != vendor_epoch and not session.runtime.status.vendor_connected
+                release_audit.set()
+                progress = await asyncio.wait_for(pending, 5)
+                assert progress.state is RestoreState.WAITING and progress.pending.reason is Prerequisite.CLOUD
+                assert progress.operation is not None and progress.operation.effects.zero_verified
+                assert not progress.operation.effects.positive_dispatched
+                assert g.controls.ready and rig.bench.firmware.effective_limit() == 0
+                assert set(rig.bench.received_limits) == {0}
+                assert controller.requests.intent() == scope and controller.released_epoch is None
+                assert controller.requests.pending_return() is None and not j.fault.latched()
+            finally:
+                release_audit.set()
+                await asyncio.gather(pending, return_exceptions=True)
+
+
 # Intent: the actual managed runner handles a stop signal by retaining zero and writing a stopped report.
 # Why: systemd shutdown must retire both connections and the journal without clearing profiles or restoring32.
 @pytest.mark.parametrize(
-    "management_enabled,failed_output,repair",
-    [(False, None, False), (True, None, False), (True, "status", False), (True, "events", False), (True, None, True)],
+    "management_enabled,failed_output,repair,management_bind_busy",
+    [
+        (False, None, False, False),
+        (True, None, False, False),
+        (True, "status", False, False),
+        (True, "events", False, False),
+        (True, "writer", False, False),
+        (True, None, True, False),
+        pytest.param(True, None, False, True, id="occupied-management-port"),
+    ],
 )
 async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
     tmp_path: Path,
@@ -312,6 +491,7 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
     management_enabled: bool,
     failed_output: str | None,
     repair: bool,
+    management_bind_busy: bool,
 ) -> None:
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         value = rig.spec.value()
@@ -355,14 +535,25 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
         monkeypatch.setattr(loop, "add_signal_handler", register)
         monkeypatch.setattr(loop, "remove_signal_handler", remove)
         management_path = None
+        management_blocker = None
         if management_enabled:
             port = unused_tcp_port_factory()
             secret = tmp_path / "management-token.json"
             management_path = tmp_path / "management.json"
             save_private(secret, {"token": TOKEN})
             save_private(management_path, {"host": "127.0.0.1", "port": port, "token_file": str(secret)})
+            if management_bind_busy:
+                management_blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                management_blocker.bind(("127.0.0.1", port))
+                management_blocker.listen()
         blocked = None
-        if failed_output is not None:
+        if failed_output == "writer":
+            # Optional output can lose its thread before the service starts.
+            def refuse_writer(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("synthetic output-worker creation refusal")
+
+            monkeypatch.setattr(managed_proxy, "ReportWriter", refuse_writer)
+        elif failed_output is not None:
             blocked = rig.prepared.config.journal.with_suffix(
                 ".status.json" if failed_output == "status" else ".events.jsonl"
             )
@@ -377,20 +568,37 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                 await until(
                     lambda: session.gateway.controls.ready and session.gateway.vendor_registration == "Accepted"
                 )
+                if management_blocker is not None:
+                    status_path = rig.prepared.config.journal.with_suffix(".status.json")
+
+                    # The service itself must keep polling the same charger owner while the socket is occupied.
+                    def reports_management(available: bool) -> bool:
+                        assert not running.done()
+                        if not status_path.exists():
+                            return False
+                        status = json.loads(status_path.read_text())
+                        return status["state"] == "healthy" and status.get("management_available") is available
+
+                    await until(lambda: reports_management(False), timeout=12)
+                    boot = session.gateway.boot_observation
+                    assert rig.bench.firmware.effective_limit() == 6
+                    management_blocker.close()
+                    await until(lambda: reports_management(True), timeout=12)
+                    assert sessions == [session] and session.gateway.boot_observation == boot
                 if management_enabled:
                     async with connect(
                         f"ws://127.0.0.1:{port}/management",
                         additional_headers={"Authorization": "Bearer " + TOKEN},
                         subprotocols=["ics-proxy.v1"],
                         proxy=None,
-                    ) as socket:
-                        status = (await call(socket, "status"))["result"]
+                    ) as client:
+                        status = (await call(client, "status"))["result"]
                         assert status["api_version"] == 1 and status["can_pause"] is True
-                        paused = await call(socket, "pause", revision=status["control_revision"])
+                        paused = await call(client, "pause", revision=status["control_revision"])
                         assert paused["ok"] and paused["result"]["state"] == "accepted"
                         async with asyncio.timeout(12):
                             while True:
-                                receipt = (await call(socket, "receipt", request_id=paused["result"]["id"]))["result"]
+                                receipt = (await call(client, "receipt", request_id=paused["result"]["id"]))["result"]
                                 if receipt["state"] == "completed":
                                     break
                                 await asyncio.sleep(0.1)
@@ -402,12 +610,12 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                             before = dict(rig.peer.configuration)
                             with refused_write(j, REVOCATIONS, "statement"):
                                 rig.peer.configuration["untouched"] = "independent native contradiction"
-                                paused = await call(socket, "pause", revision=controller.requests.intent().revision)
+                                paused = await call(client, "pause", revision=controller.requests.intent().revision)
                                 assert paused["ok"]
                                 async with asyncio.timeout(12):
                                     while True:
                                         assert not running.done()
-                                        status = (await call(socket, "status"))["result"]
+                                        status = (await call(client, "status"))["result"]
                                         if status.get("fault") == "native_repair_publication_pending":
                                             break
                                         await asyncio.sleep(0.05)
@@ -417,10 +625,10 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                             assert not running.done() and sessions == [session] and not repair_pending(j, fault)
                             assert rig.bench.firmware.effective_limit() == 0
                         if failed_output is not None:
-                            before = (await call(socket, "status"))["result"]
+                            before = (await call(client, "status"))["result"]
                             async with asyncio.timeout(12):
                                 while True:
-                                    latest = (await call(socket, "status"))["result"]
+                                    latest = (await call(client, "status"))["result"]
                                     if latest["checked_at"] > before["checked_at"]:
                                         break
                                     await asyncio.sleep(0.1)
@@ -431,9 +639,12 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                 assert await asyncio.wait_for(running, 8) == 0
             if failed_output == "status":
                 assert blocked.is_dir()
+            elif failed_output == "writer":
+                assert not rig.prepared.config.journal.with_suffix(".status.json").exists()
             else:
                 report = json.loads(rig.prepared.config.journal.with_suffix(".status.json").read_text())
                 assert report["running"] is False and report["state"] == "stopped"
+                assert report["shutdown_uncertain"] is False
             assert set(removed) == {signal.SIGTERM, signal.SIGINT}
             assert "WATCHDOG=1" in notifications and any(n.startswith("STOPPING=1") for n in notifications)
             assert session.closed and rig.bench.firmware.effective_limit() == 0
@@ -444,6 +655,8 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                 if frame[2] in ("RemoteStartTransaction", "ClearChargingProfile")
             ]
         finally:
+            if management_blocker is not None:
+                management_blocker.close()
             if not running.done():
                 if signal.SIGTERM in callbacks:
                     callbacks[signal.SIGTERM]()

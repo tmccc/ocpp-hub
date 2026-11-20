@@ -18,9 +18,12 @@ def awaiting_observations(journal: Journal) -> bool:
     )
 
 
-# No inferred lifecycle, unrelated observation, unknown mapping or ambiguous write qualifies for this narrow wait.
+# Exact closed Stops and routine known observations can wait together for real cloud acknowledgements.
 def awaiting_known_stops(journal: Journal) -> bool:
-    rows = journal.db.execute("SELECT action,payload,local,state FROM outbox ORDER BY seq").fetchall()
+    rows = journal.db.execute(
+        "SELECT q.action,q.payload,q.local,q.state,t.stop,t.vendor FROM outbox q "
+        "LEFT JOIN transactions t ON t.local=q.local ORDER BY q.seq"
+    ).fetchall()
     if (
         not rows
         or journal.active() is not None
@@ -29,12 +32,13 @@ def awaiting_known_stops(journal: Journal) -> bool:
         or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
     ):
         return False
-    for item in rows:
-        if item["action"] != "StopTransaction" or item["state"] not in ("queued", "inflight"):
+    stop_pending = False
+    for action, payload, local, state, stop, vendor in rows:
+        if state not in ("queued", "inflight"):
             return False
-        transaction = journal.db.execute(
-            "SELECT stop,vendor FROM transactions WHERE local=?", (item["local"],)
-        ).fetchone()
-        if transaction is None or transaction["vendor"] is None or transaction["stop"] != item["payload"]:
+        if action in OBSERVATION_ACTIONS and (local is None or vendor is not None):
+            continue
+        if action != "StopTransaction" or vendor is None or stop != payload:
             return False
-    return True
+        stop_pending = True
+    return stop_pending

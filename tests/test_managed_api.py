@@ -2,23 +2,126 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import ssl
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from ocpp_hub_core.prototype import managed_api
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
+from tests.current_rig import adjustable
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN, call
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
+
+
+# Intent: a queued Pause wins against an earlier unprocessed Current request at the same observed revision.
+# Why: ordinary work cannot acquire charger authority ahead of waiting restrictive work.
+async def test_management_pause_overtakes_queued_current(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c = b.controller
+        before = list(b.rig.bench.received_limits)
+        api = ManagementServer(ManagementSettings(19001, tmp_path / "unused", TOKEN), c, lambda: {})
+        current, pause = uuid.uuid4().hex, uuid.uuid4().hex
+        revision = c.requests.intent().revision
+        ordinary = asyncio.create_task(
+            api.dispatch(json.dumps({"id": current, "command": "set_current", "revision": revision, "current_a": 16})),
+            eager_start=True,
+        )
+        restrictive = asyncio.create_task(
+            api.dispatch(json.dumps({"id": pause, "command": "pause", "revision": revision})), eager_start=True
+        )
+        assert (await restrictive)["result"]["state"] == "accepted"
+        with pytest.raises(RecoveryRequiredError):
+            await ordinary
+        assert c.requests.receipt(current)["state"] == "not_found"
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(pause)["state"] == "completed"
+        assert b.rig.bench.received_limits[len(before) :] == [0]
+
+
+# Intent: an ordinary client at its read limit leaves an authenticated owner's Pause available.
+# Why: dashboard refreshes must never consume the separate budget for physically restricting the charger.
+async def test_management_status_limit_leaves_pause_available(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c = b.controller
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused", TOKEN), c, lambda: published)
+        await api.start()
+        options = {
+            "additional_headers": {"Authorization": "Bearer " + TOKEN},
+            "subprotocols": ["ics-proxy.v1"],
+            "proxy": None,
+        }
+        url = f"ws://127.0.0.1:{port}/management"
+        try:
+            async with connect(url, **options) as dashboard, connect(url, **options) as owner:
+                before = list(b.rig.bench.received_limits)
+                identifier = uuid.uuid4().hex
+                now = 10.0
+                with monkeypatch.context() as clock:
+                    clock.setattr(managed_api, "time", SimpleNamespace(monotonic=lambda: now))
+                    for _ in range(30):
+                        assert (await call(dashboard, "status"))["ok"]
+                    assert await call(dashboard, "status") == {"ok": False, "error": "not_ready"}
+                    assert b.rig.bench.received_limits == before
+                    pause = await call(owner, "pause", id=identifier, revision=c.requests.intent().revision)
+                    assert pause["ok"] and pause["result"]["state"] == "accepted"
+                    assert await call(dashboard, "status") == {"ok": False, "error": "not_ready"}
+                    now += 2.0
+                    assert (await healthy(c))["local_hold_verified"]
+                    receipt = (await call(owner, "receipt", request_id=identifier))["result"]
+                    assert receipt["state"] == "completed"
+                assert b.rig.bench.received_limits[len(before) :] == [0]
+                assert not starts(b.rig)
+        finally:
+            await api.close()
+
+
+# Intent: four reusable idle sockets cannot prevent an authenticated owner from pausing at once.
+# Why: the reserved Pause budget only helps after the owner can reach the queue.
+async def test_idle_management_connections_leave_pause_available(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c = b.controller
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused", TOKEN), c, lambda: published)
+        await api.start()
+        options = {
+            "additional_headers": {"Authorization": "Bearer " + TOKEN},
+            "subprotocols": ["ics-proxy.v1"],
+            "proxy": None,
+        }
+        url = f"ws://127.0.0.1:{port}/management"
+        try:
+            async with AsyncExitStack() as clients:
+                idle = [await clients.enter_async_context(connect(url, **options)) for _ in range(4)]
+                for client in idle:
+                    assert (await call(client, "status"))["ok"]
+                await until(lambda: len(api.idle) == 4)
+                identifier = uuid.uuid4().hex
+                async with connect(url, **options) as owner:
+                    reply = await call(owner, "pause", id=identifier, revision=c.requests.intent().revision)
+                    assert reply["ok"] and reply["result"]["state"] == "accepted"
+                    assert (await healthy(c))["local_hold_verified"]
+                    assert c.requests.receipt(identifier)["state"] == "completed"
+                    await asyncio.wait_for(idle[0].wait_closed(), 2)
+                    assert (await call(idle[-1], "status"))["ok"]
+        finally:
+            await api.close()
 
 
 # Intent: authenticated status/history are passive, and duplicate Pause is one durable/physical operation.
@@ -69,6 +172,7 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert (await call(socket, "receipt", request_id=request))["result"]["state"] == "completed"
                     status = (await call(socket, "status"))["result"]
                     assert status["healthy"] and status["local_hold_verified"] and status["can_return"]
+
                     # Fail the real delivery pump after the last complete poll.
                     async def refuse_flush():
                         raise sqlite3.OperationalError("delivery storage unavailable")
@@ -162,6 +266,6 @@ async def test_management_validation_precedes_durable_mutation(
         from ocpp_hub_core.prototype.security import SecurityError
 
         with pytest.raises(SecurityError):
-            api.dispatch(json.dumps({"id": uuid.uuid4().hex, **payload}))
+            await api.dispatch(json.dumps({"id": uuid.uuid4().hex, **payload}))
         assert controller.requests.intent().mode == "app"
         assert session.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 0

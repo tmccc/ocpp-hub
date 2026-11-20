@@ -50,6 +50,7 @@ async def control_peer():
         "requests": [],
         "receipts": {},
         "pending_pause": False,
+        "lose_pause_reply": False,
         "lose_current_before_effect": False,
         "pause_accepted": asyncio.Event(),
         "release_physical_zero": asyncio.Event(),
@@ -79,7 +80,7 @@ async def control_peer():
             can_start=True,
             can_set_current=True,
         )
-        control["receipts"][identifier] = {"id": identifier, "state": "completed"}
+        control["receipts"][identifier] = {"id": identifier, "action": "pause", "state": "completed"}
         control["physical_zero_observed"].set()
 
     # Every command and reply crosses actual authenticated websocket framing with independent request/result IDs.
@@ -99,7 +100,8 @@ async def control_peer():
             result = copy.deepcopy(state)
         elif command == "receipt":
             control["receipt_read"].set()
-            result = copy.deepcopy(control["receipts"][value["request_id"]])
+            request_id = value["request_id"]
+            result = copy.deepcopy(control["receipts"].get(request_id, {"id": request_id, "state": "not_found"}))
         elif command == "set_current":
             assert set(value) == {"id", "command", "revision", "current_a"}
             assert type(value["current_a"]) is int and 6 <= value["current_a"] <= 32
@@ -112,7 +114,7 @@ async def control_peer():
             if state["desired_control"] == "app":
                 state["station_ceiling_a"] = value["current_a"]
             state["can_start_test"] = value["current_a"] == 6
-            result = {"id": value["id"], "state": "completed"}
+            result = {"id": value["id"], "action": command, "state": "completed"}
             control["receipts"][value["id"]] = dict(result)
         elif command == "pause":
             state.update(
@@ -129,12 +131,15 @@ async def control_peer():
                 can_start_test=False,
                 can_set_current=False,
             )
-            result = {"id": value["id"], "state": "accepted"}
+            result = {"id": value["id"], "action": command, "state": "accepted"}
             control["receipts"][value["id"]] = dict(result)
             control["pause_accepted"].set()
             workers.append(asyncio.create_task(apply_zero(value["id"])))
             if not control["pending_pause"]:
                 control["release_physical_zero"].set()
+            if control["lose_pause_reply"]:
+                await socket.close()
+                return socket
         else:
             raise AssertionError("unexpected control-completion peer command")
         if control.get("result_filter") is not None:
@@ -161,10 +166,12 @@ async def control_peer():
 
 # Intent: accepted Pause remains physically unverified and Return unavailable until the independent zero event.
 # Why: a pending receipt must not make HA announce a completed hold or finish its user's service call early.
-async def test_pending_pause_waits_for_independent_zero(actual_hass, control_peer, monkeypatch):
+@pytest.mark.parametrize("lose_reply", [False, True], ids=["accepted-reply", "recovered-receipt"])
+async def test_pending_pause_waits_for_independent_zero(actual_hass, control_peer, monkeypatch, lose_reply):
     hass, peer = actual_hass, control_peer
     configured_timing(monkeypatch, 1)
     peer["pending_pause"] = True
+    peer["lose_pause_reply"] = lose_reply
     peer["state"].update(current_a=6, power_w=1440, local_charge={"state": "running", "charging": True})
 
     # An older worker can still be running after the service has recorded the newer Pause.
@@ -207,6 +214,8 @@ async def test_pending_pause_waits_for_independent_zero(actual_hass, control_pee
         ), "HA did not present the independent verified hold"
         assert peer["commands"].count("pause") == 1
         assert set(peer["commands"]) <= {"status", "pause", "receipt"}
+        (pause,) = (item for item in peer["requests"] if item["command"] == "pause")
+        assert {item["request_id"] for item in peer["requests"] if item["command"] == "receipt"} == {pause["id"]}
     finally:
         peer["release_physical_zero"].set()
         await asyncio.gather(request, return_exceptions=True)
@@ -262,7 +271,7 @@ async def test_lost_current_before_effect_preserves_observed_value(actual_hass, 
         assert number.native_value == 6 and hass.states.get(number.entity_id).state == "6"
         assert peer["state"]["requested_current_a"] == 6 and peer["state"]["control_revision"] == 0
         peer["release_status"].set()
-        with pytest.raises(HomeAssistantError):
+        with pytest.raises(HomeAssistantError, match="outcome is unknown"):
             await request
     finally:
         peer["release_status"].set()
@@ -270,8 +279,10 @@ async def test_lost_current_before_effect_preserves_observed_value(actual_hass, 
     assert hass.states.get("number.ics_proxy_charge_current_a").state == "6"
     assert peer["state"]["requested_current_a"] == 6 and peer["state"]["control_revision"] == 0
     assert peer["state"]["station_ceiling_a"] == (0 if paused else 6)
-    assert peer["commands"].count("set_current") == 1 and "receipt" not in peer["commands"]
+    assert peer["commands"].count("set_current") == 1
     first = next(request["id"] for request in peer["requests"] if request["command"] == "set_current")
+    (lookup,) = (request for request in peer["requests"] if request["command"] == "receipt")
+    assert lookup["request_id"] == first
     peer["lose_current_before_effect"] = False
     await hass.services.async_call(
         "number", "set_value", {"entity_id": "number.ics_proxy_charge_current_a", "value": 16}, blocking=True
@@ -281,4 +292,4 @@ async def test_lost_current_before_effect_preserves_observed_value(actual_hass, 
     )
     commands = [request for request in peer["requests"] if request["command"] == "set_current"]
     assert len(commands) == 2 and commands[-1]["id"] != first
-    assert set(peer["commands"]) <= {"status", "set_current"}
+    assert set(peer["commands"]) <= {"status", "set_current", "receipt"}

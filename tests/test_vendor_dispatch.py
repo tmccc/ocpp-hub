@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
+from ocpp_hub_core.prototype.connection_scope import current_control_scope
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
@@ -259,9 +260,12 @@ async def test_cancelled_vendor_start_retains_only_possible_dispatch(
 
                 gateway.charger.validate_send = blocked_validation
             frame = [2, "cancelled-start", "RemoteStartTransaction", {"connectorId": 1, "idTag": "LOCAL_TEST"}]
-            task = asyncio.create_task(gateway._vendor_call(frame, gateway._vendor_epoch))
+            task = asyncio.create_task(
+                gateway._vendor_call(frame, gateway._vendor_epoch, current_control_scope(gateway))
+            )
             await asyncio.wait_for(entered.wait(), 2)
             assert reserved_grants == [True]
+            assert gateway.authorisation.allows("LOCAL_TEST") is after_dispatch
             if failure == "cancel":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):

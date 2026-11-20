@@ -78,7 +78,10 @@ async def new_return_after_preflight_recovery(test, identifier, original, intent
 
 # Intent: a genuine HTTP503 in explicit Return preflight makes that UUID unconfirmed without a positive claim.
 # Why: fresh telemetry cannot silently replay an accepted positive request whose preflight already terminated.
-async def test_explicit_return_native503_preflight_requires_a_new_request(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("storage_refused", [False, True])
+async def test_explicit_return_native503_preflight_requires_a_new_request(
+    tmp_path, tls, unused_tcp_port, monkeypatch, storage_refused
+):
     async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=FinalReleaseHttpPeer) as b:
         test = ChargeRig(b.rig, b.session, b.c, b.sock)
         c, g, j, peer = b.c, b.session.gateway, b.session.journal, b.rig.peer
@@ -123,9 +126,24 @@ async def test_explicit_return_native503_preflight_requires_a_new_request(tmp_pa
             assert owned in g.controls._completions and not owned.done()
             assert g.controls.release_attempt is None and not g.controls._operations
             assert j.get("control") == control and b.device.effective_limit() == 0
+            if storage_refused:
+                j.db.execute(
+                    "CREATE TEMP TRIGGER refuse_return_settlement BEFORE UPDATE ON managed_requests "
+                    "WHEN NEW.action='app_control' AND NEW.state='uncertain' "
+                    "BEGIN SELECT RAISE(ABORT,'Return outcome unavailable'); END"
+                )
             peer.release.set()
             await asyncio.wait_for(returning, 5)
             assert peer.responded and owned is c.recovery._task
+            if storage_refused:
+                try:
+                    assert c.requests.receipt(identifier)["state"] == "running"
+                    await c.tick()
+                    assert c.requests.receipt(identifier)["state"] == "running"
+                    assert c.recovery._task is owned and b.device.effective_limit() == 0
+                finally:
+                    j.db.execute("DROP TRIGGER refuse_return_settlement")
+                await c.tick()
             original = require_unconfirmed_preclaim(test, identifier, Prerequisite.NATIVE, intent, control, wire_mark)
             assert j.get("control")["uncertain"] is False
             peer.select = None

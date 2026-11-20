@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import sqlite3
 import ssl
 import time
@@ -16,6 +17,7 @@ from typing import Any
 import pytest
 from ocpp_hub_core.prototype import managed_charging as charge_tests
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
@@ -23,6 +25,7 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
 from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
 from tests.handover_helpers import crash
 from tests.managed_rig import OwnerBench, healthy, introduced, managed_bench, managed_session, starts
+from tests.management_peer import TOKEN
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
@@ -101,9 +104,12 @@ async def test_first_timed_flow_retries_atomic_publication(tmp_path, tls, unused
             j.db.execute("DROP TRIGGER refuse_test_flow")
         clock[0] += 5
         assert (await healthy(c))["power_w"] > 10
-        assert c.charging.state()["state"] == "charging"
-        assert c.charging.state()["flow_started_at"] == first_flow.observed_at
-        assert c.requests.receipt(identifier)["state"] == "completed"
+        state, receipt = c.charging.state(), c.requests.receipt(identifier)
+        assert state["state"] == "charging" and state["local_transaction"] == local
+        assert state["flow_started_at"] == first_flow.observed_at
+        assert state["stop_deadline_epoch"] == first_flow.observed_at + 60
+        assert receipt["state"] == "completed"
+        assert receipt["result"] == {"positive_power_verified": True, "duration_seconds": 60}
         assert lease.deadline == first_flow.deadline == deadline + 1
         assert len(starts(test.rig)) == 1
         c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
@@ -130,6 +136,7 @@ async def test_cloud_arm_waits_for_real_cloud_start_and_positive_native_power(
         assert status["power_w"] == 1440 and test.controller.charging.state()["state"] == "charging"
         assert test.controller.charging.state()["start_source_verified"]
         assert test.controller.charging.summary()["source"] == "cloud"
+        assert test.controller.requests.receipt(identifier) == reply
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         assert (await actual_stop(test, local))["local_hold_verified"]
         assert len(starts(test.rig)) == 1
@@ -191,10 +198,11 @@ async def test_pause_preempts_queued_start_before_actual_send(
 
             # Preserve independent native HTTP validation while pausing just before the real Start send.
             async def delayed_validate(action: str, payload: dict[str, Any]) -> GateDecision | None:
+                decision = await actual_validate(action, payload)
                 if action == "RemoteStartTransaction":
                     entered.set()
                     await proceed.wait()
-                return await actual_validate(action, payload)
+                return decision
 
             monkeypatch.setattr(test.session.gateway.charger, "validate_send", delayed_validate)
         identifier = uuid.uuid4().hex
@@ -202,9 +210,23 @@ async def test_pause_preempts_queued_start_before_actual_send(
         try:
             if boundary != "immediate":
                 await asyncio.wait_for(entered.wait(), 3)
-            test.controller.command(uuid.uuid4().hex, "pause", 0)
             count = len(test.rig.bench.received_limits)
-            proceed.set()
+            if boundary == "native_send":
+                api = ManagementServer(
+                    ManagementSettings(19001, tmp_path / "unused", TOKEN), test.controller, lambda: {}
+                )
+                proceed.set()  # The real native check is ready to let the Start continue.
+                pending_pause = asyncio.create_task(
+                    api.dispatch(json.dumps({"id": uuid.uuid4().hex, "command": "pause", "revision": 0})),
+                    eager_start=True,
+                )
+                assert pending_pause.done()  # Revoke Start before yielding to its ready native check.
+                pause = await pending_pause
+                assert pause["result"]["state"] == "accepted"
+                assert test.controller.requests.intent().mode == "paused" and not starts(test.rig)
+            else:
+                test.controller.command(uuid.uuid4().hex, "pause", 0)
+                proceed.set()
             await test.controller.charging.settle()
             if boundary == "native_send":
                 await until(lambda: test.rig.bench.firmware.effective_limit() == 0)
@@ -378,6 +400,14 @@ async def test_unrelated_timer_flow_cannot_prove_cloud_start(
         assert test.controller.charging.state()["state"] == "armed"
         assert not test.controller.charging.state().get("start_source_verified")
         assert not test.controller.requests.receipt(identifier)["result"].get("positive_power_verified")
+        charging = test.controller.charging
+        assert charging.lease is not None and charging.timer is not None
+        charging.lease.deadline = time.monotonic() - 1
+        charging.changed.set()
+        await asyncio.wait_for(charging.timer, 3)
+        assert charging.state()["state"] == "completed" and charging.lease is None
+        assert test.session.journal.active() == local and test.rig.bench.firmware.current == 6
+        assert not test.rig.bench.remote_stop.is_set()
         test.controller.command(uuid.uuid4().hex, "pause", 0)
         assert (await actual_stop(test, local))["local_hold_verified"]
 

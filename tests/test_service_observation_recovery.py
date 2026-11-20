@@ -1,11 +1,16 @@
 """Production service polls recover optional-storage, Pause and cancelled-Start failures without helper ticks."""
 
 import asyncio
+import json
+import sqlite3
+import threading
 import time
 import uuid
 
 import pytest
+from ocpp_hub_core.prototype import managed_view
 from ocpp_hub_core.prototype.local_control import LocalControl
+from ocpp_hub_core.prototype.ordinary_recovery import SOURCE
 
 from tests.charge_rig import positive_flow
 from tests.managed_rig import starts
@@ -14,6 +19,169 @@ from tests.runtime_rig import until
 from tests.service_recovery_helpers import running_service
 from tests.test_worker_storage_recovery import failing_cleanup
 from tests.tls_support import tls as tls
+from tools import managed_proxy
+
+
+# Intent: a failing status projection leaves the running command supervisor and charge untouched.
+# Why: rendering follows supervision and may access reporting-only journal data.
+async def test_failed_poll_projection_keeps_observing_charge(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        b = service.charge
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        before = await service.published(state="healthy", power=True)
+        original = managed_view.observed_status
+
+        # Fail only the disposable view. The actual service poll, native evidence and wire paths run unchanged.
+        def unavailable(*args):
+            raise sqlite3.OperationalError("simulated reporting read failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(managed_view, "observed_status", unavailable)
+            observed = await service.published(before["checked_at"], state="degraded")
+            assert observed["fault"] == "status_unavailable"
+            assert observed["owner_control_enabled"] is False
+            live = await call(service.api, "status")
+            assert live["ok"] and live["result"]["fault"] == "status_unavailable"
+            assert live["result"]["owner_control_enabled"] is False
+            assert b.session.journal.active() == local
+            assert b.rig.bench.firmware.current == 6 and not b.rig.bench.remote_stop.is_set()
+        assert managed_view.observed_status is original
+        await service.published(observed["checked_at"], state="healthy", power=True)
+
+
+# A failed source-record write cannot stop a verified ordinary charge or renew its continuation proof.
+async def test_failed_source_publication_keeps_existing_charge(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        b = service.charge
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        before = await service.published(state="healthy", power=True)
+        journal = b.session.journal
+        saved = journal.get(SOURCE)
+        journal.db.execute(
+            f"CREATE TEMP TRIGGER block_source BEFORE INSERT ON meta WHEN NEW.key='{SOURCE}' "
+            "BEGIN SELECT RAISE(ABORT, 'simulated source write failure'); END"
+        )
+        try:
+            degraded = await service.published(before["checked_at"], state="degraded")
+            assert degraded["fault"] == "native_observation_unavailable"
+            assert journal.get(SOURCE) == saved
+            assert journal.active() == local and b.rig.bench.firmware.current == 6
+            assert not b.rig.bench.remote_stop.is_set() and not service.task.done() and not journal.db.in_transaction
+        finally:
+            if not service.task.done():
+                journal.db.execute("DROP TRIGGER block_source")
+        await service.published(degraded["checked_at"], state="healthy", power=True)
+
+
+# Intent: real SQLite refusal while counting queued reports does not stop a healthy service.
+# Why: the count describes an observation and carries no charger authority.
+@pytest.mark.parametrize("charging", [False, True], ids=["idle", "daily"])
+async def test_reporting_count_refusal_keeps_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, charging):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        b = service.charge
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex) if charging else None
+        before = await service.published(state="healthy", power=charging)
+        db = b.session.journal.db
+        refusals = []
+
+        # Deny the aggregate while the idle reporting pass runs. Ordinary lifecycle SQL remains available.
+        def authorize(action, first, second, database, trigger):
+            if action == sqlite3.SQLITE_FUNCTION and second == "count":
+                refusals.append(second)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        db.set_authorizer(authorize)
+        try:
+            observed = await service.published(before["checked_at"], state="healthy", power=charging)
+            assert refusals and observed["pending_lifecycle_events"] is None
+            assert observed["diagnostics"]["available"] is False
+            assert db.in_transaction is False and not service.task.done()
+            live = await call(service.api, "status")
+            assert live["ok"] and live["result"]["healthy"] and live["result"]["can_pause"]
+            assert not live["result"]["can_start"]
+            assert b.session.journal.active() == local and not b.rig.bench.remote_stop.is_set()
+        finally:
+            if not service.task.done():
+                db.set_authorizer(None)
+        recovered = await service.published(observed["checked_at"], state="healthy", power=charging)
+        assert recovered["pending_lifecycle_events"] == 0 and recovered["diagnostics"]["available"] is True
+
+
+# Intent: a failed Start authorization status read leaves an active scheduled charge healthy.
+# Why: the dashboard's explanation must not turn an optional cache read into a service shutdown and Stop.
+async def test_start_authorization_status_read_failure_keeps_service(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        b = service.charge
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        before = await service.published(state="healthy", power=True)
+        assert before["start_authorization"] == "ready"
+        db = b.session.journal.db
+        cache_refused = False
+
+        # Refuse only reads of the authorization cache. The admitted transaction and its evidence remain available.
+        def authorize(action, table, column, database, trigger):
+            nonlocal cache_refused
+            if action == sqlite3.SQLITE_READ and (table, column) == ("auth_info", "info"):
+                cache_refused = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        db.set_authorizer(authorize)
+        try:
+            observed = await service.published(before["checked_at"], state="healthy", power=True)
+            assert cache_refused and observed["start_authorization"] is None
+            live = await call(service.api, "status")
+            assert live["ok"] and live["result"]["healthy"] and live["result"]["can_pause"]
+            assert live["result"]["start_authorization"] is None and not live["result"]["can_start"]
+            assert b.session.journal.active() == local and not b.rig.bench.remote_stop.is_set()
+        finally:
+            if not service.task.done():
+                db.set_authorizer(None)
+        recovered = await service.published(observed["checked_at"], state="healthy", power=True)
+        assert recovered["start_authorization"] == "ready"
+
+
+# Intent: a held status-file write cannot delay an actual Pause or its verified result.
+# Why: disk output and charger supervision used to execute on the same thread.
+async def test_blocked_status_write_does_not_delay_pause(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    loop = asyncio.get_running_loop()
+    held, release = asyncio.Event(), threading.Event()
+    delay = threading.Event()
+    save = managed_proxy.save_private
+
+    # Block only the real reporting sink. Never replace a charger or engine operation.
+    def slow_status(path, status):
+        if path.name.endswith(".status.json") and delay.is_set():
+            loop.call_soon_threadsafe(held.set)
+            assert release.wait(18)
+        save(path, status)
+
+    monkeypatch.setattr(managed_proxy, "save_private", slow_status)
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        b = service.charge
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await service.published(state="healthy", power=True)
+        delay.set()
+        try:
+            await asyncio.wait_for(held.wait(), 8)
+            request = uuid.uuid4().hex
+            revision = b.controller.requests.intent().revision
+            assert (await call(service.api, "pause", id=request, revision=revision))["ok"]
+            await asyncio.wait_for(b.rig.bench.remote_stop.wait(), 3)
+            await service.close_daily(local)
+            await until(lambda: b.controller.requests.receipt(request)["state"] == "completed", 8)
+            assert b.rig.bench.firmware.effective_limit() == 0
+            row = b.session.journal.db.execute("SELECT result FROM managed_requests WHERE id=?", (request,)).fetchone()
+            evidence = json.loads(row["result"])
+            assert evidence["_pause"]["local"] == evidence["_stop"]["local"] == local
+            assert evidence["_stop"]["boot"] == b.session.gateway.boot_observation
+            assert "_stop" not in b.controller.requests.receipt(request)["result"]
+        finally:
+            release.set()
+        assert (await service.published(state="healthy", desired="paused"))["local_hold_verified"]
 
 
 # Intent: a failed optional diagnostic never exits serve or stops its independently known daily session.

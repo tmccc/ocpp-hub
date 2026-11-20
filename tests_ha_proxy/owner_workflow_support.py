@@ -63,19 +63,20 @@ class HomeAssistantProcess:
             assert self.process.returncode == 0, self.log.read_text()[-6000:]
 
 
-class LostPauseReply:
-    """Forward each local HA exchange to the real proxy and withhold one Pause reply."""
+class LostCommandReply:
+    """Forward local HA exchanges to the real proxy and withhold one command reply."""
 
     # Capture owner commands without changing their IDs, revisions or response bodies.
-    def __init__(self, child, proxy_first):
-        self.child, self.proxy_first = child, proxy_first
+    def __init__(self, child, command, *, commit_gate=None):
+        self.child, self.command, self.commit_gate = child, command, commit_gate
         self.control_requests = []
-        self.pause_ready = asyncio.Event()
+        self.receipt_requests = []
+        self.command_ready = asyncio.Event()
         self.reply_ready = asyncio.Event()
         self.drop_reply = asyncio.Event()
-        self.pause_reply = None
+        self.command_reply = None
 
-    # Pass one request and its reply unchanged, except for the selected Pause response.
+    # Pass one request and its reply unchanged, except for the selected command response.
     async def endpoint(self, request):
         socket = web.WebSocketResponse(protocols=["ics-proxy.v1"])
         await socket.prepare(request)
@@ -84,8 +85,10 @@ class LostPauseReply:
             return socket
         value = message.json()
         command = value["command"]
-        first_pause = command == "pause" and not self.pause_ready.is_set()
-        if command not in ("status", "history", "receipt"):
+        selected = command == self.command and not self.command_ready.is_set()
+        if command == "receipt":
+            self.receipt_requests.append(value)
+        elif command not in ("status", "history"):
             self.control_requests.append(value)
         try:
             async with connect(
@@ -94,16 +97,16 @@ class LostPauseReply:
                 subprotocols=["ics-proxy.v1"],
                 proxy=None,
             ) as peer:
-                if first_pause and self.proxy_first:
-                    await self.child.arm("after-pause-request-commit", value["id"])
+                if selected and self.commit_gate is not None:
+                    await self.child.arm(self.commit_gate, value["id"])
                 await peer.send(message.data)
-                if first_pause:
-                    self.pause_ready.set()
+                if selected:
+                    self.command_ready.set()
                 reply = await peer.recv()
         except OSError, ConnectionClosed:
             return socket
-        if first_pause:
-            self.pause_reply = json.loads(reply)
+        if selected:
+            self.command_reply = json.loads(reply)
             self.reply_ready.set()
             await self.drop_reply.wait()
             return socket

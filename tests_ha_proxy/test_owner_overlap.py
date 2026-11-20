@@ -1,6 +1,7 @@
 """Actual Home Assistant commands at the proxy's owner-control boundaries."""
 
 import asyncio
+from contextlib import AsyncExitStack
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
@@ -14,6 +15,7 @@ from tests.recovery_barriers import require_zero_held
 from tests.test_managed_current_tick_race import OneNativeResponseGate
 from tests_ha_proxy.conftest import actual_core
 from tests_ha_proxy.owner_workflow_child import press, view
+from tests_ha_proxy.owner_workflow_support import LostCommandReply
 from tests_ha_proxy.test_client import setup
 
 CURRENT = "number.ics_proxy_charge_current_a"
@@ -40,6 +42,60 @@ def saved_request(proxy, identifier):
 # Invoke the same registered number service an owner uses.
 async def select_current(hass, value):
     await hass.services.async_call("number", "set_value", {"entity_id": CURRENT, "value": value}, blocking=True)
+
+
+# Intent: HA recovers a 16 A command whose initial reply disappears after the real proxy applies it.
+# Why: the saved result must settle the original UI action without a second charger write.
+async def test_owner_current_recovers_reply_after_charger_applies_limit(
+    tmp_path, model_tls, unused_tcp_port_factory, monkeypatch
+):
+    async with (
+        process_rig(
+            tmp_path,
+            tls_for_case(tmp_path, model_tls),
+            unused_tcp_port_factory(),
+            unused_tcp_port_factory(),
+            monkeypatch,
+            32,
+            timing="fast-poll",
+        ) as proxy,
+        actual_core(tmp_path / "ha") as hass,
+        AsyncExitStack() as cleanup,
+    ):
+        await proxy.start()
+        await proxy.status(lambda data: data["can_set_current"] and data["station_ceiling_a"] == 32)
+        relay = LostCommandReply(proxy, "set_current")
+        port = await relay.start()
+        cleanup.push_async_callback(relay.close)
+        entry = await setup(hass, {"port": port})
+        baseline = len(proxy.rig.bench.device_calls)
+        selection = asyncio.create_task(select_current(hass, 16))
+        try:
+            await asyncio.wait_for(relay.reply_ready.wait(), 5)
+            (command,) = relay.control_requests
+            assert relay.command_reply["result"]["id"] == command["id"]
+            assert relay.command_reply["result"]["state"] == "accepted"
+            receipt = await proxy.completed_control(command["id"])
+            assert receipt["result"] == {"current_a": 16, "charging_started": False}
+            await proxy.status(lambda data: data["can_set_current"] and data["station_ceiling_a"] == 16)
+            assert proxy.rig.bench.firmware.effective_limit() == 16 and not selection.done()
+            relay.drop_reply.set()
+            await selection
+            await entry.runtime_data.async_refresh()
+            assert float(hass.states.get(CURRENT).state) == 16
+            (lookup,) = relay.receipt_requests
+            assert lookup["request_id"] == command["id"] and lookup["id"] != command["id"]
+            assert relay.control_requests == [command]
+            assert [
+                frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"]
+                for frame in proxy.rig.bench.device_calls[baseline:]
+                if frame[2] == "SetChargingProfile"
+            ] == [16]
+            assert not starts(proxy.rig)
+        finally:
+            if not selection.done():
+                selection.cancel()
+            await asyncio.gather(selection, return_exceptions=True)
 
 
 # Wait for fresh Resume and number availability before trusting the display.
@@ -89,7 +145,6 @@ async def test_owner_current_and_delayed_return_yield_to_pause(
                 return_waiting.set()
                 await forward_return.wait()
             elif command == "set_current":
-
                 # The held reply is from the independent native peer after this exact commit.
                 def pending():
                     change = proxy.durable()["metadata"]["managed_current_change"]

@@ -11,7 +11,7 @@ from tests.model_tls_support import tls_for_case
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import process_rig
 from tests.recovery_barriers import require_zero_held
-from tests_ha_proxy.owner_workflow_support import HomeAssistantProcess, LostPauseReply
+from tests_ha_proxy.owner_workflow_support import HomeAssistantProcess, LostCommandReply
 
 
 # Keep commissioning's saved requests outside the count of the owner's test presses.
@@ -56,7 +56,7 @@ async def test_owner_pause_with_missing_reply_and_restarts(
         proxy_pid = proxy.process.pid
         await proxy.status()
         baseline = {row["id"] for row in proxy.durable()["requests"]}
-        relay = LostPauseReply(proxy, proxy_first)
+        relay = LostCommandReply(proxy, "pause", commit_gate="after-pause-request-commit" if proxy_first else None)
         hass = HomeAssistantProcess(tmp_path, await relay.start())
         cleanup.push_async_callback(relay.close)
         cleanup.push_async_callback(hass.stop)
@@ -68,16 +68,16 @@ async def test_owner_pause_with_missing_reply_and_restarts(
         # Home Assistant does not complete its press while the saved Pause is being observed.
         press = asyncio.create_task(hass.request("pause"))
         try:
-            await asyncio.wait_for(relay.pause_ready.wait(), 5)
+            await asyncio.wait_for(relay.command_ready.wait(), 5)
             (pause,) = relay.control_requests
             if proxy_first:
                 gate = await proxy.gate("after-pause-request-commit", pause["id"])
                 assert gate["transaction_open"] is False and not relay.reply_ready.is_set()
             else:
                 await asyncio.wait_for(relay.reply_ready.wait(), 5)
-                assert relay.pause_reply["ok"] is True
-                assert relay.pause_reply["id"] == relay.pause_reply["result"]["id"] == pause["id"]
-                assert relay.pause_reply["result"]["state"] == "accepted"
+                assert relay.command_reply["ok"] is True
+                assert relay.command_reply["id"] == relay.command_reply["result"]["id"] == pause["id"]
+                assert relay.command_reply["result"]["state"] == "accepted"
             assert not press.done()
             snapshot = proxy.durable()
             (saved,) = added_requests(snapshot, baseline)
@@ -93,7 +93,12 @@ async def test_owner_pause_with_missing_reply_and_restarts(
             else:
                 relay.drop_reply.set()
             result = await press
-            assert "outcome is unknown" in result.get("error", ""), result
+            if proxy_first:
+                assert "outcome is unknown" in result.get("error", ""), result
+            else:
+                assert result == {"ok": True}
+            assert relay.receipt_requests
+            assert {read["request_id"] for read in relay.receipt_requests} == {pause["id"]}
         finally:
             relay.drop_reply.set()
             if not press.done():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import re
@@ -18,6 +19,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
+from .command_processor import CommandPriority
 from .ics import unique_object
 from .managed import ManagedController
 from .managed_view import refresh_for_read, session_history
@@ -66,7 +68,9 @@ class ManagementServer:
         self.settings, self.controller, self.status = settings, controller, status
         self.server: Server | None = None
         self.clients: set[ServerConnection] = set()
+        self.idle: dict[ServerConnection, None] = {}
         self.recent: deque[float] = deque()
+        self.recent_pauses: deque[float] = deque()
 
     # Reject browser origins, duplicate credentials, wrong paths/hosts and actual non-loopback peers before upgrade.
     def authorize(self, connection: ServerConnection, request: Request) -> Response | None:
@@ -85,26 +89,30 @@ class ManagementServer:
         return None
 
     # Validation and rate bounds run before any intent, receipt or physical control can change.
-    def dispatch(self, text: str | bytes) -> dict[str, Any]:
-        now = time.monotonic()
-        while self.recent and self.recent[0] <= now - 1:
-            self.recent.popleft()
-        if len(self.recent) >= 30:
-            raise UnavailableError("management request rate exceeded")
-        self.recent.append(now)
+    async def dispatch(self, text: str | bytes) -> dict[str, Any]:
         if not isinstance(text, str) or len(text.encode()) > 2048:
+            self.limit_requests(self.recent)
             raise SecurityError("management requires a bounded text object")
         try:
             value = json.loads(text, object_pairs_hook=unique_object)
         except ValueError, RecursionError:
+            self.limit_requests(self.recent)
             raise SecurityError("management JSON is malformed") from None
         if (
             not isinstance(value, dict)
             or not isinstance(value.get("id"), str)
             or not re.fullmatch(r"[a-f0-9]{32}", value["id"])
         ):
+            self.limit_requests(self.recent)
             raise SecurityError("management identifier is invalid")
         command = value.get("command")
+        pause = (
+            command == "pause"
+            and set(value) == {"id", "command", "revision"}
+            and type(value["revision"]) is int
+            and 0 <= value["revision"] < 2**53
+        )
+        self.limit_requests(self.recent_pauses if pause else self.recent)
         if command in ("status", "history") and set(value) == {"id", "command"}:
             return self.read_only(value["id"], command)
         if command == "receipt" and set(value) == {"id", "command", "request_id"}:
@@ -120,7 +128,12 @@ class ManagementServer:
         if set(value) != fields:
             raise SecurityError("management command is not supported")
         try:
-            result = self.controller.command(value["id"], command, value["revision"], current_a=value.get("current_a"))
+            result = await self.controller.commands.run(
+                lambda: self.controller.command(
+                    value["id"], command, value["revision"], current_a=value.get("current_a")
+                ),
+                priority=CommandPriority.RESTRICT if command == "pause" else CommandPriority.NORMAL,
+            )
         except sqlite3.Error:
             # An absent receipt outside a transaction proves this request was not admitted.
             if not self.controller.session.journal.db.in_transaction:
@@ -131,7 +144,20 @@ class ManagementServer:
                     pass
             # A reply read can fail after admission commits. The client may look up the receipt.
             return {"id": value["id"], "ok": False, "error": "outcome_unknown"}
-        return {"id": value["id"], "ok": True, "result": result}
+        binding = {"revision": value["revision"]}
+        if command == "set_current":
+            binding["current_a"] = value["current_a"]
+        return {"id": value["id"], "ok": True, "result": {**result, **binding}}
+
+    # Reserve Pause capacity independently of dashboard requests and other controls.
+    @staticmethod
+    def limit_requests(recent: deque[float]) -> None:
+        now = time.monotonic()
+        while recent and recent[0] <= now - 1:
+            recent.popleft()
+        if len(recent) >= 30:
+            raise UnavailableError("management request rate exceeded")
+        recent.append(now)
 
     # A failed journal read returns no guessed state; sent controls retain their separate unknown-outcome handling.
     def read_only(self, identifier: str, command: str, *, request_id: str | None = None) -> dict[str, Any]:
@@ -139,7 +165,7 @@ class ManagementServer:
             if command == "receipt":
                 if request_id is None:
                     raise SecurityError("management receipt identifier is missing")
-                result: Any = self.controller.requests.receipt(request_id)
+                result: Any = self.controller.requests.receipt(request_id, include_binding=True)
             elif command == "history":
                 result = {"sessions": session_history(self.controller.session.journal)}
             elif command == "status":
@@ -152,14 +178,32 @@ class ManagementServer:
 
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:
+        displaced = None
         if len(self.clients) >= 4:
-            await connection.close(1013, "Busy")
-            return
+            displaced = next(iter(self.idle), None)
+            if displaced is None:
+                await connection.close(1013, "Busy")
+                return
+            self.idle.pop(displaced)
+            self.clients.remove(displaced)
         self.clients.add(connection)
         try:
-            async for text in connection:
+            if displaced is not None:
+                await displaced.close(1013, "Idle connection replaced")
+            while connection in self.clients:
+                self.idle[connection] = None
                 try:
-                    response = self.dispatch(text)
+                    async with asyncio.timeout(30):
+                        text = await connection.recv()
+                except TimeoutError:
+                    await connection.close(1000, "Idle")
+                    return
+                finally:
+                    self.idle.pop(connection, None)
+                if connection not in self.clients:
+                    return  # A displaced reader cannot admit work after releasing its slot.
+                try:
+                    response = await self.dispatch(text)
                 except SecurityError, DeniedError:
                     response = {"ok": False, "error": "invalid_request"}
                 except RecoveryRequiredError, UnavailableError:

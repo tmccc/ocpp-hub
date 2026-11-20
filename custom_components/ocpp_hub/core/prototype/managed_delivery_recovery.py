@@ -14,8 +14,9 @@ from .control_state import ControlState
 from .events import OBSERVATION_ACTIONS
 from .managed_current import managed_current_ceiling
 from .managed_denial_faults import DELIVERY_MAPPINGS as KEY
-from .managed_denial_faults import operator_for_queued_start, operator_mapping_members_match
+from .managed_denial_faults import operator_for_queued_lifecycle, operator_mapping_members_match
 from .managed_intent import unfinished_owner_requests
+from .managed_start_delivery import retire_start_retry
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
 from .security import SecurityError
@@ -204,11 +205,13 @@ def require_queued_backlog(j: Journal, head: Delivery) -> None:
 
 
 # A later Start may be reconciled alongside an already wire-settled operator recovery for an earlier session.
-def delivery_source(j: Journal, fault: dict[str, Any], head: Delivery) -> tuple[dict[str, Any], str | None]:
+def delivery_source(
+    j: Journal, spec: NativeBoundedSpec, fault: dict[str, Any], head: Delivery
+) -> tuple[dict[str, Any], str | None]:
     if fault.get("classification") == FAULT:
         return fault, None
-    operator = operator_for_queued_start(j, fault, head)
-    if operator is not None:
+    operator = operator_for_queued_lifecycle(j, fault, head)
+    if operator is not None and operator["anchor"] == delivery_anchor(j, spec):
         return operator["prior"]["fault"], fault["proof"]
     raise RecoveryRequiredError("the Start belongs to a different or unfinished operator recovery")
 
@@ -219,7 +222,7 @@ def delivery_candidate(j: Journal, book: ResourceBook, spec: NativeBoundedSpec, 
     fault, head = j.fault.read({}), j.next_delivery()
     if head is None or head.action != "StartTransaction" or head.state not in ("ambiguous", "rejected"):
         raise RecoveryRequiredError("the delivery head is not one ambiguous managed Start")
-    source, _ = delivery_source(j, fault, head)
+    source, _ = delivery_source(j, spec, fault, head)
     if any(proof["prior_fault"] != source for proof in pending_delivery_proofs(j)):
         raise RecoveryRequiredError("earlier Start mappings belong to a different recovery")
     require_queued_backlog(j, head)
@@ -247,6 +250,8 @@ def reconcile_delivery_start(
             j, existing["proof"]
         ):
             raise RecoveryRequiredError("earlier delivery evidence cannot be replaced")
+        if j.db.execute("SELECT 1 FROM outbox WHERE token=?", (evidence.start_token,)).fetchone() is None:
+            retire_start_retry(j, evidence.start_token, evidence.local, evidence.start_digest)
         return {
             "mapping_recorded": True,
             "already_recorded": True,
@@ -263,7 +268,7 @@ def reconcile_delivery_start(
     anchor, fault = delivery_anchor(j, spec), j.fault.read({})
     head = j.next_delivery()
     assert head is not None
-    source, parent = delivery_source(j, fault, head)
+    source, parent = delivery_source(j, spec, fault, head)
     normal = j.get("managed_test_charge") if closed_normal_delivery(j) else None
     proof = {
         "version": 2,

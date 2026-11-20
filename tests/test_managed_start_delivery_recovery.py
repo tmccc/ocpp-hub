@@ -157,11 +157,25 @@ async def test_start_retry_can_itself_fail_and_recover(
             j = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
             j.mark_sent(j.next_delivery())
             j.close()
-            j = Journal(rig.prepared.config.journal, rig.prepared.config.identity)
-            assert j.next_delivery().state == "ambiguous"
+            journal_path = rig.prepared.config.journal
+            raw = journal_path.read_bytes()
+            # Both inspection passes must normalize the same private copy, leaving the real head inflight.
+            args = (tmp_path / "trial.json", strategy_file(rig, tmp_path))
+            port = rig.prepared.observer.port
+            certificate = rig.prepared.config.certificate
+            displaced = tmp_path / "unused-ocpp-certificate.pem"
+            certificate.rename(displaced)
+            try:
+                assert await operator.run("inspect", *args, None, port, kind="start-delivery") == 0
+            finally:
+                displaced.rename(certificate)
+            inspected = json.loads(capsys.readouterr().out.splitlines()[-1])["candidate"]
+            assert journal_path.read_bytes() == raw
+            assert (await approve_retry(rig, tmp_path, capsys)) == inspected
+            j = Journal(journal_path, rig.prepared.config.identity)
+            assert j.next_delivery().state == "queued"
             assert any(entry.get("superseded") for entry in j.get(KEY).values())
             j.close()
-            await approve_retry(rig, tmp_path, capsys)
         plan = (
             ["error"]
             if recovery_fault == "error-once"

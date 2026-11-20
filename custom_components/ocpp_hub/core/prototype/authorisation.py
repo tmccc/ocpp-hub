@@ -17,13 +17,19 @@ class VendorAuthorisation:
         self.journal, self.ttl = journal, ttl
 
     # Arm one authenticated start before forwarding so a nested Authorize can be answered without deadlock.
-    def reserve(self, tag: str) -> str:
+    def reserve(self, tag: str, *, prepared: bool = False) -> str:
         previous = self.journal.get("vendor_start_grant", {})
         if previous and previous.get("local") is None:
             raise ConflictError("an earlier vendor start is still awaiting a transaction")
         token = uuid.uuid4().hex
         self.journal.put(
-            "vendor_start_grant", {"digest": tag_key(tag), "expires": time.time() + self.ttl, "token": token}
+            "vendor_start_grant",
+            {
+                "digest": tag_key(tag),
+                "expires": time.time() + self.ttl,
+                "token": token,
+                **({"prepared": True} if prepared else {}),
+            },
         )
         return token
 
@@ -33,19 +39,27 @@ class VendorAuthorisation:
         return bool(grant) and grant.get("local") is None
 
     # A grant authorises only its bounded pending start or the currently open transaction bound to that grant.
-    def allows(self, tag: str) -> bool:
+    def allows(self, tag: str, *, issuing: str | None = None) -> bool:
         grant = self.journal.get("vendor_start_grant", {})
-        if grant.get("digest") != tag_key(tag):
+        if grant.get("digest") != tag_key(tag) or (grant.get("prepared") is True and grant.get("token") != issuing):
             return False
         local = grant.get("local")
         return (local is None and grant.get("expires", 0) > time.time()) or (
             local is not None and self.journal.active() == local
         )
 
+    # Only the actual wire owner can make its prepared grant available to incoming charger reports.
+    def issue(self, token: str) -> None:
+        grant = self.journal.get("vendor_start_grant", {})
+        if grant.get("token") != token or grant.get("prepared") is not True:
+            raise ConflictError("vendor Start no longer owns the prepared authorization grant")
+        grant.pop("prepared")
+        self.journal.put("vendor_start_grant", grant)
+
     # Bind once; a subsequent transaction cannot reuse the pending grant after its original session stops.
     def consume(self, tag: str, local: int) -> None:
         grant = self.journal.get("vendor_start_grant", {})
-        if grant.get("digest") == tag_key(tag):
+        if grant.get("digest") == tag_key(tag) and grant.get("prepared") is not True:
             self.journal.put("vendor_start_grant", {**grant, "local": local})
 
     # An actual refusal revokes this request only, never a replacement's newer grant.

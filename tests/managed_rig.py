@@ -39,7 +39,7 @@ class OwnerBench(Bench):
 
 
 class CloudReplyPeer:
-    """Only the independent cloud's Stop response changes; engine, journal and TLS transport stay real."""
+    """Vary selected independent cloud replies while the engine, journal and TLS transport stay real."""
 
     # Record actions by actual correlated RPC identity before the peer sends its response.
     def __init__(self, connection, bench):
@@ -62,24 +62,30 @@ class CloudReplyPeer:
     # A retry still needs a real response on this socket; operator proof cannot manufacture that response.
     async def send(self, raw):
         frame = decode(raw)
-        if frame[0] == 3 and self.actions.get(frame[1]) == "StopTransaction":
+        action = self.actions.get(frame[1])
+        if frame[0] == 3 and action == "StopTransaction":
             gate = getattr(self.bench, "stop_gate", None)
             if gate is not None and not gate.is_set():
                 waits = getattr(self.bench, "held_stop_replies", [])
                 self.bench.held_stop_replies = [*waits, frame[1]]
                 await gate.wait()
             info = getattr(self.bench, "stop_info", None)
+            result = getattr(self.bench, "stop_result", None)
             if getattr(self.bench, "stop_error", False):
                 raw = build_call_error(frame[1], "InternalError", "synthetic cloud refusal")
+            elif result is not None:
+                raw = build_call_result(frame[1], result)
             elif info is not None:
                 raw = build_call_result(frame[1], {"idTagInfo": info})
+        elif frame[0] == 3 and action == "Authorize" and (info := getattr(self.bench, "authorize_info", None)):
+            raw = build_call_result(frame[1], {"idTagInfo": info})
         await self.connection.send(raw)
 
 
 class ReplyBench(OwnerBench):
     """Use the same independent cloud implementation behind its transparent response wrapper."""
 
-    # Keep ordinary cloud Boot/Authorize/Start behavior, changing only the final Stop reply at the peer.
+    # Keep ordinary cloud behavior unless a test supplies a specific reply.
     async def vendor(self, connection):
         await super().vendor(CloudReplyPeer(connection, self))
 

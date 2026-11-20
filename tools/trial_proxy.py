@@ -8,8 +8,12 @@ import asyncio
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -37,14 +41,20 @@ from ocpp_hub_core.prototype.native_bounded import (  # noqa: E402
     capture_native_bounded_baseline,
 )
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
-from ocpp_hub_core.prototype.store import fingerprint  # noqa: E402
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver  # noqa: E402
-from ocpp_hub_core.prototype.trial_session import PreparedTrial, TrialSession, preflight, save_private  # noqa: E402
+from ocpp_hub_core.prototype.trial_session import (  # noqa: E402
+    PreparedNative,
+    TrialSession,
+    preflight,
+    save_private,
+)
 
 
 # Loading a native strategy is dormant and must match both the original baseline and the actual listener settings.
-def native_spec(path: Path, prepared: PreparedTrial) -> NativeBoundedSpec:
+def native_spec(path: Path, prepared: PreparedNative) -> NativeBoundedSpec:
+    prepared.config.check_paths(path)
     spec = NativeBoundedSpec.parse(private_json(path))
     config, route = prepared.config, spec.trial_route
     if (
@@ -57,6 +67,33 @@ def native_spec(path: Path, prepared: PreparedTrial) -> NativeBoundedSpec:
     ):
         raise SecurityError("native bounded strategy does not match the configured commissioning listener")
     return spec
+
+
+# A stopped inspection runs normal recovery checks on a private copy, with the original owner lock held.
+@contextmanager
+def operator_journal(config: TrialConfig, *, inspect: bool) -> Iterator[Journal]:
+    if not inspect:
+        with closing(Journal(config.journal, config.identity)) as journal:
+            yield journal
+        return
+
+    import fcntl
+
+    original = config.journal
+    with Path(str(original) + ".lock").open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RecoveryRequiredError("journal already has an active owner") from None
+        with tempfile.TemporaryDirectory(prefix="ics-journal-inspect-") as temporary:
+            copy = Path(temporary) / original.name
+            shutil.copyfile(original, copy)
+            # Copy committed WAL frames without opening SQLite on the original or rebuilding its -shm file.
+            wal = Path(str(original) + "-wal")
+            if wal.exists():
+                shutil.copyfile(wal, Path(str(copy) + "-wal"))
+            with closing(Journal(copy, config.identity)) as journal:
+                yield journal
 
 
 # Write only safe classified JSON; neither exception text nor configuration objects are printed.

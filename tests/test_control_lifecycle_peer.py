@@ -22,7 +22,7 @@ async def test_legacy_app_return_uses_actual_healthy_status(tmp_path, tls, unuse
         c.requests.accept(identifier, "app_control", expected.revision)
         c.requests.finish(identifier, state, {"legacy": True})
         before = c.requests.receipt(identifier)
-        limits, start_calls = list(b.rig.bench.received_limits), starts(b.rig)
+        calls = list(b.rig.bench.device_calls)
         status = await c.tick()
         assert status["state"] == "healthy" and status["owner_control_enabled"]
         assert c.requests.intent() == expected
@@ -35,8 +35,32 @@ async def test_legacy_app_return_uses_actual_healthy_status(tmp_path, tls, unuse
             }
         else:
             assert c.requests.receipt(identifier) == before
-        assert b.rig.bench.received_limits == limits and starts(b.rig) == start_calls
+        assert b.rig.bench.device_calls == calls
         assert j.active() is None
+
+
+# Intent: the regular poll rejects a stale saved Return and leaves the current Pause in force.
+# Why: an older accepted receipt cannot give the proxy permission to send any charger command.
+async def test_stale_saved_return_keeps_verified_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        intent, identifier = c.requests.intent(), uuid.uuid4().hex
+        c.command(identifier, "app_control", intent.revision)
+        # Model a saved Return from before the current Pause revision.
+        j.db.execute("UPDATE managed_requests SET revision=? WHERE id=?", (intent.revision - 1, identifier))
+        calls = list(b.rig.bench.device_calls)
+
+        assert (await c.tick())["local_hold_verified"]
+        assert c.requests.intent() == intent
+        assert c.requests.receipt(identifier) == {
+            "id": identifier,
+            "action": "app_control",
+            "state": "failed",
+            "result": {"classification": "stale_revision"},
+        }
+        assert b.rig.bench.firmware.effective_limit() == 0 and b.rig.bench.device_calls == calls
 
 
 # Intent: stopping waits without beginning Return, while a full real completion pool retains its old uncertainty.
@@ -75,6 +99,31 @@ async def test_return_prelaunch_disposition_uses_actual_owner(tmp_path, tls, unu
         finally:
             release.set()
             await asyncio.gather(*tasks)
+
+
+# Intent: a failed first Return write leaves its exact accepted request available on the next poll.
+# Why: no physical operation has started, so a temporary SQLite refusal must not stop supervision.
+async def test_return_claim_retries_after_transient_storage(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "app_control", c.requests.intent().revision)
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_return_claim BEFORE UPDATE ON managed_requests "
+            "WHEN NEW.state='running' BEGIN SELECT RAISE(ABORT,'Return claim unavailable'); END"
+        )
+        before = list(b.rig.bench.device_calls)
+        try:
+            await c.tick()
+            assert c.requests.receipt(identifier)["state"] == "accepted"
+            assert b.rig.bench.firmware.effective_limit() == 0
+        finally:
+            j.db.execute("DROP TRIGGER refuse_return_claim")
+        assert not any(frame[2] == "SetChargingProfile" for frame in b.rig.bench.device_calls[len(before) :])
+        assert (await healthy(c))["owner_control_enabled"]
+        assert c.requests.receipt(identifier)["state"] == "completed" and not starts(b.rig)
 
 
 # Intent: a Return behind an actual suspended automatic restore stays accepted without launching another attempt.

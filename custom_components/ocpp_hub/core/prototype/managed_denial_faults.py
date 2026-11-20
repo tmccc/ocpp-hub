@@ -59,8 +59,8 @@ def current_operator_proof(j: Journal, fault: dict[str, Any]) -> dict[str, Any] 
 
 
 # Actual new denials must originate from a complete immutable Start archived when the operator accepted this debt.
-def archived_start_matches(
-    proof: dict[str, Any], token: str, local: int | None, digest: str, *, queued_only: bool = False
+def archived_delivery_matches(
+    proof: dict[str, Any], action: str, token: str, local: int | None, digest: str, *, queued_only: bool = False
 ) -> bool:
     if type(local) is not int or local < 0:
         return False
@@ -69,7 +69,7 @@ def archived_start_matches(
             row
             for row in proof["prior"].get("outbox", [])
             if row.get("token") == token
-            and row.get("action") == "StartTransaction"
+            and row.get("action") == action
             and row.get("local") == local
             and (not queued_only or row.get("state") == "queued")
             and fingerprint(json.loads(row["payload"])) == digest
@@ -77,6 +77,22 @@ def archived_start_matches(
         return len(matches) == 1
     except ValueError, TypeError, KeyError:
         return False
+
+
+# Denial and mapping proofs archive only Starts through this narrower helper.
+def archived_start_matches(
+    proof: dict[str, Any], token: str, local: int | None, digest: str, *, queued_only: bool = False
+) -> bool:
+    return archived_delivery_matches(proof, "StartTransaction", token, local, digest, queued_only=queued_only)
+
+
+# The removed observation has its own durable rejection even while the earlier queue drains.
+def observation_resolution(j: Journal, token: str) -> dict[str, Any]:
+    row = j.db.execute("SELECT * FROM rejected_observations WHERE token=?", (token,)).fetchone()
+    return {
+        "rejection": dict(row) if row is not None else None,
+        "retained": j.db.execute("SELECT 1 FROM outbox WHERE token=?", (token,)).fetchone() is not None,
+    }
 
 
 # The existing operator recovery owns its own wire replies before a later Start can be mapped alongside it.
@@ -139,15 +155,24 @@ def proof_denial_member(proof: dict[str, Any], denial: dict[str, Any]) -> bool:
     return archived_start_matches(proof, denial["start_token"], denial["local"], denial["start_digest"])
 
 
-# A later queued Start belongs to the same recovery only after the earlier proof's wire work is settled.
-def operator_for_queued_start(j: Journal, fault: dict[str, Any], head: Delivery) -> dict[str, Any] | None:
+# A later queued lifecycle belongs to recovery only after the predecessor's own outcome is settled.
+def operator_for_queued_lifecycle(j: Journal, fault: dict[str, Any], head: Delivery) -> dict[str, Any] | None:
     proof = current_operator_proof(j, fault)
+    kinds: tuple[str, ...] = ("observation",)
+    if head.action == "StartTransaction":
+        kinds += ("start-delivery", "stop-delivery")
     if (
         proof is None
-        or proof["kind"] not in ("start-delivery", "stop-delivery")
+        or proof["kind"] not in kinds
         or not operator_wire_settled(proof)
         or not operator_mapping_members_match(j, proof)
-        or not archived_start_matches(proof, head.token, head.transaction, fingerprint(head.payload), queued_only=True)
+        or not archived_delivery_matches(
+            proof, head.action, head.token, head.transaction, fingerprint(head.payload), queued_only=True
+        )
+    ):
+        return None
+    if proof["kind"] == "observation" and proof.get("resolved") != observation_resolution(
+        j, proof["attestation"]["observation_token"]
     ):
         return None
     source = proof["prior"].get("fault") or {}

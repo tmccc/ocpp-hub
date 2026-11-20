@@ -159,6 +159,61 @@ async def test_new_pause_repairs_superseded_late_introduction_zero(
                 release.set()
 
 
+# Intent: zero confirmation survives storage healing on the same connection and Boot.
+# Why: an actual open scheduled session must not stay at zero just because the first zero receipt failed.
+async def test_zero_receipt_storage_failure_does_not_strand_reconnect(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        c, s, rig = b.controller, b.session, b.rig
+        g, j = s.gateway, s.journal
+        local = await positive_flow(b, "daily")
+        rig.peer.permission_enabled, rig.bench.firmware.requested_current = False, 0
+        await healthy(c)
+        await b.charger.close()
+        await until(lambda: not s.runtime.status.charger_connected)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async with rig.charger(s) as charger:
+            send = charger.send
+
+            # Hold the real peer's first Accepted zero reply until the exact receipt write can fail.
+            async def hold_zero(raw):
+                answer = decode(raw)
+                call = next((row for row in rig.bench.device_calls if row[1] == answer[1]), None)
+                if not entered.is_set() and answer[0] == 3 and call is not None and call[2] == "SetChargingProfile":
+                    periods = call[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+                    if all(period["limit"] == 0 for period in periods):
+                        assert answer[2] == {"status": "Accepted"}
+                        entered.set()
+                        await release.wait()
+                await send(raw)
+
+            monkeypatch.setattr(charger, "send", hold_zero)
+            try:
+                assert (await rig.bench.call(charger, "reconnect-storage", "BootNotification", BOOT))[0] == 3
+                await asyncio.wait_for(entered.wait(), 2)
+                epoch, boot = g._charger_epoch, g.boot_observation
+                probe = current_probe(s.runtime, epoch)
+                assert probe is not None and c.native.audited_epoch == epoch
+                refused = []
+                j.db.create_function("witness_refused_zero", 0, lambda: refused.append(True) or 0)
+                j.db.execute(
+                    "CREATE TEMP TRIGGER refuse_zero_receipt BEFORE UPDATE ON trial_resources "
+                    "WHEN NEW.key='profile:7001' AND OLD.state='pending' AND NEW.state='confirmed' "
+                    "BEGIN SELECT witness_refused_zero(); SELECT RAISE(ABORT,'zero receipt unavailable'); END"
+                )
+                try:
+                    release.set()
+                    await until(lambda: len(refused) >= 2)
+                    assert not probe.done() and rig.bench.firmware.effective_limit() == 0
+                finally:
+                    j.db.execute("DROP TRIGGER refuse_zero_receipt")
+                assert (await healthy(c))["station_ceiling_a"] == 6
+                assert g.boot_observation == boot and c.native.introduced_epoch == epoch and j.active() == local
+                assert not starts(rig) and not rig.bench.remote_stop.is_set()
+                await close_session(rig, s, charger, local)
+            finally:
+                release.set()
+
+
 # Intent: a real deferred probe retains introduction ownership while its Native body has retired for retry sleep.
 # Why: completion repair cannot borrow the quiet gap before that same service starts another restrictive attempt.
 @pytest.mark.parametrize("current", [6, 32])

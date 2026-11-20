@@ -11,18 +11,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.trial_proxy import emit, load_core, native_spec, preflight  # noqa: E402
+from tools.trial_proxy import emit, load_core, native_spec  # noqa: E402
 
 load_core()
 from ocpp_hub_core.prototype.managed_current_prepare import prepare_current_capability  # noqa: E402
 from ocpp_hub_core.prototype.native_http import read_native  # noqa: E402
 from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
+from ocpp_hub_core.prototype.trial_session import preflight_native  # noqa: E402
 
 
 # A named action is the only write path; the default parses private inputs without contacting the charger.
 async def run(action: str, config_path: Path, spec_path: Path) -> int:
-    prepared = preflight(config_path)
+    prepared = preflight_native(config_path)
     spec = native_spec(spec_path, prepared)
     if action == "check":
         emit({"offline_only": True, "native_ceiling_a": 32, "charger_changed": False})

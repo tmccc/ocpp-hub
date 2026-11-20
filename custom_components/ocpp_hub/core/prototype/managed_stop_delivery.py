@@ -55,6 +55,21 @@ def stop_identity(j: Journal, item: Delivery) -> dict[str, Any]:
     )
 
 
+# Latch only a rejection that still identifies the exact retained Stop, including on upgrade.
+def latch_rejected_stop(j: Journal, item: Delivery) -> None:
+    if j.get("managed_mode") is None or j.fault.latched() or item.state != "rejected":
+        return
+    rejection = j.get(REJECTION, {})
+    if rejection.get("delivery_token") != item.token:
+        return
+    identity = stop_identity(j, item)
+    if all(rejection.get(key) == value for key, value in identity.items()):
+        j.fault.replace(
+            {"classification": "owner_control_or_delivery_uncertain", "at_epoch": rejection["observed_at_epoch"]}
+        )
+        j.phase.fault(j.get("control", {}))
+
+
 # Record the delivery transition before reporting failure; never strand an unexplained inflight lifecycle head.
 def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str) -> None:
     identity = stop_identity(j, item)
@@ -109,6 +124,9 @@ def reject_stop_reply(j: Journal, item: Delivery, response: Any, *, reason: str)
             j.put(PROOFS, records)
         j.put(REJECTION, rejection)
         j.db.execute("UPDATE outbox SET state='rejected' WHERE token=?", (item.token,))
+        rejected = j.next_delivery()
+        assert rejected is not None
+        latch_rejected_stop(j, rejected)
 
 
 # Approval applies only to this complete malformed Stop response, never an error or another event's metadata.

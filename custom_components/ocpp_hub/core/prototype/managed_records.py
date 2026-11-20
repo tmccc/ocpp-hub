@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, cast, overload
 
-from .managed_intent import ControlIntent, decode_intent, finish_request
+from .managed_intent import ControlIntent, decode_intent, finish_request, insert_request
 from .store import RecoveryRequiredError, encoded
 
 if TYPE_CHECKING:
@@ -128,14 +128,20 @@ class CurrentChangeJournal:
             }
         )
         self.journal.db.execute("INSERT INTO managed_current_requests VALUES(?,?)", (identifier, target))
-        self.journal.db.execute(
-            "INSERT INTO managed_requests VALUES(?,?,?,'accepted',?)",
-            (identifier, "set_current", caller.revision, json.dumps({"accepted_at": time.time()})),
-        )
+        insert_request(self.journal, identifier, "set_current", caller.revision, {"accepted_at": time.time()})
+
+    # Binding is saved with the physical control claim, before station transmission can start.
+    def bind(self, identifier: str, ticket: str, boot: str) -> None:
+        change = self.read()
+        if not change.selecting or change.identifier != identifier or not self.journal.db.in_transaction:
+            raise RecoveryRequiredError("current selection no longer owns its station claim")
+        self.replace({**change.value, "ticket": ticket, "boot": boot})
 
     # Publish the verified selection and its receipt together after the caller checks the live profile.
     def complete(self, identifier: str, target: int) -> None:
-        self.replace({"id": identifier, "current_a": target, "state": "completed"})
+        saved = self.read().value
+        binding: dict[str, Any] = {key: saved[key] for key in ("ticket", "boot") if key in saved}
+        self.replace({"id": identifier, "current_a": target, "state": "completed", **binding})
         finish_request(self.journal, identifier, "completed", {"current_a": target, "charging_started": False})
 
     # Record the failed selection and retain its evidence whether a newer owner has already taken over.

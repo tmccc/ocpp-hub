@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,11 +16,25 @@ from .ics import is_safe_transaction_query
 from .native_faults import NativeContentError
 from .policy import DeniedError
 from .recovery_contracts import GateDecision, Guard, Pending
+from .rpc import profile_status
 from .security import SecurityError
-from .store import Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import Journal, RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_bootstrap import initialize_trial_baseline
 from .trial_evidence import Evidence, Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
+
+_STATION_ZERO_PREDECESSOR = "trial_station_zero_predecessor"
+
+
+# Only storage of the reserved zero profile can yield to a separately proved Stop.
+@contextmanager
+def _profile_storage(station_zero: bool) -> Iterator[None]:
+    try:
+        yield
+    except sqlite3.Error as error:
+        if station_zero:
+            raise StationZeroStorageError("station zero profile storage failed") from error
+        raise
 
 
 @dataclass(frozen=True, repr=False)
@@ -96,6 +110,8 @@ class ResourceBook:
     # A fresh trial cannot silently claim an older unowned journal or replace its original baseline.
     def __init__(self, journal: Journal, baseline: Baseline) -> None:
         self.journal, self.baseline = journal, baseline
+        self._station_loss_observed = False
+        self.retiring: Callable[[], bool] = lambda: False
         self.before_positive_release: Guard | None = None
         if baseline.identity_digest != fingerprint(journal.identity):
             raise SecurityError("baseline belongs to another charger")
@@ -267,6 +283,10 @@ class ResourceBook:
                 raise DeniedError("trial is not accepting mutations")
         if action == "SetChargingProfile":
             canonical = profile_projection(payload)
+            if canonical["id"] == HUB_PROFILE_ID and self.journal.get("managed_mode") and self.station_ceiling_lost():
+                raise DeniedError("a managed station ceiling verified absent cannot be recreated")
+            if canonical["limit"] > 0 and self.retiring():
+                raise DeniedError("retiring service cannot send a positive charging profile")
             ceiling = 6
             if self.journal.get("managed_current_capability") is not None:
                 # Imports stay local because the immutable native specification also uses the baseline data shape.
@@ -290,8 +310,12 @@ class ResourceBook:
                     scope = (body.get("connnectroId"), body.get("purpose"))
                     if scope == tuple(canonical[k] for k in ("connector", "purpose")):
                         raise DeniedError("trial profile would replace an original profile scope")
-            with self.journal.atomic():
-                existing = self.journal.db.execute("SELECT state FROM trial_resources WHERE key=?", (key,)).fetchone()
+            station_zero = canonical["id"] == HUB_PROFILE_ID and canonical["limit"] == 0
+            desired = encoded(canonical)
+            with _profile_storage(station_zero), self.journal.atomic():
+                existing = self.journal.db.execute(
+                    "SELECT state,desired FROM trial_resources WHERE key=?", (key,)
+                ).fetchone()
                 if existing is None or existing["state"] == "absent_verified":
                     if (
                         self.journal.db.execute(
@@ -302,12 +326,22 @@ class ResourceBook:
                         raise RecoveryRequiredError("trial resource receipt capacity reached")
                 if existing is None:
                     self.journal.db.execute(
-                        "INSERT INTO trial_resources VALUES(?,?,NULL,'pending',NULL)", (key, encoded(canonical))
+                        "INSERT INTO trial_resources VALUES(?,?,NULL,'pending',NULL)", (key, desired)
                     )
                 else:
+                    if station_zero and existing["state"] in ("pending", "uncertain") and existing["desired"]:
+                        previous = json.loads(existing["desired"])
+                        if (
+                            isinstance(previous, dict)
+                            and type(previous.get("limit")) in (int, float)
+                            and previous["limit"] > 0
+                            and previous | {"limit": 0} == canonical
+                        ):
+                            # Zero must not erase the one prior profile that may still be installed after a lost reply.
+                            self.journal.put(_STATION_ZERO_PREDECESSOR, {"zero": desired, "profile": previous})
                     self.journal.db.execute(
                         "UPDATE trial_resources SET desired=?,state='pending',observed_digest=NULL WHERE key=?",
-                        (encoded(canonical), key),
+                        (desired, key),
                     )
         elif action == "ClearChargingProfile":
             key = "profile:" + str(payload.get("id"))
@@ -335,16 +369,27 @@ class ResourceBook:
             payload["id"] if action == "ClearChargingProfile" else payload["csChargingProfiles"]["chargingProfileId"]
         )
         key = "profile:" + str(identifier)
-        if answer[0] == 3 and answer[2].get("status") == "Accepted":
-            if action == "SetChargingProfile":
-                self.journal.db.execute(
-                    "UPDATE trial_resources SET confirmed=desired,state='confirmed',observed_digest=NULL WHERE key=?",
-                    (key,),
-                )
+        station_zero = (
+            action == "SetChargingProfile"
+            and identifier == HUB_PROFILE_ID
+            and profile_projection(payload)["limit"] == 0
+        )
+        with _profile_storage(station_zero):
+            if profile_status(action, answer) == "Accepted":
+                if action == "SetChargingProfile":
+                    retire = identifier == HUB_PROFILE_ID and self.journal.get(_STATION_ZERO_PREDECESSOR) is not None
+                    with self.journal.atomic() if retire else nullcontext():
+                        self.journal.db.execute(
+                            "UPDATE trial_resources SET confirmed=desired,state='confirmed',observed_digest=NULL "
+                            "WHERE key=?",
+                            (key,),
+                        )
+                        if retire:
+                            self.journal.db.execute("DELETE FROM meta WHERE key=?", (_STATION_ZERO_PREDECESSOR,))
+                else:
+                    self.journal.db.execute("UPDATE trial_resources SET state='clear_acknowledged' WHERE key=?", (key,))
             else:
-                self.journal.db.execute("UPDATE trial_resources SET state='clear_acknowledged' WHERE key=?", (key,))
-        else:
-            self.journal.db.execute("UPDATE trial_resources SET state='uncertain' WHERE key=?", (key,))
+                self.journal.db.execute("UPDATE trial_resources SET state='uncertain' WHERE key=?", (key,))
 
     # Inspect every owned-resource contradiction before publishing unrelated absence/confirmation observations.
     def _owned_conflict(self, current: dict[str, Resource], rows: list[Any]) -> tuple[str, str | None] | None:
@@ -355,10 +400,19 @@ class ResourceBook:
             resource = current.get(row["key"])
             if resource is None:
                 continue
-            if row["state"] == "absent_verified":
+            if (
+                row["state"] == "absent_verified"
+                or self._station_loss_observed
+                and row["key"] == f"profile:{HUB_PROFILE_ID}"
+            ):
                 return "resource_reappeared", resource.key
             possible = [json.loads(row[key]) for key in ("desired", "confirmed") if row[key] is not None]
-            if resource.canonical not in possible:
+            if resource.canonical not in possible and not (
+                row["key"] == f"profile:{HUB_PROFILE_ID}"
+                and row["state"] in ("pending", "uncertain")
+                and self.journal.get(_STATION_ZERO_PREDECESSOR)
+                == {"zero": row["desired"], "profile": resource.canonical}
+            ):
                 return "owned_profile_changed", resource.key
             if row["observed_digest"] is not None and row["observed_digest"] != resource.digest:
                 return "owned_profile_bytes_changed", resource.key
@@ -386,7 +440,7 @@ class ResourceBook:
         return None
 
     # Complete inventory may settle lost ACKs, but diagnostic SQL cannot hide an already proved contradiction.
-    def owned_present(self, evidence: Evidence) -> list[Resource]:
+    def owned_present(self, evidence: Evidence, *, record_unchanged: bool = True) -> list[Resource]:
         evidence.require_fresh(self.journal.identity)
         current = {r.key: r for r in evidence.resources}
         rows = self.journal.db.execute("SELECT * FROM trial_resources").fetchall()
@@ -404,9 +458,12 @@ class ResourceBook:
                 "resources", "native inventory fault: " + conflict[0] + "; independent reconciliation is required"
             )
         try:
+            station_absent = strict is None and self.record_missing_station(evidence)
             # Keep the existing observed-absence accounting even if an independent original fault remains latched.
             for row in rows:
-                if row["key"] not in current:
+                if station_absent and row["key"] == f"profile:{HUB_PROFILE_ID}":
+                    continue  # Its absence is already recorded or fenced in memory for this installation.
+                if row["key"] not in current and row["state"] != "absent_verified":
                     self.journal.db.execute(
                         "UPDATE trial_resources SET state='absent_verified',observed_digest=NULL WHERE key=?",
                         (row["key"],),
@@ -420,15 +477,61 @@ class ResourceBook:
             for row in rows:
                 resource = current.get(row["key"])
                 if resource is not None:
-                    self.journal.db.execute(
-                        "UPDATE trial_resources SET observed_digest=? WHERE key=?", (resource.digest, resource.key)
-                    )
+                    if record_unchanged or row["observed_digest"] != resource.digest:
+                        self.journal.db.execute(
+                            "UPDATE trial_resources SET observed_digest=? WHERE key=?", (resource.digest, resource.key)
+                        )
                     result.append(resource)
         except sqlite3.Error as failure:
             if strict is not None:
                 raise strict from failure
             raise
         return sorted(result, key=lambda r: (r.identifier == HUB_PROFILE_ID, r.key))
+
+    # Keep a proved missing profile fenced even when SQLite cannot save the inventory observation.
+    def record_missing_station(self, evidence: Evidence) -> bool:
+        key = f"profile:{HUB_PROFILE_ID}"
+        if any(resource.key == key for resource in evidence.resources) or not self.journal.get("managed_mode"):
+            return False
+        evidence.require_fresh(self.journal.identity, 5)
+        receipt = self.journal.db.execute("SELECT state,confirmed FROM trial_resources WHERE key=?", (key,)).fetchone()
+        if receipt is None or receipt["confirmed"] is None:
+            return False
+        self._station_loss_observed = True
+        if receipt["state"] != "absent_verified":
+            try:
+                self.journal.db.execute(
+                    "UPDATE trial_resources SET state='absent_verified',observed_digest=NULL WHERE key=?", (key,)
+                )
+            except sqlite3.Error:
+                if self.journal.db.in_transaction:
+                    raise  # Preserve the enclosing transaction's failure boundary.
+        return True
+
+    # The reserved station profile was independently found absent after previously being confirmed owned.
+    def station_ceiling_lost(self) -> bool:
+        return self._station_loss_observed or (
+            self.journal.db.execute(
+                "SELECT 1 FROM trial_resources WHERE key=? AND state='absent_verified' AND confirmed IS NOT NULL",
+                (f"profile:{HUB_PROFILE_ID}",),
+            ).fetchone()
+            is not None
+        )
+
+    def require_confirmed_station(self, resources: tuple[Resource, ...], maximum: float) -> None:
+        key = f"profile:{HUB_PROFILE_ID}"
+        receipt = self.journal.db.execute("SELECT * FROM trial_resources WHERE key=?", (key,)).fetchone()
+        station = next((resource for resource in resources if resource.key == key), None)
+        if (
+            station is None
+            or receipt is None
+            or receipt["state"] != "confirmed"
+            or receipt["confirmed"] is None
+            or json.loads(receipt["confirmed"]) != station.canonical
+            or receipt["observed_digest"] is not None and receipt["observed_digest"] != station.digest
+            or station.canonical.get("limit", float("inf")) > maximum
+        ):
+            raise DeniedError("the fresh native station ceiling does not match its confirmed limit")
 
     # Compare the already observed station with its exact saved receipt only when the caller reaches this proof.
     @staticmethod

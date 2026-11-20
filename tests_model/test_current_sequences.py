@@ -174,7 +174,7 @@ async def test_current_resolution_sequences(tmp_path, model_tls, monkeypatch, re
                     require_zero_held(rig, zero_mark)
                 assert 0 <= firmware.effective_limit() <= max(case.initial, case.target)
             confirmed = case.outcome == "valid" and case.events.index("resolve") < case.events.index("pause")
-            if "native" in case.boundary and case.events.index("boot") < case.events.index("resolve"):
+            if case.events.index("boot") < case.events.index("resolve"):
                 confirmed = False
             expected = case.target if confirmed else case.initial
             if case.boundary == "paused-native":

@@ -188,7 +188,8 @@ class StationDiscovery:
             raise RecoveryRequiredError("legacy trial profiles require reconciliation before selecting new semantics")
         if previous is not None and previous != selected:
             raise RecoveryRequiredError("station selection or reported capabilities changed; no automatic rearm")
-        self.journal.put("station_selection", selected)
+        if previous is None:
+            self.journal.put("station_selection", selected)
         self.capabilities, self.epoch = capabilities, epoch
         return self.choice
 

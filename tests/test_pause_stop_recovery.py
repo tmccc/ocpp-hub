@@ -5,7 +5,9 @@ import copy
 import uuid
 
 import pytest
+from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype.gateway import decode
+from ocpp_hub_core.prototype.native_faults import STATION_CEILING_LOST
 
 from tests import managed_rig as mp
 from tests.charge_rig import positive_flow
@@ -34,6 +36,38 @@ async def genuine_stop(b, local):
     assert response[0] == 3
     b.rig.peer.permission_enabled = False
     await until(lambda: b.session.journal.active() is None and b.session.journal.next_delivery() is None)
+
+
+async def test_second_pause_sends_its_stop_without_waiting_for_poll(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        c = b.c
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await mp.healthy(c)
+        entered, release = asyncio.Event(), asyncio.Event()
+        read = c.native.read
+
+        async def delay_first_stop(*args, **kwargs):
+            if kwargs.get("stop_only") and not entered.is_set():
+                entered.set()
+                await release.wait()
+            return await read(*args, **kwargs)
+
+        monkeypatch.setattr(c.native, "read", delay_first_stop)
+        first, second = uuid.uuid4().hex, uuid.uuid4().hex
+        c.command(first, "pause", c.requests.intent().revision)
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            c.command(second, "pause", c.requests.intent().revision)
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.shield(c.pause_task), 4)
+        stop = [frame[3] for frame in b.rig.bench.device_calls if frame[2] == "RemoteStopTransaction"]
+        assert stop == [{"transactionId": local}]
+        assert c.requests.receipt(first)["state"] == "failed"
+        assert c.requests.receipt(second)["state"] == "accepted"
+        await genuine_stop(b, local)
+        assert (await mp.healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(second)["state"] == "completed"
 
 
 # Intent: an actual identical Boot retires an earlier Stop ACK, including a reply arriving after that Boot.
@@ -315,3 +349,84 @@ async def test_pause_stop_binding_storage_refusal_rolls_back_claim_and_recovers(
         assert not j.get("managed_control_fault") and j.get("trial_phase") == "active"
         assert not mp.starts(rig) and not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
         assert rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: station-specific write refusal cannot prevent an already claimed Stop of the exact known session.
+# Why: a command acknowledgement leaves Pause pending until actual closure and the repaired zero write agree.
+@pytest.mark.parametrize("stage", ["intent", "reply", "station_row"])
+async def test_pause_sends_known_stop_when_station_zero_cannot_be_saved(
+    tmp_path, tls, unused_tcp_port, monkeypatch, stage
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        c, j, rig, controls = b.c, b.session.journal, b.rig, b.session.gateway.controls
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await mp.healthy(c)
+        boundary = {
+            "intent": "json_extract(NEW.desired,'$.limit')=0 AND NEW.state='pending'",
+            "reply": "json_extract(NEW.desired,'$.limit')=0 AND OLD.state='pending' AND NEW.state='confirmed'",
+            "station_row": "1",
+        }[stage]
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_station_zero BEFORE UPDATE ON trial_resources "
+            "WHEN NEW.key='profile:7001' AND " + boundary + " "
+            "BEGIN SELECT RAISE(ABORT,'station zero storage refused'); END"
+        )
+        mark = len(rig.bench.device_calls)
+        request = uuid.uuid4().hex
+        try:
+            if stage == "station_row":
+                assert (await c.tick())["state"] == "healthy"
+            assert c.command(request, "pause", c.requests.intent().revision)["state"] == "accepted"
+            await asyncio.wait_for(c.pause_task, 5)
+            assert controls.stop_acknowledged(local) and j.active() == local
+            assert c.requests.receipt(request)["state"] == "accepted" and j.get("control")["uncertain"]
+            profile = j.db.execute("SELECT state FROM trial_resources WHERE key='profile:7001'").fetchone()
+            assert profile["state"] == ("pending" if stage == "reply" else "confirmed")
+            assert j.db.in_transaction is False
+            assert any(call[2] == "SetChargingProfile" for call in rig.bench.device_calls[mark:]) == (stage == "reply")
+            status = await c.tick()
+            assert not status.get("local_hold_verified")
+            assert [call[3] for call in rig.bench.device_calls[mark:] if call[2] == "RemoteStopTransaction"] == [
+                {"transactionId": local}
+            ]
+        finally:
+            j.db.execute("DROP TRIGGER refuse_station_zero")
+        await genuine_stop(b, local)
+        assert (await mp.healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(request)["state"] == "completed"
+        assert rig.bench.firmware.effective_limit() == 0 and not mp.starts(rig)
+
+
+# Intent: Pause reports a missing ceiling even if its own exact Stop was accepted before the next poll.
+# Why: a genuine end to this charge cannot verify a zero-profile hold once the profile is gone.
+async def test_pause_discovering_missing_station_sends_stop_without_recreating_it(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        c, j, rig = b.c, b.session.journal, b.rig
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await mp.healthy(c)
+        lost = False
+
+        # The simulated device loses the first real zero profile before the following complete native audit.
+        async def lose_profile(action, payload):
+            nonlocal lost
+            if not lost and action == "SetChargingProfile":
+                rig.bench.firmware.profiles.pop(HUB_PROFILE_ID)
+                lost = True
+
+        monkeypatch.setattr(rig.bench, "before_reply", lose_profile)
+        mark = len(rig.bench.device_calls)
+        request = uuid.uuid4().hex
+        c.command(request, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(c.pause_task, 5)
+        assert lost and j.fault.classification() == STATION_CEILING_LOST
+        assert j.active() == local and b.session.gateway.controls.stop_acknowledged(local)
+        assert [call[2] for call in rig.bench.device_calls[mark:] if call[2] != "GetCompositeSchedule"] == [
+            "SetChargingProfile",
+            "RemoteStopTransaction",
+        ]
+        await genuine_stop(b, local)
+        status = await c.tick()
+        assert status["fault"] == STATION_CEILING_LOST and not status.get("local_hold_verified")
+        assert c.requests.receipt(request)["state"] == "accepted"

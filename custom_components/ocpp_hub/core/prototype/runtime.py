@@ -21,7 +21,7 @@ from .gateway import Gateway
 from .policy import DeniedError
 from .rpc import IntroductionDeferredError, RegistrationDeferredError, Sender, UnavailableError
 from .security import Admission, SecurityError, offline_server, offline_vendor, validate_offline_vendor
-from .store import ConflictError, RecoveryRequiredError
+from .store import ConflictError, RecoveryRequiredError, StationZeroStorageError
 
 
 @dataclass(frozen=True)
@@ -154,20 +154,23 @@ class ConnectionRuntime:
             self.status.charger_connected = True
             self.status.boot_observed = False
         probe: asyncio.Task[None] | None = None
+        boot_retry: asyncio.Task[None] | None = None
         try:
             if previous is not None:
                 await previous.close(code=1012)
             probe = asyncio.create_task(self._boot_probe(epoch))
             probe.add_done_callback(lambda _: self._introductions.discard(introduction))
+            boot_retry = asyncio.create_task(self._watch_boot_retry(epoch, probe))
             async for raw in connection:
                 await self.gateway.receive("charger", raw, epoch)
         except (ConnectionClosed, UnavailableError, DeniedError) as error:
             self.status.last_failure = type(error).__name__
             self.status.charger_fault.record(error, "charger_receive", self.gateway.charger.diagnostics.action)
         finally:
-            if probe is not None:
-                probe.cancel()
-                await asyncio.gather(probe, return_exceptions=True)
+            probes = [task for task in (probe, boot_retry) if task is not None]
+            for task in probes:
+                task.cancel()
+            await asyncio.gather(*probes, return_exceptions=True)
             self._introductions.discard(introduction)
             try:
                 self.gateway.detach_charger(epoch)
@@ -211,9 +214,19 @@ class ConnectionRuntime:
                 await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
                 return
             except (UnavailableError, TimeoutError) as error:
+                if self.gateway.current_boot_seen(epoch):
+                    return  # A genuine Boot can finish while the read-only probe is waiting for its gate.
                 self.status.last_failure = "BootOrCeilingUnavailable"
                 self.status.charger_fault.record(error, "boot_probe", "TriggerMessage")
             wait, delay = delay, min(2 * delay, self.settings.retry_max)
+
+    # After the initial introduction, retry only Boot discovery. It cannot replay an introduction's Stop.
+    async def _watch_boot_retry(self, epoch: int, probe: asyncio.Task[None]) -> None:
+        await asyncio.shield(probe)
+        while True:
+            await self.gateway.wait_for_boot_retry(epoch)
+            await self._wait_for_real_boot(epoch)
+            self.status.boot_observed = self.gateway.current_boot_seen(epoch)
 
     # Only a genuine Boot starts introduction; its restrictive retry has a separate lifetime from Boot probing.
     async def _boot_probe(self, epoch: int) -> None:
@@ -224,6 +237,7 @@ class ConnectionRuntime:
             if self.before_ceiling is not None:
                 delay = self.settings.retry_min
                 while True:
+                    await self._wait_for_real_boot(epoch)
                     try:
                         await self.before_ceiling()
                         break
@@ -237,8 +251,21 @@ class ConnectionRuntime:
                         delay = min(2 * delay, self.settings.retry_max)
             self.gateway._require_epoch("charger", epoch)
             if self.ceiling_enabled():
+                # Wait for a replacement observation without treating changed metadata as the audited charger.
+                revision = self.gateway.boot_metadata_revision, self.gateway.controls._revision
+                await self._wait_for_real_boot(epoch)
+                if revision != (self.gateway.boot_metadata_revision, self.gateway.controls._revision):
+                    raise UnavailableError("charger authority changed before restrictive verification")
                 await self._confirm_introduced_ceiling(epoch)
-        except (UnavailableError, TimeoutError, DeniedError, RecoveryRequiredError, sqlite3.Error) as error:
+        except (
+            UnavailableError,
+            TimeoutError,
+            DeniedError,
+            RecoveryRequiredError,
+            SecurityError,
+            ConflictError,
+            sqlite3.Error,
+        ) as error:
             # Later introduction may own Stop; record its storage failure without replaying that work.
             self.status.last_failure = "BootOrCeilingUnavailable"
             self.status.charger_fault.record(error, "boot_or_ceiling", self.gateway.charger.diagnostics.action)
@@ -274,8 +301,10 @@ class ConnectionRuntime:
             return same_authority() and gateway.boot_observation == boot
 
         # A new identical Boot discards the old attempt; the next attempt repeats zero and composite verification.
-        def replace_observation() -> bool:
+        async def replace_observation() -> bool:
             nonlocal boot
+            if not gateway.current_boot_seen(epoch):
+                await self._wait_for_real_boot(epoch)
             if same_authority() and gateway.boot_observation is not None and gateway.boot_observation != boot:
                 boot = gateway.boot_observation
                 return True
@@ -292,9 +321,9 @@ class ConnectionRuntime:
             try:
                 await gateway.controls.ensure_ceiling(guard=guard if retrying or restricted() else None)
                 return
-            except (UnavailableError, TimeoutError) as error:
+            except (UnavailableError, TimeoutError, StationZeroStorageError) as error:
                 if not restricted():
-                    if not replace_observation():
+                    if not await replace_observation():
                         raise
                     retrying = True
                     continue
@@ -302,7 +331,7 @@ class ConnectionRuntime:
                 self.status.charger_fault.record(error, "boot_or_ceiling", gateway.charger.diagnostics.action)
                 await asyncio.sleep(delay)
                 gateway._require_epoch("charger", epoch)
-                if not restricted() and not replace_observation():
+                if not restricted() and not await replace_observation():
                     raise UnavailableError("restrictive introduction was superseded") from None
                 retrying = True
                 delay = min(2 * delay, self.settings.retry_max)
@@ -370,12 +399,23 @@ class ConnectionRuntime:
                         stage = self._vendor_stage()
                         if self.gateway.vendor_registration == "Accepted":
                             delay = self.settings.retry_min
-                        self.gateway.detach_vendor(epoch)
-                        self.status.vendor_connected = False
+                        try:
+                            self.gateway.detach_vendor(epoch)
+                        finally:
+                            self.status.vendor_connected = False
             except sqlite3.Error as error:
                 # Local storage refusal is not evidence of a failed cloud introduction or response.
                 self.status.last_failure = type(error).__name__
-            except (OSError, ConnectionClosed, InvalidHandshake, UnavailableError, DeniedError) as error:
+            except (
+                OSError,
+                ConnectionClosed,
+                InvalidHandshake,
+                UnavailableError,
+                DeniedError,
+                RecoveryRequiredError,
+                SecurityError,
+                ConflictError,
+            ) as error:
                 self.status.last_failure = type(error).__name__
                 if self.status.vendor_fault.count == fault_count:
                     self.status.vendor_fault.record(error, stage, self.gateway.vendor.diagnostics.action)

@@ -36,9 +36,11 @@ async def test_original_profiles_block_writes_and_legacy_clears(tmp_path: Path, 
     rig = legacy_rig(tmp_path / "state.db", purpose)
     original = rig.baseline.value()
     try:
+        await rig.boot()
+        boot_reply = list(rig.charger_frames)
         with pytest.raises(DeniedError):
             await rig.gateway.set_limit(6)
-        assert not rig.charger_frames
+        assert rig.charger_frames == boot_reply
         assert rig.book.original_profile_count
         with pytest.raises(SecurityError):
             rig.book.require_profile_free_baseline()
@@ -182,6 +184,7 @@ async def test_stop_after_clean_rollback_never_recreates_profile(tmp_path, tls, 
 async def test_independent_station_absence_invalidates_readiness_and_clear(tmp_path: Path) -> None:
     rig = TrialRig(tmp_path / "state.db")
     try:
+        await rig.boot()
         await rig.gateway.set_limit(6)
         assert rig.gateway.controls.ready
         rig.firmware.answer("ClearChargingProfile", {"id": 7001})
@@ -200,6 +203,7 @@ async def test_independent_station_absence_invalidates_readiness_and_clear(tmp_p
 async def test_owned_inventory_mismatch_freezes_cached_readiness(tmp_path: Path, change: str) -> None:
     rig = TrialRig(tmp_path / "state.db")
     try:
+        await rig.boot()
         await rig.gateway.set_limit(6)
         rig.book.owned_present(rig.evidence())
         if change == "limit":
@@ -244,6 +248,7 @@ async def test_owned_inventory_mismatch_freezes_cached_readiness(tmp_path: Path,
 async def test_owned_inventory_fault_keeps_safety_stop(tmp_path: Path) -> None:
     rig = TrialRig(tmp_path / "state.db")
     try:
+        await rig.boot()
         await rig.gateway.set_limit(6)
         await rig.charger("start", "StartTransaction", START)
         rig.firmware.requested_current = 32

@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 
 import pytest
 from ocpp_hub_core.prototype import managed_charging
-from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 
 from tests import managed_rig as mp
 from tests.charge_rig import positive_flow, ready
@@ -53,38 +52,20 @@ async def selected_source(tmp_path, tls, port, monkeypatch, current):
         yield b
 
 
-# Cancel only the real outer managed coroutine before its first instruction; LocalControl is never intercepted.
-async def cancel_outer_before_execution(b):
+# Cancel the newly accepted Start worker before yielding, with the real LocalControl child untouched.
+async def cancel_outer_before_execution(b, prior_receipt=None):
     c, j = b.controller, b.session.journal
-    loop, original_factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
-    victims = []
     identifier, before_intent = uuid.uuid4().hex, c.requests.intent()
     original_calls = copy.deepcopy(b.rig.bench.device_calls)
-
-    # Preserve ordinary scheduling for every other owned native, timer, protocol and cleanup task.
-    def cancel_only_outer(loop, coroutine, **kwargs):
-        task = asyncio.Task(coroutine, loop=loop, eager_start=False, **kwargs)
-        if (
-            getattr(coroutine, "cr_code", None) is ManagedCharging._start.__code__
-            and coroutine.cr_frame.f_locals.get("self") is c.charging
-        ):
-            task.cancel()
-            victims.append(task)
-        return task
-
-    try:
-        loop.set_task_factory(cancel_only_outer)
-        accepted = c.command(identifier, "start", before_intent.revision)
-        assert accepted["id"] == identifier and accepted["state"] == "accepted"
-        worker = c.charging.worker
-        assert worker is not None
-        await asyncio.gather(worker, return_exceptions=True)
-    finally:
-        loop.set_task_factory(original_factory)
-    assert victims == [worker] and worker.cancelled()
+    accepted = c.command(identifier, "start", before_intent.revision)
+    assert accepted["id"] == identifier and accepted["state"] == "accepted"
+    worker = c.charging.worker
+    assert worker is not None and worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+    assert worker.cancelled()
     assert c.charging.state()["start_attempted"] is False and c.charging.state()["start_rpc_accepted"] is False
-    assert j.get("local_start_receipt") is None and b.rig.bench.device_calls == original_calls
-    assert not mp.starts(b.rig) and c.requests.intent() == before_intent
+    assert j.get("local_start_receipt") == prior_receipt and b.rig.bench.device_calls == original_calls
+    assert c.requests.intent() == before_intent
     return identifier, before_intent
 
 

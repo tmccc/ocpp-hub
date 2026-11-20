@@ -214,5 +214,12 @@ async def test_full_live_alias_budget_rejects_retired_reactivation_but_allows_li
                 assert j.get("vendor_profiles") == aliases and j.get("next_vendor_profile") == counter
                 assert len(rig.bench.firmware.profiles) == 3 and retired not in rig.bench.firmware.profiles
                 assert (await healthy(c))["owner_control_enabled"]
+                alias = aliases["1003"]
+                cleared = await rig.bench.cloud_call("clear-second-live-profile", "ClearChargingProfile", {"id": 1003})
+                assert cleared[0] == 3 and cleared[2] == {"status": "Accepted"}
+                assert rig.bench.device_calls[-1][2:] == ["ClearChargingProfile", {"id": alias}]
+                assert (await healthy(c))["owner_control_enabled"]
+                assert set(rig.bench.firmware.profiles) == {7001, aliases["1002"]}
+                assert not j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed'").fetchone()
         finally:
             await session.close()

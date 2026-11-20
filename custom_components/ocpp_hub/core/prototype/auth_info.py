@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -48,6 +50,14 @@ def expiry(value: Any) -> float:
         raise DeniedError("cloud authorization expiry is invalid") from None
 
 
+@dataclass(frozen=True)
+class AuthorizationObservation:
+    """The wire sequence orders decisions, and the timestamp supports expiry checks."""
+
+    sequence: int
+    observed: float
+
+
 class InfoBook:
     """Bounded digest-keyed metadata, separately gated by approved local tags or a single-start grant."""
 
@@ -58,11 +68,49 @@ class InfoBook:
         journal.db.execute(
             "CREATE TABLE IF NOT EXISTS auth_info(digest TEXT PRIMARY KEY,info TEXT NOT NULL,observed REAL NOT NULL)"
         )
+        journal.db.execute(
+            "CREATE TABLE IF NOT EXISTS auth_info_order("
+            "digest TEXT PRIMARY KEY REFERENCES auth_info(digest) ON DELETE CASCADE,sequence INTEGER NOT NULL)"
+        )
+        self._sequence = journal.db.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM ("
+            "SELECT MAX(sequence) AS sequence FROM auth_info_order UNION ALL "
+            "SELECT MAX(sequence) FROM delivery_reply_authorization)"
+        ).fetchone()[0]
+
+    # Order actual replies inside the wire gate while keeping expiry checks on wall time.
+    def observe(self) -> AuthorizationObservation:
+        self._sequence += 1
+        return AuthorizationObservation(self._sequence, time.time())
 
     # Record actual Accepted and denied decisions alike so a denial cannot be hidden by an older positive entry.
-    def put(self, tag: str, value: Any) -> dict[str, Any]:
+    def put(self, tag: str, value: Any, observation: AuthorizationObservation | None = None) -> dict[str, Any]:
         info = validate_info(value)
         key = tag_key(tag)
+        observation = observation or self.observe()
+        with nullcontext() if self.journal.db.in_transaction else self.journal.atomic():
+            self._put(key, info, observation)
+        return info
+
+    # A saved acknowledgement can retire its event even when newer authorization already exists.
+    def put_delivery(
+        self, tag: str, info: dict[str, Any], observation: AuthorizationObservation | None, *, restored: bool
+    ) -> None:
+        key = tag_key(tag)
+        cached = self.journal.db.execute(
+            "SELECT sequence FROM auth_info LEFT JOIN auth_info_order USING(digest) WHERE digest=?", (key,)
+        ).fetchone()
+        if cached is not None:
+            sequence = cached[0]
+            # Old journal rows cannot prove order after replacement, even after a rollback and re-upgrade.
+            if observation is None or (sequence is None and restored):
+                return
+            if sequence is not None and sequence >= observation.sequence:
+                return
+        self._put(key, info, observation)
+
+    # Persist the metadata and its order in the same transaction, limiting retained historical tags.
+    def _put(self, key: str, info: dict[str, Any], observation: AuthorizationObservation | None) -> None:
         if self.journal.db.execute("SELECT 1 FROM auth_info WHERE digest=?", (key,)).fetchone() is None:
             if self.journal.db.execute("SELECT COUNT(*) FROM auth_info").fetchone()[0] >= self.capacity:
                 current = self.journal.get("vendor_start_grant", {}).get("digest")
@@ -75,8 +123,10 @@ class InfoBook:
                         "authorization metadata capacity reached without an evictable historical tag"
                     )
                 self.journal.db.execute("DELETE FROM auth_info WHERE digest=?", (oldest,))
-        self.journal.db.execute("INSERT OR REPLACE INTO auth_info VALUES(?,?,?)", (key, encoded(info), time.time()))
-        return info
+        observed = observation.observed if observation is not None else time.time()
+        self.journal.db.execute("INSERT OR REPLACE INTO auth_info VALUES(?,?,?)", (key, encoded(info), observed))
+        if observation is not None:
+            self.journal.db.execute("INSERT INTO auth_info_order VALUES(?,?)", (key, observation.sequence))
 
     # Only metadata from an actual correlated response can be returned; an expired decision stays expired.
     def stored(self, tag: str) -> dict[str, Any] | None:

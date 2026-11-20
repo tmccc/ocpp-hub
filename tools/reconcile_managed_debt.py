@@ -11,15 +11,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.trial_proxy import emit, load_core, native_spec, preflight  # noqa: E402
+from tools.trial_proxy import emit, load_core, native_spec, operator_journal  # noqa: E402
 
 load_core()
 from ocpp_hub_core.prototype.managed_debt_evidence import ATTESTATIONS  # noqa: E402
 from ocpp_hub_core.prototype.managed_debt_recovery import debt_candidate, reconcile_debt  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
-from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
+from ocpp_hub_core.prototype.trial_session import preflight_native  # noqa: E402
 
 
 # The explicit actions have a read-only native observer and journal owner; none has a charger writer or listener.
@@ -30,7 +30,7 @@ async def run(
         raise SecurityError("native HTTP port is invalid")
     if kind not in ATTESTATIONS:
         raise SecurityError("operator debt kind is invalid")
-    prepared = preflight(config)
+    prepared = preflight_native(config)
     spec = native_spec(strategy, prepared)
     evidence = None
     if evidence_path is not None:
@@ -56,8 +56,7 @@ async def run(
     if action == "reconcile" and evidence is None:
         raise SecurityError("reconciliation requires explicit independently verified operator evidence")
     prepared.observer.port = native_port
-    journal = Journal(prepared.config.journal, prepared.config.identity)
-    try:
+    with operator_journal(prepared.config, inspect=action == "inspect") as journal:
         book = ResourceBook(journal, prepared.baseline)
         native = await prepared.observer.observe_handover()
         if action == "inspect":
@@ -65,8 +64,6 @@ async def run(
         else:
             assert evidence is not None
             emit(reconcile_debt(journal, book, spec, native, kind, evidence))
-    finally:
-        journal.close()
     return 0
 
 

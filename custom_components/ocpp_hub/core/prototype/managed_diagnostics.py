@@ -21,9 +21,12 @@ FAULTS = frozenset(
         "owner_release_unconfirmed",
         "native_authority_or_preservation_failed",
         "measured_output_limit_exceeded",
+        "station_composite_current_exceeded",
+        "station_ceiling_lost",
         "owner_control_or_delivery_uncertain",
         "operator_debt_reconciled_at_zero",
         "native_observation_unavailable",
+        "status_unavailable",
         "current_update_pending",
         "start_operation_pending",
         "listener_certificate_expiring",
@@ -149,6 +152,8 @@ def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, A
 def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = None) -> dict[str, Any]:
     current = time.time() if now is None else now
     try:
+        if "pending_lifecycle_events" in status and status["pending_lifecycle_events"] is None:
+            raise ValueError("diagnostic queue counts are unavailable")
         fault, blockers, recovery = fault_summary(c)
         commands, count = pending_commands(c, current)
         gateway, journal = c.session.gateway, c.session.journal

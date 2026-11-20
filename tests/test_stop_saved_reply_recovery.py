@@ -65,6 +65,7 @@ def saved_stop(path, reply):
         "ack": [3, stop.token, {}],
         "error": [4, stop.token, "InternalError", "synthetic cloud failure", {}],
         "invalid_authorization": [3, stop.token, {"idTagInfo": {"status": "Expired"}}],
+        "invalid_shape": [3, stop.token, {"status": "Rejected"}],
     }[reply]
     DeliveryReply.received(stop, answer).save(j, stop)
     return j, baseline, policy, observed, stop.token
@@ -89,5 +90,19 @@ def test_saved_stop_reply_cannot_become_no_reply_candidate(tmp_path, reply, reop
             debt_candidate(j, book, policy, observed, "stop-delivery")
         assert list(j.db.iterdump()) == before
         assert j.db.execute("SELECT token FROM delivery_replies").fetchone()[0] == token
+    finally:
+        j.close()
+
+
+# Intent: a saved Stop reply with invalid top-level fields cannot be classified as only a local storage failure.
+# Why: process replacement must distinguish a valid cloud ACK from a correlated but invalid result.
+def test_invalid_saved_stop_result_is_not_storage_only(tmp_path):
+    path = tmp_path / "journal.db"
+    j, _, _, _, _ = saved_stop(path, "invalid_shape")
+    j.close()
+    j = Journal(path, IDENTITY)
+    try:
+        reply = DeliveryReply.restore(j, j.next_delivery())
+        assert reply is not None and not reply.storage_only(j)
     finally:
         j.close()

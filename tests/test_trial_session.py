@@ -3,15 +3,213 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+import uuid
+from contextlib import closing
 
 import pytest
+from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
-from tests.prototype_rig import START
+from tests.charge_rig import owner_rig, positive_flow, ready
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
+
+
+@pytest.mark.parametrize("failure", ["write_intent", "write_reply", "different_native_session"])
+async def test_managed_shutdown_waits_for_genuine_stop_after_station_write_failure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, failure
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        j, controls = b.session.journal, b.session.gateway.controls
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await healthy(b.controller)
+        condition = (
+            "OLD.state='pending' AND NEW.state='confirmed'" if failure == "write_reply" else "NEW.state='pending'"
+        )
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_shutdown_zero BEFORE UPDATE ON trial_resources "
+            "WHEN NEW.key='profile:7001' AND json_extract(NEW.desired,'$.limit')=0 AND "
+            + condition
+            + " BEGIN SELECT RAISE(ABORT,'shutdown station zero refused'); END"
+        )
+        if failure == "different_native_session":
+            native = b.rig.peer.native
+
+            def unrelated_session(key):
+                report = native(key)
+                if key == "SESSION" and b.rig.bench.firmware.active == local:
+                    report["saveData"]["sessionList"][0]["_transactionId"] = local + 1
+                return report
+
+            monkeypatch.setattr(b.rig.peer, "native", unrelated_session)
+        b.controller.request_stop()
+        mark = len(b.rig.bench.device_calls)
+        shutdown = asyncio.create_task(b.session.close())
+        if failure == "different_native_session":
+            await until(lambda: controls._stopping is not None and controls._stopping.done())
+        else:
+            await until(lambda: controls.stop_acknowledged(local))
+        # Acceptance must leave the receiver up while the charger still owes the actual report.
+        await asyncio.sleep(0.1)
+        assert not shutdown.done() and j.active() == local
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        actual = await b.rig.bench.call(b.charger, "delayed-shutdown-stop", "StopTransaction", stop)
+        assert actual[0] == 3
+        b.rig.peer.permission_enabled = False
+        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        await shutdown
+
+        commands = b.rig.bench.device_calls[mark:]
+        assert [call[3] for call in commands if call[2] == "RemoteStopTransaction"] == (
+            [] if failure == "different_native_session" else [{"transactionId": local}]
+        )
+        assert any(call[2] == "SetChargingProfile" for call in commands) == (failure == "write_reply")
+        assert b.session.final_status["shutdown_attempt_uncertain"] is True
+        with closing(sqlite3.connect(j.path.as_uri() + "?mode=ro", uri=True)) as reader:
+            assert reader.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()[0] is not None
+
+
+async def test_managed_shutdown_does_not_stop_across_a_repeat_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await healthy(b.controller)
+        original_send = b.charger.send
+        g = b.session.gateway
+        boot = g.boot_observation
+        token = "repeat-boot-during-zero"
+        boot_reply = asyncio.get_running_loop().create_future()
+        b.rig.bench.replies[token] = boot_reply
+        reported = False
+
+        # A real Boot with the same metadata is a distinct observation on the same socket.
+        async def boot_before_composite_reply(raw):
+            nonlocal reported
+            reply = json.loads(raw)
+            if (
+                not reported
+                and reply[0] == 3
+                and any(
+                    frame[1] == reply[1] and frame[2] == "GetCompositeSchedule" for frame in b.rig.bench.device_calls
+                )
+            ):
+                reported = True
+                await original_send(build_call(token, "BootNotification", BOOT))
+            await original_send(raw)
+
+        b.controller.request_stop()
+        monkeypatch.setattr(b.charger, "send", boot_before_composite_reply)
+        mark = len(b.rig.bench.device_calls)
+        shutdown = asyncio.create_task(b.session.close())
+        assert (await asyncio.wait_for(boot_reply, 2))[0] == 3 and g.boot_observation not in (boot, None)
+        controls = g.controls
+        await until(lambda: controls._stopping is not None and controls._stopping.done())
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert (await b.rig.bench.call(b.charger, "stop-after-repeat-boot", "StopTransaction", stop))[0] == 3
+        b.rig.peer.permission_enabled = False
+        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        await shutdown
+        assert not [call for call in b.rig.bench.device_calls[mark:] if call[2] == "RemoteStopTransaction"]
+        assert b.session.final_status["shutdown_attempt_uncertain"] is True
+
+
+async def test_managed_shutdown_stops_late_transaction_for_already_issued_owner_start(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j, controls = b.controller, b.session.journal, b.session.gateway.controls
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        tag = starts(b.rig)[0][3]["idTag"]
+        assert j.get("local_start_receipt")["stage"] == "accepted" and j.active() is None
+
+        c.request_stop()
+        shutdown = asyncio.create_task(b.session.close())
+        await until(lambda: controls.ready and controls.desired() == 0)
+        fresh = await b.rig.bench.call(b.charger, "fresh-authorize-during-shutdown", "Authorize", {"idTag": tag})
+        assert fresh[2]["idTagInfo"]["status"] == "Invalid"
+        start = await b.rig.bench.call(b.charger, "late-issued-owner-start", "StartTransaction", START | {"idTag": tag})
+        assert start[0] == 3 and start[2]["idTagInfo"]["status"] == "Accepted"
+        local = start[2]["transactionId"]
+        assert j.active() == local and not j.get("control")["start_pending"]
+        await until(lambda: controls.stop_acknowledged(local))
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert (await b.rig.bench.call(b.charger, "stop-late-issued-owner-start", "StopTransaction", stop))[0] == 3
+        await shutdown
+
+        assert [call[3] for call in b.rig.bench.device_calls if call[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+        assert len(starts(b.rig)) == 1 and b.rig.bench.firmware.effective_limit() == 0
+        assert b.session.final_status["shutdown_attempt_uncertain"] is False
+
+
+async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await healthy(b.controller)
+        original_send = b.charger.send
+        b.session.gateway.charger.timeout = 0.8
+
+        async def omit_stop_reply(raw):
+            reply = json.loads(raw)
+            if reply[0] == 3 and any(
+                call[1] == reply[1] and call[2] == "RemoteStopTransaction" for call in b.rig.bench.device_calls
+            ):
+                return
+            await original_send(raw)
+
+        monkeypatch.setattr(b.charger, "send", omit_stop_reply)
+        b.controller.request_stop()
+        shutdown = asyncio.create_task(b.session.close())
+        await asyncio.wait_for(b.rig.bench.remote_stop.wait(), 3)
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert (await b.rig.bench.call(b.charger, "shutdown-reported-stop", "StopTransaction", stop))[0] == 3
+        b.rig.peer.permission_enabled = False
+        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        await shutdown
+        assert b.rig.bench.firmware.effective_limit() == 0
+        assert b.session.final_status["shutdown_attempt_uncertain"] is False
+        with closing(sqlite3.connect(b.session.journal.path.as_uri() + "?mode=ro", uri=True)) as reader:
+            row = reader.execute("SELECT value FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
+            saved = json.loads(row[0])
+            assert saved["local"] == local and saved["state"] == "verified" and saved["boot"]
+
+
+# Intent: a saved Stop is not enough to verify a final hold while the actual native session still reports open.
+# Why: the two device reports can arrive in either order after a genuine charge.
+async def test_managed_shutdown_requires_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        assert (await healthy(b.controller))["charging_session_open"]
+        peer = b.rig.peer
+        native = peer.native
+        session_report = native("SESSION")
+        b.controller.request_stop()
+        replay = await b.rig.bench.call(
+            b.charger, "replay-during-shutdown", "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+        )
+        assert replay[0] == 3 and replay[2]["transactionId"] == local
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert (await b.rig.bench.call(b.charger, "managed-stop-first", "StopTransaction", stop))[0] == 3
+        assert b.session.journal.active() is None
+
+        # Leave this independent channel open past the real shutdown deadline.
+        def delayed_closure(key):
+            return session_report if key == "SESSION" else native(key)
+
+        monkeypatch.setattr(peer, "native", delayed_closure)
+        b.rig.bench.cp, b.rig.bench.connection = "C", "Charging"
+        await b.session.close()
+        assert b.rig.bench.firmware.effective_limit() == 0
+        assert b.session.final_status["shutdown_attempt_uncertain"] is True
 
 
 # Intent: whole-second device timestamps and a delayed real TLS reply still confirm a presently effective ceiling.

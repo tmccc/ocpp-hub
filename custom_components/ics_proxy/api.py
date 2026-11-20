@@ -56,6 +56,10 @@ class ProxyError(Exception):
     """A fixed safe error, without credentials, URLs or raw peer bodies."""
 
 
+class UnknownCommandOutcomeError(ProxyError):
+    """The command may have reached the proxy, so only its saved result can settle it."""
+
+
 class ProxyClient:
     """Home Assistant shares the host network with the proxy; every connection is literal loopback only."""
 
@@ -87,10 +91,10 @@ class ProxyClient:
                     response = await connection.receive_json()
         except aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError:
             if sending and command not in ("status", "history", "receipt"):
-                raise ProxyError(_UNKNOWN_OUTCOME) from None
+                raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None
             raise ProxyError("The local charger proxy could not be reached or authenticated") from None
         if response == {"id": identifier, "ok": False, "error": "outcome_unknown"}:
-            raise ProxyError(_UNKNOWN_OUTCOME)
+            raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME)
         if (
             not isinstance(response, dict)
             or response.get("ok") is not True
@@ -125,24 +129,62 @@ class ProxyClient:
                 )
         return result
 
-    # Acceptance is separate from actual zero/release confirmation; a lost response never repeats the physical write.
+    # Send the control once and recover a lost first reply by reading the original request's receipt.
     async def command(self, action: str, revision: int, **fields: Any) -> None:
+        supplied_id = "id" in fields
         identifier = fields.pop("id", uuid.uuid4().hex)
-        receipt = await self.request(action, id=identifier, revision=revision, **fields)
-        if (
-            not isinstance(receipt.get("id"), str)
-            or not re.fullmatch(r"[a-f0-9]{32}", receipt["id"])
-            or receipt["id"] != identifier
-        ):
+
+        def matches(receipt: dict[str, Any], *, lookup: bool = False) -> bool:
+            returned_id = receipt.get("id")
+            if not isinstance(returned_id, str) or not re.fullmatch(r"[a-f0-9]{32}", returned_id):
+                return False
+            returned_action = receipt.get("action") if lookup else receipt.get("action", action)
+            if returned_id != identifier or returned_action != action:
+                return False
+            if (
+                lookup
+                and supplied_id
+                and ("revision" not in receipt or (action == "set_current" and "current_a" not in receipt))
+            ):
+                return False
+            observed_revision = receipt.get("revision", revision)
+            if type(observed_revision) is not int or observed_revision != revision:
+                return False
+            if action == "set_current" and "current_a" in receipt:
+                return type(receipt["current_a"]) is int and receipt["current_a"] == fields.get("current_a")
+            return True
+
+        try:
+            receipt: dict[str, Any] | None = await self.request(action, id=identifier, revision=revision, **fields)
+        except UnknownCommandOutcomeError:
+            receipt = None
+        if receipt is not None and not matches(receipt):
             raise ProxyError("The local charger proxy returned an invalid command receipt")
         try:
             async with asyncio.timeout(25):
+                if receipt is None:
+                    saved = await self.request("receipt", request_id=identifier)
+                    if not matches(saved, lookup=True) or saved.get("state") not in (
+                        "accepted",
+                        "running",
+                        "completed",
+                        "failed",
+                        "uncertain",
+                    ):
+                        raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME)
+                    receipt = saved
                 while receipt.get("state") in ("accepted", "running"):
                     await asyncio.sleep(1)
                     receipt = await self.request("receipt", request_id=identifier)
-                    if receipt.get("id") != identifier:
+                    if not matches(receipt, lookup=True):
                         raise ProxyError("The local charger proxy returned another command's receipt")
         except TimeoutError, ProxyError:
+            if receipt is None:
+                raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None
             raise ProxyError("The request was recorded; physical confirmation is still pending") from None
+        if receipt.get("state") == "uncertain":
+            raise ProxyError(
+                "The proxy recorded the request. The charger outcome is uncertain. Check the charger status."
+            )
         if receipt.get("state") != "completed":
             raise ProxyError("The charger could not confirm the requested control state")

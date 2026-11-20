@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import time
 
 import pytest
@@ -100,7 +101,7 @@ async def peer():
                 can_start=True,
                 can_start_test=not paused,
             )
-            receipts[value["id"]] = {"id": value["id"], "state": "completed"}
+            receipts[value["id"]] = {"id": value["id"], "action": command, "state": "completed"}
             result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
             if control["lose_reply"]:
                 await socket.close()
@@ -114,7 +115,7 @@ async def peer():
                 can_start_test=False,
                 test_charge={"source": "local", "state": "armed", "duration_seconds": 120, "seconds_remaining": 120},
             )
-            receipts[value["id"]] = {"id": value["id"], "state": "completed"}
+            receipts[value["id"]] = {"id": value["id"], "action": command, "state": "completed"}
             result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
             if control["lose_reply"]:
                 await socket.close()
@@ -135,14 +136,15 @@ async def peer():
                 owner_control_enabled=True,
                 local_charge={"state": "running", "charging": False},
             )
-            receipts[value["id"]] = {"id": value["id"], "state": "completed"}
+            receipts[value["id"]] = {"id": value["id"], "action": command, "state": "completed"}
             result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
             if control["lose_reply"]:
                 await socket.close()
                 return socket
         elif command == "receipt":
             await asyncio.sleep(control["receipt_delay"])
-            result = receipts[value["request_id"]]
+            request_id = value["request_id"]
+            result = receipts.get(request_id, {"id": request_id, "state": "not_found"})
         else:
             raise AssertionError("unexpected client command")
         if control.get("result_filter") is not None:
@@ -261,20 +263,76 @@ async def test_stale_readings_are_unavailable_and_alerts_are_debounced(actual_ha
     assert not coordinator.notified and coordinator.problem_since is None
 
 
-# Intent: a lost mutating reply is surfaced to HA and followed only by status refresh, never an automatic retry.
-# Why: duplicate user-visible operations cannot be inferred safe from a transport timeout.
-async def test_lost_pause_reply_does_not_retry_control(actual_hass, peer):
+# Intent: a dropped reply or explicit unknown result is resolved by reading the original Pause receipt.
+# Why: the saved result can confirm the hold without issuing a second Pause.
+@pytest.mark.parametrize("drop_reply", [True, False], ids=["dropped-reply", "unknown-outcome"])
+async def test_lost_pause_reply_does_not_retry_control(actual_hass, peer, drop_reply):
     hass = actual_hass
     entry = await setup(hass, peer)
-    peer["lose_reply"] = True
-    with pytest.raises(HomeAssistantError, match="outcome is unknown"):
-        await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    peer["lose_reply"] = drop_reply
+
+    # Model the proxy's explicit response when acceptance commits but its first receipt read fails.
+    def unknown_reply(command, request, result):
+        if command == "pause":
+            return json.dumps({"id": request["id"], "ok": False, "error": "outcome_unknown"})
+        return None
+
+    if not drop_reply:
+        peer["raw_response"] = unknown_reply
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
     await entry.runtime_data.async_refresh()
-    assert peer["commands"].count("pause") == 1
+    pause, lookup = (request for request in peer["requests"] if request["command"] != "status")
+    assert pause["command"] == "pause"
+    assert lookup["command"] == "receipt" and lookup["request_id"] == pause["id"] and lookup["id"] != pause["id"]
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
 
 
-# Intent: a transport failure during sending reports an unknown outcome and never claims definite delivery or retries.
+# Intent: a possibly sent command needs an exact, readable receipt to confirm success.
+# Why: even a freshly paused charger does not identify which request caused the hold.
+@pytest.mark.parametrize(
+    "lookup_failure", ["wrong-id", "wrong-action", "wrong-action-after-acceptance", "unreadable", "uncertain", "failed"]
+)
+async def test_lost_pause_reply_requires_a_matching_result(actual_hass, peer, lookup_failure):
+    entry = await setup(actual_hass, peer)
+    peer["lose_reply"] = True
+
+    # Preserve real response framing while changing only the saved result of the follow-up read.
+    def raw_receipt(command, request, result):
+        if command != "receipt":
+            return None
+        if lookup_failure == "unreadable":
+            return "{"
+        if lookup_failure == "wrong-id":
+            result = {**result, "id": "f" * 32}
+        elif lookup_failure == "wrong-action-after-acceptance" and peer["commands"].count("receipt") == 1:
+            result = {**result, "state": "accepted", "action": "pause"}
+        elif lookup_failure.startswith("wrong-action"):
+            result = {**result, "action": "start"}
+        else:
+            result = {**result, "state": lookup_failure}
+        return json.dumps({"id": request["id"], "ok": True, "result": result})
+
+    peer["raw_response"] = raw_receipt
+    messages = {
+        "failed": "could not confirm the requested control state",
+        "uncertain": "The proxy recorded the request. The charger outcome is uncertain",
+        "wrong-action-after-acceptance": "request was recorded; physical confirmation is still pending",
+    }
+    message = messages.get(lookup_failure, "outcome is unknown")
+    with pytest.raises(HomeAssistantError, match=message):
+        await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    await entry.runtime_data.async_refresh()
+    pause, *lookups = (request for request in peer["requests"] if request["command"] != "status")
+    assert pause["command"] == "pause"
+    assert len(lookups) == (2 if lookup_failure == "wrong-action-after-acceptance" else 1)
+    assert all(
+        lookup["command"] == "receipt" and lookup["request_id"] == pause["id"] and lookup["id"] != pause["id"]
+        for lookup in lookups
+    )
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
+
+
+# Intent: a transport failure during sending can only be resolved by the matching saved receipt.
 # Why: send_json can fail before sending any bytes or after the complete request reached the real local peer.
 @pytest.mark.parametrize("after_send", [False, True])
 @pytest.mark.parametrize("command", ["pause", "start", "start_test"])
@@ -295,8 +353,11 @@ async def test_send_failure_uses_uncertain_delivery_wording(actual_hass, peer, m
         raise ClientConnectionError("synthetic send interruption")
 
     monkeypatch.setattr(ClientWebSocketResponse, "send_json", failed_send)
-    with pytest.raises(ProxyError, match="may have been sent; its outcome is unknown"):
+    if after_send:
         await client.command(command, 0)
+    else:
+        with pytest.raises(ProxyError, match="may have been sent; its outcome is unknown"):
+            await client.command(command, 0)
     assert len(attempts) == 1
     await actual_hass.async_block_till_done()
     if after_send:
@@ -304,7 +365,8 @@ async def test_send_failure_uses_uncertain_delivery_wording(actual_hass, peer, m
             while peer["commands"].count(command) == 0:
                 await asyncio.sleep(0.01)
     assert peer["commands"].count(command) == int(after_send)
-    assert "receipt" not in peer["commands"]
+    (lookup,) = (request for request in peer["requests"] if request["command"] == "receipt")
+    assert lookup["request_id"] == attempts[0]["id"]
 
 
 # Intent: pending Start and current work retain their actual operation label under both app and paused intent.
@@ -466,16 +528,17 @@ async def test_normal_start_from_ready_control_reports_zero_watt_session_honestl
     assert "start_test" not in peer["commands"]
 
 
-# Intent: a normal Start with a lost response is refreshed from status without repeating the request.
+# Intent: a normal Start with a lost response is recovered from its original receipt.
 # Why: acknowledgement uncertainty cannot authorize a second session or silently convert it into a timed test.
 async def test_lost_normal_start_reply_does_not_retry(actual_hass, peer):
     hass = actual_hass
     entry = await setup(hass, peer)
     peer["lose_reply"] = True
-    with pytest.raises(HomeAssistantError, match="outcome is unknown"):
-        await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
     await entry.runtime_data.async_refresh()
-    assert peer["commands"].count("start") == 1 and set(peer["commands"]) <= {"status", "start"}
+    start, lookup = (request for request in peer["requests"] if request["command"] != "status")
+    assert start["command"] == "start"
+    assert lookup["command"] == "receipt" and lookup["request_id"] == start["id"]
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "Local session"
     assert hass.states.get("button.ics_proxy_start").state == "unavailable"
 
@@ -565,19 +628,19 @@ async def test_explicit_test_button_sends_one_fixed_request_and_disables_duplica
     assert peer["commands"].count("start_test") == 1
 
 
-# Intent: a lost test-start response refreshes status and surfaces uncertainty without repeating the mutation.
+# Intent: a lost test-start response is recovered without repeating the mutation.
 # Why: an accepted test and its automatic Stop remain service-owned even when HA misses the response.
 async def test_lost_test_start_reply_never_retries_or_rearms(actual_hass, peer):
     hass = actual_hass
     entry = await setup(hass, peer)
     peer["lose_reply"] = True
-    with pytest.raises(HomeAssistantError, match="outcome is unknown"):
-        await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start_test"}, blocking=True)
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start_test"}, blocking=True)
     await entry.runtime_data.async_refresh()
-    assert peer["commands"].count("start_test") == 1
+    start, lookup = (request for request in peer["requests"] if request["command"] != "status")
+    assert start["command"] == "start_test"
+    assert lookup["command"] == "receipt" and lookup["request_id"] == start["id"]
     assert hass.states.get("button.ics_proxy_start_test").state == "unavailable"
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "Local test"
-    assert set(peer["commands"]) <= {"status", "start_test"}
 
 
 # Intent: both the service readiness flag and current independent health are required for the test button.

@@ -14,10 +14,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from ocpp_hub_core.frames import build_call
-from ocpp_hub_core.prototype import recovery_policy
 from ocpp_hub_core.prototype.connection_scope import current_scope
-from ocpp_hub_core.prototype.gateway import Gateway
 from ocpp_hub_core.prototype.local_control import ControlSupersededError, LocalControl
 from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, Prerequisite, RestoreState, WireReply
@@ -245,8 +242,9 @@ async def recover_failed_return(b, failed, before):
 
 # Intent: real resource ACK storage refusal preserves actual positive Accepted knowledge and confirms owned zero.
 # Why: after_result failure must not erase the reply recorded by on_reply or permit a replay of the same Return.
+@pytest.mark.parametrize("diagnostic_available", [True, False], ids=["diagnostic-available", "diagnostic-refused"])
 async def test_actual_positive_reply_survives_resource_ack_statement_refusal(
-    tmp_path, tls, unused_tcp_port, monkeypatch
+    tmp_path, tls, unused_tcp_port, monkeypatch, diagnostic_available
 ):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, g, j = b.controller, b.session.gateway, b.session.journal
@@ -262,9 +260,17 @@ async def test_actual_positive_reply_survives_resource_ack_statement_refusal(
             "BEGIN SELECT release_sql_observed('resource-ack',NEW.desired); "
             "SELECT RAISE(ABORT,'independent positive resource ACK unavailable'); END"
         )
+        diagnostic_writes = []
+        if not diagnostic_available:
+            j.db.create_function("observe_refused_release_diagnostic", 1, diagnostic_writes.append)
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_release_diagnostic BEFORE INSERT ON meta "
+                "WHEN NEW.key='managed_release_failure' BEGIN SELECT observe_refused_release_diagnostic(NEW.key); "
+                "SELECT RAISE(ABORT,'independent optional diagnostic unavailable'); END"
+            )
         try:
             returning = accepted_return(b, before)
-            await tick_with_storage_outcome(c)
+            poll = await tick_with_storage_outcome(c)
             assert not errors and len(observations) == 1
             cut = observations[0]
             assert cut["label"] == "resource-ack" and cut["resource"]["action"] == "SetChargingProfile"
@@ -283,10 +289,18 @@ async def test_actual_positive_reply_survives_resource_ack_statement_refusal(
             assert c.requests.receipt(returning)["state"] == "uncertain"
             assert j.get("control")["inhibit"] and j.get("control")["uncertain"]
             assert b.rig.bench.firmware.effective_limit() == 0
+            assert j.fault.classification() == "owner_release_unconfirmed"
+            assert poll is result.failure
+            if not diagnostic_available:
+                assert diagnostic_writes == ["managed_release_failure"]
+                assert j.get("managed_release_failure") is None
         finally:
             b.rig.bench.before_reply = previous
             j.db.execute("DROP TRIGGER refuse_positive_resource_ack")
             j.db.create_function("release_sql_observed", 2, None)
+            if not diagnostic_available:
+                j.db.execute("DROP TRIGGER refuse_release_diagnostic")
+                j.db.create_function("observe_refused_release_diagnostic", 1, None)
         await recover_failed_return(b, returning, before)
 
 
@@ -416,6 +430,10 @@ async def test_cancelled_poll_cannot_abandon_owned_return_publication(tmp_path, 
             assert c.requests.intent().revision == before["intent"].revision + 1
             receipt = copy.deepcopy(c.requests.receipt(returning))
             assert receipt["state"] == "completed" and g.controls.ready and b.rig.bench.firmware.effective_limit() == 6
+            settled = refresh_for_read(c, pending)
+            assert settled["control_mode"] == "waiting" and not settled["return_pending"]
+            assert settled.get("fault") is None and settled["station_ceiling_a"] is None
+            assert not settled["owner_control_enabled"] and not settled["can_start"]
             assert c.command(returning, "app_control", before["intent"].revision) == receipt
             assert len(positive_calls(b, before["wire"])) == 1
         finally:
@@ -479,163 +497,60 @@ async def test_late_return_reply_keeps_the_newer_pause(tmp_path, tls, unused_tcp
 
 
 # Intent: a real matching Boot after child COMMIT retires successful result A without faulting current authority B.
-# Why: coordinator completion must classify STALE rather than repeat publication or borrow its old Boot proof.
+# Why: a late observer must preserve the completed Return and verify the ceiling under the newer Boot.
 async def test_matching_boot_after_child_publication_retires_only_result(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, g, j = b.controller, b.session.gateway, b.session.journal
         before = await pause_prefix(b)
         replies = observe_device_replies(SimpleNamespace(sock=b.charger), monkeypatch)
         witness, previous_reply = capture_positive(b)
-        original_send, previous_profile = b.charger.send, sys.getprofile()
-        boot_id = uuid.uuid4().hex
-        boot_reply = asyncio.get_running_loop().create_future()
-        burst, boot_entries, policies, trace_rows, after_commit, errors, notifications = {}, [], [], [], [], [], []
+        published, resume = asyncio.Event(), asyncio.Event()
+        release = g.controls.release_result
 
-        # Buffer the actual verification ACK and genuine Boot as adjacent wire frames, not injected engine callbacks.
-        async def reply_then_boot(raw):
-            answer = json.loads(raw)
-            call = next((frame for frame in b.rig.bench.device_calls if frame[1] == answer[1]), None)
-            attempt = g.controls.release_attempt
-            if (
-                not burst
-                and answer[0] == 3
-                and call is not None
-                and call[2] == "GetCompositeSchedule"
-                and attempt is witness.get("attempt")
-                and attempt is not None
-                and attempt.positive_may_have_dispatched
-                and not attempt.positive_confirmed
-                and b.rig.bench.firmware.effective_limit() == 6
-            ):
-                burst.update(call=copy.deepcopy(call), answer=copy.deepcopy(answer), scope=current_scope(g))
-                b.rig.bench.replies[boot_id] = boot_reply
-                await original_send(raw)
-                await original_send(build_call(boot_id, "BootNotification", BOOT))
-                return
-            await original_send(raw)
+        # Wait only after the actual child has committed, before the coordinator consumes its real result.
+        async def wait_after_commit(*args, **kwargs):
+            result = await release(*args, **kwargs)
+            if result.published and not published.is_set():
+                published.set()
+                await resume.wait()
+            return result
 
-        # The real SQL trace schedules only a read-only observation after the child's synchronous COMMIT path.
-        def committed_observation():
-            try:
-                attempt = witness["attempt"]
-                after_commit.append(
-                    {
-                        "published": attempt.published,
-                        "finished": attempt.finished,
-                        "completion_pending": not witness["completion"].done(),
-                        "scope": current_scope(g),
-                        "released_epoch": c.released_epoch,
-                        "intent": c.requests.intent(),
-                        "control": copy.deepcopy(j.get("control")),
-                    }
-                )
-            except Exception as error:
-                errors.append(type(error).__name__)  # Observer failures are asserted outside engine execution.
-
-        # Select only the actual shared-control handoff row; never run a command or mutate metadata in this trace.
-        def trace(statement):
-            if trace_rows or not statement.startswith("INSERT OR REPLACE INTO meta "):
-                return
-            frame = sys._getframe(1)
-            try:
-                while frame is not None:
-                    if (
-                        frame.f_code is type(j).put.__code__
-                        and frame.f_locals.get("self") is j
-                        and frame.f_locals.get("key") == "control"
-                        and frame.f_locals.get("value", {}).get("owner") == "shared"
-                    ):
-                        trace_rows.append(
-                            {
-                                "candidate": copy.deepcopy(frame.f_locals["value"]),
-                                "in_transaction": j.db.in_transaction,
-                                "attempt": g.controls.release_attempt,
-                            }
-                        )
-                        asyncio.get_running_loop().call_soon(committed_observation)
-                        break
-                    frame = frame.f_back
-            except Exception as error:
-                errors.append(type(error).__name__)
-            finally:
-                del frame
-
-        # Profile real entries/results without adding awaits, replacing methods or altering any classification.
-        def observe(frame, event, arg):
-            try:
-                attempt = witness.get("attempt")
-                if event == "call" and frame.f_code is Gateway._local_answer.__code__:
-                    if (
-                        frame.f_locals.get("self") is g
-                        and frame.f_locals.get("token") == f"{g._charger_epoch}:{boot_id}"
-                    ):
-                        boot_entries.append(
-                            {
-                                "published": attempt is not None and attempt.published,
-                                "finished": attempt is not None and attempt.finished,
-                                "child_done": bool(witness.get("children")) and witness["children"][0].done(),
-                                "completion_pending": not witness["completion"].done(),
-                                "scope_before_boot": current_scope(g),
-                            }
-                        )
-                if frame.f_code is recovery_policy.release_disposition.__code__ and attempt is not None:
-                    if event == "call" and frame.f_locals.get("result").published:
-                        policies.append(
-                            {
-                                "result": frame.f_locals["result"],
-                                "current": frame.f_locals["current"],
-                                "released_epoch": c.released_epoch,
-                                "control": copy.deepcopy(j.get("control")),
-                            }
-                        )
-                    if event == "return" and arg is recovery_policy.ReleaseDisposition.STALE:
-                        notifications.append("stale")
-            except Exception as error:
-                errors.append(type(error).__name__)
-            if previous_profile is not None:
-                previous_profile(frame, event, arg)
-
-        monkeypatch.setattr(b.charger, "send", reply_then_boot)
-        j.db.set_trace_callback(trace)
-        sys.setprofile(observe)
+        monkeypatch.setattr(g.controls, "release_result", wait_after_commit)
+        returning = accepted_return(b, before)
+        poll = asyncio.create_task(c.tick())
         try:
-            returning = accepted_return(b, before)
-            await c.tick()
-            answer = await asyncio.wait_for(asyncio.shield(boot_reply), 5)
-            assert answer[0] == 3 and answer[2]["status"] == "Accepted"
-            assert not errors and burst and len(trace_rows) == len(after_commit) == len(boot_entries) == 1
-            assert burst["answer"][2]["status"] == "Accepted"
-            assert burst["answer"][2]["chargingSchedule"]["chargingSchedulePeriod"] == [{"startPeriod": 0, "limit": 6}]
-            assert trace_rows[0]["in_transaction"] and trace_rows[0]["attempt"] is witness["attempt"]
-            boot = boot_entries[0]
-            assert boot["published"] and boot["finished"] and boot["child_done"] and boot["completion_pending"]
-            assert boot["scope_before_boot"] == before["scope"]
-            assert after_commit[0]["published"] and after_commit[0]["finished"]
-            assert after_commit[0]["completion_pending"]
-            assert len(policies) == 1 and notifications == ["stale"]
-            policy = policies[0]
-            assert policy["result"].published_authority.scope == before["scope"]
-            assert policy["current"].scope == current_scope(g) and current_scope(g) != before["scope"]
-            assert current_scope(g).epoch == before["scope"].epoch
-            assert current_scope(g).metadata_revision == before["scope"].metadata_revision
+            await asyncio.wait_for(published.wait(), 5)
+            original = c.requests.receipt(returning)
+            assert original["state"] == "completed"
+            assert c.requests.intent().mode == "app" and g.controls.ready
+            assert witness["attempt"].finished and witness["attempt"].published
+            assert witness["children"][0].done() and not witness["completion"].done()
+            assert current_scope(g) == before["scope"]
+
+            assert (await b.rig.bench.call(b.charger, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
+            current = current_scope(g)
+            assert current.lineage == before["scope"].lineage and current != before["scope"]
+            assert not g.controls.ready and b.rig.bench.firmware.effective_limit() == 6
+            assert c.requests.receipt(returning) == original
+            resume.set()
+
+            await poll
+            result = await finished_attempt(b, witness, replies, before)
             progress = witness["completion"].result()
             assert progress.state is RestoreState.YIELDED and not progress.shared
-            assert progress.operation.published
-            assert progress.operation.published_authority == policy["result"].published_authority
-            assert c.released_epoch == policy["released_epoch"] == after_commit[0]["released_epoch"]
-            assert j.get("control") == policy["control"] and not j.get("managed_control_fault")
-            assert c.requests.intent().mode == "app" and c.requests.receipt(returning)["state"] == "completed"
-            result = await finished_attempt(b, witness, replies, before)
+            assert progress.operation.published_authority.scope == before["scope"]
             assert result.failure is None and result.published and result.effects.positive_verified
-            assert not result.effects.zero_dispatched and b.rig.bench.firmware.effective_limit() == 6
+            assert not result.effects.zero_dispatched and not j.fault.latched()
+            assert c.requests.receipt(returning) == original and b.rig.bench.firmware.effective_limit() == 6
         finally:
-            sys.setprofile(previous_profile)
-            j.db.set_trace_callback(None)
+            resume.set()
+            await asyncio.gather(poll, return_exceptions=True)
             b.rig.bench.before_reply = previous_reply
+
         pause, revision = uuid.uuid4().hex, c.requests.intent().revision
         c.command(pause, "pause", revision)
         await completed_control(b, pause, mode="paused", revision=revision + 1, ceiling=0)
-        assert c.requests.receipt(returning)["state"] == "completed"
+        assert c.requests.receipt(returning) == original
 
 
 # Intent: a newer real Pause after owned SHARED completion must retire the awaiting consumer's old result.

@@ -26,11 +26,12 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from ocpp_hub_core.prototype.managed_view import health_snapshot, publish_poll  # noqa: E402
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
+from ocpp_hub_core.prototype.store import RecoveryRequiredError  # noqa: E402
 from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_private  # noqa: E402
 
 from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, incident_report  # noqa: E402
-from tools.managed_reporting import Reporting  # noqa: E402
+from tools.managed_reporting import Reporting, ReportWriter  # noqa: E402
 from tools.trial_proxy import native_spec  # noqa: E402
 
 _SUPERVISION_POLL_SECONDS = 5
@@ -82,23 +83,27 @@ def health(path: Path, now: float | None = None) -> dict[str, Any]:
     return health_snapshot(private_json(path), now)
 
 
+# Check the same management settings offline and at service startup.
+def management_settings(config: TrialConfig, path: Path | None) -> ManagementSettings | None:
+    if path is None:
+        return None
+    check_spec_path(config, path)
+    management = ManagementSettings.load(path)
+    check_spec_path(config, management.token_file)
+    if management.token_file in (config.native_secret, config.incoming_secret, config.upstream_secret):
+        raise SecurityError("management credential must be independent")
+    if config.listener_host == "127.0.0.1" and config.listener_port == management.port:
+        raise SecurityError("management and charger listeners require separate ports on loopback")
+    return management
+
+
 # Start one journal owner and retain the same zero/recovery/event semantics through every supervised replacement.
 async def serve(config_path: Path, spec_path: Path, management_path: Path | None = None) -> int:
     prepared = preflight(config_path)
     check_spec_path(prepared.config, spec_path)
     spec = native_spec(spec_path, prepared)
     expires = prepared.tls.certificate_expires_at
-    management = None
-    if management_path is not None:
-        check_spec_path(prepared.config, management_path)
-        management = ManagementSettings.load(management_path)
-        check_spec_path(prepared.config, management.token_file)
-        if management.token_file in (
-            prepared.config.native_secret,
-            prepared.config.incoming_secret,
-            prepared.config.upstream_secret,
-        ):
-            raise SecurityError("management credential must be independent")
+    management = management_settings(prepared.config, management_path)
     session = TrialSession(prepared, native_bounded=spec, allow_local_start=False, allow_unplugged_native=True)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -120,11 +125,22 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     events_path = prepared.config.journal.with_suffix(".events.jsonl")
     started = time.time()
     reporting = Reporting(ROOT)
+    writer: ReportWriter | None = None
     published: dict[str, Any] = {"running": True, "state": "starting"}
     api: ManagementServer | None = None
     incident: IncidentRecorder | None = None
     try:
+        try:
+            writer = ReportWriter(
+                partial(
+                    reporting.write, status_path=status_path, events_path=events_path, save=save_private, event=event
+                )
+            )
+        except OSError, RuntimeError:
+            reporting.output_errors += 1
         await session.start()
+        if not session.started:
+            raise RecoveryRequiredError("managed startup requires an open charger listener")
         controller = ManagedController(session)
         try:
             incident = IncidentRecorder(prepared.config.incident_events, partial(event, maximum=MAX_EVENT_BYTES))
@@ -134,14 +150,23 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
             session.gateway.controls.incident_observer = incident.observe
         if management is not None:
             api = ManagementServer(management, controller, lambda: dict(published))
-            await api.start()
         notify("READY=1\nSTATUS=Waiting for verified charger and owner control")
         while not stopped.is_set():
+            if api is not None and api.server is None:
+                try:
+                    await api.start()
+                except OSError:
+                    pass  # Retry the optional loopback socket without retiring charger supervision.
             status = await controller.tick()
+            if api is not None:
+                status["management_available"] = api.server is not None
+            previous = reporting.previous
             published = publish_poll(
                 controller, status, pid=os.getpid(), started=started, expires=expires, observe=reporting.observe
             )
-            if reporting.write(published, status_path, events_path, save_private, event):
+            if writer is not None:
+                writer.submit(published)
+            if reporting.previous != previous:
                 notify("STATUS=App/schedule control: " + str(published.get("state")))
             try:
                 await asyncio.wait_for(stopped.wait(), _SUPERVISION_POLL_SECONDS)
@@ -151,28 +176,37 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
         request_stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        notify("STOPPING=1\nSTATUS=Retaining charger hold and persistent records")
-        if api is not None:
-            await api.close()
+        notify("STOPPING=1\nSTATUS=Checking final charger hold")
         try:
-            if controller is not None:
-                await controller.current.close()
-                await controller.charging.close()
-                if controller.pause_task is not None:
-                    await asyncio.gather(controller.pause_task, return_exceptions=True)
-            await session.close()
+            try:
+                if api is not None:
+                    await api.close()
+            finally:
+                try:
+                    if controller is not None:
+                        await controller.current.close()
+                        await controller.charging.close()
+                        if controller.pause_task is not None:
+                            await asyncio.gather(controller.pause_task, return_exceptions=True)
+                finally:
+                    await session.close()
         finally:
             if incident is not None:
                 incident.close()
-            try:
-                save_private(
-                    status_path, {"running": False, "state": "stopped", "checked_at": time.time(), "pid": os.getpid()}
+            shutdown_uncertain = (session.final_status or {}).get("shutdown_attempt_uncertain") is not False
+            if writer is not None:
+                await writer.close(
+                    {
+                        "running": False,
+                        "state": "stopped",
+                        "checked_at": time.time(),
+                        "pid": os.getpid(),
+                        "shutdown_uncertain": shutdown_uncertain,
+                    }
                 )
-            except OSError, SecurityError:
-                pass  # Required session closure already completed; an old report continues to age visibly.
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.remove_signal_handler(sig)
-    return 0
+    return 2 if shutdown_uncertain else 0
 
 
 # Explicit serve is the only networking action; other actions read local files.
@@ -200,10 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             prepared = preflight(args.config)
             check_spec_path(prepared.config, args.native_bounded_spec)
             native_spec(args.native_bounded_spec, prepared)
-            if args.management_config is not None:
-                check_spec_path(prepared.config, args.management_config)
-                management = ManagementSettings.load(args.management_config)
-                check_spec_path(prepared.config, management.token_file)
+            management_settings(prepared.config, args.management_config)
             remaining = prepared.tls.certificate_expires_at - time.time()
             print(
                 json.dumps(

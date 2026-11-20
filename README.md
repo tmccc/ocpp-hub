@@ -510,12 +510,15 @@ diagnostic schemas on an older proxy remain compatible with the existing health 
 
 Pending current and Start operations retain their own labels and current intent/revision while physical
 measurements remain unknown. Missing connection facts remain unknown rather than being labelled disconnected.
+Status reads use live command state for pending messages and diagnostics. Once a command settles, the proxy can
+show that it is waiting for a fresh charger reading while retaining the earlier diagnostic timeline.
 Verified local app/schedule control remains labelled as available during a cloud outage, with `cloud offline`
 shown explicitly. Both native and status readings must still be fresh; an outage never extends their deadlines.
 The timeline retains cloud-wait and cleanup phases, protocol details retain Boot-probe and completed-RPC labels,
-and retained historical diagnostic labels remain readable. A control whose send or reply fails is reported as
-possibly sent with an unknown outcome; the client does not retry it. Optional native observation notes can fail
-without terminating supervision. Required atomic fault proof and command settlement retain their storage checks.
+and retained historical diagnostic labels remain readable. When the first reply to a control is lost, the client
+reads the saved receipt for that request. An unreadable or unconfirmed result stays unknown. The client sends the
+control once. Optional native observation notes can fail without terminating supervision. Required atomic fault
+proof and command settlement retain their storage checks.
 
 Software metadata distinguishes the actual HA/client version and an available installed client `BUILD` stamp from
 source fingerprints. The proxy fingerprint covers the installed core Python sources and its managed/reporting/trial
@@ -773,14 +776,19 @@ gate subsequent control. Unknown transactions, lower meters and contradictory St
 
 The default commissioning policy remains strict. `tools/acknowledge_native_history.py check --config <private-file>
 --native-bounded-spec <private-file>` is dormant input validation. Its explicit `acknowledge` action requires the
-service to be stopped and acquires the existing journal's exclusive lock before fresh native reads. It accepts only
-the specific history-preservation fault with native6 or this journal's commissioned native32 under HW32, owned
-confirmed0, closed all-phase-zero, unchanged
-configuration/schedule, matching prior Boot and no lifecycle, unbound Start, command or mutation debt. Archive,
+service to be stopped and acquires the existing journal's exclusive lock before fresh native reads. For an isolated
+history-preservation fault it requires native6 or this journal's commissioned native32 under HW32, a confirmed
+owned zero, a closed session at zero on all phases, unchanged configuration and schedule, a matching prior Boot
+and a settled journal. Archive,
 policy, operator receipt and retirement of that fault commit atomically into inhibited recovery; no charger writer
 exists in the tool. Fresh actual Boot, resource/ledger reconciliation and the ordinary guarded release remain
 required after restart. The same acknowledged history policy follows that journal through eventual original-backend
 restoration, with all ordinary32A/hardware/resource checks intact. Other journals cannot inherit this permission.
+
+If missing original history blocks recovery of a vendor command, acknowledge the history first using the same tool.
+This requires a paused, closed charger with an independently verified zero hold. The acknowledgement records the
+history and preserves the vendor command and its evidence. Complete the applicable vendor reconciliation next,
+then use a fresh Pause to acknowledge it before a separate Return.
 
 Live recovery on2026-11-10 retained27 full historical records locally while the charger returned25; the two absent
 older records remain an informational warning. Actual Boot/cloud/native recovery returned app/schedule authority at
@@ -1156,7 +1164,8 @@ refuse journal startup before this workflow can run.
 `tools/reconcile_managed_debt.py` provides the same exclusive offline boundary for nine specific debts:
 
 - `--kind observation` retires one legacy rejected routine report.
-- `--kind vendor-write` resolves one independently settled uncertain vendor mutation.
+- `--kind vendor-write` resolves the oldest unresolved vendor command with its own independent evidence.
+  Inspect again for each remaining command. A fresh Pause can acknowledge the recovery once all commands settle.
 - `--kind local-start` retires an issued or accepted owner Start whose source was never identified, including a
   lost RemoteStart reply or acceptance committed before management publication.
 - `--kind vendor-start` retires an accepted, unbound cloud Start grant using its exact confirmed command receipt.

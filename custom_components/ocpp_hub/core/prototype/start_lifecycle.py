@@ -1,4 +1,4 @@
-"""One journal-level owner for Start evidence and the normal request's lifecycle projections."""
+"""One journal-level owner for Start evidence and command outcomes."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
-from .managed_intent import ControlIntent
+from .managed_intent import ControlIntent, insert_request
 from .start_handoff import StartHandoffContext, StartPublication
 from .start_settlement import (
     ChargeStart,
@@ -190,12 +190,11 @@ class StartLifecycle:
                     "start_rpc_accepted": False,
                     "start_attempted": False,
                     "current_a": lease.current_a,
+                    **({"accepted_boot": lease.accepted_boot} if lease.accepted_boot is not None else {}),
+                    **({"mutation_floor": lease.first_mutation} if not local else {}),
                 },
             )
-            j.db.execute(
-                "INSERT INTO managed_requests VALUES(?,?,?,?,?)",
-                (lease.identifier, action, lease.revision, state, json.dumps(result)),
-            )
+            insert_request(j, lease.identifier, action, lease.revision, result, state=state)
         self.lease = lease
 
     # Initial preparation joins the wire child's transaction after the caller's live permission check.
@@ -244,7 +243,15 @@ class StartLifecycle:
         self.lease = None
 
     # Expiry bookkeeping retains accepted/unknown evidence and cannot grant any physical Stop permission.
-    def expire(self, lease: ChargeLease, reason: str, preserve: bool, failure: dict[str, Any] | None) -> None:
+    def expire(
+        self,
+        lease: ChargeLease,
+        reason: str,
+        preserve: bool,
+        failure: dict[str, Any] | None,
+        *,
+        target: int | None = None,
+    ) -> None:
         j = self.journal
         j.put(
             "managed_test_charge",
@@ -253,20 +260,41 @@ class StartLifecycle:
                 "state": "expired" if preserve else "stopping",
                 "stop_reason": reason,
                 "expired_normal": lease.normal,
+                **({"stop_local": target} if not lease.normal else {}),
                 **({"failure": failure} if failure is not None else {}),
             },
         )
         self._finish(lease.identifier, "uncertain", {"classification": reason})
 
-    # Timed/cloud metadata shares storage but never becomes an alternate writer of a normal Start record.
-    def project_test(self, state: dict[str, Any]) -> None:
-        if state.get("kind") == "normal":
+    # Publish verified timed flow and its receipt together inside the caller's transaction.
+    def confirm_test_flow(
+        self,
+        lease: ChargeLease,
+        state: dict[str, Any],
+        local: int,
+        observed_at: float,
+        duration: float,
+        *,
+        cloud_start: tuple[str, str] | None = None,
+    ) -> None:
+        if lease.normal or state.get("kind") == "normal":
             raise RecoveryRequiredError("normal Start metadata requires its lifecycle transition")
-        self.journal.put("managed_test_charge", state)
-
-    # A normal observation may update measurement without changing publication, intent or the request result.
-    def measurement(self, state: dict[str, Any], charging: bool) -> None:
-        self.journal.put("managed_test_charge", {**state, "charging": charging})
+        if state.get("id") != lease.identifier:
+            raise RecoveryRequiredError("verified test flow belongs to another request")
+        self.journal.put(
+            "managed_test_charge",
+            {
+                **state,
+                "state": "charging",
+                "flow_started_at": observed_at,
+                "stop_deadline_epoch": observed_at + duration,
+                "local_transaction": local,
+                "start_source_verified": True,
+                **({"cloud_start": {"grant": cloud_start[0], "mutation": cloud_start[1]}} if cloud_start else {}),
+            },
+        )
+        # The pending-state filter preserves the cloud arm receipt completed at admission.
+        self._finish(lease.identifier, "completed", {"positive_power_verified": True, "duration_seconds": duration})
 
     # Startup normalization keeps the caller's independently committed Pause/intent claim in the same transaction.
     def interrupted(self, state: dict[str, Any], preserve: bool) -> None:
@@ -370,8 +398,6 @@ class StartLifecycle:
         if record.phase == "running":
             if session is not None and session.stop is not None:
                 self.complete_normal(state, local, stopped_at=time.time(), finish_request=False)
-            elif native is not None and native.physical.native_transaction_id == local and j.active() == local:
-                self.measurement(state, native.physical.power_w > 10)
             return True
         if not allow_open or lease is None or not lease.normal or record.published is not True or native is None:
             return False
@@ -430,6 +456,44 @@ class StartLifecycle:
             j.put("local_start_receipt", {**receipt, "stage": stage, **({"settled_ticket": ticket} if settled else {})})
             if settled:
                 j.control.project(control, start_pending=False)
+
+    # A newer Pause can settle an exact, unbound device rejection after verifying its own closed zero.
+    def settle_rejected_pause(self, revision: int, require_hold: Callable[[dict[str, Any]], None]) -> None:
+        j = self.journal
+        control = j.get("control", {})
+        if control.get("start_pending") is not True:
+            return
+        record = self.load(ledger=False)
+        if record is None or record.request is None:
+            return
+        receipt, request = record.receipt, record.request
+        ticket = control.get("ticket")
+        if (
+            record.source != "local"
+            or record.kind not in ("normal", "test")
+            or not record.request_matches()
+            or record.attempted is not True
+            or record.published is not False
+            or record.reported_local is not None
+            or request.state not in ("accepted", "running", "uncertain")
+            or request.revision >= revision
+            or receipt.request_id != request.identifier
+            or receipt.stage != "rejected"
+            or receipt.local is not None
+            or not receipt.digest
+            or receipt.digest != record.projection_digest
+            or not receipt.ticket
+            or not ticket
+            or receipt.ticket == ticket
+        ):
+            return
+        with j.atomic():
+            require_hold(control)
+            j.put(
+                "local_start_receipt",
+                {**json.loads(receipt.body), "settled_ticket": ticket, "pause_revision": revision},
+            )
+            j.control.project(control, start_pending=False)
 
     # Proven unissued preparation retires independently of whichever later owner currently holds zero.
     def retire_prepared(self, ticket: str | None) -> None:
@@ -544,6 +608,12 @@ class StartLifecycle:
         if stopped_at is not None:
             changes["stopped_at"] = stopped_at
         self.journal.put("managed_test_charge", {**state, **changes})
+
+    # An unrelated daily can retire expired test work without completing its pending Start successfully.
+    def retire_independent_test(self, lease: ChargeLease, state: dict[str, Any]) -> None:
+        with self.journal.atomic():
+            self.complete_metadata(state, reason="independent_daily")
+            self._finish(lease.identifier, "failed", {"classification": "independent_daily"})
 
     # All local management outcomes share encoding and exact optional filters, inside their existing transaction.
     def _finish(

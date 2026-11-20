@@ -24,9 +24,15 @@ async def test_completed_reads_leave_capacity_and_keep_mutation_receipts(tmp_pat
         write = [2, "write", "RemoteStopTransaction", {"transactionId": 12}]
         expected = await cache.response("vendor", 1, write, handle)
         for index in range(100):
-            await cache.response("vendor", 1, [2, str(index), "GetConfiguration", {}], handle)
+            await cache.response("vendor", 1, [2, str(index), "GetConfiguration", {}], handle, read=True)
         assert len(calls) == 101
         assert cache._items == {}
+        assert len(cache._reads) == 1
+        assert [row["token"] for row in j.db.execute("SELECT token FROM inbound_receipts")] == ["write"]
+        recent = [2, "99", "GetConfiguration", {}]
+        assert await cache.response("vendor", 1, recent, handle, read=True) == expected
+        other = await cache.response("vendor", 1, [2, "write", "GetConfiguration", {}], handle, read=True)
+        assert decode(other)[2] == "FormationViolation"
         assert await cache.response("vendor", 1, write, handle) == expected
         changed = await cache.response("vendor", 1, write[:3] + [{"transactionId": 13}], handle)
         assert decode(changed)[2] == "FormationViolation" and len(calls) == 101

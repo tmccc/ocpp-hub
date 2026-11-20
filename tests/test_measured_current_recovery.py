@@ -4,22 +4,129 @@ import asyncio
 import copy
 import json
 import uuid
+from dataclasses import replace
 
 import pytest
 from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
+from ocpp_hub_core.prototype.native_faults import MEASURED_FAULT
+from ocpp_hub_core.prototype.security import SecurityError
 from websockets.asyncio.client import connect
 
 from tests import managed_rig as mp
-from tests.charge_rig import positive_flow, ready
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.current_rig import commissioned
+from tests.handover_helpers import crash
 from tests.management_peer import TOKEN, call
 from tests.native_peer_failures import InterruptedNativePeer
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
+
+
+# Intent: an admitted open charge with excessive measurements reaches protective zero after a restart or reconnect.
+# Why: the first native read and the first Boot audit must both allow the existing restrictive hold.
+@pytest.mark.parametrize(
+    "boundary,selected",
+    [
+        ("reconnect", 32),
+        ("replacement", 32),
+        ("configuration_changed", 32),
+        ("reconnect", 16),
+        ("replacement", 16),
+        ("storage_refusal", 16),
+    ],
+)
+async def test_measurement_excess_retains_restrictive_startup(
+    tmp_path, tls, unused_tcp_port, monkeypatch, boundary, selected
+):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, selected) as b:
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        assert (await mp.healthy(b.controller))["current_a"] == selected
+        firmware, peer = b.rig.bench.firmware, b.rig.peer
+        original = peer.native
+
+        # Keep the real charger session and configuration, altering only its independent meter response.
+        def measured(key):
+            response = original(key)
+            if key == "METER" and firmware.current:
+                response[0]["meterData"]["cur"] = [selected * 10 + 6, 0, 0]
+            return response
+
+        monkeypatch.setattr(peer, "native", measured)
+        mark = len(b.rig.bench.device_calls)
+        restart = boundary in ("replacement", "configuration_changed")
+        if restart:
+            await crash(b.session)
+            session = mp.managed_session(b.rig)
+            if boundary == "configuration_changed":
+                monkeypatch.setitem(peer.configuration, "other-setting", "changed")
+                try:
+                    with pytest.raises(SecurityError, match="configuration|schedule"):
+                        await session.start()
+                    assert not session.started and not session.journal.fault.latched()
+                    assert len(b.rig.bench.device_calls) == mark
+                finally:
+                    await session.close()
+                assert session.final_status["shutdown_attempt_uncertain"] is True
+                return
+            await session.start()
+            c = mp.ManagedController(session)
+        else:
+            session, c = b.session, b.controller
+            await b.charger.close()
+            await until(lambda: session.gateway.charger.sender is None)
+        storage_attempts = []
+        if boundary == "storage_refusal":
+            # Refuse only the first actual fault publication, then allow the same Boot to finish it.
+            def refuse_once():
+                storage_attempts.append(True)
+                return int(len(storage_attempts) == 1)
+
+            db = session.journal.db
+            db.create_function("refuse_measurement_once", 0, refuse_once)
+            db.execute(
+                "CREATE TEMP TRIGGER refuse_measurement BEFORE INSERT ON meta "
+                "WHEN NEW.key='managed_native_failure' AND refuse_measurement_once() "
+                "BEGIN SELECT RAISE(ABORT,'measurement storage temporarily unavailable'); END"
+            )
+        try:
+            async with b.rig.charger(session) as charger:
+                assert (await b.rig.bench.call(charger, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
+                await until(session.journal.fault.latched, 6)
+                async with asyncio.timeout(8):
+                    while (
+                        not session.journal.fault.latched()
+                        or session.journal.fault.classification() != MEASURED_FAULT
+                        or not session.gateway.controls.ready
+                    ):
+                        await c.tick()
+                        await asyncio.sleep(0.02)
+                assert firmware.effective_limit() == firmware.current == 0
+                if boundary == "storage_refusal":
+                    assert len(storage_attempts) >= 2
+                assert session.journal.active() == local
+                assert not [
+                    frame
+                    for frame in b.rig.bench.device_calls[mark:]
+                    if frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction")
+                ]
+                c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                async with asyncio.timeout(8):
+                    while not b.rig.bench.remote_stop.is_set():
+                        await c.tick()
+                        await asyncio.sleep(0.02)
+                recovered = replace(b, session=session, controller=c, charger=charger)
+                assert (await actual_stop(recovered, local))["local_hold_verified"]
+                assert not session.journal.fault.latched()
+                c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
+                assert (await mp.healthy(c))["station_ceiling_a"] == selected
+        finally:
+            if restart:
+                await c.charging.close()
+                await session.close()
 
 
 # Intent: a pure measured current trip recovers only after new Pause, actual closure/ACK and full native zero.

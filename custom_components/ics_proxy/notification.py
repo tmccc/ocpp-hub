@@ -102,8 +102,7 @@ class ProxyNotice:
     def show(self) -> None:
         persistent_notification.async_create(
             self.hass,
-            "The local iCS charger proxy needs attention. Check its status on the iCS Charger dashboard. "
-            "The proxy retains its charging limits and any requested pause."
+            "The iCS charger proxy needs attention. Check the current limit and pause on the iCS Charger dashboard."
             + (" Last reported: " + self.detail if self.detail else ""),
             title="Charger proxy needs attention",
             notification_id=self.notification_id,

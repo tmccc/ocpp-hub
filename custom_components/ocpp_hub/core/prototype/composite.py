@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from sys import float_info
 
 from ..frames import Frame
 from .policy import DeniedError, number
 from .rpc import UnavailableError
+
+STATION_COMPOSITE_FAULT = "station_composite_current_exceeded"
 
 
 class FutureScheduleError(UnavailableError):
@@ -16,6 +19,10 @@ class FutureScheduleError(UnavailableError):
     def __init__(self, ahead_seconds: float) -> None:
         super().__init__("composite schedule does not yet cover response completion")
         self.ahead_seconds = ahead_seconds
+
+
+class ExcessiveCompositeError(UnavailableError):
+    """A complete present schedule offers more current than the requested ceiling."""
 
 
 # Validate every period and limit before distinguishing a future interval from an invalid or unsafe response.
@@ -38,6 +45,7 @@ def verify_composite(frame: Frame, limit: float, completed_at: datetime) -> None
     if not isinstance(periods, list) or not 1 <= len(periods) <= 128:
         raise UnavailableError("invalid composite schedule periods")
     previous = -1
+    exceeds_limit = False
     for period in periods:
         if not isinstance(period, dict):
             raise UnavailableError("invalid composite schedule period")
@@ -54,9 +62,10 @@ def verify_composite(frame: Frame, limit: float, completed_at: datetime) -> None
             raise UnavailableError("invalid composite schedule periods")
         previous = offset
         try:
-            number(period.get("limit"), limit)
+            offered = number(period.get("limit"), float_info.max)
         except DeniedError:
-            raise UnavailableError("effective current exceeds the requested ceiling") from None
+            raise UnavailableError("invalid composite schedule current") from None
+        exceeds_limit = exceeds_limit or offered > limit
     try:
         raw_start = result.get("scheduleStart")
         if not isinstance(raw_start, str):
@@ -68,6 +77,10 @@ def verify_composite(frame: Frame, limit: float, completed_at: datetime) -> None
     except ValueError:
         raise UnavailableError("composite schedule requires valid timezone-aware coverage") from None
     if age < 0:
+        if exceeds_limit:
+            raise UnavailableError("future schedule exceeds the requested ceiling")
         raise FutureScheduleError(-age)
     if age >= schedule["duration"]:
         raise UnavailableError("composite schedule has already ended")
+    if exceeds_limit:
+        raise ExcessiveCompositeError("effective current exceeds the requested ceiling")

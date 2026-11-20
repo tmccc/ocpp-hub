@@ -10,13 +10,43 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
+from .managed_debt_recovery import vendor_history_recovery_scope
 from .managed_intent import ControlIntent, unfinished_owner_requests, write_intent
+from .managed_native_repair import retire_history_omission_revocations
+from .managed_recovery_zero import require_paused_owned_zero
 from .native_bounded import NativeBoundedSpec
-from .native_history import NativeHistoryArchive, audit_history, history_policy
+from .native_history import (
+    ORIGINAL_HISTORY_OMISSION,
+    ORIGINAL_HISTORY_REFUSAL,
+    STARTUP_HISTORY_OMISSION,
+    MissingOriginalHistoryError,
+    NativeHistoryArchive,
+    audit_history,
+    history_policy,
+    inspect_history,
+)
 from .native_start_attempts import split_attempts
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
+
+HISTORY_ACK = "native_history_policy_acknowledgement"
+
+
+# A history repair owns only history, so its latch must leave unrelated pending work to its existing owner.
+def history_recovery_idle(journal: Journal, *, check_owner_requests: bool = True) -> bool:
+    grant = journal.get("vendor_start_grant")
+    return not (
+        journal.get("uncertain_vendor_command")
+        or grant
+        and grant.get("local") is None
+        or journal.active() is not None
+        or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+        or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
+        or check_owner_requests
+        and journal.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'").fetchone()
+        and unfinished_owner_requests(journal, include_pause=True)
+    )
 
 
 # An unsuccessful timed test keeps its original uncertain reply after its effect has been physically stopped.
@@ -59,7 +89,93 @@ def _superseded_tests(journal: Journal, revision: int, fault_at: float) -> list[
 def acknowledge_history_policy(
     journal: Journal, book: ResourceBook, spec: NativeBoundedSpec, native: HandoverEvidence
 ) -> dict[str, Any]:
+    fault, failure = journal.fault.read({}), journal.get("managed_native_failure", {})
+    owns_fault = matches_history_fault(fault, failure, ORIGINAL_HISTORY_REFUSAL)
+    receipt = journal.get(HISTORY_ACK, {})
+    if receipt.get("vendor_recovery") and journal.get("native_history_policy") is not None:
+        require_paused_owned_zero(journal, book, spec, native)
+        inspect_history(journal, spec.digest, list(native.history), False)
+        return {**receipt["summary"], "already_recorded": True, "fault_cleared": False, "charging_started": False}
+    if not owns_fault or not history_recovery_idle(journal):
+        retire_fault = (
+            owns_fault
+            and failure.get("source") in (ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION)
+            and fault.get("native_failure_digest") == fingerprint(failure)
+        )
+        with journal.atomic():
+            revocations = retire_history_omission_revocations(journal, fault)
+            scope = vendor_history_recovery_scope(journal, spec, retiring_history_fault=retire_fault)
+            if scope is not None:
+                if revocations:
+                    scope["history_revocations"] = revocations
+                return acknowledge_history_with_vendor_debt(journal, book, spec, native, scope, retire_fault)
+            if revocations:
+                raise RecoveryRequiredError("no matching vendor recovery owns the historical refusal")
     return _reconcile(journal, book, spec, native, attempts=False)
+
+
+# Require an independent current omission and the same paused original zero used by vendor recovery.
+def acknowledge_history_with_vendor_debt(
+    journal: Journal,
+    book: ResourceBook,
+    spec: NativeBoundedSpec,
+    native: HandoverEvidence,
+    scope: dict[str, Any],
+    retire_fault: bool,
+) -> dict[str, Any]:
+    require_paused_owned_zero(journal, book, spec, native)
+    current = list(native.history)
+    try:
+        inspect_history(journal, spec.digest, current, False)
+    except MissingOriginalHistoryError:
+        summary = record_history_policy(journal, history_policy(journal, spec.digest), current, vendor_recovery=scope)
+    else:
+        raise RecoveryRequiredError("no missing original historical records were independently observed")
+    if retire_fault:
+        journal.fault.clear()
+    return {**summary, "fault_cleared": retire_fault, "charging_started": False}
+
+
+# The receipt binds independent history evidence without settling any command the operator still owns.
+def record_history_policy(
+    journal: Journal,
+    policy: dict[str, Any] | None,
+    current: list[dict[str, Any]],
+    *,
+    vendor_recovery: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    original = journal.get("native_bounded_handover")["original_history"]
+    summary = NativeHistoryArchive(journal).observe(original, current, allow_missing=policy is not None)
+    if policy is not None:
+        if not summary["missing_records"]:
+            raise RecoveryRequiredError("no missing historical records were independently observed")
+        journal.put("native_history_policy", policy)
+    journal.put(
+        HISTORY_ACK,
+        {
+            "policy": policy,
+            "prior_fault": journal.fault.read({}),
+            "prior_failure": journal.get("managed_native_failure", {}),
+            "at_epoch": time.time(),
+            "native_digest": fingerprint(current),
+            "summary": summary,
+            "charging_started": False,
+            **({"vendor_recovery": vendor_recovery} if vendor_recovery is not None else {}),
+        },
+    )
+    return summary
+
+
+# Identify the particular native refusal whose own latch the offline tool is allowed to retire.
+def matches_history_fault(fault: dict[str, Any], failure: dict[str, Any], detail: str) -> bool:
+    return (
+        fault.get("classification") == "native_authority_or_preservation_failed"
+        and failure.get("type") == "SecurityError"
+        and failure.get("detail") == detail
+        and type(fault.get("at_epoch")) in (int, float)
+        and type(failure.get("at_epoch")) in (int, float)
+        and 0 <= fault["at_epoch"] - failure["at_epoch"] <= 2
+    )
 
 
 # Repair the parser fault under the installed capability and preserve the existing archive policy.
@@ -75,11 +191,7 @@ def _reconcile(
 ) -> dict[str, Any]:
     fault, failure = journal.fault.read({}), journal.get("managed_native_failure", {})
     policy = history_policy(journal, spec.digest)
-    detail = (
-        "complete connected-handover native evidence is required"
-        if attempts
-        else "native bounded handover must preserve every original history record"
-    )
+    detail = "complete connected-handover native evidence is required" if attempts else ORIGINAL_HISTORY_REFUSAL
     binding = native.physical.configuration_digest
     if managed_current_ceiling(journal, spec) == 32:
         spec.require_managed(native, journal.identity, closed=True, allow_unplugged=True)
@@ -87,25 +199,13 @@ def _reconcile(
     else:
         spec.require(native, journal.identity, "trial", closed=True, allow_unplugged=True)
     if (
-        fault.get("classification") != "native_authority_or_preservation_failed"
-        or failure.get("type") != "SecurityError"
-        or failure.get("detail") != detail
-        or type(fault.get("at_epoch")) not in (int, float)
-        or type(failure.get("at_epoch")) not in (int, float)
-        or not 0 <= fault["at_epoch"] - failure["at_epoch"] <= 2
+        not matches_history_fault(fault, failure, detail)
         or not journal.phase.read().held
         or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
         or journal.get("trial_preservation_fault")
         or journal.get("trial_inventory_fault")
-        or journal.get("uncertain_vendor_command")
-        or journal.get("vendor_start_grant", {}).get("local") is None
-        and bool(journal.get("vendor_start_grant", {}))
         or journal.get("trial_binding", {}).get("configuration_digest") != binding
-        or journal.active() is not None
-        or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-        or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-        or not attempts
-        and unfinished_owner_requests(journal, include_pause=True)
+        or not history_recovery_idle(journal, check_owner_requests=not attempts)
     ):
         raise RecoveryRequiredError("history reconciliation requires the matching native fault and a settled journal")
     spec.require_boot(journal.get("boot"))
@@ -173,24 +273,19 @@ def _reconcile(
                 },
             )
         else:
-            summary = NativeHistoryArchive(journal).observe(
-                journal.get("native_bounded_handover")["original_history"], list(native.history), allow_missing=True
-            )
-            if not summary["missing_records"]:
-                raise RecoveryRequiredError("no missing historical records were independently observed")
-            journal.put("native_history_policy", policy)
-            journal.put(
-                "native_history_policy_acknowledgement",
-                {
-                    "policy": policy,
-                    "prior_fault": fault,
-                    "prior_failure": failure,
-                    "at_epoch": time.time(),
-                    "native_digest": fingerprint(list(native.history)),
-                    "summary": summary,
-                    "charging_started": False,
-                },
-            )
+            current = list(native.history)
+            startup = failure.get("source") == STARTUP_HISTORY_OMISSION and fault.get(
+                "native_failure_digest"
+            ) == fingerprint(failure)
+            allow_missing = True
+            if startup:
+                try:
+                    inspect_history(journal, spec.digest, current, False)
+                except MissingOriginalHistoryError:
+                    pass
+                else:
+                    allow_missing = False
+            summary = record_history_policy(journal, policy if allow_missing else None, current)
         journal.fault.clear()
         journal.phase.recover()
         journal.control.hold(control)

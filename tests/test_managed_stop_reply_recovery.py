@@ -12,6 +12,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_debt_recovery import KEY
 from ocpp_hub_core.prototype.managed_stop_delivery import REJECTION, WIRE_ACK
+from ocpp_hub_core.prototype.managed_view import session_history
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
@@ -27,10 +28,14 @@ from tools import reconcile_managed_debt as operator
 
 
 # Record a genuine native-timer lifecycle so Stop has its actual local/cloud mapping and immutable body.
-async def stop_lifecycle(rig, session, charger, info):
+async def stop_lifecycle(rig, session, charger, info, *, authorization=None):
     opened = await rig.bench.call(charger, "original-start", "StartTransaction", START | {"idTag": "NATIVE_TIMER"})
     local = opened[2]["transactionId"]
     await until(lambda: session.journal.vendor_id(local) is not None and session.journal.next_delivery() is None)
+    if authorization is not None:
+        rig.bench.authorize_info = {"status": authorization}
+        result = await rig.bench.call(charger, "fresh-authorization", "Authorize", {"idTag": "NATIVE_TIMER"})
+        assert result[0] == 3 and result[2] == {"idTagInfo": rig.bench.authorize_info}
     rig.bench.stop_info = info
     await rig.bench.call(
         charger,
@@ -133,18 +138,79 @@ async def test_valid_stop_reply_needs_no_reconciliation(tmp_path, tls, unused_tc
             assert not s.journal.get(REJECTION) and not s.journal.get(KEY)
 
 
+# Intent: the first refused Stop owns its durable fault even when ordinary supervision has not run.
+# Why: replacement may await that lifecycle before its first healthy poll and must still explain the zero hold.
+async def test_first_stop_rejection_after_replacement_latches_its_fault(tmp_path, tls, unused_tcp_port):
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
+        gate = asyncio.Event()
+        rig.bench.stop_gate = gate
+        try:
+            async with running(rig, "stop-before-replacement", release_on_exit=False) as (s, c, charger):
+                await mp.healthy(c)
+                local = await stop_lifecycle(rig, s, charger, None)
+                await until(lambda: len(getattr(rig.bench, "held_stop_replies", [])) == 1)
+                token = s.journal.next_delivery().token
+                assert not s.journal.fault.latched()
+            async with running(rig, "replacement-receives-first-refusal") as (s, c, _):
+                await until(lambda: len(rig.bench.held_stop_replies) == 2)
+                rig.bench.stop_error = True
+                gate.set()
+                await until(lambda: s.journal.next_delivery().state == "rejected")
+                head = s.journal.next_delivery()
+                assert (head.token, head.transaction) == (token, local)
+                assert s.journal.get(REJECTION)["delivery_token"] == token
+                assert s.journal.fault.classification() == "owner_control_or_delivery_uncertain"
+                assert s.journal.get("control")["inhibit"] is True
+                assert (await c.tick())["state"] == "attention"
+                assert [frame[1] for frame in rig.bench.stop_wires] == [token, token]
+        finally:
+            gate.set()
+
+
+# Intent: an invalid top-level result keeps the genuine Stop pending, including after independently approved retry.
+# Why: a correlated object alone must not be used as proof the cloud acknowledged this lifecycle.
+async def test_unknown_stop_result_fields_cannot_settle_delivery(tmp_path, tls, unused_tcp_port, capsys):
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
+        rig.bench.stop_result = {"status": "Rejected"}
+        async with running(rig, "invalid-stop-result") as (s, c, charger):
+            await mp.healthy(c)
+            local = await stop_lifecycle(rig, s, charger, None)
+            await until(lambda: s.runtime.status.delivery_blocked or s.journal.next_delivery() is None)
+            stop = s.journal.next_delivery()
+            assert stop is not None and stop.state == "rejected" and stop.transaction == local
+            assert s.journal.get(REJECTION)["reason"] == "response_shape_invalid"
+            assert s.journal.get(REJECTION)["reply_digest"] == fingerprint(rig.bench.stop_result)
+            assert session_history(s.journal)[0]["cloud_acknowledged"] is False
+            await c.tick()
+            await pause(c)
+        await reconcile(rig, tmp_path, capsys)
+        async with running(rig, "same-invalid-stop-result") as (s, c, charger):
+            await until(lambda: s.runtime.status.delivery_blocked)
+            current = s.journal.next_delivery()
+            assert current is not None and current.token == stop.token and current.state == "rejected"
+            retry = next(iter(s.journal.get(KEY).values()))
+            assert retry.get("superseded") and retry["proof"]["wire_ack"] is None
+            assert session_history(s.journal)[0]["cloud_acknowledged"] is False
+        await reconcile(rig, tmp_path, capsys)
+        rig.bench.stop_result = {}
+        async with running(rig, "valid-stop-result") as (s, c, charger):
+            await return_after_ack(rig, s, c)
+            assert session_history(s.journal)[0]["cloud_acknowledged"] is True
+            assert [wire[1] for wire in rig.bench.stop_wires] == [stop.token] * 3
+
+
 # Intent: malformed Stop metadata retains its event until exact offline proof and a genuine matching wire reply.
-# Why: neither an operator statement nor a pre-ACK Pause can fabricate delivery or cache invalid authorization.
+# Why: ignoring that metadata must preserve earlier cloud decisions and cannot fabricate delivery.
 @pytest.mark.parametrize(
-    "info",
+    "info,authorization",
     [
-        {"status": "Accepted", "expiryDate": "2030-01-01T00:00:00+0000"},
-        {"status": "Accepted", "parentIdTag": "P" * 21},
-        {"status": "not-a-status"},
+        ({"status": "Accepted", "expiryDate": "2030-01-01T00:00:00+0000"}, None),
+        ({"status": "Accepted", "parentIdTag": "P" * 21}, "Blocked"),
+        ({"status": "not-a-status"}, "Expired"),
     ],
 )
 async def test_stop_retry_requires_exact_evidence_then_wire_ack(
-    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, info
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, info, authorization
 ):
     async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=ReplyBench) as rig:
         strategy = strategy_file(rig, tmp_path)
@@ -156,7 +222,9 @@ async def test_stop_retry_requires_exact_evidence_then_wire_ack(
         async with rig.charger(s) as charger:
             await mp.introduced(rig, s, charger, "rejected-stop-boot")
             await mp.healthy(c)
-            local = await stop_lifecycle(rig, s, charger, info)
+            local = await stop_lifecycle(rig, s, charger, info, authorization=authorization)
+            cached_auth = s.gateway.auth_info.stored("NATIVE_TIMER")
+            assert cached_auth["status"] == (authorization or "Accepted")
             await until(lambda: s.runtime.status.delivery_blocked)
             await c.tick()
             old_pause, revision = await pause(c)
@@ -223,10 +291,7 @@ async def test_stop_retry_requires_exact_evidence_then_wire_ack(
             assert j.get("next_transaction") == counter
             assert dict(j.db.execute("SELECT * FROM transactions WHERE local=?", (local,)).fetchone()) == original
             assert next(iter(j.get(KEY).values()))["proof"]["wire_ack"] is not None
-            assert (
-                j.db.execute("SELECT 1 FROM auth_info WHERE digest=?", (fingerprint("native_timer"),)).fetchone()
-                is None
-            )
+            assert replacement.gateway.auth_info.stored("NATIVE_TIMER") == cached_auth
             assert (await c.tick())["state"] == "attention"
             c.command(early_pause, "pause", early_revision)
             assert (await c.tick())["state"] == "attention"
@@ -234,6 +299,7 @@ async def test_stop_retry_requires_exact_evidence_then_wire_ack(
             if c.pause_task is not None:
                 await c.pause_task
             assert (await mp.healthy(c))["local_hold_verified"]
+            assert c.charging.authorization_status() == ("denied" if authorization else "ready")
             assert rig.bench.firmware.effective_limit() == 0 and not mp.starts(rig)
             returning = uuid.uuid4().hex
             c.command(returning, "app_control", c.requests.intent().revision)

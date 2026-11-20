@@ -1,12 +1,18 @@
 """One actually received cloud reply awaiting its exact local journal transaction."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from ..frames import Frame, parse_frame
-from .auth_info import validate_info
+from .auth_info import AuthorizationObservation, validate_info
 from .managed_start_delivery import ATTEMPTS, RETRIES
 from .policy import DeniedError
 from .store import Delivery, Journal, RecoveryRequiredError, encoded
+
+
+# StopTransaction confirms delivery with an empty object or optional authorization metadata.
+def stop_result_shape_supported(result: dict[str, Any]) -> bool:
+    return set(result) <= {"idTagInfo"}
 
 
 @dataclass(frozen=True)
@@ -18,16 +24,24 @@ class DeliveryReply:
     payload: str
     transaction: int | None
     answer: Frame
+    authorization: AuthorizationObservation | None = None
+    restored: bool = field(default=False, compare=False)
 
     # Capture immutable event identity before any reply-dependent database operation can fail.
     @classmethod
-    def received(cls, item: Delivery, answer: Frame) -> DeliveryReply:
-        return cls(item.token, item.action, encoded(item.payload), item.transaction, answer)
+    def received(
+        cls, item: Delivery, answer: Frame, authorization: AuthorizationObservation | None = None
+    ) -> DeliveryReply:
+        return cls(item.token, item.action, encoded(item.payload), item.transaction, answer, authorization)
 
     # Restart can use an actually saved response, including a denial, without inventing acceptance or retransmitting.
     @classmethod
     def restore(cls, journal: Journal, item: Delivery) -> DeliveryReply | None:
-        row = journal.db.execute("SELECT * FROM delivery_replies WHERE token=?", (item.token,)).fetchone()
+        row = journal.db.execute(
+            "SELECT delivery_replies.*, sequence, observed FROM delivery_replies "
+            "LEFT JOIN delivery_reply_authorization USING(token) WHERE token=?",
+            (item.token,),
+        ).fetchone()
         if row is None:
             return None
         answer = parse_frame(row["answer"])
@@ -47,7 +61,10 @@ class DeliveryReply:
             )
         ):
             raise RecoveryRequiredError("saved cloud reply is not a correlated result")
-        reply = cls(row["token"], row["action"], row["payload"], row["local"], answer)
+        authorization = (
+            AuthorizationObservation(row["sequence"], row["observed"]) if row["sequence"] is not None else None
+        )
+        reply = cls(row["token"], row["action"], row["payload"], row["local"], answer, authorization, restored=True)
         reply.require(item)
         return reply
 
@@ -67,6 +84,11 @@ class DeliveryReply:
                 "INSERT INTO delivery_replies VALUES(?,?,?,?,?)",
                 (self.token, self.action, self.payload, self.transaction, encoded(self.answer)),
             )
+            if self.authorization is not None:
+                journal.db.execute(
+                    "INSERT INTO delivery_reply_authorization VALUES(?,?,?)",
+                    (self.token, self.authorization.sequence, self.authorization.observed),
+                )
 
     # A repaired database may retry only the exact received reply against its original sent head.
     def require(self, item: Delivery) -> None:
@@ -88,6 +110,8 @@ class DeliveryReply:
             errors = journal.get(RETRIES, {}).get(self.token, {}).get("errors", 0)
             return type(errors) is int and 0 <= errors < ATTEMPTS - 1
         result = self.answer[2]
+        if self.action == "StopTransaction" and not stop_result_shape_supported(result):
+            return False
         try:
             if "idTagInfo" in result:
                 validate_info(result["idTagInfo"])

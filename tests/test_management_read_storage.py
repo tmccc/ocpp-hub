@@ -41,6 +41,20 @@ async def test_management_read_storage_refusal_recovers_same_socket(
 
         port = unused_tcp_port_factory()
         api = ManagementServer(ManagementSettings(port, tmp_path / "unused-token", TOKEN), c, lambda: published)
+        read_only = api.read_only
+        refuse_read = False
+
+        # Apply the real SQLite refusal only during the synchronous read on the management socket.
+        def scoped_read(identifier, name, *, request_id=None):
+            if not refuse_read:
+                return read_only(identifier, name, request_id=request_id)
+            j.db.set_authorizer(authorize)
+            try:
+                return read_only(identifier, name, request_id=request_id)
+            finally:
+                j.db.set_authorizer(None)
+
+        monkeypatch.setattr(api, "read_only", scoped_read)
         await api.start()
         try:
             async with connect(
@@ -49,13 +63,13 @@ async def test_management_read_storage_refusal_recovers_same_socket(
                 subprotocols=["ics-proxy.v1"],
             ) as socket:
                 assert (await call(socket, "status"))["result"]["healthy"]
-                j.db.set_authorizer(authorize)
+                refuse_read = True
                 try:
                     response = await call(socket, command, **({"request_id": pause} if command == "receipt" else {}))
                     assert attempts
                     assert response == {"ok": False, "error": "not_ready"}
                 finally:
-                    j.db.set_authorizer(None)
+                    refuse_read = False
                 restored = (await call(socket, "status"))["result"]
                 assert restored["healthy"] and restored["desired_control"] == "paused"
                 assert restored["control_revision"] == before[0].revision
@@ -152,6 +166,7 @@ async def test_current_reply_storage_and_cached_disconnect(tmp_path, tls, unused
                 await c.current.settle()
                 receipt = await call(socket, "receipt", request_id=identifier)
                 assert receipt["result"]["state"] == "completed"
+                assert receipt["result"]["revision"] == revision and receipt["result"]["current_a"] == 16
                 assert (await call(socket, "set_current", id=identifier, revision=revision, current_a=16)) == {
                     "id": identifier,
                     "ok": True,
@@ -170,7 +185,11 @@ async def test_current_reply_storage_and_cached_disconnect(tmp_path, tls, unused
                 assert not any(after[key] for key in ("healthy", "local_hold_verified", "can_return", "boot_verified"))
                 assert before["native_age_seconds"] is not None and before["vehicle_connected"] is True
                 measurements = (
-                    "native_age_seconds", "power_w", "current_a", "vehicle_connected", "charging_session_open"
+                    "native_age_seconds",
+                    "power_w",
+                    "current_a",
+                    "vehicle_connected",
+                    "charging_session_open",
                 )
                 assert all(after[key] is None for key in measurements)
                 assert after["sessions"] == before["sessions"] and after["requested_current_a"] == 16

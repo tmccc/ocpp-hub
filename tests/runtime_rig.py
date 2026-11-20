@@ -19,7 +19,6 @@ from websockets.asyncio.server import ServerConnection
 
 from tests.prototype_firmware import Firmware
 from tests.prototype_rig import BOOT
-from tests.tls_support import accept_cap
 
 NOW = "2030-01-01T00:00:00Z"
 
@@ -106,10 +105,21 @@ class Bench:
     # Supply a synthetic introduction; no actual Boot was available in the recorded device export.
     async def boot(self, charger: Any) -> None:
         await charger.send(build_call("boot", "BootNotification", BOOT))
-        assert decode(await charger.recv())[2]["status"] == "Accepted"
-        cap = decode(await charger.recv())
-        assert cap[2] == "SetChargingProfile"
-        await accept_cap(charger, cap, self.firmware)
+        boot_accepted = cap_received = composite_received = False
+        async with asyncio.timeout(5):
+            while not (boot_accepted and composite_received):
+                frame = decode(await charger.recv())
+                if frame[0] == 3:
+                    assert frame[1] == "boot" and frame[2]["status"] == "Accepted"
+                    boot_accepted = True
+                    continue
+                assert frame[0] == 2 and frame[2] in ("SetChargingProfile", "GetCompositeSchedule")
+                if frame[2] == "SetChargingProfile":
+                    cap_received = True
+                else:
+                    assert cap_received
+                    composite_received = True
+                await charger.send(build_call_result(frame[1], self.firmware.answer(frame[2], frame[3])))
         await until(lambda: self.gateway.controls.ready)
 
     # Keep runtime teardown before journal close so cancelled tasks never touch a closed database.

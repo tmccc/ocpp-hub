@@ -145,9 +145,11 @@ async def running_service(
                         local = session.journal.active()
                         if local is not None and not task.done():
                             await service.close_daily(local)
+                        if not task.done():
+                            callbacks[signal.SIGTERM]()
+                            assert await asyncio.wait_for(task, 10) == 0
         finally:
             rig.peer.unavailable = False
             if not task.done():
                 callbacks[signal.SIGTERM]()
-                result = await asyncio.wait_for(task, 10)
-                assert result == 0
+                await asyncio.wait_for(task, 10)

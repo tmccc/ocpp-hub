@@ -48,7 +48,6 @@ async def current_peer():
         "state": state,
         "commands": [],
         "requests": [],
-        "lose_reply": False,
         "pending_receipt": False,
         "reject_current": False,
     }
@@ -89,11 +88,8 @@ async def current_peer():
                 state.update(
                     can_start=False, can_set_current=False, local_charge={"state": "running", "charging": False}
                 )
-            receipts[value["id"]] = {"id": value["id"], "state": "completed"}
+            receipts[value["id"]] = {"id": value["id"], "action": command, "state": "completed"}
             result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
-            if control["lose_reply"]:
-                await socket.close()
-                return socket
         else:
             raise AssertionError("unexpected current-client command")
         await socket.send_json({"id": value["id"], "ok": True, "result": result})
@@ -187,19 +183,17 @@ async def test_invalid_current_does_not_reach_the_management_service(actual_hass
     assert actual_hass.states.get("number.ics_proxy_charge_current_a").state == "6"
 
 
-# Intent: a rejected current operation retains its old reading and a lost reply never causes another request.
-# Why: neither an error nor a timeout proves the remote effect did not happen, and the entity is not optimistic.
-@pytest.mark.parametrize("lost", [False, True], ids=["rejected", "lost-reply"])
-async def test_current_errors_refresh_status_without_retry_or_optimistic_state(actual_hass, current_peer, lost):
-    current_peer["lose_reply"] = lost
-    current_peer["reject_current"] = not lost
+# Intent: a definite rejection retains the old current without making a receipt request.
+# Why: only ambiguous delivery needs recovery.
+async def test_rejected_current_retains_observed_state(actual_hass, current_peer):
+    current_peer["reject_current"] = True
     await setup(actual_hass, current_peer)
     with pytest.raises(HomeAssistantError):
         await actual_hass.services.async_call(
             "number", "set_value", {"entity_id": "number.ics_proxy_charge_current_a", "value": 16}, blocking=True
         )
     assert current_peer["commands"].count("set_current") == 1
-    assert actual_hass.states.get("number.ics_proxy_charge_current_a").state == ("16" if lost else "6")
+    assert actual_hass.states.get("number.ics_proxy_charge_current_a").state == "6"
     assert set(current_peer["commands"]) <= {"status", "set_current"}
 
 

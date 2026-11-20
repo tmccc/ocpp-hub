@@ -44,7 +44,12 @@ class ManagedStartBinding:
             and owner.get("stage") in ("issued", "accepted")
             and owner.get("digest") == digest
         )
-        cloud_match = bool(vendor.get("local") is None and vendor.get("digest") == digest and vendor.get("token"))
+        cloud_match = bool(
+            vendor.get("prepared") is not True
+            and vendor.get("local") is None
+            and vendor.get("digest") == digest
+            and vendor.get("token")
+        )
         if not (local_match or cloud_match):
             return False
         catalogue = j.get("managed_schedule_tags")
@@ -168,6 +173,9 @@ class ManagedStartReports:
     # Use the independently observed native occurrence and schedule.
     async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None:
         return await self.charging.prepare_native_report(payload)
+
+    async def verify_station(self) -> None:
+        await self.charging.controller.native.require_reported_start_ceiling()
 
     # A held report is allowed only for the existing operation.
     def permits_held(self, tag: str) -> bool:

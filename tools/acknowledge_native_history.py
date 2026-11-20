@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.trial_proxy import emit, load_core, native_spec, preflight  # noqa: E402
+from tools.trial_proxy import emit, load_core, native_spec  # noqa: E402
 
 load_core()
 
@@ -21,11 +21,12 @@ from ocpp_hub_core.prototype.native_history_recovery import (  # noqa: E402
 )
 from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
+from ocpp_hub_core.prototype.trial_session import preflight_native  # noqa: E402
 
 
 # No listener, charger writer or service lifecycle is available through this deliberately small operator tool.
 async def run(action: str, config_path: Path, spec_path: Path) -> int:
-    prepared = preflight(config_path)
+    prepared = preflight_native(config_path)
     spec = native_spec(spec_path, prepared)
     if action == "check":
         emit({"inputs_valid": True, "offline_only": True, "charger_changed": False})

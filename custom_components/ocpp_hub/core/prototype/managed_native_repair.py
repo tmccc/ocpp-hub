@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from .managed_denial_faults import denial_source_fault
 from .native_faults import NativeContentError
+from .native_history import ORIGINAL_HISTORY_OMISSION, ORIGINAL_HISTORY_REFUSAL, MissingOriginalHistoryError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 
 AUDITS = "managed_native_repair_audits"
@@ -32,6 +33,32 @@ def repair_revoked(journal: Journal, fault: dict[str, Any]) -> bool:
     if not isinstance(rows, dict):
         return True
     return any(fingerprint(source) in rows for source in repair_sources(journal, fault))
+
+
+# Retire only explicitly typed omissions inside the transaction that independently repairs the history.
+def retire_history_omission_revocations(journal: Journal, fault: dict[str, Any]) -> dict[str, Any]:
+    if not journal.db.in_transaction:
+        raise RecoveryRequiredError("retiring a history refusal requires the archive transaction")
+    rows = journal.get(REVOCATIONS, {})
+    if not fault or not isinstance(rows, dict):
+        return {}
+    retired = {}
+    for source in repair_sources(journal, fault):
+        key = fingerprint(source)
+        if key not in rows:
+            continue
+        row = rows[key]
+        if (
+            not isinstance(row, dict)
+            or row.get("fault") != source
+            or row.get("typed_refusal")
+            != {"stage": "history", "detail": ORIGINAL_HISTORY_REFUSAL, "source": ORIGINAL_HISTORY_OMISSION}
+        ):
+            return {}
+        retired[key] = row
+    if retired:
+        journal.put(REVOCATIONS, {key: row for key, row in rows.items() if key not in retired})
+    return retired
 
 
 # An unresolved audit outcome withholds proof even if later peer data is normal after replacement.
@@ -144,6 +171,8 @@ class NativeRepairAudits:
     ) -> None:
         if attempt is not None:
             refusal = {"stage": error.stage, "detail": str(error)[:1024]} if error is not None else None
+            if refusal is not None and isinstance(error, MissingOriginalHistoryError):
+                refusal["source"] = ORIGINAL_HISTORY_OMISSION
             self.pending = (attempt, outcome, refusal)
             self.pending_storage_error = storage_error
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from ocpp_hub_core.prototype.native_history import NativeHistoryArchive
+from ocpp_hub_core.prototype.native_history import NativeHistoryArchive, latest_completion_available
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import ConflictError, Journal
 
@@ -40,6 +40,17 @@ def history_journal(tmp_path: Path) -> Iterator[Journal]:
 # Compare the entire application database around a rejected observation, including any newly inserted rows.
 def contents(journal: Journal) -> str:
     return "\n".join(journal.db.iterdump())
+
+
+# Intent: an archived older session cannot obscure a known newer managed closure after a clock correction.
+# Why: assigned IDs establish order even when the charger's two start timestamps run backward.
+def test_latest_archive_uses_known_closure_order(history_journal: Journal) -> None:
+    older, latest = row(1001), row(1002) | {"startTime": 1000, "stopTime": 1060}
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([], [older, latest], allow_missing=True)
+    archive.observe([], [latest], allow_missing=True)
+    assert latest_completion_available(history_journal, {1002: 1000}, 1002)
+    assert not latest_completion_available(history_journal, {1001: 2001}, 1001)
 
 
 # Intent: any number of absent original records is archived and reported without rewriting original admission data.

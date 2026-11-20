@@ -125,7 +125,16 @@ async def test_incomplete_charger_history_does_not_relabel_previous_energy(actua
 # Intent: complete native HTTP history feeds the real published status and actual HA last-energy sensor.
 # Why: unreadable later history hides last energy, while an unreadable older entry leaves a valid new charge visible.
 @pytest.mark.parametrize(
-    "clock", ["normal", "reversed", "future_stop", "older_reversed", "zero_energy", "delayed_history"]
+    "clock",
+    [
+        "normal",
+        "reversed",
+        "future_stop",
+        "older_reversed",
+        "zero_energy",
+        "delayed_history",
+        "delayed_older_unreadable",
+    ],
 )
 async def test_native_history_to_actual_ha_sensor(
     actual_hass, tmp_path, tls, unused_tcp_port_factory, monkeypatch, clock
@@ -143,7 +152,7 @@ async def test_native_history_to_actual_ha_sensor(
     now = int(time.time())
     old = {"transactionId": 1, "startTime": now - 3600, "stopTime": now - 1800, "meterStart": 1000, "meterStop": 6614}
     latest = {"transactionId": 2, "startTime": now - 100, "stopTime": now - 10, "meterStart": 1000, "meterStop": 2000}
-    if clock == "reversed":
+    if clock in ("reversed", "delayed_older_unreadable"):
         latest["stopTime"] = now - 200
     elif clock == "future_stop":
         latest["stopTime"] = now + 45
@@ -176,7 +185,7 @@ async def test_native_history_to_actual_ha_sensor(
                 entity = actual_hass.states.get("sensor.ics_proxy_last_session_energy")
                 assert entity.state == ("unknown" if expected_energy is None else str(expected_energy))
                 assert rig.bench.history == original and not starts(rig)
-                if clock == "delayed_history":
+                if clock in ("delayed_history", "delayed_older_unreadable"):
                     timestamp = datetime.fromtimestamp(now, UTC).isoformat()
                     body = START | {"idTag": "NATIVE_TIMER", "timestamp": timestamp}
                     opened = await rig.bench.call(charger, "recent-scheduled-start", "StartTransaction", body)
@@ -184,7 +193,8 @@ async def test_native_history_to_actual_ha_sensor(
                     rig.peer.permission_enabled = True
                     rig.bench.cp, rig.bench.connection = "C", "Charging"
                     rig.bench.firmware.fire_plan(9)
-                    assert (await healthy(controller))["charging_session_open"]
+                    published = await healthy(controller)
+                    assert published["charging_session_open"]
                     meter_stop = body["meterStart"] + 3000
                     await rig.bench.call(
                         charger,
@@ -194,6 +204,9 @@ async def test_native_history_to_actual_ha_sensor(
                     )
                     rig.peer.permission_enabled = False
                     rig.bench.cp, rig.bench.connection = "B", "Plug"
+                    # A live receipt read can see genuine closure before the next native poll.
+                    await entry.runtime_data.async_refresh()
+                    assert actual_hass.states.get(entity.entity_id).state == "unknown"
                     published = await healthy(controller)
                     assert not published["charging_session_open"] and published["last_session_energy_kwh"] is None
                     await entry.runtime_data.async_refresh()
@@ -201,8 +214,9 @@ async def test_native_history_to_actual_ha_sensor(
                     rig.bench.history = [
                         {
                             "transactionId": local,
-                            "startTime": now,
-                            "stopTime": now + 1,
+                            # The device clock moved backward between these independently recorded sessions.
+                            "startTime": now - 1200,
+                            "stopTime": now - 1100,
                             "meterStart": body["meterStart"],
                             "meterStop": meter_stop,
                         },

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from ocpp_hub_core import commands
+from ocpp_hub_core.prototype.connection_scope import current_control_scope
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
@@ -30,7 +31,9 @@ async def test_rollback_receipts_survive_transaction_retirement(tmp_path, tls, u
         vendor = session.journal.vendor_id(local)
         payload = commands.set_charging_profile(1, commands.PURPOSE_TX, 6, 101, stack_level=2, transaction_id=vendor)
         result = await session.gateway._vendor_call(
-            [2, "profile", "SetChargingProfile", payload], session.gateway._vendor_epoch
+            [2, "profile", "SetChargingProfile", payload],
+            session.gateway._vendor_epoch,
+            current_control_scope(session.gateway),
         )
         from ocpp_hub_core.prototype.gateway import decode
 
@@ -75,6 +78,7 @@ async def test_baseline_and_original_scope_collisions(tmp_path: Path) -> None:
 @pytest.mark.parametrize("change", ["original-changed", "unknown-profile", "owned-changed"])
 async def test_rollback_rejects_changed_inventory(tmp_path: Path, change: str) -> None:
     rig = TrialRig(tmp_path / "state.db")
+    await rig.boot()
     await rig.gateway.set_limit(6)
     if change == "original-changed":
         rig.firmware.plans[9]["limitCurrent"] = 16
@@ -128,6 +132,7 @@ async def test_resource_reappearance_after_verified_absence_is_not_owned(tmp_pat
 # Why: a failed native audit must not disable the owner's safety Stop while physical current can still flow.
 async def test_blocked_mode_keeps_safety_stop_available(tmp_path: Path) -> None:
     rig = TrialRig(tmp_path / "state.db")
+    await rig.boot()
     await rig.gateway.set_limit(6)
     await rig.charger("start", "StartTransaction", START)
     rig.firmware.requested_current = 6

@@ -9,7 +9,7 @@ import ssl
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -17,17 +17,21 @@ from typing import Any
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
+from ocpp_hub_core.prototype.managed_intent import ManagedRequests
 from ocpp_hub_core.prototype.native_history import audit_history, history_policy
 from ocpp_hub_core.prototype.native_history_recovery import acknowledge_history_policy
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
-from tests.connected_rig import ConnectedBench
+from tests.charge_rig import ChargeRig
+from tests.connected_rig import ConnectedBench, strategy_file
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.prototype_rig import START
+from tests.recovery_barriers import completed_control
 from tests.test_native_bounded_handover import restore_original_route, verify_original_backend
 from tests.tls_support import tls as tls
+from tools import acknowledge_native_history as history_tool
 
 
 @dataclass
@@ -146,6 +150,151 @@ async def test_acknowledgement_archives_exact_bodies_and_preserves_authority(
         assert receipt["charging_started"] is False and receipt["summary"] == journal.get("native_history_summary")
         assert rig.bench.device_calls == writes and rig.peer.requests == native_requests
         assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
+
+
+# Intent: history that disappears while the service is stopped gains the same recoverable fault on startup.
+# Why: the existing offline acknowledgment needs the fault even though the failing startup cannot open a listener.
+@pytest.mark.parametrize("case", ["missing", "changed", "restored", "app-intent"])
+async def test_cold_start_history_loss_records_repair_before_listening(
+    tmp_path, tls, unused_tcp_port, monkeypatch, case
+):
+    original = closed_records()
+    async with managed_bench(tmp_path, tls, unused_tcp_port, initial_history=original) as rig:
+        strategy = strategy_file(rig, tmp_path)
+        first = managed_session(rig)
+        await first.start()
+        controller = ManagedController(first)
+        rig.route_to_trial()
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "before-stopped-history-loss")
+            await healthy(controller)
+            if case != "app-intent":
+                request, revision = uuid.uuid4().hex, controller.requests.intent().revision
+                controller.command(request, "pause", revision)
+                b = ChargeRig(rig, first, controller, charger)
+                await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
+            await first.close()
+
+        rig.bench.history = copy.deepcopy(original[1:])
+        if case == "changed":
+            rig.bench.history[0]["meterStop"] += 1
+        before = list(rig.bench.device_calls)
+        refused = managed_session(rig)
+        try:
+            with pytest.raises(SecurityError, match="preserve every original history record"):
+                await refused.start()
+            assert not refused.started and rig.bench.device_calls == before
+            journal = refused.journal
+            if case == "changed":
+                assert not journal.fault.latched()
+                assert journal.get("managed_native_failure") is None
+                return
+            assert journal.phase.read().held
+            assert journal.fault.classification() == "native_authority_or_preservation_failed"
+            detail = journal.get("managed_native_failure")
+            assert detail["type"] == "SecurityError" and "preserve every original" in detail["detail"]
+            assert rig.bench.firmware.effective_limit() == 0
+        finally:
+            await refused.close()
+
+        if case == "restored":
+            rig.bench.history = copy.deepcopy(original)
+        preflight = history_tool.preflight_native
+
+        # The real offline tool reads the actual native HTTP peer on its test-assigned loopback port.
+        def native_peer(path):
+            prepared = preflight(path)
+            prepared.observer.port = rig.prepared.observer.port
+            return prepared
+
+        monkeypatch.setattr(history_tool, "preflight_native", native_peer)
+        assert await history_tool.run("acknowledge", tmp_path / "trial.json", strategy) == 0
+        assert rig.bench.device_calls == before and rig.bench.firmware.effective_limit() == 0
+
+        repaired = managed_session(rig)
+        await repaired.start()
+        controller = ManagedController(repaired)
+        async with rig.charger(repaired) as charger:
+            await introduced(rig, repaired, charger, "after-stopped-history-ack")
+            status = await healthy(controller)
+            if case == "app-intent":
+                assert status["owner_control_enabled"] and rig.bench.firmware.effective_limit() == 6
+            else:
+                assert status["local_hold_verified"] and rig.bench.firmware.effective_limit() == 0
+            if case == "restored":
+                assert repaired.journal.get("native_history_policy") is None
+                assert repaired.journal.get("native_history_summary") == {"archived_records": 3, "missing_records": 0}
+            else:
+                assert status["history_warning"] == "records_absent_from_charger"
+                assert repaired.journal.get("native_history_summary") == {"archived_records": 3, "missing_records": 1}
+            b = ChargeRig(rig, repaired, controller, charger)
+            request, revision = uuid.uuid4().hex, controller.requests.intent().revision
+            controller.command(request, "pause", revision)
+            await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
+            request, revision = uuid.uuid4().hex, controller.requests.intent().revision
+            controller.command(request, "app_control", revision)
+            await completed_control(b, request, mode="app", revision=revision + 1, ceiling=6)
+            assert not starts(rig)
+
+
+# Intent: a startup history omission cannot take ownership from a pending Pause or vendor write.
+# Why: if exact history returns, the prior command must still have its normal recovery path.
+@pytest.mark.parametrize("debt", ["pause", "vendor-write"])
+async def test_cold_start_transient_history_omission_preserves_pending_owner(tmp_path, tls, unused_tcp_port, debt):
+    original = closed_records()
+    async with managed_bench(tmp_path, tls, unused_tcp_port, initial_history=original) as rig:
+        first = managed_session(rig)
+        await first.start()
+        controller = ManagedController(first)
+        rig.route_to_trial()
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "before-interrupted-owner")
+            await healthy(controller)
+            request, revision = uuid.uuid4().hex, controller.requests.intent().revision
+            controller.command(request, "pause", revision)
+            await completed_control(
+                ChargeRig(rig, first, controller, charger), request, mode="paused", revision=revision + 1, ceiling=0
+            )
+            path, identity = first.journal.path, first.journal.identity
+            await first.close()
+
+        with closing(Journal(path, identity)) as journal:
+            if debt == "pause":
+                requests = ManagedRequests(journal)
+                request, revision = uuid.uuid4().hex, requests.intent().revision
+                requests.accept(request, "pause", revision)
+            else:
+                request = journal.mutation_intent("vendor", "DataTransfer", {"vendorId": "IoCharger"})
+
+        rig.bench.history = copy.deepcopy(original[1:])
+        refused = managed_session(rig)
+        try:
+            with pytest.raises(SecurityError, match="preserve every original history record"):
+                await refused.start()
+            assert not refused.started and not refused.journal.fault.latched()
+            assert refused.journal.get("managed_native_failure") is None
+        finally:
+            await refused.close()
+
+        rig.bench.history = original
+        recovered = managed_session(rig)
+        await recovered.start()
+        assert not recovered.journal.fault.latched() and rig.bench.firmware.effective_limit() == 0
+        if debt == "pause":
+            controller = ManagedController(recovered)
+            async with rig.charger(recovered) as charger:
+                await introduced(rig, recovered, charger, "after-interrupted-owner")
+                await completed_control(
+                    ChargeRig(rig, recovered, controller, charger),
+                    request,
+                    mode="paused",
+                    revision=revision + 1,
+                    ceiling=0,
+                )
+        else:
+            row = recovered.journal.db.execute("SELECT state FROM mutations WHERE token=?", (request,)).fetchone()
+            assert row["state"] == "pending"
+        assert not starts(rig)
 
 
 # Intent: the persisted decision permits fresh real Boot/reconciliation and later retention loss without Start.

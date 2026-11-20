@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,7 @@ class OrdinaryRecovery:
     # The existing controller retains all native/resource/zero and outgoing ownership guards.
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
+        self.source_published = False
 
     # A verified normal local Start may join ordinary supervision only after its exact request really completed.
     def verified_normal(self) -> bool:
@@ -160,19 +162,23 @@ class OrdinaryRecovery:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         if not self.ordinary() or not g.current_boot_seen(g._charger_epoch):
             return
-        j.put(
-            SOURCE,
-            {
-                "revision": c.requests.intent().revision,
-                "local": j.active(),
-                "start": self.start_digest(j.active()),
-                "source": self.source(native),
-                "boot": g.boot_observation,
-                "epoch": g._charger_epoch,
-                "observed_at": native.physical.observed_at,
-                "native_digest": native.digest,
-            },
-        )
+        self.source_published = False
+        local = j.active()
+        source = {
+            "revision": c.requests.intent().revision,
+            "local": local,
+            "start": self.start_digest(local),
+            "source": self.source(native),
+            "boot": g.boot_observation,
+            "epoch": g._charger_epoch,
+            "observed_at": native.physical.observed_at,
+            "native_digest": native.digest,
+        }
+        try:
+            j.put(SOURCE, source)
+        except sqlite3.Error:
+            return  # The previous proof cannot authorize recovery while publication is unavailable.
+        self.source_published = True
 
     # The shared zero-only recovery works after reconnect as well as after a bounded ordinary telemetry outage.
     def needed(self) -> bool:
@@ -198,9 +204,13 @@ class OrdinaryRecovery:
             )
         if not physical.transaction_open or known is not None or type(local) is not int:
             return False
+        # OCPP closed first. Only the latest connector lifecycle can explain an open native report at zero.
         return (
             j.db.execute(
-                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL AND vendor IS NOT NULL", (local,)
+                "SELECT 1 FROM ("
+                "SELECT local, stop, vendor FROM transactions WHERE connector=1 ORDER BY local DESC LIMIT 1"
+                ") WHERE local=? AND stop IS NOT NULL AND vendor IS NOT NULL",
+                (local,),
             ).fetchone()
             is not None
         )
@@ -264,7 +274,8 @@ class OrdinaryRecovery:
         hold, source = j.get(KEY, {}), j.get(SOURCE, {})
         grant, local_start = j.get("vendor_start_grant", {}), local_start_receipt(j)
         if (
-            not self.ordinary()
+            not self.source_published
+            or not self.ordinary()
             or not self.active()
             or hold.get("local") != local
             or j.active() != local
