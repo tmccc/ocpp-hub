@@ -186,7 +186,11 @@ async def test_unknown_start_is_not_replayed_after_cleanup_failure(tmp_path, tls
                     await until(lambda: bool(refusals))
                 finally:
                     bench.store.db.execute("DROP TRIGGER refuse_start_cleanup")
-                await until(lambda: runtime.status.delivery_blocked_cause == "reconciliation")
+                await until(
+                    lambda: runtime.status.delivery_blocked_cause == "reconciliation"
+                    and (pending := bench.store.next_delivery()) is not None
+                    and pending.state == "ambiguous"
+                )
                 await charger_call(charger, "Heartbeat", {})
                 assert bench.store.next_delivery().state == "ambiguous"
                 assert bench.store.vendor_id(head.transaction) is None
