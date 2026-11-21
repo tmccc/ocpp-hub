@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
@@ -14,7 +15,7 @@ from .local_control import local_start_receipt
 from .managed_sources import recorded_station_profile
 from .managed_start_binding import known_plan_source
 from .native_bounded import NativeReadinessError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .store import RecoveryRequiredError, fingerprint
 from .trial_rollback import lifecycle_decision
@@ -27,6 +28,15 @@ KEY = "managed_ordinary_recovery"
 SOURCE = "managed_ordinary_source"
 
 
+@dataclass(frozen=True)
+class OrdinaryCompletion:
+    """One completed physical release awaiting its exact bookkeeping write."""
+
+    hold: dict[str, Any]
+    authority: AuthorityStamp
+    completed_at: float
+
+
 class OrdinaryRecovery:
     """A station hold never creates a Start, guesses a Stop, or borrows another lifecycle's continuation receipt."""
 
@@ -34,6 +44,7 @@ class OrdinaryRecovery:
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
         self.source_published = False
+        self.completion: OrdinaryCompletion | None = None
 
     # A verified normal local Start may join ordinary supervision only after its exact request really completed.
     def verified_normal(self) -> bool:
@@ -479,6 +490,30 @@ class OrdinaryRecovery:
 
         return NativeStartReport(None, None, None, accepted)
 
+    # Retry the journal note under the exact release that already completed, without touching the charger.
+    def finish_recovery(self) -> Pending | None:
+        completed = self.completion
+        if completed is None:
+            return None
+        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
+        try:
+            with j.atomic():
+                if (
+                    not c.stopping
+                    and j.phase.read().active
+                    and not j.fault.latched()
+                    and c.publication_is_current(completed.authority)
+                    and c.released_epoch == completed.authority.scope.epoch
+                    and g.controls.ready
+                    and g.controls.desired() > 0
+                    and j.get(KEY) == completed.hold
+                ):
+                    j.put(KEY, {**completed.hold, "state": "complete", "completed_at": completed.completed_at})
+        except sqlite3.Error as error:
+            return Pending(Prerequisite.RECONCILIATION, "ordinary recovery awaits its completion record", error)
+        self.completion = None
+        return None
+
     # Fresh zero/source proof restores only the original intent and never emits a Start or Stop.
     async def recover(self) -> Pending | None:
         c, j = self.c, self.c.session.journal
@@ -507,8 +542,10 @@ class OrdinaryRecovery:
                 return decision
         elif native.physical.transaction_open:
             return Pending(Prerequisite.LIFECYCLE, "ordinary idle recovery cannot adopt a new native transaction")
+        hold = j.get(KEY)
         progress = await c.recovery.restore(continuing_local=local)
         if not progress.shared:
             return progress.pending
-        j.put(KEY, {**j.get(KEY), "state": "complete", "completed_at": time.time()})
-        return None
+        assert progress.operation is not None and progress.operation.published_authority is not None
+        self.completion = OrdinaryCompletion(hold, progress.operation.published_authority, time.time())
+        return self.finish_recovery()

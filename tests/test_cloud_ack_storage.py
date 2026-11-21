@@ -32,7 +32,7 @@ from tests.connected_rig import strategy_file
 from tests.current_rig import commissioned
 from tests.handover_helpers import crash
 from tests.native_peer_failures import InterruptedNativePeer
-from tests.prototype_rig import START
+from tests.prototype_rig import START, Rig
 from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
 from tests.tls_support import tls as tls
@@ -47,6 +47,54 @@ ACTIONS = (
     "StartTransaction",
     "StopTransaction",
 )
+
+
+# Intent: a real matched cloud Start reply survives cancellation before the delivery worker consumes it.
+# Why: reconnecting should use that reply after a process replacement and never send the Start again.
+async def test_correlated_start_reply_survives_delivery_retirement(tmp_path):
+    path = tmp_path / "state.db"
+    rig = Rig(path)
+    await rig.boot()
+    start = await rig.charger("initial-start", "StartTransaction", START)
+    assert start[0] == 3
+    local = start[2]["transactionId"]
+    sent = asyncio.get_running_loop().create_future()
+
+    # Only the independent cloud delays its reply. The actual gateway and its delivery owner run unchanged.
+    async def vendor_send(raw):
+        frame = decode(raw)
+        if frame[0] == 2 and frame[2] == "StartTransaction":
+            sent.set_result(frame)
+        else:
+            await rig.vendor_send(raw)
+
+    epoch = rig.gateway.attach_vendor(vendor_send)
+    pump = asyncio.create_task(rig.gateway.flush())
+    try:
+        request = await asyncio.wait_for(sent, 2)
+        assert rig.store.next_delivery().state == "inflight"
+        response = {"transactionId": 9100, "idTagInfo": {"status": "Accepted"}}
+        await rig.gateway.receive("vendor", build_call_result(request[1], response), epoch)
+        pump.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pump
+        saved = DeliveryReply.restore(rig.store, rig.store.next_delivery())
+        assert saved is not None and saved.answer == [3, request[1], response]
+    finally:
+        if not pump.done():
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+        await rig.close()
+
+    replacement = Rig(path)
+    try:
+        await replacement.boot()
+        await replacement.cloud()
+        assert replacement.store.vendor_id(local) == 9100
+        assert replacement.store.next_delivery() is None
+        assert not [frame for frame in replacement.vendor_frames if frame[:1] == [2] and frame[2] == "StartTransaction"]
+    finally:
+        await replacement.close()
 
 
 @dataclass

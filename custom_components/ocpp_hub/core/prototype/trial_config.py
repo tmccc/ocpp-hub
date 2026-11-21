@@ -296,12 +296,13 @@ def verify_listener_certificate(descriptor: int, name: str) -> float:
             text=True,
             timeout=5,
             pass_fds=(descriptor,),
+            env={**os.environ, "LC_ALL": "C"},
         )
-        if result.returncode:
+        lines = result.stdout.splitlines()
+        match_kind = "IP" if option == "-checkip" else "Hostname"
+        if result.returncode or f"{match_kind} {name} does match certificate" not in lines:
             raise ValueError
-        dates = dict(
-            line.split("=", 1) for line in result.stdout.splitlines() if line.startswith(("notBefore=", "notAfter="))
-        )
+        dates = dict(line.split("=", 1) for line in lines if line.startswith(("notBefore=", "notAfter=")))
         if (
             not ssl.cert_time_to_seconds(dates["notBefore"])
             <= time.time()

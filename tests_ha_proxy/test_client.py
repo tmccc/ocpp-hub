@@ -340,16 +340,24 @@ async def test_command_outcome_uses_saved_reason(actual_hass, peer, action):
 
     entry = await setup(actual_hass, peer)
     peer["lose_reply"] = True
+    newer_id = "d" * 32
+    newer_read, confirmed = asyncio.Event(), asyncio.Event()
 
     # The independent peer retains Pause as requested while publishing the old command's separate outcome.
-    def saved_receipt(command, _request, result):
+    def saved_receipt(command, request, result):
         if command != "receipt":
             return result
+        if request.get("request_id") == newer_id:
+            newer_read.set()
+            completed = confirmed.is_set()
+            if completed:
+                peer["state"].update(local_hold_verified=True, pause_pending=False)
+            return {"id": newer_id, "action": "pause", "state": "completed" if completed else "accepted"}
         peer["state"].update(
             desired_control="paused", local_hold_verified=False, owner_control_enabled=False, pause_pending=True
         )
         reason = (
-            {"classification": "superseded_by_pause", "superseded_by": "d" * 32}
+            {"classification": "superseded_by_pause", "superseded_by": newer_id}
             if action == "pause"
             else {"classification": "return_not_sent"}
         )
@@ -357,13 +365,23 @@ async def test_command_outcome_uses_saved_reason(actual_hass, peer, action):
 
     peer["result_filter"] = saved_receipt
     if action == "pause":
-        await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
-        assert entry.runtime_data.data["pause_pending"] and not entry.runtime_data.data["local_hold_verified"]
+        press = asyncio.create_task(
+            actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+        )
+        try:
+            await asyncio.wait_for(newer_read.wait(), 3)
+            assert not press.done() and not peer["state"]["local_hold_verified"]
+        finally:
+            confirmed.set()
+            await asyncio.wait_for(press, 3)
+        assert entry.runtime_data.data["local_hold_verified"]
     else:
         with pytest.raises(ProxyError, match="stopped before sending"):
             await entry.runtime_data.client.command(action, 0)
-    sent, lookup = [request for request in peer["requests"] if request["command"] != "status"]
+    sent, lookup, *later = [request for request in peer["requests"] if request["command"] != "status"]
     assert sent["command"] == action and lookup["command"] == "receipt" and lookup["request_id"] == sent["id"]
+    assert len(later) == (2 if action == "pause" else 0)
+    assert all(request["command"] == "receipt" and request["request_id"] == newer_id for request in later)
 
 
 # Intent: a transport failure during sending can only be resolved by the matching saved receipt.

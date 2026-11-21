@@ -38,6 +38,7 @@ class FormatCloud:
         self.accept_legacy = False
         self.boots = 0
         self.seen: list[list[Any]] = []
+        self.incomplete_status_reply = False
 
     # Accept registration, then reject selected status formats; a later policy change permits exact retained replay.
     async def serve(self, connection: ServerConnection) -> None:
@@ -60,6 +61,8 @@ class FormatCloud:
                 answer = {"currentTime": NOW}
             else:
                 answer = {}
+            if self.incomplete_status_reply and frame[2] == "StatusNotification":
+                await connection.send(json.dumps([3, frame[1], []]))
             await connection.send(build_call_result(frame[1], answer))
 
 
@@ -76,6 +79,7 @@ async def test_new_clock_replies_keep_format_sensitive_simulated_cloud_online(
 ) -> None:
     bench = Bench(tmp_path / "state.db", tls, admission)
     vendor = FormatCloud()
+    vendor.incomplete_status_reply = True
     try:
         async with serve(
             vendor.serve, "127.0.0.1", 0, ssl=tls[0], subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG

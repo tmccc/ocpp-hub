@@ -40,7 +40,7 @@ class HistoryObservation:
         if age > max_age:
             raise StaleEvidenceError("native observation exceeded its freshness limit")
         integer(self.count, 0, 10000)
-        integer(self.floor, 1000, 2**31 - 1025)
+        integer(self.floor, 1000)
 
 
 # Treat missing, duplicate, invalid and exhausted native identities as an audit failure rather than an empty history.
@@ -57,7 +57,6 @@ def observe_history(value: Any, identity: str, hardware: str, observed_at: float
         if len(set(identifiers)) != len(identifiers):
             raise ValueError
         floor = max([1000, *identifiers])
-        integer(floor, 1000, 2**31 - 1025)
         return HistoryObservation(
             fingerprint(identity), fingerprint(hardware), observed_at, fingerprint(value), len(value), floor
         )
@@ -82,6 +81,8 @@ def initialize_allocation(journal: Journal, history: HistoryObservation, identit
             return
         if journal.get("next_transaction") is not None or journal.phase.read().value != "prepared":
             raise RecoveryRequiredError("an existing ledger cannot be reseeded from native history")
+        if history.floor > 2**31 - 1025:
+            raise RecoveryRequiredError("native history leaves too few transaction numbers for initial allocation")
         if set(row[0] for row in journal.db.execute("SELECT key FROM meta")) != {
             "identity",
             "trial_baseline",

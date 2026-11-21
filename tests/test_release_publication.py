@@ -31,6 +31,32 @@ from tests.tls_support import tls as tls
 pytestmark = pytest.mark.asyncio
 
 
+# Intent: Return can settle an unsent failure when its own preparation write is refused.
+# Why: a refused request record must leave the verified hold available for polling and a new Return.
+async def test_return_binding_write_refusal_finishes_without_sending(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        await pause_prefix(b)
+        c, j = b.controller, b.session.journal
+        mark = len(b.rig.bench.device_calls)
+        identifier, revision = uuid.uuid4().hex, c.requests.intent().revision
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_return_binding BEFORE UPDATE ON managed_requests "
+            "WHEN NEW.id='" + identifier + "' AND json_type(NEW.result,'$._return')='object' "
+            "BEGIN SELECT RAISE(ABORT,'Return preparation write refused'); END"
+        )
+        try:
+            c.command(identifier, "app_control", revision)
+            assert (await healthy(c))["local_hold_verified"]
+            result = c.requests.receipt(identifier)
+            assert result["state"] == "failed" and result["result"] == {"classification": "return_not_sent"}
+            assert not positive_calls(b, mark) and not j.fault.latched()
+        finally:
+            j.db.execute("DROP TRIGGER refuse_return_binding")
+        retry = uuid.uuid4().hex
+        c.command(retry, "app_control", revision)
+        await completed_control(b, retry, mode="app", revision=revision + 1, ceiling=6)
+
+
 # Count actual positive station calls independently of the controller's result classification.
 def positive_calls(b, mark):
     return [

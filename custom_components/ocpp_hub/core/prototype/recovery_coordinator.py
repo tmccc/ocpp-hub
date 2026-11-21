@@ -112,6 +112,8 @@ class RecoveryCoordinator:
     # Run one bounded recovery pass and rebuild obligations after every await.
     async def advance(self) -> Pending | None:
         c, g = self.c, self.c.session.gateway
+        if (completion := c.ordinary.finish_recovery()) is not None:
+            return completion
         visited: frozenset[RecoveryWork] = frozenset()
         while (work := next_recovery_work(self.obligations(), visited)) is not None:
             visited = visited | {work}
@@ -368,7 +370,17 @@ class RecoveryCoordinator:
             if return_request is not None:
                 if not isinstance(ticket, str):
                     raise RecoveryRequiredError("Return requires its current zero hold ticket")
-                c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
+                try:
+                    c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
+                except sqlite3.Error as error:
+                    return RestoreProgress(
+                        RestoreState.WAITING,
+                        Pending(
+                            Prerequisite.RECONCILIATION,
+                            "Return ended before sending because the journal could not save it",
+                            error,
+                        ),
+                    )
         return ReleaseAttempt(
             "automatic" if expected_intent.mode == "app" else "explicit",
             expected_intent,

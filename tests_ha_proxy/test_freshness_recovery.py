@@ -36,8 +36,13 @@ async def test_healthy_proxy_pause_shows_notice_on_setup(actual_hass, peer):
     assert "scheduled charging are still paused" in notifications[coordinator.notification_id]["message"]
     assert actual_hass.states.get("button.ics_proxy_app_control").state != "unavailable"
 
+    peer["state"].update(healthy=False, local_hold_verified=False)
+    await coordinator.async_refresh()
+    await actual_hass.async_block_till_done()
+    assert "Waiting for the charger to confirm the pause" in notifications[coordinator.notification_id]["message"]
+
     peer["state"].pop("pause_reason")
-    peer["state"]["control_revision"] += 1
+    peer["state"].update(healthy=True, local_hold_verified=True, control_revision=peer["state"]["control_revision"] + 1)
     await coordinator.async_refresh()
     await actual_hass.async_block_till_done()
     assert coordinator.fresh_healthy and coordinator.notification_id not in notifications

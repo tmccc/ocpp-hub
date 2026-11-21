@@ -51,18 +51,36 @@ def test_allocation_persists_without_reseeding(tmp_path: Path) -> None:
         journal.close()
 
 
-# Intent: malformed, duplicate and exhausted history never becomes a fresh allocation boundary.
+# Intent: malformed, duplicate and out-of-range history never becomes an allocation boundary.
 # Why: treating an error or truncated identifier as empty history would reuse saved native session numbers.
 @pytest.mark.parametrize(
     "value",
     [None, {}, [None], [{}]]
-    + [[{"transactionId": value}] for value in (True, False, "1", 1.0, 0, -1, 2**31, 2**31 - 1)]
+    + [[{"transactionId": value}] for value in (True, False, "1", 1.0, 0, -1, 2**31)]
     + [[{"transactionId": 7}, {"transactionId": 7}], [{"transactionId": value + 1} for value in range(10001)]]
     + [[{"transactionId": 1, "invalid": float("nan")}]],
 )
 def test_invalid_native_history_cannot_reserve(value: Any) -> None:
     with pytest.raises(SecurityError):
         observe_history(value, "OFFLINE001", "HW", time.time())
+
+
+# Intent: existing history remains readable at legal IDs which would leave too little space for commissioning.
+# Why: a new ledger needs headroom, while a legitimate observed ID must remain available for supervision.
+def test_history_headroom_applies_only_to_initial_allocation(tmp_path: Path) -> None:
+    journal = prepared_ledger(tmp_path / "state.db")
+    try:
+        limit = 2**31 - 1025
+        fresh = observe_history([{"transactionId": limit + 1}], journal.identity, "HW", time.time())
+        with pytest.raises(RecoveryRequiredError, match="too few transaction numbers"):
+            initialize_allocation(journal, fresh, journal.identity, "HW")
+        initial = observe_history([{"transactionId": limit}], journal.identity, "HW", time.time())
+        initialize_allocation(journal, initial, journal.identity, "HW")
+        assert journal.start("first-charge", START)["transactionId"] == fresh.floor
+        initialize_allocation(journal, fresh, journal.identity, "HW")
+        assert observe_history([{"transactionId": 2**31 - 1}], journal.identity, "HW", time.time()).floor == 2**31 - 1
+    finally:
+        journal.close()
 
 
 # Intent: failure after the counter write rolls the whole reservation back without creating any lifecycle fact.

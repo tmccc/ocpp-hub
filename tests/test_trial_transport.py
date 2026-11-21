@@ -16,7 +16,7 @@ import pytest
 from ocpp_hub_core.frames import basic_auth_header
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from ocpp_hub_core.prototype.store import fingerprint
-from ocpp_hub_core.prototype.trial_config import PreparedTLS, prepare_tls, read_file
+from ocpp_hub_core.prototype.trial_config import PreparedTLS, prepare_tls, read_file, verify_listener_certificate
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver
 from ocpp_hub_core.prototype.trial_resources import Baseline
 from ocpp_hub_core.prototype.trial_session import preflight, save_private
@@ -29,6 +29,26 @@ from websockets.http11 import Request
 
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
+
+
+# Intent: refuse a certificate name mismatch even if an older checker exits successfully.
+# Why: a zero command exit alone does not prove the name that the charger will verify.
+def test_listener_certificate_requires_positive_name_result(monkeypatch):
+    from ocpp_hub_core.prototype import trial_config
+
+    # Older OpenSSL writes valid dates and a textual mismatch while returning zero.
+    def checked(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "notBefore=Jan  1 00:00:00 2020 GMT\nnotAfter=Jan  1 00:00:00 2040 GMT\n"
+                "IP 127.0.0.1 does NOT match certificate\n"
+            ),
+        )
+
+    monkeypatch.setattr(trial_config.subprocess, "run", checked)
+    with pytest.raises(SecurityError, match="certificate name or validity"):
+        verify_listener_certificate(0, "127.0.0.1")
 
 
 # Intent: default CLI validation parses files/certificates but creates no journal, socket or DNS request.

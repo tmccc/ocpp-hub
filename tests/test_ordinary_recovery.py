@@ -22,7 +22,10 @@ from tests.tls_support import tls as tls
 
 # Intent: an ordinary same-connection zero hold during a genuine cloud outage preserves the owner's app revision.
 # Why: recovering phase alone does not mean a replacement introduction retired the owner's authority.
-async def test_same_connection_outage_hold_preserves_app_authority(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("completion_refused", [False, True])
+async def test_same_connection_outage_hold_preserves_app_authority(
+    tmp_path, tls, unused_tcp_port, monkeypatch, completion_refused
+):
     async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32, native_peer=InterruptedNativePeer) as b:
         c, g, j = b.controller, b.session.gateway, b.session.journal
         intent = c.requests.intent()
@@ -64,8 +67,29 @@ async def test_same_connection_outage_hold_preserves_app_authority(tmp_path, tls
                 b.rig.peer.unavailable = False
                 transport.config = original
         await until(lambda: g.vendor_registration == "Accepted")
+        if completion_refused:
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_recovery_completion BEFORE INSERT ON meta "
+                "WHEN NEW.key='managed_ordinary_recovery' AND json_extract(NEW.value,'$.state')='complete' "
+                "BEGIN SELECT RAISE(ABORT,'completion storage temporarily busy'); END"
+            )
+            try:
+                async with asyncio.timeout(5):
+                    while c.ordinary.completion is None:
+                        status = await c.tick()
+                        await asyncio.sleep(0.02)
+                assert status["state"] == "reconciling" and g.controls.ready and g.controls.desired() == 32
+                hold = j.get("managed_ordinary_recovery")
+                mark = list(b.rig.bench.received_limits)
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.get("managed_ordinary_recovery") == hold and b.rig.bench.received_limits == mark
+            finally:
+                j.db.execute("DROP TRIGGER refuse_recovery_completion")
         status = await healthy(c)
         assert c.requests.intent() == intent and status["station_ceiling_a"] == 32
+        if completion_refused:
+            assert j.get("managed_ordinary_recovery")["state"] == "complete"
+            assert b.rig.bench.received_limits == mark
         assert not starts(b.rig) and not any(f[2] == "RemoteStopTransaction" for f in b.rig.bench.device_calls)
 
 

@@ -244,9 +244,20 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         *,
         on_reply: Callable[[str, Frame], None] | None = None,
+        retain_reply_on_exit: bool = False,
     ) -> Frame:
         return require_reply(
-            await self.call_result(action, payload, priority, check, token, before_send, on_dispatch, on_reply=on_reply)
+            await self.call_result(
+                action,
+                payload,
+                priority,
+                check,
+                token,
+                before_send,
+                on_dispatch,
+                on_reply=on_reply,
+                retain_reply_on_exit=retain_reply_on_exit,
+            )
         )
 
     # Managed operations consume an unsent prerequisite as data while sharing the sole send and cleanup path.
@@ -261,10 +272,19 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         *,
         on_reply: Callable[[str, Frame], None] | None = None,
+        retain_reply_on_exit: bool = False,
     ) -> CallResult:
         async with self.gate.enter(priority):
             return await self._call_locked(
-                action, payload, check, token, before_send, on_dispatch, priority > 0, on_reply
+                action,
+                payload,
+                check,
+                token,
+                before_send,
+                on_dispatch,
+                priority > 0,
+                on_reply,
+                retain_reply_on_exit=retain_reply_on_exit,
             )
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
@@ -371,6 +391,8 @@ class Peer:
         preemptible: bool = True,
         on_reply: Callable[[str, Frame], None] | None = None,
         on_sent: Callable[[str], None] | None = None,
+        *,
+        retain_reply_on_exit: bool = False,
     ) -> CallResult:
         if check is not None:
             decision = check()
@@ -385,6 +407,7 @@ class Peer:
         future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
         self._pending[unique_id] = future
         dispatched = False
+        noted_reply = False
         try:
             actual = payload() if callable(payload) else payload
             decision = await self._validate(action, actual, future, preemptible)
@@ -416,12 +439,26 @@ class Peer:
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 if on_reply is not None:
+                    noted_reply = True
                     on_reply(action, answer)
                 if self.after_result is not None:
                     self.after_result(action, actual, answer)
                 self.diagnostics.phase = "complete"
                 return Reply(answer)
-        except (TimeoutError, OSError) as error:
+        except (TimeoutError, OSError, asyncio.CancelledError) as error:
+            # The delivery owner can retain a reply already accepted by the receiver before the task unwinds.
+            if (
+                retain_reply_on_exit
+                and dispatched
+                and not noted_reply
+                and on_reply is not None
+                and future.done()
+                and not future.cancelled()
+                and future.exception() is None
+            ):
+                on_reply(action, future.result())
+            if isinstance(error, asyncio.CancelledError):
+                raise
             detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
             raise UnavailableError(detail) from error
         finally:

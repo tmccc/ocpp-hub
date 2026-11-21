@@ -25,6 +25,29 @@ from tests.tls_support import tls as tls
 pytestmark = pytest.mark.asyncio
 
 
+# Intent: a committed Start can be repeated across an identical Boot before new ceiling verification.
+# Why: the original transaction ID is a receipt. Returning it cannot start another charge.
+async def test_committed_start_reply_survives_ceiling_recheck(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16, native_peer=InterruptedNativePeer) as b:
+        g, j, rig = b.session.gateway, b.session.journal, b.rig
+        local = await positive_flow(b, "daily")
+        assert (await healthy(b.controller))["current_a"] == 16
+        vendor = j.vendor_id(local)
+        rig.peer.unavailable = True
+        try:
+            assert (await rig.bench.call(b.charger, "same-socket-boot", "BootNotification", BOOT))[0] == 3
+            assert not g.controls.ready and g._tag_allowed("NATIVE_TIMER")
+            mark = len(rig.bench.device_calls)
+            reply = await rig.bench.call(
+                b.charger, "same-start-new-id", "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            assert reply[0] == 3 and reply[2]["transactionId"] == local
+            assert j.active() == local and j.vendor_id(local) == vendor
+            assert len(rig.bench.device_calls) == mark
+        finally:
+            rig.peer.unavailable = False
+
+
 # Delay the first correlated reply without changing the actual independent charger response.
 def delay_reply(monkeypatch, rig, charger, action):
     send, held, entered = charger.send, [], asyncio.Event()

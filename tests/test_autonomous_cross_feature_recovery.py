@@ -206,13 +206,15 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                 assert_hold_waiting(later)
                 assert has_saved_reply(path, held)
                 pending_return = await receipt(child, return_id)
-                assert pending_return["state"] in ("accepted", "running", "uncertain")
+                assert pending_return["state"] in ("accepted", "running", "uncertain", "failed")
+                if pending_return["state"] == "failed":
+                    assert pending_return["result"] == {"classification": "return_not_sent"}
                 assert firmware.effective_limit() == 0
                 if repair_order == "native-first-restart":
                     await child.kill()
                     # After death the committed row can no longer change before the replacement reads it.
                     interrupted = next(row for row in child.durable()["requests"] if row["id"] == return_id)
-                    assert interrupted["state"] in ("accepted", "running", "uncertain")
+                    assert interrupted["state"] in ("accepted", "running", "uncertain", "failed")
                     await child.start()
                     current = await child.status(lambda value: value.get("local_hold_verified") is True)
                     assert_hold_waiting(current)
@@ -224,9 +226,9 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                         "id": return_id,
                         "action": "app_control",
                         "revision": early_return_revision,
-                        "state": "uncertain",
+                        "state": "failed" if interrupted["state"] == "failed" else "uncertain",
                         "result": public_return_result(interrupted)
-                        if interrupted["state"] == "uncertain"
+                        if interrupted["state"] in ("uncertain", "failed")
                         else {"classification": "process_replaced"},
                     }
                 repair_ack_commit(path)

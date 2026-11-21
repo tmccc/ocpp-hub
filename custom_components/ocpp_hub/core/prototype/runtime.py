@@ -131,6 +131,13 @@ class ConnectionRuntime:
         self._runner = asyncio.create_task(self._vendor_runner())
         return self
 
+    # A failed cloud worker needs full service retirement before a replacement can own the same journal.
+    def require_vendor_worker(self) -> None:
+        worker = self._runner
+        if worker is not None and worker.done() and not self._closing:
+            failure = None if worker.cancelled() else worker.exception()
+            raise RuntimeError("the cloud worker stopped unexpectedly") from failure
+
     # Translate closed socket sends into the gateway's durable uncertain-outcome boundary.
     @staticmethod
     def _sender(connection: ClientConnection | ServerConnection) -> Sender:

@@ -152,6 +152,7 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
             api = ManagementServer(management, controller, lambda: dict(published))
         notify("READY=1\nSTATUS=Waiting for verified charger and owner control")
         while not stopped.is_set():
+            session.runtime.require_vendor_worker()
             if api is not None and api.server is None:
                 try:
                     await api.start()

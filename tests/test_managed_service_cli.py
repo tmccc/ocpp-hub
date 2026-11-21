@@ -479,6 +479,7 @@ async def test_automatic_release_waits_at_zero_after_cloud_loss(
         (True, "events", False, False),
         (True, "writer", False, False),
         (True, None, True, False),
+        pytest.param(False, "cloud_worker", False, False, id="unexpected-cloud-worker-exit"),
         pytest.param(True, None, False, True, id="occupied-management-port"),
     ],
 )
@@ -635,8 +636,14 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                             assert latest["diagnostics"]["reporting_errors"] > 0
                             assert latest["healthy"] and latest["local_hold_verified"]
                             assert not running.done() and rig.bench.firmware.effective_limit() == 0
-                callbacks[signal.SIGTERM]()
-                assert await asyncio.wait_for(running, 8) == 0
+                if failed_output == "cloud_worker":
+                    assert session.runtime._runner is not None and not session.runtime._runner.done()
+                    session.runtime._runner.cancel()
+                    with pytest.raises(RuntimeError, match="cloud worker stopped unexpectedly"):
+                        await asyncio.wait_for(running, 8)
+                else:
+                    callbacks[signal.SIGTERM]()
+                    assert await asyncio.wait_for(running, 8) == 0
             if failed_output == "status":
                 assert blocked.is_dir()
             elif failed_output == "writer":

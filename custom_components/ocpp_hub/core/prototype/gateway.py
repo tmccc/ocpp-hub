@@ -45,6 +45,10 @@ from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, enco
 from .vendor_read_recovery import recover_legacy_vendor_read
 
 
+class MalformedReplyError(DeniedError):
+    """A recognizable reply envelope cannot complete a waiting call."""
+
+
 class MalformedCallError(DeniedError):
     """A malformed request with a usable correlation ID."""
 
@@ -81,6 +85,8 @@ def decode(raw: str | bytes) -> Frame:
         and isinstance(frame[4], dict)
     ):
         return frame
+    if frame[0] in (3, 4):
+        raise MalformedReplyError("invalid reply shape")
     raise DeniedError("invalid frame shape")
 
 
@@ -289,6 +295,8 @@ class Gateway:
         peer = self.charger if side == "charger" else self.vendor
         try:
             frame = decode(raw)
+        except MalformedReplyError:
+            return  # Keep waiting for a valid reply on this connection or its ordinary deadline.
         except MalformedCallError as error:
             if peer.sender is not None:
                 await peer.sender(build_call_error(str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape"))
@@ -499,6 +507,8 @@ class Gateway:
                 raise UnavailableError("reported Start belongs to a retired charger Boot")
 
         check()
+        if self.journal.known_start(payload):
+            return self._record_start(receipt, payload, occurred, None)
         if self.start_reports is not None and not self.journal.known_start(payload):
             await self.start_reports.prepare_hold(payload)
             check()
@@ -510,7 +520,7 @@ class Gateway:
                 if not self.journal.known_start(payload):
                     raise
             check()
-        if self._tag_allowed(payload.get("idTag")):
+        if not self.journal.known_start(payload) and self._tag_allowed(payload.get("idTag")):
             await self.controls.ensure_ceiling()
             check()
         if self.journal.get("control", {}).get("ticket") != ticket and not self.journal.known_start(payload):
@@ -1426,7 +1436,7 @@ class Gateway:
                     try:
                         current = item
                         sent = False
-                        authorization: AuthorizationObservation | None = None
+                        received_reply: DeliveryReply | None = None
 
                         # Persist possible delivery inside the CALL gate, immediately before send.
                         def before_send() -> None:
@@ -1436,9 +1446,10 @@ class Gateway:
                             sent = True
                             self.delivery_outcome_uncertain = item.action in ("StartTransaction", "StopTransaction")
 
-                        # Attach order to the actual reply before any independent authorization can proceed.
+                        # Retain the exact reply and its order before the vendor gate can pass to another caller.
                         def received(_action: str, answer: Frame) -> None:
-                            nonlocal authorization
+                            nonlocal received_reply
+                            authorization = None
                             if (
                                 self.policy.strict_cloud_authorization
                                 and isinstance(current.payload.get("idTag"), str)
@@ -1446,12 +1457,25 @@ class Gateway:
                                 and "idTagInfo" in answer[2]
                             ):
                                 authorization = self.auth_info.observe()
+                            received_reply = DeliveryReply.received(current, answer, authorization)
 
                         answer = await self.vendor.call(
-                            item.action, payload, token=item.token, before_send=before_send, on_reply=received
+                            item.action,
+                            payload,
+                            token=item.token,
+                            before_send=before_send,
+                            on_reply=received,
+                            retain_reply_on_exit=True,
                         )
                     except UnavailableError, asyncio.CancelledError:
-                        if sent:
+                        if received_reply is not None:
+                            self._delivery_reply = received_reply
+                            try:
+                                self.delivery_outcome_uncertain = not received_reply.storage_only(self.journal)
+                                received_reply.save(self.journal, self.journal.next_delivery() or item)
+                            except sqlite3.Error:
+                                pass  # Retry saving this same reply in the next delivery run.
+                        elif sent:
                             try:
                                 with self.journal.atomic():
                                     self.journal.db.execute(
@@ -1465,7 +1489,7 @@ class Gateway:
                                 # Preserve cancellation/peer failure; recover the unanswered head on the next flush.
                                 pass
                         raise
-                    self._delivery_reply = DeliveryReply.received(item, answer, authorization)
+                    self._delivery_reply = received_reply or DeliveryReply.received(item, answer)
                     self.delivery_outcome_uncertain = not self._delivery_reply.storage_only(self.journal)
                 try:
                     self._delivery_reply.save(self.journal, self.journal.next_delivery() or item)

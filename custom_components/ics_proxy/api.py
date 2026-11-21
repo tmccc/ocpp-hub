@@ -161,8 +161,11 @@ class ProxyClient:
             receipt = None
         if receipt is not None and not matches(receipt):
             raise ProxyError("The local charger proxy returned an invalid command receipt")
+        receipt_id = identifier
+        followed: set[str] = set()
         try:
-            async with asyncio.timeout(25):
+            # A normal Start can spend up to 60 seconds waiting for its local charging session.
+            async with asyncio.timeout(70 if action == "start" else 25):
                 if receipt is None:
                     saved = await self.request("receipt", request_id=identifier)
                     if not matches(saved, lookup=True) or saved.get("state") not in (
@@ -174,10 +177,22 @@ class ProxyClient:
                     ):
                         raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME)
                     receipt = saved
-                while receipt.get("state") in ("accepted", "running"):
-                    await asyncio.sleep(1)
-                    receipt = await self.request("receipt", request_id=identifier)
-                    if not matches(receipt, lookup=True):
+                while True:
+                    if receipt.get("state") in ("accepted", "running"):
+                        await asyncio.sleep(1)
+                    elif action == "pause" and (newer := _newer_pause(receipt)) is not None:
+                        if newer == identifier or newer in followed:
+                            raise ProxyError("A newer Pause could not be confirmed.")
+                        followed.add(newer)
+                        receipt_id = newer
+                    else:
+                        break
+                    receipt = await self.request("receipt", request_id=receipt_id)
+                    if receipt_id == identifier:
+                        matched = matches(receipt, lookup=True)
+                    else:
+                        matched = receipt.get("id") == receipt_id and receipt.get("action") == "pause"
+                    if not matched:
                         raise ProxyError("The local charger proxy returned another command's receipt")
         except TimeoutError, ProxyError:
             if receipt is None:
@@ -189,16 +204,20 @@ class ProxyClient:
             )
         result = receipt.get("result")
         if receipt.get("state") == "failed" and isinstance(result, dict):
-            classification = result.get("classification")
-            if (
-                action == "pause"
-                and classification == "superseded_by_pause"
-                and isinstance(newer := result.get("superseded_by"), str)
-                and newer != identifier
-                and re.fullmatch(r"[a-f0-9]{32}", newer)
-            ):
-                return  # The newer Pause owns confirmation. The button refreshes the live status.
-            if action == "app_control" and classification == "return_not_sent":
+            if action == "app_control" and result.get("classification") == "return_not_sent":
                 raise ProxyError("Return to app / schedule stopped before sending a command to the charger.")
         if receipt.get("state") != "completed":
             raise ProxyError("The charger could not confirm the requested control state")
+
+
+# A matched replacement points to another Pause receipt to read, without repeating either command.
+def _newer_pause(receipt: dict[str, Any]) -> str | None:
+    result = receipt.get("result")
+    if (
+        receipt.get("state") != "failed"
+        or not isinstance(result, dict)
+        or result.get("classification") != "superseded_by_pause"
+    ):
+        return None
+    identifier = result.get("superseded_by")
+    return identifier if isinstance(identifier, str) and re.fullmatch(r"[a-f0-9]{32}", identifier) else None
