@@ -668,6 +668,8 @@ class CommandOutcomes:
 
     # Settle once the actual response is durable. A failed write retains this exact resource for retry.
     def publish_profile(self, reply: VendorProfileReply) -> bool:
+        if not self.awaits_storage(reply.mutation):
+            return True
         if not self.save_profile_reply(reply):
             return False
         j = self.journal

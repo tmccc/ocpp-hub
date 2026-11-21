@@ -362,6 +362,16 @@ async def test_boot_during_vendor_profile_wait_is_verified_before_status(tmp_pat
     async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
         c, g, rig = b.controller, b.session.gateway, b.rig
         send, held, entered = delay_reply(monkeypatch, rig, b.charger, "SetChargingProfile")
+        charger_call = g.charger.call
+
+        # Let the saved reply settle before the vendor handler resumes with the same answer.
+        async def retry_before_return(action, *args, **kwargs):
+            answer = await charger_call(action, *args, **kwargs)
+            if action == "SetChargingProfile" and kwargs.get("on_receive") is not None:
+                g.decide(g.retry_reply_writes)
+            return answer
+
+        monkeypatch.setattr(g.charger, "call", retry_before_return)
         profile = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 16, 1001, stack_level=0)
         vendor = asyncio.create_task(rig.bench.cloud_call("waiting-profile", "SetChargingProfile", profile))
         await asyncio.wait_for(entered.wait(), 3)
