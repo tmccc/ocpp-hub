@@ -544,6 +544,85 @@ async def test_late_return_reply_keeps_the_newer_pause(tmp_path, tls, unused_tcp
             await asyncio.gather(consumer, return_exceptions=True)
 
 
+# Intent: a cloud loss after claim but before dispatch can end Return at reverified zero without faulting.
+# Why: the owner may retry directly once cloud returns, without a second Pause or a replay of this request.
+async def test_claimed_return_cloud_loss_before_positive_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, j = b.controller, b.session.gateway, b.session.journal
+        before = await pause_prefix(b)
+        runtime, validate = b.session.runtime, g.charger.validate_send
+        assert validate is not None
+        interrupted = []
+
+        # Drop the genuine fake-cloud socket during the owned positive profile validation.
+        async def drop_cloud(action, payload):
+            if (
+                not interrupted
+                and action == "SetChargingProfile"
+                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
+            ):
+                attempt = g.controls.release_attempt
+                assert attempt is not None and attempt.ticket is not None and not attempt.positive_may_have_dispatched
+                interrupted.append(attempt)
+                await b.rig.bench.cloud.close()
+                await until(lambda: not runtime.status.vendor_connected)
+            return await validate(action, payload)
+
+        returning = accepted_return(b, before)
+        with monkeypatch.context() as pause_cloud:
+            pause_cloud.setattr(runtime, "vendor_enabled", lambda: False)
+            pause_cloud.setattr(g.charger, "validate_send", drop_cloud)
+            progress = await c.recovery.restore(before["intent"], return_request=returning, claim_return=True)
+        assert interrupted and progress.state is RestoreState.REQUEST_NOT_SENT
+        assert progress.operation is not None and progress.operation.effects.zero_verified
+        assert not positive_calls(b, before["wire"]) and not j.fault.latched()
+        assert c.requests.receipt(returning)["result"] == {"classification": "return_not_sent"}
+        assert c.requests.intent() == before["intent"] and b.rig.bench.firmware.effective_limit() == 0
+        await until(lambda: g.vendor_registration == "Accepted" and runtime.status.vendor_connected)
+        retry = accepted_return(b, before)
+        await completed_control(b, retry, mode="app", revision=before["intent"].revision + 1, ceiling=6)
+        assert len(positive_calls(b, before["wire"])) == 1
+
+
+# Intent: a real replacement Boot before the Return child claims keeps its existing hold and does not send.
+# Why: the previous Boot no longer owns a release, even if it has the same displayed charger information.
+async def test_matching_boot_before_child_claim_retires_unsent_return(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, j = b.controller, b.session.gateway, b.session.journal
+        before = await pause_prefix(b)
+        entered, resume = asyncio.Event(), asyncio.Event()
+        actual_release = g.controls.release_result
+        attempts = []
+
+        # Delay only the real child launch, after the original native proof and request binding are complete.
+        async def wait_before_child(attempt, **kwargs):
+            attempts.append(attempt)
+            entered.set()
+            await resume.wait()
+            return await actual_release(attempt, **kwargs)
+
+        monkeypatch.setattr(g.controls, "release_result", wait_before_child)
+        returning = accepted_return(b, before)
+        consumer = asyncio.create_task(
+            c.recovery.restore(before["intent"], return_request=returning, claim_return=True)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert attempts and attempts[0].ticket is None and current_scope(g) == before["scope"]
+            reply = await b.rig.bench.call(b.charger, "replacement-before-claim", "BootNotification", BOOT)
+            assert reply[0] == 3 and current_scope(g) != before["scope"]
+            resume.set()
+            progress = await asyncio.wait_for(asyncio.shield(consumer), 8)
+            assert progress.state is RestoreState.REQUEST_NOT_SENT
+            assert attempts[0].ticket is None and not positive_calls(b, before["wire"])
+            assert c.requests.receipt(returning)["result"] == {"classification": "return_not_sent"}
+            assert c.requests.intent() == before["intent"] and not j.fault.latched()
+            assert b.rig.bench.firmware.effective_limit() == 0 and (await healthy(c))["local_hold_verified"]
+        finally:
+            resume.set()
+            await asyncio.gather(consumer, return_exceptions=True)
+
+
 # Intent: a real matching Boot after child COMMIT retires successful result A without faulting current authority B.
 # Why: a late observer must preserve the completed Return and verify the ceiling under the newer Boot.
 async def test_matching_boot_after_child_publication_retires_only_result(tmp_path, tls, unused_tcp_port, monkeypatch):

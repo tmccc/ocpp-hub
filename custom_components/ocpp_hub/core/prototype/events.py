@@ -95,6 +95,12 @@ def validate_observation(action: str, payload: dict[str, Any], journal: Journal,
             for sample in samples:
                 if not isinstance(sample, dict) or not isinstance(sample.get("value"), str):
                     raise DeniedError("invalid meter sample")
+                representation = sample.get("format", "Raw")
+                # Signed measurements are forwarded intact; only raw measurements are numeric.
+                if representation == "SignedData" and sample["value"].strip():
+                    continue
+                if representation != "Raw":
+                    raise DeniedError("invalid meter sample format")
                 try:
                     value = float(sample["value"])
                 except ValueError:

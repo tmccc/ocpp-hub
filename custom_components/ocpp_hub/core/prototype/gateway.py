@@ -939,6 +939,7 @@ class Gateway:
                     wire=wire,
                     local=local_transaction,
                     profile=profile,
+                    new_profile=profile_write is not None and profile_write.allocated,
                 )
                 return token_id
 

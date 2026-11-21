@@ -10,14 +10,49 @@ from types import SimpleNamespace
 
 import pytest
 from ocpp_hub_core.prototype import trial_evidence
+from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.security import StaleEvidenceError
 
-from tests.charge_rig import owner_start, positive_flow, ready
+from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
 from tests.managed_rig import healthy, starts
 from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests.trial_peer import Bench
+
+
+# Intent: a new charger lifecycle report retires the earlier dashboard measurement before the next poll.
+# Why: the viewer cannot use power or session state taken before a genuine Start or Stop.
+@pytest.mark.parametrize("event", ["start", "stop"])
+async def test_charger_lifecycle_change_retires_older_live_measurement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, event
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        observed = await healthy(c)
+        local = await positive_flow(b, "daily")
+        if event == "stop":
+            observed = await healthy(c)
+            assert observed["charging_session_open"] is True and observed["power_w"] == 1440
+            reply = await b.rig.bench.call(
+                b.charger,
+                "daily-natural-stop",
+                "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+            )
+            assert reply[0] == 3 and j.active() is None
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        else:
+            assert observed["charging_session_open"] is False and j.active() == local
+        stale = refresh_for_read(c, dict(observed, running=True, certificate_remaining_seconds=86400))
+        assert stale["charging_session_open"] is None and stale["power_w"] is None
+        assert not stale["can_start"] and not stale["can_set_current"]
+        fresh = await healthy(c)
+        assert fresh["charging_session_open"] is (event == "start")
+        if event == "start":
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+            await actual_stop(b, local)
 
 
 # Intent: the same actual native sample can expire at observed's final Pause check without ending supervision.

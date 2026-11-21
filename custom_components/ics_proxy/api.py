@@ -60,6 +60,10 @@ class UnknownCommandOutcomeError(ProxyError):
     """The command may have reached the proxy, so only its saved result can settle it."""
 
 
+class ReceiptUnavailableError(ProxyError):
+    """A temporary receipt read failure can be retried without issuing another command."""
+
+
 class ProxyClient:
     """Home Assistant shares the host network with the proxy; every connection is literal loopback only."""
 
@@ -89,12 +93,16 @@ class ProxyClient:
                     sending = True
                     await connection.send_json({"id": identifier, "command": command, **fields})
                     response = await connection.receive_json()
-        except aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError:
+        except (aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError) as error:
+            if command == "receipt" and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
+                raise ReceiptUnavailableError("The saved command result is temporarily unavailable") from None
             if sending and command not in ("status", "history", "receipt"):
                 raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None
             raise ProxyError("The local charger proxy could not be reached or authenticated") from None
         if response == {"id": identifier, "ok": False, "error": "outcome_unknown"}:
             raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME)
+        if command == "receipt" and response == {"ok": False, "error": "not_ready"}:
+            raise ReceiptUnavailableError("The saved command result is temporarily unavailable")
         if (
             not isinstance(response, dict)
             or response.get("ok") is not True
@@ -128,6 +136,14 @@ class ProxyClient:
                     (row["energy_kwh"] for row in result["charger_sessions"] if row["stopped_at"] is not None), None
                 )
         return result
+
+    # Retry only temporary read failures within the command caller's existing deadline.
+    async def _receipt(self, identifier: str) -> dict[str, Any]:
+        while True:
+            try:
+                return await self.request("receipt", request_id=identifier)
+            except ReceiptUnavailableError:
+                await asyncio.sleep(1)
 
     # Send the control once and recover a lost first reply by reading the original request's receipt.
     async def command(self, action: str, revision: int, **fields: Any) -> None:
@@ -167,7 +183,7 @@ class ProxyClient:
             # Both local Start commands can spend up to 60 seconds waiting for physical confirmation.
             async with asyncio.timeout(70 if action in ("start", "start_test") else 25):
                 if receipt is None:
-                    saved = await self.request("receipt", request_id=identifier)
+                    saved = await self._receipt(identifier)
                     if not matches(saved, lookup=True) or saved.get("state") not in (
                         "accepted",
                         "running",
@@ -187,7 +203,7 @@ class ProxyClient:
                         receipt_id = newer
                     else:
                         break
-                    receipt = await self.request("receipt", request_id=receipt_id)
+                    receipt = await self._receipt(receipt_id)
                     if receipt_id == identifier:
                         matched = matches(receipt, lookup=True)
                     else:

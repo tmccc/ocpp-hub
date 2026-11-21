@@ -13,6 +13,7 @@ from tests.charge_rig import ChargeRig, actual_stop, positive_flow
 from tests.current_rig import selected_ready
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
@@ -99,6 +100,31 @@ async def test_first_boot_readiness_wait_recovers_on_same_boot(tmp_path, tls, un
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
             await session.close()
+
+
+# Intent: an installed proxy retries a brief native outage before opening its listener on the same start.
+# Why: require the full existing admission proof without depending on a whole process restart for a single bad read.
+async def test_transient_cold_native_outage_retries_before_listening(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6, native_peer=InterruptedNativePeer) as b:
+        await crash(b.session)
+        peer = b.rig.peer
+        peer.unavailable = True
+        replacement = managed_session(b.rig)
+        starting = asyncio.create_task(replacement.start())
+        try:
+            failed = await asyncio.wait_for(peer.failed_reads.get(), 3)
+            assert failed["action"] == "getConfig"
+            assert not replacement.started and replacement.runtime._server is None
+            peer.unavailable = False
+            await asyncio.wait_for(starting, 5)
+            controller = ManagedController(replacement)
+            async with b.rig.charger(replacement) as charger:
+                await introduced(b.rig, replacement, charger, "native-startup-retried")
+                assert (await healthy(controller))["station_ceiling_a"] == 6
+        finally:
+            peer.unavailable = False
+            await asyncio.gather(starting, return_exceptions=True)
+            await replacement.close()
 
 
 # Intent: a stopped service can receive real closure for its known unplugged session at zero.

@@ -175,9 +175,10 @@ class Journal:
                 ).fetchone()
             ):
                 self.put("vendor_start_grant", {})
+            self._retire_prepared_profile_aliases()
             self.db.execute(
                 "DELETE FROM mutations WHERE state='pending' AND token IN "
-                "(SELECT mutation FROM vendor_command_scope WHERE wire_result='prepared')"
+                "(SELECT mutation FROM vendor_command_scope WHERE wire_result IN ('prepared','prepared_new_profile'))"
             )
             self.db.execute(
                 "UPDATE mutations SET state='uncertain' WHERE state='pending' AND token IN "
@@ -203,6 +204,30 @@ class Journal:
                 from .managed_stop_delivery import latch_rejected_stop
 
                 latch_rejected_stop(self, head)
+
+    # Undo only fresh profile aliases retired before dispatch and before any resource was recorded.
+    def _retire_prepared_profile_aliases(self) -> None:
+        prepared = {
+            row[0]
+            for row in self.db.execute(
+                "SELECT profile FROM vendor_command_scope JOIN mutations ON mutation=token "
+                "WHERE state='pending' AND action='SetChargingProfile' AND origin='vendor' "
+                "AND wire_result='prepared_new_profile'"
+            )
+        }
+        if not prepared:
+            return
+        resources = set()
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trial_resources'").fetchone():
+            resources = {row[0] for row in self.db.execute("SELECT key FROM trial_resources")}
+        profiles = self.get("vendor_profiles", {})
+        retained = {
+            vendor: local
+            for vendor, local in profiles.items()
+            if local not in prepared or f"profile:{local}" in resources
+        }
+        if retained != profiles:
+            self.put("vendor_profiles", retained)
 
     # Preserve history while allowing a cloud ID to recur only after its previous lifecycle has drained.
     def _migrate_vendor_ids(self) -> None:
@@ -410,10 +435,20 @@ class Journal:
         wire: str,
         local: int | None,
         profile: int | None,
+        new_profile: bool = False,
     ) -> None:
         self.db.execute(
-            "INSERT INTO vendor_command_scope VALUES(?,?,?,?,?,?,?,'prepared')",
-            (token, request, vendor_epoch, boot, wire, local, profile),
+            "INSERT INTO vendor_command_scope VALUES(?,?,?,?,?,?,?,?)",
+            (
+                token,
+                request,
+                vendor_epoch,
+                boot,
+                wire,
+                local,
+                profile,
+                "prepared_new_profile" if new_profile else "prepared",
+            ),
         )
 
     # Record a classified wire response without storing raw messages or claiming lifecycle closure.

@@ -32,11 +32,12 @@ from .native_faults import (
 )
 from .native_history import ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION, MissingOriginalHistoryError
 from .native_history_recovery import history_recovery_idle
+from .native_http import NativeTransportUnavailableError
 from .policy import Policy
 from .recovery_contracts import require_allowed
 from .rpc import IntroductionDeferredError, UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
@@ -389,7 +390,14 @@ class TrialSession:
             selected = self._commissioned_selection()
             known_local = self.journal.active() if self.journal.get("trial_binding") is not None else None
             try:
-                native = await self.native_bounded.read(selected_current=selected, closing_local=known_local)
+                try:
+                    native = await self.native_bounded.read(selected_current=selected, closing_local=known_local)
+                except NativeTransportUnavailableError, StaleEvidenceError, UnavailableError:
+                    if not self.journal.get("managed_mode") or not self.journal.get("trial_binding"):
+                        raise
+                    # Retry a brief outage for an installed proxy while still requiring a complete startup audit.
+                    await asyncio.sleep(0.25)
+                    native = await self.native_bounded.read(selected_current=selected, closing_local=known_local)
             except _NativeMeasurementError as error:
                 refusal = self._measured_refusal(error, selected)
                 latch_managed_fault(self.gateway, refusal.classification, diagnostic=refusal.diagnostic)

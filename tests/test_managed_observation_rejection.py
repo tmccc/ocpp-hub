@@ -47,6 +47,21 @@ REPORTS = [
         "MeterValues",
         {"connectorId": 1, "meterValue": [{"timestamp": START["timestamp"], "sampledValue": [{"value": "1000"}]}]},
     ),
+    (
+        "MeterValues",
+        {
+            "connectorId": 1,
+            "meterValue": [
+                {
+                    "timestamp": START["timestamp"],
+                    "sampledValue": [
+                        {"value": "1000", "format": "Raw"},
+                        {"value": "00AA", "format": "SignedData"},
+                    ],
+                }
+            ],
+        },
+    ),
     ("FirmwareStatusNotification", {"status": "Downloaded"}),
     ("DiagnosticsStatusNotification", {"status": "Uploaded"}),
 ]
@@ -73,6 +88,7 @@ async def test_rejected_report_does_not_block_lifecycle(tmp_path, tls, unused_tc
             await healthy(c)
             assert (await rig.bench.call(charger, "report", action, payload))[0] == 3
             await until(lambda: s.journal.next_delivery() is None)
+            assert any(frame[0] == 2 and frame[2:] == [action, payload] for frame in rig.bench.calls)
             audit = s.journal.db.execute("SELECT * FROM rejected_observations").fetchall()
             assert len(audit) == 1 and audit[0]["action"] == action and audit[0]["code"] == "NotSupported"
             assert not s.runtime.status.delivery_blocked and not s.journal.get("managed_control_fault")

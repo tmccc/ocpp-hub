@@ -106,6 +106,39 @@ async def test_vendor_attachment_storage_failure_twice(tmp_path, tls, admission)
         await bench.close()
 
 
+# Intent: restart removes a newly reserved, unsent profile alias while retaining all actual/legacy profiles.
+# Why: a crash during validation should neither consume live profile capacity nor delete an existing assignment.
+def test_restart_retires_only_unwritten_profile_alias(tmp_path):
+    path = tmp_path / "state.db"
+    with closing(Journal(path, "PROFILE-RESTART")) as journal:
+        journal.db.execute(
+            "CREATE TABLE trial_resources("
+            "key TEXT PRIMARY KEY,desired TEXT,confirmed TEXT,state TEXT NOT NULL,observed_digest TEXT)"
+        )
+        journal.db.execute("INSERT INTO trial_resources(key,state) VALUES('profile:100003','pending')")
+        journal.put("vendor_profiles", {"1": 100001, "2": 100002, "3": 100003, "4": 100004})
+        journal.put("next_vendor_profile", 100004)
+        with journal.atomic():
+            for vendor, is_new in ((1, False), (2, True), (3, True), (4, True)):
+                mutation = journal.mutation_intent("vendor", "SetChargingProfile", {"id": vendor})
+                journal.bind_vendor_command(
+                    mutation,
+                    request=str(vendor),
+                    vendor_epoch=1,
+                    boot=None,
+                    wire=str(vendor),
+                    local=None,
+                    profile=100000 + vendor,
+                    new_profile=is_new,
+                )
+                if vendor == 4:
+                    journal.record_vendor_result(mutation, "dispatched")
+    with closing(Journal(path, "PROFILE-RESTART")) as journal:
+        assert journal.get("vendor_profiles") == {"1": 100001, "3": 100003, "4": 100004}
+        assert journal.get("next_vendor_profile") == 100004
+        assert [row[0] for row in journal.db.execute("SELECT state FROM mutations")] == ["uncertain"]
+
+
 # Install a real deferred FK violation at the archive insert; only transaction completion is refused.
 def defer_archive_commit(journal):
     journal.db.execute("CREATE TABLE fail_history_parent(id INTEGER PRIMARY KEY)")

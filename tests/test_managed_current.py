@@ -23,10 +23,34 @@ from tests.current_rig import adjustable, locally_ready, select
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.management_peer import TOKEN, call
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.test_native_history_archive import unassigned
 from tests.tls_support import tls as tls
+
+
+# Intent: a newer failed charger observation retires the old idle proof for all positive owner controls.
+# Why: a command from a still-open dashboard cannot change intent using a sample the proxy has since lost.
+async def test_failed_native_poll_retires_positive_command_admission(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=InterruptedNativePeer) as test:
+        c = test.controller
+        before = c.requests.intent()
+        assert c.current.available(c.latest_native)
+        assert c.charging.available(c.latest_native, normal=True)
+        mark = len(test.rig.bench.device_calls)
+        test.rig.peer.unavailable = True
+        try:
+            assert (await c.tick())["fault"] == "native_observation_unavailable"
+            for action, fields in (("set_current", {"current_a": 16}), ("start", {})):
+                identifier = uuid.uuid4().hex
+                with pytest.raises(RecoveryRequiredError, match="requires fresh idle authority"):
+                    c.command(identifier, action, before.revision, **fields)
+                assert c.requests.receipt(identifier)["state"] == "not_found"
+            assert c.requests.intent() == before and len(test.rig.bench.device_calls) == mark
+        finally:
+            test.rig.peer.unavailable = False
+        assert (await healthy(c))["owner_control_enabled"]
 
 
 # Intent: approved current selections preserve real app authority and native HW32.

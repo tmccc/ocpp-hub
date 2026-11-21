@@ -267,6 +267,9 @@ class RecoveryCoordinator:
                 self._settle_return(ReturnSettlement(return_request, expected_intent, failure=failure))
             raise
         if return_request is not None and not progress.shared:
+            if progress.state is RestoreState.REQUEST_NOT_SENT:
+                self._settle_return(ReturnSettlement(return_request, expected_intent, failure="return_not_sent"))
+                return progress
             operation = progress.operation
             await_cloud = False
             if (operation is None or not operation.claimed) and progress.pending is not None:
@@ -447,7 +450,7 @@ class RecoveryCoordinator:
             faulted=j.fault.latched(),
             publication_allowed=not isinstance(decision, Pending),
         )
-        if disposition is ReleaseDisposition.WAIT and result.claimed:
+        if disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT) and result.claimed:
             with j.atomic():
                 if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
                     raise RecoveryRequiredError("owned release zero acknowledgement was superseded")

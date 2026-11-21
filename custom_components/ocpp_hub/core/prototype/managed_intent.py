@@ -512,9 +512,14 @@ class ManagedRequests:
 
     # Healthy app observation can close the oldest accepted legacy receipt with no authority change.
     def complete_legacy_return(self) -> None:
-        pending = self.pending_return()
-        if pending is not None:
-            self.returned(pending[0])
+        try:
+            pending = self.pending_return()
+            if pending is not None:
+                self.returned(pending[0])
+        except sqlite3.Error:
+            if self.journal.db.in_transaction:
+                raise
+            # A later healthy poll can finish this old receipt without affecting existing app authority.
 
     # Actual release publishes app intent in its child transaction; legacy healthy completion changes no intent.
     def returned(

@@ -6,7 +6,7 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.recovery_contracts import Prerequisite
 
-from tests.charge_rig import ready
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.managed_rig import healthy, starts
 from tests.test_managed_current_tick_race import OneNativeResponseGate
 from tests.tls_support import tls as tls
@@ -37,6 +37,34 @@ async def test_legacy_app_return_uses_actual_healthy_status(tmp_path, tls, unuse
             assert c.requests.receipt(identifier) == before
         assert b.rig.bench.device_calls == calls
         assert j.active() is None
+
+
+# Intent: an old Return receipt can retry its cosmetic completion independently of a verified app charge.
+# Why: briefly losing a history write cannot shut down an already working charger connection.
+async def test_old_app_return_receipt_write_cannot_interrupt_charging(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        local = await positive_flow(b, "daily")
+        await healthy(c)
+        intent, identifier = c.requests.intent(), uuid.uuid4().hex
+        c.requests.accept(identifier, "app_control", intent.revision)
+        before = list(b.rig.bench.device_calls)
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_legacy_return BEFORE UPDATE ON managed_requests "
+            "WHEN NEW.action='app_control' AND NEW.state='completed' "
+            "BEGIN SELECT RAISE(ABORT,'legacy receipt unavailable'); END"
+        )
+        try:
+            status = await c.tick()
+            assert status["state"] == "healthy" and status["power_w"] == 1440
+            assert c.requests.receipt(identifier)["state"] == "accepted" and j.active() == local
+        finally:
+            j.db.execute("DROP TRIGGER refuse_legacy_return")
+        assert (await healthy(c))["power_w"] == 1440
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert b.rig.bench.device_calls == before
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        await actual_stop(b, local)
 
 
 # Intent: the regular poll rejects a stale saved Return and leaves the current Pause in force.

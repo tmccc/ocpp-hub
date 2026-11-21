@@ -200,7 +200,9 @@ async def test_deferred_pause_receipt_keeps_acceptance_classification(actual_has
             )
     else:
         await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
-    assert peer["commands"].count("pause") == peer["commands"].count("receipt") == 1
+    assert peer["commands"].count("pause") == 1
+    count = peer["commands"].count("receipt")
+    assert (2 <= count <= 3) if delay else (count == 1)
 
 
 # Intent: HA startup, reload and unload perform status reads only and never instantiate the legacy OCPP backend.
@@ -285,6 +287,27 @@ async def test_lost_pause_reply_does_not_retry_control(actual_hass, peer, drop_r
     assert pause["command"] == "pause"
     assert lookup["command"] == "receipt" and lookup["request_id"] == pause["id"] and lookup["id"] != pause["id"]
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
+
+
+# Intent: a temporary receipt refusal can recover whether the original Pause reply arrived or was lost.
+# Why: the safe follow-up is another read of the same request, never a second charger command.
+@pytest.mark.parametrize("drop_reply", [False, True])
+async def test_temporary_pause_receipt_failure_retries_only_the_read(actual_hass, peer, drop_reply):
+    await setup(actual_hass, peer)
+    peer["lose_reply"] = drop_reply
+    peer["pending_receipt"] = True
+
+    # The original Pause still settles. Refuse just the first read of its saved result.
+    def first_read_unavailable(command, _request, _result):
+        if command == "receipt" and peer["commands"].count("receipt") == 1:
+            return json.dumps({"ok": False, "error": "not_ready"})
+        return None
+
+    peer["raw_response"] = first_read_unavailable
+    await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    pause, first, final = (request for request in peer["requests"] if request["command"] != "status")
+    assert pause["command"] == "pause" and first["command"] == final["command"] == "receipt"
+    assert first["request_id"] == final["request_id"] == pause["id"]
 
 
 # Intent: a possibly sent command needs an exact, readable receipt to confirm success.

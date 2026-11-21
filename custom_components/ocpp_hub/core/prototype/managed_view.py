@@ -536,19 +536,30 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         pending_fault = "owner_release_pending"
     pause_pending = c.requests.pending_pause()
     station_lost = c.session.book.station_ceiling_lost()
-    # A pending Pause can still show the last measured app reading with its original age.
+    # A pending Pause may show the last sample for the same session, but a new lifecycle needs a new reading.
+    native = c.latest_native
     sample_available = (
         result.get("charger_connected") is True
         and current is not None
         and observed is not None
         and current.scope == observed.scope
         and (current == observed or pause_pending and observed.intent.mode == "app")
-        and c.latest_native is not None
+        and native is not None
         and pending_fault is None
         and not station_lost
     )
     if not sample_available:
         clear_native_sample(result)
+    elif native is not None and native.physical.native_transaction_id != j.active():
+        result.update(
+            current_a=None,
+            power_w=None,
+            charging_session_open=None,
+            vehicle_drawing_power=None,
+            vehicle_connected=None,
+            local_charge=None,
+            test_charge=None,
+        )
     result.setdefault("last_session_energy_kwh", None)
     supervising = not c.stopping and not j.fault.latched() and not station_lost
     scope_current = sample_available and current == observed and supervising

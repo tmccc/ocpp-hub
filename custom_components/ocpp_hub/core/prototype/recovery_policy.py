@@ -40,6 +40,7 @@ class ReleaseDisposition(Enum):
 
     SHARED = "shared"
     WAIT = "wait"
+    NOT_SENT = "not_sent"
     FAULT = "fault"
     STALE = "stale"
 
@@ -65,9 +66,12 @@ def release_disposition(
         and not effects.positive_verified
         and not effects.zero_dispatched
         and not effects.zero_verified
-        and current == result.authority
-        and zero_ready
-        and not faulted
+        and (
+            result.pending.reason is Prerequisite.SUPERSEDED
+            or current == result.authority
+            and zero_ready
+            and not faulted
+        )
     ):
         return ReleaseDisposition.WAIT
     if (
@@ -90,9 +94,9 @@ def release_disposition(
             else ReleaseDisposition.STALE
         )
     if (
-        purpose == "automatic"
-        and result.claimed
+        result.claimed
         and result.pending is not None
+        and (purpose == "automatic" or result.pending.reason is Prerequisite.CLOUD_ACK)
         and result.failure is None
         and not result.cancelled
         and not result.cleanup_failed
@@ -104,7 +108,8 @@ def release_disposition(
         and zero_ready
         and not faulted
     ):
-        return ReleaseDisposition.WAIT
+        # Once claimed, an explicit Return ends here; only automatic recovery can reuse the wait.
+        return ReleaseDisposition.WAIT if purpose == "automatic" else ReleaseDisposition.NOT_SENT
     return ReleaseDisposition.FAULT
 
 
@@ -157,6 +162,8 @@ def restore_progress(disposition: ReleaseDisposition, result: OwnedReleaseResult
         pending = Pending(Prerequisite.SUPERSEDED, "a subsequent owner event retired completed release authority")
     elif disposition is ReleaseDisposition.WAIT:
         return RestoreProgress(RestoreState.WAITING, result.pending, result)
+    elif disposition is ReleaseDisposition.NOT_SENT:
+        return RestoreProgress(RestoreState.REQUEST_NOT_SENT, result.pending, result)
     elif disposition is ReleaseDisposition.SHARED:
         return RestoreProgress(RestoreState.SHARED, operation=result)
     else:

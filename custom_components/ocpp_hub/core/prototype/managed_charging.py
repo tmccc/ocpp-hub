@@ -280,6 +280,8 @@ class ManagedCharging:
         if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
             return "timed_test_requires_cloud"
         if native is not None:
+            if c.native.last_verified_at == 0:
+                return "native_observation_stale"
             if native.physical.connection != "Plug":
                 return "vehicle_not_plugged_in"
             if native.physical.transaction_open:

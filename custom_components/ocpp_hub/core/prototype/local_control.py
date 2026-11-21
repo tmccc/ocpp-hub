@@ -32,6 +32,7 @@ from .recovery_contracts import (
     NotSent,
     OwnedReleaseResult,
     Pending,
+    Prerequisite,
     ReleaseHandoff,
     Reply,
     ResultCall,
@@ -917,6 +918,14 @@ class LocalControl:
         if self.journal.phase.starting:
             raise DeniedError("initial native admission has not completed")
         previous = self.journal.get("control", {})
+        if attempt is not None and rollback_guard is not None:
+            # A task can start after a new Boot or hold has replaced the verified preflight.
+            try:
+                rollback_guard()
+            except UnavailableError as error:
+                return Pending(Prerequisite.SUPERSEDED, "release Boot changed before the claim", error)
+            if previous.get("ticket") != attempt.before_ticket:
+                return Pending(Prerequisite.SUPERSEDED, "release hold changed before the claim")
         if previous.get("uncertain") and not acknowledge_uncertainty:
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
         epoch, ticket = self._claim(previous.get("inhibit", False))

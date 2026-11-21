@@ -341,7 +341,7 @@ class ManagedCurrentLimits:
             return "managed_start_active"
         if not c.requests.has_capacity():
             return "request_capacity_exhausted"
-        if native is None or not 0 <= time.time() - native.physical.observed_at <= 15:
+        if native is None or c.native.last_verified_at == 0 or not 0 <= time.time() - native.physical.observed_at <= 15:
             return "native_observation_stale"
         if native.physical.transaction_open:
             return "native_transaction_open"
