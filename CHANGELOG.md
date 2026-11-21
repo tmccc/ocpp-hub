@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Save definite replies to cloud Start and Stop against the original command. Retry journal writes without
+  repeating the charger command, settle saved replies after restart and show when a known reply is still being saved.
 - Keep buffered charger reports in their arrival generation across Boot. Require completed cloud registration
   for control and keep the cloud connection through an unchanged charger Boot.
 - Verify the native output limit before confirming a selected ceiling or a continuing zero hold. Preserve

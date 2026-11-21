@@ -22,6 +22,7 @@ REASONS = {
     "pause_verification_pending": "Pause is requested; physical zero output has not yet been verified.",
     "lifecycle_acknowledgement_pending": "A genuine session event is awaiting the manufacturer's acknowledgement.",
     "command_outcome_unknown": "A previously issued command has an unresolved outcome.",
+    "vendor_reply_storage_pending": "The charger answered, and the proxy is saving the reply.",
     "delivery_storage_pending": "Delivery is waiting for required journal storage to recover.",
     "preservation_review_required": "Preserved configuration or charger resources require operator review.",
     "status_stale": "The service status is stale or its timestamp is unavailable.",

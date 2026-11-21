@@ -86,6 +86,7 @@ class Journal:
             except BlockingIOError:
                 raise RecoveryRequiredError("journal already has an active owner") from None
             from .control_state import ControlAuthority
+            from .forwarded_reply import ForwardedReplies
             from .installation_lifecycle import InstallationLifecycle
             from .managed_records import CurrentChangeJournal, ManagedFaultJournal
             from .retired_schedules import schedule_history
@@ -103,6 +104,7 @@ class Journal:
             self.control = ControlAuthority(self)
             self.phase = InstallationLifecycle(self)
             self.starts = StartLifecycle(self)
+            self.forwarded = ForwardedReplies(self)
             self.current_change = CurrentChangeJournal(self)
             self.fault = ManagedFaultJournal(self)
             self._initialize(path, identity)
@@ -180,6 +182,7 @@ class Journal:
                 "DELETE FROM mutations WHERE state='pending' AND token IN "
                 "(SELECT mutation FROM vendor_command_scope WHERE wire_result IN ('prepared','prepared_new_profile'))"
             )
+            self.forwarded.recover_saved()
             self.db.execute(
                 "UPDATE mutations SET state='uncertain' WHERE state='pending' AND token IN "
                 "(SELECT mutation FROM vendor_command_scope WHERE wire_result='dispatched')"

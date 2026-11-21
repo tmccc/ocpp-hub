@@ -259,6 +259,11 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
         j = c.session.journal
         value.update(phase=j.phase.read().value, automatic_charge_restart=False)
         try:
+            vendor_pending = j.db.execute(
+                "SELECT token FROM mutations WHERE origin='vendor' AND state!='confirmed'"
+            ).fetchall()
+            known = sum(j.forwarded.awaits_storage(row["token"]) for row in vendor_pending)
+            uncertain = len(vendor_pending) - known
             value.update(
                 pending_lifecycle_events=j.db.execute(
                     "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
@@ -266,18 +271,16 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
                 pending_observations=j.db.execute(
                     "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
                 ).fetchone()[0],
-                vendor_write_uncertain=j.db.execute(
-                    "SELECT COUNT(*) FROM mutations WHERE origin='vendor' AND state!='confirmed'"
-                ).fetchone()[0],
-                operator_reconciliation_required=bool(j.get("uncertain_vendor_command"))
-                or j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed'").fetchone()
-                is not None,
+                vendor_write_uncertain=uncertain,
+                vendor_reply_storage_pending=known,
+                operator_reconciliation_required=bool(j.get("uncertain_vendor_command")) or bool(uncertain),
             )
         except sqlite3.Error:
             value.update(
                 pending_lifecycle_events=None,
                 pending_observations=None,
                 vendor_write_uncertain=None,
+                vendor_reply_storage_pending=None,
                 operator_reconciliation_required=None,
             )
     return value

@@ -132,6 +132,12 @@ async def test_actual_control_mode_explains_unconfirmed_return(actual_hass, peer
         ("strict_refusal", None, None, "operator review is required"),
         ("audit_outcome_unknown", None, None, "ordinary recovery remains blocked"),
         ("verification_pending", "delivery_storage_pending", None, "required journal storage"),
+        (
+            "not_assessed",
+            "vendor_reply_storage_pending",
+            None,
+            "The charger answered, and the proxy is saving the reply.",
+        ),
         ("not_assessed", "pause_verification_pending", None, "physical zero output has not yet been verified"),
         ("not_assessed", "command_outcome_unknown", None, "unresolved outcome"),
         ("not_assessed", "cloud_start_pending", None, "cloud Start is awaiting its matching session"),

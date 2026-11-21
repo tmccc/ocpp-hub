@@ -172,6 +172,7 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
             ),
             (bool(status.get("pending_lifecycle_events")), "lifecycle_acknowledgement_pending"),
             (bool(status.get("operator_reconciliation_required")), "command_outcome_unknown"),
+            (bool(status.get("vendor_reply_storage_pending")), "vendor_reply_storage_pending"),
             (c.session.runtime.status.delivery_blocked_cause == "storage", "delivery_storage_pending"),
             (
                 bool(journal.get("trial_preservation_fault") or journal.get("trial_inventory_fault")),

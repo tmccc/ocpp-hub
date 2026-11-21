@@ -23,6 +23,7 @@ from .command_processor import CommandPriority, CommandProcessor
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
 from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
+from .forwarded_reply import TRANSACTION_COMMANDS, ForwardedReply
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, data_value, known_write
 from .local_control import LocalControl
@@ -222,6 +223,11 @@ class Gateway:
         processor = self.command_processor
         return decision() if processor is None else await processor.run(decision)
 
+    # Retry the original recorded response and its independent connection receipt without sending either command again.
+    def retry_reply_writes(self) -> None:
+        self.journal.forwarded.retry()
+        self._inbound.retry()
+
     # Restrict new transports or changed introductions before they can authorize any charging-capable request.
     def _restrict_trial_introduction(self) -> None:
         if self.journal.phase.read().active and self.journal.get("trial_binding") is not None:
@@ -333,6 +339,7 @@ class Gateway:
         for task in replies:
             task.cancel()
         await asyncio.gather(*replies, return_exceptions=True)
+        self.decide(self.retry_reply_writes, priority=CommandPriority.RESTRICT)
 
     # Drain request handlers and their independent refusal replies in deterministic offline tests.
     async def drain(self) -> None:
@@ -1028,9 +1035,11 @@ class Gateway:
         ics_write: IcsWrite | None = None
         grant: str | None = None
         profile_write: VendorProfileWrite | None = None
+        forwarded_reply: ForwardedReply | None = None
         dispatched = False
         charger_epoch = self._charger_epoch
         wire = "c-" + uuid.uuid4().hex
+        priority = CommandPriority.RESTRICT if action == "RemoteStopTransaction" else CommandPriority.NORMAL
 
         # From this boundary onward even a sender exception can follow a physical transmission.
         def on_dispatch(_action: str) -> None:
@@ -1041,6 +1050,19 @@ class Gateway:
                     if grant is not None:
                         self.authorisation.issue(grant)
             dispatched = True
+
+        # The peer records the actual answer before another owner or a failed local write can supersede it.
+        def received(received_action: str, answer: Frame) -> None:
+            nonlocal forwarded_reply
+            if dispatched and mutation is not None:
+                forwarded_reply = self.journal.forwarded.capture(mutation, received_action, wire, answer)
+
+        # Finalize captured replies independently of the handler's ability to return on the original socket.
+        def finish() -> None:
+            if forwarded_reply is None:
+                self._finish_vendor_dispatch(action, original, mutation, grant, profile_write, dispatched)
+            elif not self.journal.forwarded.publish(forwarded_reply):
+                self.journal.forwarded.publish(forwarded_reply)
 
         try:
             self.policy.kind(action, original)
@@ -1097,7 +1119,6 @@ class Gateway:
                 )
                 return token_id
 
-            priority = CommandPriority.RESTRICT if action == "RemoteStopTransaction" else CommandPriority.NORMAL
             if supervised and self.command_processor is not None:
                 await self.command_processor.run(require_origin, priority=priority)
             if write and action != "RemoteStopTransaction":
@@ -1194,28 +1215,21 @@ class Gateway:
                 token=wire,
                 before_send=prepare_clear if action == "ClearChargingProfile" else None,
                 on_dispatch=on_dispatch,
+                on_receive=received if action in TRANSACTION_COMMANDS else None,
             )
+            if forwarded_reply is not None:
+                return reply_as(answer, token)
 
             # Apply the translated reply to the request that actually reached the charger.
             def settle(answer: Frame) -> str:
                 if action in ("SetChargingProfile", "ClearChargingProfile") and answer[0] == 3:
                     if profile_status(action, answer) is None:
                         raise UnavailableError("unobserved charging profile response")
-                if (
-                    action in ("RemoteStartTransaction", "RemoteStopTransaction")
-                    and answer[0] == 3
-                    and answer[2]
-                    not in (
-                        {"status": "Accepted"},
-                        {"status": "Rejected"},
-                    )
-                ):
+                if action in TRANSACTION_COMMANDS and answer[0] == 3:
                     raise UnavailableError("unobserved remote transaction command response")
                 if query is not None:
                     answer = query.response(answer)
                 with self.journal.atomic():
-                    if grant is not None and answer[0] == 3 and answer[2] == {"status": "Rejected"}:
-                        self.authorisation.revoke(grant)
                     if profile_write is not None and answer[0] == 3 and answer[2] == {"status": "Accepted"}:
                         self._accepted_vendor_profile(profile_write)
                     if ics_write is not None and ics_write.accepted(answer):
@@ -1249,6 +1263,9 @@ class Gateway:
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
+            if forwarded_reply is not None:
+                return build_call_result(token, {"status": forwarded_reply.status})
+
             # Storage may itself be unavailable; the already durable pre-send intent remains the recovery boundary.
             # Keep an uncertain physical command visible to recovery.
             def retain_uncertainty() -> None:
@@ -1266,9 +1283,7 @@ class Gateway:
             self.decide(retain_uncertainty)
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
         finally:
-            self.decide(
-                lambda: self._finish_vendor_dispatch(action, original, mutation, grant, profile_write, dispatched)
-            )
+            self.decide(finish, priority=priority)
         return text
 
     # Retire only proven-unsent work; cancellation or any error after dispatch retains physical uncertainty.
@@ -1565,6 +1580,7 @@ class Gateway:
     async def flush(self, *, can_send: Callable[[], bool] | None = None) -> None:
         epoch = self._vendor_epoch
         async with self._flush_lock:
+            self.decide(self.retry_reply_writes)
             self.decide(self._refresh_delivery_uncertainty)
             self._require_epoch("vendor", epoch)
             await self._ensure_vendor_boot()
@@ -1616,8 +1632,7 @@ class Gateway:
                             payload,
                             token=item.token,
                             before_send=before_send,
-                            on_reply=received,
-                            retain_reply_on_exit=True,
+                            on_receive=received,
                         )
                     except UnavailableError, asyncio.CancelledError:
                         self.decide(lambda: self._interrupted_delivery(item, received_reply, sent))

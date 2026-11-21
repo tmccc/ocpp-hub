@@ -7,12 +7,14 @@ from ocpp_hub_core import commands
 from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
 from ocpp_hub_core.prototype.connection_scope import current_control_scope
 from ocpp_hub_core.prototype.gateway import decode
+from ocpp_hub_core.prototype.managed_diagnostics import snapshot
+from ocpp_hub_core.prototype.managed_view import poll_base
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from websockets.asyncio.server import serve
 
-from tests.charge_rig import ready
+from tests.charge_rig import positive_flow, ready
 from tests.prototype_rig import START
 from tests.runtime_rig import Bench, until
 from tests.tls_support import admission as admission
@@ -20,12 +22,18 @@ from tests.tls_support import tls as tls
 from tests.trial_peer import Bench as TrialBench
 
 
-# Intent: retry a refused journal publication using the real charger rejection already received.
+# Intent: retain the real charger rejection through repeated refusals of its journal publication.
 # Why: the issued grant and its result must settle together, without another physical command.
-async def test_cloud_start_rejection_survives_one_failed_outcome_write(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("failures,newer_pause,slow_send", [(1, False, True), (2, False, False), (2, True, False)])
+async def test_cloud_start_rejection_survives_failed_outcome_writes(
+    tmp_path, tls, unused_tcp_port, monkeypatch, failures, newer_pause, slow_send
+):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         journal, bench = b.session.journal, b.rig.bench
         sender = b.charger.send
+        reached, release = asyncio.Event(), asyncio.Event()
+        drained = asyncio.Event()
         writes = 0
 
         # Change only the synthetic charger's actual reply after its independent receiver records the request.
@@ -34,27 +42,142 @@ async def test_cloud_start_rejection_survives_one_failed_outcome_write(tmp_path,
             if frame[0] == 3 and any(
                 call[1] == frame[1] and call[2] == "RemoteStartTransaction" for call in bench.device_calls
             ):
+                reached.set()
+                if newer_pause or slow_send:
+                    await release.wait()
                 raw = build_call_result(frame[1], {"status": "Rejected"})
             await sender(raw)
 
-        # Refuse only the first write of this definite outcome in the real transaction.
-        def refuse_once():
+        charger = b.session.gateway.charger
+        wire_send = charger.sender
+        assert wire_send is not None
+
+        # The real receiver can see the rejection before the outgoing send finishes draining.
+        async def drain_start(raw):
+            await wire_send(raw)
+            frame = decode(raw)
+            if frame[0] == 2 and frame[2] == "RemoteStartTransaction":
+                await drained.wait()
+
+        # Refuse the specified writes of this definite outcome in the real transaction.
+        def refuse_write():
             nonlocal writes
             writes += 1
-            return writes == 1
+            return writes <= failures
 
         monkeypatch.setattr(b.charger, "send", reject_start)
-        journal.db.create_function("refuse_first_start_result", 0, refuse_once)
+        if slow_send:
+            monkeypatch.setattr(charger, "sender", drain_start)
+        journal.db.create_function("refuse_start_result", 0, refuse_write)
         journal.db.execute(
             "CREATE TEMP TRIGGER fail_start_result BEFORE UPDATE ON vendor_command_scope "
-            "WHEN NEW.wire_result='Rejected' AND refuse_first_start_result() "
+            "WHEN NEW.wire_result='Rejected' AND refuse_start_result() "
             "BEGIN SELECT RAISE(ABORT,'synthetic journal refusal'); END"
         )
-        reply = await bench.cloud_call("record-rejected-start", "RemoteStartTransaction", {"idTag": "CLOUD_OWNER"})
-        assert reply == [3, "record-rejected-start", {"status": "Rejected"}] and writes == 2
+        if newer_pause:
+            journal.db.execute(
+                "CREATE TEMP TRIGGER fail_start_reply_cache BEFORE UPDATE OF response ON inbound_receipts "
+                "WHEN NEW.side='vendor' AND NEW.token='record-rejected-start' "
+                "BEGIN SELECT RAISE(ABORT,'synthetic response cache refusal'); END"
+            )
+        request = asyncio.create_task(
+            bench.cloud_call("record-rejected-start", "RemoteStartTransaction", {"idTag": "CLOUD_OWNER"})
+        )
+        try:
+            await asyncio.wait_for(reached.wait(), 2)
+            if newer_pause:
+                b.controller.command("a" * 32, "pause", b.controller.requests.intent().revision)
+            if slow_send:
+                auth = b.session.gateway.authorisation
+                assert auth.allows("CLOUD_OWNER")
+                release.set()
+                await until(lambda: not auth.allows("CLOUD_OWNER"))
+                assert not request.done()
+        finally:
+            release.set()
+            drained.set()
+        reply = await request
+        assert reply == [3, "record-rejected-start", {"status": "Rejected"}]
+        await b.controller.tick()
+        assert writes == failures + 1
         assert not journal.get("vendor_start_grant") and not journal.get("uncertain_vendor_command")
         assert journal.db.execute("SELECT wire_result FROM vendor_command_scope").fetchone()[0] == "Rejected"
         assert sum(call[2] == "RemoteStartTransaction" for call in bench.device_calls) == 1
+        if newer_pause:
+            assert (
+                journal.db.execute(
+                    "SELECT response FROM inbound_receipts WHERE side='vendor' AND token=?", (reply[1],)
+                ).fetchone()[0]
+                is None
+            )
+            await bench.cloud.send(build_call(reply[1], "RemoteStartTransaction", {"idTag": "CLOUD_OWNER"}))
+            await until(lambda: sum(frame == reply for frame in bench.calls) == 2)
+            assert sum(call[2] == "RemoteStartTransaction" for call in bench.device_calls) == 1
+            assert b.controller.requests.intent().mode == "paused"
+            assert bench.firmware.effective_limit() == 0
+            journal.db.execute("DROP TRIGGER fail_start_reply_cache")
+            await b.controller.tick()
+            saved = journal.db.execute(
+                "SELECT response FROM inbound_receipts WHERE side='vendor' AND token=?", (reply[1],)
+            ).fetchone()[0]
+            assert decode(saved) == reply
+
+
+# Intent: the accepted cloud Stop remains known even when its final mutation update repeatedly fails.
+# Why: the actual closure report and the accepted command are different facts, and each owns one record.
+@pytest.mark.recovery_replay
+async def test_cloud_stop_keeps_reply_while_waiting_for_storage_and_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        journal, bench = b.session.journal, b.rig.bench
+        local = await positive_flow(b, "daily")
+        cloud_id = journal.vendor_id(local)
+        assert cloud_id is not None
+        refused = 0
+
+        # The saved answer has its own transaction. Refuse only the later mutation update.
+        def attempt():
+            nonlocal refused
+            refused += 1
+            return 1
+
+        journal.db.create_function("refuse_stop_completion", 0, attempt)
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_stop_completion BEFORE UPDATE ON mutations "
+            "WHEN NEW.action='RemoteStopTransaction' AND NEW.state='confirmed' AND refuse_stop_completion() "
+            "BEGIN SELECT RAISE(ABORT,'synthetic journal refusal'); END"
+        )
+        try:
+            reply = await bench.cloud_call(
+                "durable-accepted-stop", "RemoteStopTransaction", {"transactionId": cloud_id}
+            )
+            assert reply == [3, "durable-accepted-stop", {"status": "Accepted"}] and refused >= 2
+            row = journal.db.execute(
+                "SELECT state,wire_result,local FROM mutations JOIN vendor_command_scope ON mutation=token"
+            ).fetchone()
+            assert tuple(row) == ("pending", "Accepted", local)
+            assert not journal.get("uncertain_vendor_command") and journal.active() == local
+            status = poll_base(b.controller)
+            assert status["vendor_reply_storage_pending"] == 1 and status["vendor_write_uncertain"] == 0
+            assert status["operator_reconciliation_required"] is False
+            blockers = snapshot(b.controller, status)["blockers"]
+            assert "vendor_reply_storage_pending" in blockers and "command_outcome_unknown" not in blockers
+        finally:
+            journal.db.execute("DROP TRIGGER refuse_stop_completion")
+        await b.controller.tick()
+        assert journal.db.execute("SELECT state FROM mutations").fetchone()[0] == "confirmed"
+        assert journal.active() == local
+        stopped = await bench.call(
+            b.charger,
+            "closure-after-ack",
+            "StopTransaction",
+            {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+        )
+        assert stopped[0] == 3 and journal.active() is None
+        b.rig.peer.permission_enabled = False
+        await until(lambda: journal.next_delivery() is None)
+        assert sum(call[2] == "RemoteStopTransaction" for call in bench.device_calls) == 1
 
 
 # Intent: an accepted profile replacement without a transaction remains clearable after the old session ends.

@@ -9,6 +9,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
@@ -57,6 +58,8 @@ class InboundCache:
         self.db.execute("DELETE FROM inbound_receipts")
         self._items: dict[tuple[str, int, str], tuple[str, asyncio.Future[str]]] = {}
         self._reads: OrderedDict[tuple[str, int, str], tuple[str, str]] = OrderedDict()
+        self._awaiting_write: OrderedDict[tuple[str, int, str], tuple[str, str]] = OrderedDict()
+        self._write_capacity = capacity if journal is None else journal.capacity
         self._epochs: dict[str, int] = {}
 
     # An interrupted handler may have transmitted a mutation; its duplicate receives failure and never replays it.
@@ -64,26 +67,40 @@ class InboundCache:
     def unavailable(token: str) -> str:
         return build_call_error(token, "InternalError", "request outcome unavailable; request was not replayed")
 
-    # Commit mutations before waking duplicates and retain only a bounded window of completed read replies.
+    # A failed cache write leaves the handler's outcome intact and its pre-send receipt prevents redispatch.
     def complete(
         self, key: tuple[str, int, str], digest: str, future: asyncio.Future[str], text: str, read: bool
     ) -> str:
-        if read:
-            side, epoch, _ = key
-            if self._epochs.get(side, epoch) == epoch:
+        side, epoch, _ = key
+        if self._epochs.get(side, epoch) == epoch:
+            if read:
                 self._reads[key] = (digest, text)
                 if len(self._reads) > self.capacity:
                     self._reads.popitem(last=False)
-        else:
-            try:
-                self.db.execute(
-                    "UPDATE inbound_receipts SET response=? WHERE side=? AND epoch=? AND token=?", (text, *key)
-                )
-            except sqlite3.Error:
-                text = self.unavailable(key[2])  # A durable pending receipt still prevents replay.
+            elif not self._save_response(key, digest, text):
+                self._awaiting_write[key] = (digest, text)
+                if len(self._awaiting_write) > self._write_capacity:
+                    self._awaiting_write.popitem(last=False)
         future.set_result(text)
         self._items.pop(key, None)
         return text
+
+    # Only amend the existing receipt with the same connection, request and body.
+    def _save_response(self, key: tuple[str, int, str], digest: str, text: str) -> bool:
+        try:
+            self.db.execute(
+                "UPDATE inbound_receipts SET response=? WHERE side=? AND epoch=? AND token=? AND digest=?",
+                (text, *key, digest),
+            )
+        except sqlite3.Error:
+            return False
+        self._awaiting_write.pop(key, None)
+        return True
+
+    # Response storage can recover independently of the physical outcome and the original caller.
+    def retry(self) -> None:
+        for key, (digest, text) in tuple(self._awaiting_write.items()):
+            self._save_response(key, digest, text)
 
     # Preserve mutation receipts for the whole connection; an evicted read can safely run again.
     async def response(
@@ -134,7 +151,7 @@ class InboundCache:
             if previous[0] != digest:
                 return build_call_error(token, "FormationViolation", "CALL id has a different request body")
             return previous[1], False
-        recent = self._reads.get(key)
+        recent = self._reads.get(key) or self._awaiting_write.get(key)
         if recent is not None:
             if recent[0] != digest:
                 return build_call_error(token, "FormationViolation", "CALL id has a different request body")
@@ -162,9 +179,10 @@ class InboundCache:
     def retire(self, side: str, epoch: int) -> None:
         self.db.execute("DELETE FROM inbound_receipts WHERE side=? AND epoch!=?", (side, epoch))
         self._epochs[side] = epoch
-        self._reads = OrderedDict(
-            (key, value) for key, value in self._reads.items() if key[0] != side or key[1] == epoch
-        )
+        for cache in (self._reads, self._awaiting_write):
+            for key in tuple(cache):
+                if key[0] == side and key[1] != epoch:
+                    del cache[key]
 
 
 # Preserve the actual peer's result or error while restoring the original requester id.
@@ -248,6 +266,7 @@ class Peer:
         self.sender: Sender | None = None
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
+        self._receivers: dict[str, tuple[CommandPriority, Callable[[Frame], None]]] = {}
         self.before_send: Callable[[str, dict[str, Any]], GateDecision | None] | None = None
         self.validate_send: Callable[[str, dict[str, Any]], Awaitable[Guard | GateDecision | None]] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
@@ -264,6 +283,10 @@ class Peer:
         self.diagnostics.reply(len(frame[1]), future is not None and not future.done())
         if future is not None and not future.done():
             future.set_result(frame)
+            receiver = self._receivers.pop(frame[1], None)
+            if receiver is not None:
+                priority, record = receiver
+                self.decide(lambda: record(frame), priority=priority)
 
     # Send a request only after rechecking current authority inside the gate.
     async def call(
@@ -277,7 +300,7 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         *,
         on_reply: Callable[[str, Frame], None] | None = None,
-        retain_reply_on_exit: bool = False,
+        on_receive: Callable[[str, Frame], None] | None = None,
     ) -> Frame:
         return require_reply(
             await self.call_result(
@@ -289,7 +312,7 @@ class Peer:
                 before_send,
                 on_dispatch,
                 on_reply=on_reply,
-                retain_reply_on_exit=retain_reply_on_exit,
+                on_receive=on_receive,
             )
         )
 
@@ -305,7 +328,7 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         *,
         on_reply: Callable[[str, Frame], None] | None = None,
-        retain_reply_on_exit: bool = False,
+        on_receive: Callable[[str, Frame], None] | None = None,
     ) -> CallResult:
         async with self.gate.enter(priority):
             return await self._call_locked(
@@ -317,7 +340,7 @@ class Peer:
                 on_dispatch,
                 priority > 0,
                 on_reply,
-                retain_reply_on_exit=retain_reply_on_exit,
+                on_receive=on_receive,
             )
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
@@ -425,7 +448,7 @@ class Peer:
         on_reply: Callable[[str, Frame], None] | None = None,
         on_sent: Callable[[str], None] | None = None,
         *,
-        retain_reply_on_exit: bool = False,
+        on_receive: Callable[[str, Frame], None] | None = None,
     ) -> CallResult:
         priority = CommandPriority.NORMAL if preemptible else CommandPriority.RESTRICT
         processor = self.command_processor
@@ -444,7 +467,6 @@ class Peer:
         future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
         self._pending[unique_id] = future
         dispatched = False
-        noted_reply = False
         try:
             actual = self.decide(payload, priority=priority) if callable(payload) else payload
             validation = await self._validate(action, actual, future, preemptible)
@@ -486,31 +508,20 @@ class Peer:
             if isinstance(message, Pending):
                 return NotSent(message)
             async with asyncio.timeout(self.timeout):
+                # Receipts can arrive while the original sender is still draining.
                 dispatched = True
+                if on_receive is not None:
+                    self._receivers[unique_id] = (priority, partial(on_receive, action))
                 await sender(message)
                 if on_sent is not None:
                     sent = on_sent
                     self.decide(lambda: sent(action), priority=priority)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
-                if on_reply is not None:
-                    noted_reply = True
                 result = self.decide(lambda: self._accept_reply(action, actual, answer, on_reply), priority=priority)
                 self.diagnostics.phase = "complete"
                 return result
         except (TimeoutError, OSError, UnavailableError, asyncio.CancelledError) as error:
-            # The delivery owner can retain a reply already accepted by the receiver before the task unwinds.
-            if (
-                retain_reply_on_exit
-                and dispatched
-                and not noted_reply
-                and on_reply is not None
-                and future.done()
-                and not future.cancelled()
-                and future.exception() is None
-            ):
-                remembered, observe = future.result(), on_reply
-                self.decide(lambda: observe(action, remembered), priority=priority)
             if isinstance(error, (UnavailableError, asyncio.CancelledError)):
                 raise
             detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
@@ -518,6 +529,7 @@ class Peer:
         finally:
             self.diagnostics.interrupted()
             self._pending.pop(unique_id, None)
+            self._receivers.pop(unique_id, None)
             if future.done() and not future.cancelled():
                 future.exception()
             elif not future.done():

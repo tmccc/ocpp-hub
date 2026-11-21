@@ -41,7 +41,11 @@ class VendorAuthorisation:
     # A grant authorises only its bounded pending start or the currently open transaction bound to that grant.
     def allows(self, tag: str, *, issuing: str | None = None) -> bool:
         grant = self.journal.get("vendor_start_grant", {})
-        if grant.get("digest") != tag_key(tag) or (grant.get("prepared") is True and grant.get("token") != issuing):
+        if (
+            grant.get("digest") != tag_key(tag)
+            or (grant.get("prepared") is True and grant.get("token") != issuing)
+            or self.journal.forwarded.rejected(grant.get("mutation"))
+        ):
             return False
         local = grant.get("local")
         return (local is None and grant.get("expires", 0) > time.time()) or (

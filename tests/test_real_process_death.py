@@ -5,7 +5,9 @@ import copy
 import json
 import os
 import signal
+import sqlite3
 import uuid
+from contextlib import closing
 
 import pytest
 
@@ -20,6 +22,134 @@ from tests.recovery_barriers import require_zero_held
 from tests_model.catalog import input_digest
 from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
 from tests_model.test_current_sequences import BoundaryPeer
+
+
+# Intent: a saved definite forwarded Start reply survives an actual process cut and permits the next scheduled charge.
+# Why: a cut before the reply commits has a different, genuinely unknown outcome and must retain a protective hold.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("cut", ["before-forwarded-reply-commit", "after-forwarded-reply-commit"])
+async def test_process_cut_at_forwarded_start_reply(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, cut):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        ports(),
+        ports(),
+        monkeypatch,
+        16,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        bench = child.rig.bench
+        answer = bench.firmware.answer
+
+        # Keep the real simulated charger link and return a definite rejection for the app command.
+        def reject(action, payload):
+            return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
+
+        # Inspect only the exact original command's committed records through an independent read-only connection.
+        def recorded(identifier):
+            path = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT state,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
+                    "WHERE request=?",
+                    (identifier,),
+                ).fetchone()
+
+        monkeypatch.setattr(bench.firmware, "answer", reject)
+        await child.start()
+        await child.status()
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        identifier = uuid.uuid4().hex
+        await child.arm(cut, identifier)
+        caller = asyncio.create_task(bench.cloud_call(identifier, "RemoteStartTransaction", {"idTag": "APP_OWNER"}))
+        try:
+            gate = await child.gate(cut, identifier)
+            saved = cut.startswith("after")
+            assert gate["transaction_open"] is not saved
+            assert recorded(identifier) == ("pending", "Rejected" if saved else "dispatched")
+            await child.kill()
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        await child.start()
+        assert child.durable()["metadata"]["managed_control_intent"] == intent
+        assert recorded(identifier) == (("confirmed", "Rejected") if saved else ("uncertain", "dispatched"))
+        assert len(starts(child.rig)) == 1
+        if saved:
+            assert (await child.status())["requested_current_a"] == 16
+            assert await child.scheduled_sessions(16, True)
+        else:
+            status = await child.status(
+                lambda value: (
+                    value.get("charger_connected") is True and value.get("operator_reconciliation_required") is True
+                )
+            )
+            assert status["vendor_write_uncertain"] == 1 and not status["can_start"]
+            assert bench.firmware.effective_limit() == 0
+        assert len(starts(child.rig)) == 1
+
+
+# Intent: a saved forwarded Stop acknowledgement survives replacement with its original session still open.
+# Why: the charger must report actual closure and the proxy must retain the original start and stop records.
+@pytest.mark.recovery_replay
+async def test_process_saved_forwarded_stop_waits_for_closure(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, 16, timing="fast-poll"
+    ) as child:
+        bench = child.rig.bench
+        await child.start()
+        await child.status()
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        vendor = (await child.delivered(local))["vendor"]
+
+        identifier = uuid.uuid4().hex
+        cut = "after-forwarded-reply-commit"
+        await child.arm(cut, identifier)
+        caller = asyncio.create_task(bench.cloud_call(identifier, "RemoteStopTransaction", {"transactionId": vendor}))
+
+        # Observe only the exact forwarded command's committed state, independently of the service process.
+        def recorded():
+            path = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT state,wire_result,wire_request,local FROM vendor_command_scope "
+                    "JOIN mutations ON mutation=token WHERE request=?",
+                    (identifier,),
+                ).fetchall()
+
+        try:
+            await child.gate(cut, identifier)
+            [(state, result, wire, target)] = recorded()
+            assert (state, result, target) == ("pending", "Accepted", local)
+            assert bench.firmware.active == local
+            await child.kill()
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        await child.start()
+        assert recorded() == [("confirmed", "Accepted", wire, local)]
+        durable = child.durable()
+        assert durable["metadata"]["managed_control_intent"] == intent
+        assert durable["transactions"][0]["stop"] is None
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop)
+        assert answer[0] == 3
+        transaction = await child.delivered(local, closed=True)
+        assert transaction["vendor"] == vendor
+        assert json.loads(transaction["start"]) == start
+        assert json.loads(transaction["stop"]) == stop
+        assert sum(frame[1] == wire for frame in bench.device_calls) == 1
 
 
 # Intent: automatic recovery after real process death retires its exact abandoned choice before later selections.

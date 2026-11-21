@@ -97,6 +97,7 @@ async def test_real_poll_shapes_and_post_fault_read_order(tmp_path, tls, unused_
                 "pending_observations",
                 "automatic_charge_restart",
                 "vendor_write_uncertain",
+                "vendor_reply_storage_pending",
                 "operator_reconciliation_required",
             }
             native = await c.settled_native()

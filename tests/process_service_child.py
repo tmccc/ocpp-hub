@@ -56,6 +56,20 @@ class ObservedConnection(sqlite3.Connection):
         if Gate.phase == "none" or Gate.fired:
             return
         operation = sql.strip().upper()
+        if Gate.phase in ("before-forwarded-reply-commit", "after-forwarded-reply-commit"):
+            if (
+                operation == "COMMIT"
+                and super()
+                .execute(
+                    "SELECT 1 FROM vendor_command_scope JOIN mutations ON mutation=token "
+                    "WHERE request=? AND state='pending' AND wire_result IN ('Accepted','Rejected')",
+                    (Gate.identifier,),
+                )
+                .fetchone()
+                is not None
+            ):
+                Gate.freeze(self, "before-forwarded-reply-commit" if before else "after-forwarded-reply-commit")
+            return
         state = self.metadata("managed_test_charge")
         receipt = self.metadata("local_start_receipt")
         current = self.metadata("managed_current_change")
