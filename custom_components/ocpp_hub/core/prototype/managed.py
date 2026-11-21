@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from functools import partial
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
@@ -121,6 +122,7 @@ class ManagedController:
         self.native.positive_guard = self.positive_decision
         self.native.continuation_guard = self.continuation_decision
         self.native.recovery_zero_only = self.charging.recovery_zero_only
+        self.native.stop_after_introduction = partial(session.gateway.stop, requests=self.requests)
         binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest, self.charging)
         session.gateway.start_reports = ManagedStartReports(self.charging, binding)
         self.native.command_source_observer = binding.observe
@@ -353,6 +355,9 @@ class ManagedController:
 
             # A restrictive Stop still belongs to one current owner request and one known local session.
             def guard() -> None:
+                active = j.active()
+                # After the claim, a genuine closure may arrive before this Stop's acknowledgement.
+                same_target = active == local or active is None and stop_ticket is not None
                 if (
                     self.stopping
                     or intent.mode != "paused"
@@ -360,7 +365,7 @@ class ManagedController:
                     or self.requests.pause_request() != request
                     or not control_scope_matches(g, connection)
                     or fingerprint(j.get("boot")) != self.native.spec.boot_digest
-                    or j.active() != local
+                    or not same_target
                 ):
                     raise RecoveryRequiredError("owner Stop awaits the current Pause and known session")
                 control = j.get("control", {})

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep a reconnect Stop and its real reply with the pending Pause that owns the open session.
 - Keep a fresh charger report after Boot distinct from a buffered report that reused its message ID.
 - Recheck historical iCS transaction mappings immediately before sending the query and when translating its reply.
 - Keep the timed charge's zero hold available if recording its Stop and reading the native charger both fail,

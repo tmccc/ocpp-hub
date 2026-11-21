@@ -65,6 +65,14 @@ The [Pause ordering tests](../tests/test_managed_controls.py) hold the outgoing 
 Return or a current increase at the native validation boundary. Pause can take control before or after successful
 validation. In both orders, the simulated charger receives no positive profile from the superseded command.
 
+The [issued-command tests](../tests/test_issued_pause_reconnect.py) let the charger receive Start or apply a
+positive profile for Return or a current increase before Pause. The reply arrives late on its original connection
+in one order and is retried on a replacement connection in the other. The proxy re-establishes zero on the replacement.
+A delayed Start report and a second Pause with an earlier Stop still pending both require a Stop for the exact
+open session. The replacement Stop reply stays with the current Pause whether the independent closure report
+arrives before or after it. Introduction shares a Stop already sent by the same Pause. Pause completes after
+closure has been verified.
+
 The focused interaction checks run in the ordinary engine suite. The finite families below have their
 own per-case manifest and recovery evidence.
 

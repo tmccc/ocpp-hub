@@ -11,6 +11,7 @@ from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
+from ..frames import Frame
 from .command_processor import CommandPriority
 from .connection_scope import ConnectionLineage, control_scope_matches, current_scope
 from .control_state import ControlState
@@ -78,6 +79,7 @@ class NativeBoundedHandover:
         self.observation_listener: Callable[[HandoverEvidence], None] | None = None
         self.continuation_guard: Callable[[HandoverEvidence, int], GateDecision] | None = None
         self.recovery_zero_only: Callable[[], bool] | None = None
+        self.stop_after_introduction: Callable[[], Awaitable[Frame]] = gateway.stop
         self.positive_guard: Callable[[HandoverEvidence], GateDecision] | None = None
         self.audited_epoch: int | None = None
         self._introductions: set[object] = set()
@@ -666,8 +668,8 @@ class NativeBoundedHandover:
                     except UnavailableError, TimeoutError, StationZeroStorageError:
                         # Runtime can retry the exact-Boot zero proof without rerunning this audit or Stop.
                         pass
-                elif journal.active() is not None:
-                    await gateway.stop()
+                elif (local := journal.active()) is not None and not gateway.controls.stop_acknowledged(local):
+                    await self.stop_after_introduction()
 
             # Keep the audited metadata and revision. The runtime checks zero against the latest actual Boot.
             def publish() -> None:

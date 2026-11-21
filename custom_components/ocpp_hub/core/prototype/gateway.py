@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ..frames import ERROR_FORMATION_VIOLATION, Frame, build_call_error, build_call_result
 from .auth_info import AuthorizationObservation, InfoBook, expiry, validate_info
@@ -52,6 +52,9 @@ from .security import SecurityError
 from .start_handoff import OwnedStartResult, StartHandoff
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
+
+if TYPE_CHECKING:
+    from .managed_intent import ManagedRequests
 
 PROFILE_COMMANDS = frozenset({"SetChargingProfile", "ClearChargingProfile"})
 
@@ -1539,22 +1542,47 @@ class Gateway:
             handoff=handoff,
         )
 
-    # A local stop installs a durable zero-current hold even when there is no known transaction to stop.
-    async def stop(self) -> Frame:
+    # A local Stop can carry the current owner Pause through introduction to its exact wire reply.
+    async def stop(self, *, requests: ManagedRequests | None = None) -> Frame:
         if not self.journal.get("managed_mode"):
             return await self.controls.stop()
         connection, local = current_control_scope(self), self.journal.active()
+        intent, request = None, None
+        if requests is not None:
+            try:
+                pending, ownership = requests.pause_request(), requests.pause_ownership()
+            except sqlite3.Error, SecurityError:
+                if self.journal.db.in_transaction:
+                    raise
+                # The existing protective Stop still has authority if the optional request link is unreadable.
+            else:
+                if (
+                    pending is not None
+                    and pending.revision == ownership.intent.revision
+                    and ownership.owns_ticket(pending.hold)
+                ):
+                    intent, request = ownership.intent, pending
 
-        # An introduction Stop cannot adopt a different transaction while it waits for its restrictive turn.
+        # Preserve this boot, target and Pause across the wait, including legitimate closure before the Stop reply.
         def guard() -> None:
             if (
                 self.retiring()
                 or not control_scope_matches(self, connection)
                 or self.journal.active() not in (None, local)
+                or intent is not None
+                and requests is not None
+                and requests.intent() != intent
             ):
-                raise UnavailableError("local Stop belongs to a superseded Boot or transaction")
+                raise UnavailableError("local Stop belongs to a superseded Boot, transaction or Pause")
 
-        return await self.controls.stop(expected_local=local, guard=guard)
+        # Join an existing Pause Stop or retain the original request on this connection's own wire evidence.
+        # The protective send still uses the original introduction claim and its independent zero proof.
+        return await self.controls.stop(
+            expected_local=local,
+            guard=guard,
+            owner=("pause", intent, request, local, connection) if request is not None else None,
+            request_id=request.identifier if request is not None else None,
+        )
 
     # Releasing ownership confirms the physical resume ceiling before permitting vendor writes again.
     async def release(self, acknowledge_uncertainty: bool = False) -> None:
