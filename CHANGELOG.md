@@ -13,6 +13,7 @@
 - Handle late Start and Stop errors on their original connections. Retain the first complete incident entry after a partial write.
 - Refresh delivery counts, age certificate status, and report when a saved charger check is still being written.
 - Keep definite incompatible charger responses separate from a temporary lack of a response.
+  Duplicate response framing headers count as an incompatibility.
 - Check the saved service mode before startup can change a journal.
 - Keep commissioning terminal controls available after a long pasted line.
 - Keep the fault evidence with the Pause that acknowledged it so recovery can still use that Pause after a restart.
@@ -21,7 +22,8 @@
 - Finish saved forwarded profile replies and exact local Start replies after a restart.
 - Use the same unanswered-command evidence for status and zero protection. A matched late reply can
   resolve the hold caused by that exact command, then normal recovery checks current charging conditions.
-- Retain an accepted profile reply while its local records are being saved. Retry Pause recovery
+- Retain an accepted profile reply while its local records are being saved. Settle it once even if a retry
+  finishes before the original command handler resumes. Retry Pause recovery
   evidence for the same request and retire a Return claim that Boot superseded before dispatch.
 - Keep an outstanding cloud Start report on its original connection long enough to accept a late
   answer. Defer queued reports during Boot and retry incomplete native readings during introduction.

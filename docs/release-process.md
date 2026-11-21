@@ -34,6 +34,8 @@ Pre-releases use `X.Y.Z-rcN` (HACS shows it as a pre-release).
 The normal full gate requires all four complete twenty-worker suites on the exact clean commit. Follow
 [the developer guide](developer.md#setup-and-checks) for pinned runtimes, raw evidence and collection executors.
 The validator audits the four suites and runs the additional iCS checks on the frozen release candidate.
+Workers finish their assigned cases after a test fails so the run can report the other failures together.
+Every case must pass for the suite to qualify.
 
 For a standalone proxy release, use the full commit from the target's verified installation record. Supply the
 Python interpreter from either pinned Home Assistant runtime for the week rehearsal.
@@ -98,6 +100,8 @@ defaults to `sensor.uptime` and can be set via `uptime_entity`.
 Verify installed software identity, fresh local/native and HA state, preserved records and the requested mode.
 Record cloud connectivity separately from local readiness. Respect commissioning's documented physical limits;
 routine updates do not require another dedicated charging trial when the owner has excluded one.
+When comparing a journal migration with the running service, rehearse journal and gateway initialization on
+a copy. Gateway initialization also creates the table for saved authorization refusals.
 
 ### Rehearsed standalone software rollback
 
