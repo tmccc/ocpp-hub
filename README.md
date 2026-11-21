@@ -47,6 +47,10 @@ Native command validation has a separate bounded allowance from sending and awai
 freshness limits still apply. A newer restrictive control can cancel an unsent audit, while a dispatched command
 retains its actual reply or unknown outcome.
 
+The proxy uses one queue to decide what to send and how incoming reports and replies change charging state.
+The charger and cloud connections keep reading while requests wait. A newer Pause can take effect while an
+earlier reply is outstanding. The earlier reply still belongs to the request and charging session that sent it.
+
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
 an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the

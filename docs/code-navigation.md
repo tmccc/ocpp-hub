@@ -64,6 +64,7 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | Area | Main code to follow | Regression starting points under `tests/` |
 | --- | --- | --- |
 | Process and connections | [`trial_session.py`](../custom_components/ocpp_hub/core/prototype/trial_session.py), `TrialSession`; `trial_transport.py`; `runtime.py`, `ConnectionRuntime`; `tools/managed_proxy.py` | `test_managed_service_cli.py`, `test_service_observation_recovery.py`, `test_managed_boot_supersession.py` |
+| Command decision order | [`command_processor.py`](../custom_components/ocpp_hub/core/prototype/command_processor.py), `CommandProcessor`; `Gateway` shares it with both peers, admission receipts, and local control | `test_command_processor.py`, `test_managed_start_reply_lifecycle_order.py`, `test_rpc_validation_deadlines.py` |
 | OCPP dispatch and policy | [`gateway.py`](../custom_components/ocpp_hub/core/prototype/gateway.py), `Gateway`; `rpc.py`; `station.py`; `policy.py`; `ics.py`; `ics_writes.py`; shared frame/session code | `test_protocol_diagnostics.py`, `test_prototype_ics.py`, `test_prototype_ics_writes.py` |
 | Management and intent | [`managed_api.py`](../custom_components/ocpp_hub/core/prototype/managed_api.py), `ManagementServer`; `managed_intent.py`, `ManagedRequests`; `managed.py`, `ManagedController.command()` | `test_managed_api.py`, `test_managed_controls.py`, `test_managed_return_exclusion.py` |
 | Physical control authority | [`control_state.py`](../custom_components/ocpp_hub/core/prototype/control_state.py), `ControlState` and `Journal.control`; the sole serializer for ownership, holds, ticket completion and current/Start projections | `test_control_authority.py`, `test_bound_owner_retirement.py`, `test_release_publication.py` |
@@ -81,6 +82,14 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 
 Read recovery siblings alongside their callers. The small modules divide proof and settlement across files; a
 function that returns successfully may only advance one boundary, leaving an actual command or receipt pending.
+
+`TrialSession` creates one `CommandProcessor` and `ManagedController` uses that same instance. The queue runs short
+synchronous decisions for command claims, send checks, incoming charger reports, matched replies, and native
+observations. Pause and other protective decisions have priority. Ordinary decisions at the same priority keep
+queue order. Socket reads, sends and native HTTP waits run independently. The peer matches a reply to its request
+as it arrives. The queue then lets the request owner record the result and check the original Boot, ticket and
+session before publishing any change in authority. Start and Stop replies record what the peer confirmed.
+Lifecycle reports and independent observations establish what the charger actually did.
 
 `Journal.control` is the only production writer of the existing physical-authority record. `ControlState` preserves
 raw extra fields and missing-key defaults; its shared/hold predicates distinguish legacy truthy flags from explicit

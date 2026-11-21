@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use one command queue for charging decisions, incoming reports and reply outcomes. Keep network waits
+  independent so a newer Pause can take effect while the proxy waits for an earlier reply.
 - Recover a vendor-confirmed Start whose reply went missing while later charge reports are queued. Keep the
   charger at zero until the entire queue is delivered and a fresh Pause completes.
 - Show when the vendor reconnects while an earlier charge report remains unconfirmed.
