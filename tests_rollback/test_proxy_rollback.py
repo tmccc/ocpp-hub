@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 from tests.managed_rig import starts
 from tests.model_tls_support import model_tls as model_tls
@@ -17,6 +18,19 @@ from tests.prototype_rig import START
 from tests.recovery_barriers import require_zero_held
 from tests.runtime_rig import until
 from tools.check_proxy_rollback import check_rollback, main
+
+
+# Intent: a refused rollback identifies each source only if its bytes match the rehearsed build.
+# Why: the operator must know which of the two supplied paths failed verification.
+def test_unrehearsed_build_reports_only_verified_commit(tmp_path, builds):
+    current, previous = builds
+    config = SimpleNamespace(journal=tmp_path / "unused.sqlite3")
+    wrong_previous = check_rollback(config, current, current)
+    assert wrong_previous.reason == "build_pair_unrehearsed"
+    assert wrong_previous.current_commit is not None and wrong_previous.previous_commit is None
+    wrong_current = check_rollback(config, previous, previous)
+    assert wrong_current.reason == "build_pair_unrehearsed"
+    assert wrong_current.current_commit is None and wrong_current.previous_commit is not None
 
 
 # Select only actual lifecycle commands from the simulated cloud's transcript.

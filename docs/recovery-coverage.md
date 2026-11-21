@@ -279,7 +279,8 @@ Observation receipts commit with the queued event and local status effects. Pend
 terminal retention is bounded by the journal capacity (default10,000), with room for currently pending observations.
 A replacement socket or process retains the logical generation until its first accepted Boot. A new Boot permits
 fresh untimed events under reused counters; validated timed observations can still match their exact earlier CALL
-and body. A new CALL ID always remains a new report. An identical untimed counter/body before replacement Boot
+and body. A queued report keeps the generation recorded when it arrived, even if the next Boot commits first.
+A new CALL ID always remains a new report. An identical untimed counter/body before replacement Boot
 is inherently ambiguous: publication follows the retained retry window, while local cable-departure handling stays
 conservative. No finite cache promises recognition after unbounded intervening traffic.
 

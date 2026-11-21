@@ -162,7 +162,9 @@ async def test_acknowledgement_archives_exact_bodies_and_preserves_authority(
 
 # Intent: history that disappears while the service is stopped gains the same recoverable fault on startup.
 # Why: the existing offline acknowledgment needs the fault even though the failing startup cannot open a listener.
-@pytest.mark.parametrize("case", ["missing", "changed", "restored", "app-intent", "only-attempt-missing"])
+@pytest.mark.parametrize(
+    "case", ["missing", "changed", "restored", "app-intent", "only-attempt-missing", "queued-status"]
+)
 async def test_cold_start_history_loss_records_repair_before_listening(
     tmp_path, tls, unused_tcp_port, monkeypatch, case
 ):
@@ -185,6 +187,10 @@ async def test_cold_start_history_loss_records_repair_before_listening(
                 await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
             await first.close()
 
+        if case == "queued-status":
+            report = {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
+            with closing(Journal(first.journal.path, first.journal.identity)) as original_journal:
+                queued = original_journal.enqueue("StatusNotification", report)
         rig.bench.history = copy.deepcopy(original[1:])
         if case == "changed":
             rig.bench.history[0]["meterStop"] += 1
@@ -220,6 +226,10 @@ async def test_cold_start_history_loss_records_repair_before_listening(
         monkeypatch.setattr(history_tool, "preflight_native", native_peer)
         assert await history_tool.run("acknowledge", tmp_path / "trial.json", strategy) == 0
         assert rig.bench.device_calls == before and rig.bench.firmware.effective_limit() == 0
+        if case == "queued-status":
+            with closing(Journal(first.journal.path, first.journal.identity)) as original_journal:
+                delivery = original_journal.next_delivery()
+                assert delivery.token == queued and delivery.payload == report and delivery.state == "queued"
 
         repaired = managed_session(rig)
         await repaired.start()

@@ -777,7 +777,8 @@ while only running handlers consume the bounded memory pool. Cancellation or a s
 replaying a possibly dispatched command.
 
 Management capacity counts unresolved requests, retaining terminal UUID results for idempotency. All charging
-admissions reserve Pause capacity. A new Pause can also replace the active Pause receipt in an older full journal;
+admissions reserve Pause capacity. A short-lived local connection can accept Pause while the four ordinary
+connections are busy. A new Pause can also replace the active Pause receipt in an older full journal;
 previous UUID rows remain queryable as superseded. Verified-absent resource receipts and their aliases retain their
 ownership history without consuming live-resource capacity. Spontaneous reappearance still blocks control, and an
 explicit reactivation must fit the live-resource limit. These changes do not recycle protocol identifiers.
@@ -786,6 +787,8 @@ A Stop naming the exact accepted transaction with a nondecreasing energy meter c
 after a device-clock correction. The original reported Start and Stop timestamps remain unchanged; a separate
 private clock-discontinuity record marks reversed chronology. Native closure, resource and delivery checks still
 gate subsequent control. Unknown transactions, lower meters and contradictory Stop reports remain rejected.
+For a known open session, the charger must report a native output limit within the selected ceiling. A continuing
+zero hold also requires the native output limit and every phase of measured draw to be zero.
 
 The default commissioning policy remains strict. `tools/acknowledge_native_history.py check --config <private-file>
 --native-bounded-spec <private-file>` is dormant input validation. Its explicit `acknowledge` action requires the

@@ -123,7 +123,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and current.get("pause_reason") == "cloud_connection_failed"
         )
         native_fresh = usable_age(native_age) and 0 <= native_age <= 15
-        if offline_pause:
+        if offline_pause and current.get("state") != "attention":
             detail = "The proxy requested Pause after it could not connect to the charger cloud. "
             if native_fresh and current.get("local_hold_verified") is True:
                 detail += "App and scheduled charging are still paused."

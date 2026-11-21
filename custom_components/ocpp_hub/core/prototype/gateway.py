@@ -374,7 +374,15 @@ class Gateway:
         if reserved and (not stop or side in self._reserved_stops):
             self._refuse_call(side, current_epoch, frame[1], "OccurrenceConstraintViolation", "request queue is full")
             return
-        task = asyncio.create_task(self._answer(side, current_epoch, frame, current_control_scope(self)))
+        # A Boot read after this report must not move it into another observation generation.
+        generation = None
+        if side == "charger" and frame[2] in OBSERVATION_ACTIONS:
+            try:
+                generation = self.journal.get("observation_generation", 0)
+            except sqlite3.Error:
+                self._refuse_call(side, current_epoch, frame[1], "InternalError", "observation generation unavailable")
+                return
+        task = asyncio.create_task(self._answer(side, current_epoch, frame, current_control_scope(self), generation))
         self._tasks.add(task)
         if reserved:
             self._reserved_stops[side] = task
@@ -389,7 +397,14 @@ class Gateway:
         task.add_done_callback(self._finished)
 
     # Deduplicate a peer's requests before execution and never send old replies onto a replacement connection.
-    async def _answer(self, side: str, epoch: int, frame: Frame, charger_scope: ControlScope | None) -> None:
+    async def _answer(
+        self,
+        side: str,
+        epoch: int,
+        frame: Frame,
+        charger_scope: ControlScope | None,
+        observation_generation: int | None,
+    ) -> None:
         current = self._charger_epoch if side == "charger" else self._vendor_epoch
         if epoch != current:
             return
@@ -398,7 +413,7 @@ class Gateway:
         async def handle() -> str:
             if side == "charger":
                 boot = charger_scope[0].boot if charger_scope is not None else None
-                return await self._charger_call(frame, epoch, boot)
+                return await self._charger_call(frame, epoch, boot, observation_generation)
             return await self._vendor_call(frame, epoch, charger_scope)
 
         read = False
@@ -507,7 +522,9 @@ class Gateway:
         del self.failures[:-32]
 
     # Send a local result only after its storage commit; transport failure leaves the receipt available for retry.
-    async def _charger_call(self, frame: Frame, epoch: int, boot: str | None) -> str:
+    async def _charger_call(
+        self, frame: Frame, epoch: int, boot: str | None, observation_generation: int | None
+    ) -> str:
         token, action = str(frame[1]), str(frame[2])
         payload: dict[str, Any] = frame[3]
         mutation: str | None = None
@@ -576,7 +593,7 @@ class Gateway:
                         await self.controls.ensure_ceiling()
                         self._require_epoch("charger", epoch)
                     response = await self.decide_report(
-                        lambda: self._commit_charger_report(epoch, receipt, action, payload)
+                        lambda: self._commit_charger_report(epoch, receipt, action, payload, observation_generation)
                     )
                 text = build_call_result(token, response)
         except DeniedError, ConflictError:
@@ -732,14 +749,18 @@ class Gateway:
         )
 
     # Recheck the sender's generation in the turn that writes its report.
-    def _commit_charger_report(self, epoch: int, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _commit_charger_report(
+        self, epoch: int, token: str, action: str, payload: dict[str, Any], observation_generation: int | None
+    ) -> dict[str, Any]:
         self._require_epoch("charger", epoch)
         # Even Heartbeat requires a readable journal.
         self.journal.get("control", {}).get("ticket")
-        return self._local_answer(token, action, payload)
+        return self._local_answer(token, action, payload, observation_generation)
 
     # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
-    def _local_answer(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _local_answer(
+        self, token: str, action: str, payload: dict[str, Any], observation_generation: int | None
+    ) -> dict[str, Any]:
         if action == "Heartbeat":
             return {"currentTime": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
         if action == "Authorize":
@@ -767,9 +788,12 @@ class Gateway:
             response = {"idTagInfo": info} if info is not None else None
             return self.journal.stop(token, payload, self.authorisation.retire, response)
         if action in OBSERVATION_ACTIONS:
+            assert observation_generation is not None
             validate_observation(action, payload, self.journal, check_history=False)
             with self.journal.atomic():
-                published = self._observations.accept(self._charger_epoch, token.partition(":")[2], action, payload)
+                published = self._observations.accept(
+                    self._charger_epoch, observation_generation, token.partition(":")[2], action, payload
+                )
                 if published and action == "StatusNotification":
                     self.journal.put("last_status", payload)
                 elif published and action == "MeterValues" and type(payload.get("transactionId")) is int:
@@ -1304,6 +1328,8 @@ class Gateway:
         self, action: str, payload: dict[str, Any], require_cap: bool = True, *, own_mutation: str | None = None
     ) -> None:
         kind = self.policy.kind(action, payload)
+        if kind == "write" and self.vendor_registration != "Accepted":
+            raise UnavailableError("cloud controls await completed registration")
         if (
             kind == "write"
             and action != "RemoteStopTransaction"
@@ -1675,10 +1701,12 @@ class Gateway:
             if item.action == "StartTransaction" and item.state in ("ambiguous", "inflight"):
                 self.delivery_outcome_uncertain = True
                 with self.journal.atomic():
-                    self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
-                    current_head = self.journal.next_delivery()
-                    assert current_head is not None
-                    supersede_unknown_start_retry(self.journal, current_head)
+                    if item.state == "inflight":
+                        self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
+                        current_head = self.journal.next_delivery()
+                        assert current_head is not None
+                        item = current_head
+                    supersede_unknown_start_retry(self.journal, item)
             elif item.action == "StartTransaction":
                 with self.journal.atomic():
                     latch_start_delivery_fault(self.journal)

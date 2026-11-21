@@ -125,8 +125,8 @@ class RollbackCheck:
 
     allowed: bool
     reason: str
-    current_commit: str = CURRENT.commit
-    previous_commit: str = PREVIOUS.commit
+    current_commit: str | None = None
+    previous_commit: str | None = None
     pause_revision: int | None = None
 
 
@@ -471,14 +471,17 @@ def check_snapshot(
 # Give a classified read-only result. The check never launches either build or changes a configuration.
 def check_rollback(config: TrialConfig, current: Path, previous: Path) -> RollbackCheck:
     build = None
+    previous_commit = None
     try:
         build = next((build for build in (CURRENT, *MIGRATED_RELEASES) if build_matches(current, build)), None)
-        require(build is not None and build_matches(previous, PREVIOUS), "build_pair_unrehearsed")
+        if build_matches(previous, PREVIOUS):
+            previous_commit = PREVIOUS.commit
+        require(build is not None and previous_commit is not None, "build_pair_unrehearsed")
         with stopped_journal(config.journal) as db:
             revision = check_snapshot(
                 db, config, migrated_only=build.migrated_only, recovered_journal=build.recovered_journal
             )
-        return RollbackCheck(True, "rehearsed_stopped_journal", current_commit=build.commit, pause_revision=revision)
+        return RollbackCheck(True, "rehearsed_stopped_journal", build.commit, previous_commit, revision)
     except RollbackRefusedError as error:
         reason = str(error)
     except (
@@ -492,7 +495,7 @@ def check_rollback(config: TrialConfig, current: Path, previous: Path) -> Rollba
         SecurityError,
     ):
         reason = "journal_unavailable_or_malformed"
-    return RollbackCheck(False, reason, current_commit=(build or CURRENT).commit)
+    return RollbackCheck(False, reason, build.commit if build is not None else None, previous_commit)
 
 
 # Load the private configuration locally and print a result that contains no file paths, IDs or saved payloads.

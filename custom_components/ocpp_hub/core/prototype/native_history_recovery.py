@@ -33,14 +33,18 @@ HISTORY_ACK = "native_history_policy_acknowledgement"
 
 
 # A history repair owns only history, so its latch must leave unrelated pending work to its existing owner.
-def history_recovery_idle(journal: Journal, *, check_owner_requests: bool = True) -> bool:
+def history_recovery_idle(
+    journal: Journal, *, check_owner_requests: bool = True, retain_queued_status: bool = False
+) -> bool:
     grant = journal.get("vendor_start_grant")
+    waiting = "SELECT 1 FROM outbox WHERE state!='queued' OR action!='StatusNotification' OR local IS NOT NULL LIMIT 1"
+    outbox = waiting if retain_queued_status else "SELECT 1 FROM outbox LIMIT 1"
     return not (
         journal.get("uncertain_vendor_command")
         or grant
         and grant.get("local") is None
         or journal.active() is not None
-        or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+        or journal.db.execute(outbox).fetchone()
         or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
         or check_owner_requests
         and journal.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'").fetchone()
@@ -90,7 +94,7 @@ def acknowledge_history_policy(
         require_paused_owned_zero(journal, book, spec, native)
         inspect_history(journal, spec.digest, list(native.history), False)
         return {**receipt["summary"], "already_recorded": True, "fault_cleared": False, "charging_started": False}
-    if not owns_fault or not history_recovery_idle(journal):
+    if not owns_fault or not history_recovery_idle(journal, retain_queued_status=True):
         retire_fault = (
             owns_fault
             and failure.get("source") in (ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION)
@@ -205,7 +209,7 @@ def _reconcile(
         or journal.get("trial_preservation_fault")
         or journal.get("trial_inventory_fault")
         or journal.get("trial_binding", {}).get("configuration_digest") != binding
-        or not history_recovery_idle(journal, check_owner_requests=not attempts)
+        or not history_recovery_idle(journal, check_owner_requests=not attempts, retain_queued_status=not attempts)
     ):
         raise RecoveryRequiredError("history reconciliation requires the matching native fault and a settled journal")
     spec.require_boot(journal.get("boot"))

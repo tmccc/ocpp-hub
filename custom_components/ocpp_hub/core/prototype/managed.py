@@ -725,7 +725,7 @@ class ManagedController:
             decision = self.continuation_decision(native, continuing_local)
             if isinstance(decision, Pending):
                 return decision
-            if any(v != 0 for v in native.currents_a + native.powers_w):
+            if native.output_limit_a != 0 or any(v != 0 for v in native.currents_a + native.powers_w):
                 return Pending(Prerequisite.LIFECYCLE, "the identified original session awaits a verified zero hold")
         decision = self.native.session_decision(native)
         if isinstance(decision, Pending):
@@ -900,6 +900,7 @@ class ManagedController:
                         raise StationCeilingLostError("the known charging session lost its owned station ceiling")
                     raise SecurityError("managed local station ceiling is absent or unconfirmed")
                 native.physical.require_fresh(self.session.journal.identity, 5)
+                self.native.require_selected_output(native)
                 if measured.exceeded:
                     raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
                 return True

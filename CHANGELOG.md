@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep buffered charger reports in their arrival generation across Boot. Require completed cloud registration
+  for control and keep the cloud connection through an unchanged charger Boot.
+- Verify the native output limit before confirming a selected ceiling or a continuing zero hold. Preserve
+  the existing lost-profile response when the native station profile is absent.
+- Let isolated history repair retain queued routine status reports. Stop rewriting an already ambiguous
+  cloud Start row at every poll.
+- Reserve one local connection for Pause when ordinary clients are busy. Show the current charger fault in
+  Home Assistant and report commissioning and rollback identities from current, verified facts.
 - Expire a charger reading after any new Start or Stop, including a complete charge between polls. Recheck the
   exact native observation at dispatch.
 - Keep receiving command replies while a charger startup response is waiting to send. Give an already-sent

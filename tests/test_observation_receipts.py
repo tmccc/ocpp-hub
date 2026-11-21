@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
+from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype import managed_start_delivery
 
 from tests.observation_helpers import ObservationTLS, observation_payload, observation_suffix
@@ -110,6 +111,21 @@ async def test_boot_storage_failure_preserves_observation_generation(tmp_path, t
         assert peer.j.get("observation_generation") == generation + 1
         await peer.flush()
         assert len([f for f in peer.cloud_calls if f[2] == action]) == 1
+
+
+# Intent: bind a buffered untimed report to the generation present before the following Boot arrives.
+# Why: the replacement reader can accept both messages before either asynchronous response sends.
+async def test_buffered_observation_before_replacement_boot_uses_original_generation(tmp_path, tls):
+    async with ObservationTLS(tmp_path / "state.db", tls) as peer:
+        action, payload = observation_payload("status-untimed", None)
+        assert (await peer.call("status", action, payload))[0] == 3
+        await peer.replace()
+        gateway = peer.g
+        await gateway.receive("charger", build_call("status", action, payload))
+        await gateway.receive("charger", build_call("new-boot", "BootNotification", BOOT))
+        await gateway.drain()
+        await peer.flush()
+        assert len([frame for frame in peer.cloud_calls if frame[2] == action]) == 1
 
 
 # Intent: distinct IDs and genuine recurring statuses remain distinct while same-connection ID conflicts fail.

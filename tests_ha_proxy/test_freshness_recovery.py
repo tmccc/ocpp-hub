@@ -15,6 +15,7 @@ from tests import conftest as _engine  # noqa: F401 - register the standalone en
 from tests.tls_support import tls as tls
 from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_client import setup
+from tests_ha_proxy.test_diagnostics import detail
 
 
 # Intent: the first healthy status can still report a persistent Pause selected by the proxy.
@@ -41,8 +42,19 @@ async def test_healthy_proxy_pause_shows_notice_on_setup(actual_hass, peer):
     await actual_hass.async_block_till_done()
     assert "Waiting for the charger to confirm the pause" in notifications[coordinator.notification_id]["message"]
 
+    peer["state"].update(
+        state="attention",
+        diagnostics=detail() | {"current_fault": "station_ceiling_lost"},
+    )
+    await coordinator.async_refresh()
+    await actual_hass.async_block_till_done()
+    assert "The charger lost its current-limit profile" in notifications[coordinator.notification_id]["message"]
+    assert "Waiting for the charger to confirm the pause" not in notifications[coordinator.notification_id]["message"]
+
     peer["state"].pop("pause_reason")
-    peer["state"].update(healthy=True, local_hold_verified=True, control_revision=peer["state"]["control_revision"] + 1)
+    peer["state"].update(
+        healthy=True, state="healthy", local_hold_verified=True, control_revision=peer["state"]["control_revision"] + 1
+    )
     await coordinator.async_refresh()
     await actual_hass.async_block_till_done()
     assert coordinator.fresh_healthy and coordinator.notification_id not in notifications

@@ -176,6 +176,7 @@ async def test_retained_ceiling_is_rechecked_without_rewriting(tmp_path, tls, un
         try:
             assert (await rig.bench.call(b.charger, "new-boot", "BootNotification", BOOT))[0] == 4
             assert not g.controls.ready and not g.current_boot_seen(g._charger_epoch)
+            assert not (await b.session.command({"command": "status"}))["boot_observed"]
         finally:
             j.db.execute("DROP TRIGGER refuse_boot")
         assert (await rig.bench.call(b.charger, "new-boot", "BootNotification", BOOT))[0] == 3

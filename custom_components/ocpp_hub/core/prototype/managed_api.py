@@ -59,7 +59,7 @@ class ManagementSettings:
 
 
 class ManagementServer:
-    """Four bounded local clients share cached status and durable command acceptance, never journal ownership."""
+    """Four local clients share ordinary work, with one short-lived reservation for Pause."""
 
     # A status provider is a private in-process snapshot, rather than a new native observation on every UI refresh.
     def __init__(
@@ -68,6 +68,7 @@ class ManagementServer:
         self.settings, self.controller, self.status = settings, controller, status
         self.server: Server | None = None
         self.clients: set[ServerConnection] = set()
+        self.pause_client: ServerConnection | None = None
         self.idle: dict[ServerConnection, None] = {}
         self.recent: deque[float] = deque()
         self.recent_pauses: deque[float] = deque()
@@ -89,7 +90,7 @@ class ManagementServer:
         return None
 
     # Validation and rate bounds run before any intent, receipt or physical control can change.
-    async def dispatch(self, text: str | bytes) -> dict[str, Any]:
+    async def dispatch(self, text: str | bytes, *, pause_only: bool = False) -> dict[str, Any]:
         if not isinstance(text, str) or len(text.encode()) > 2048:
             self.limit_requests(self.recent)
             raise SecurityError("management requires a bounded text object")
@@ -112,6 +113,8 @@ class ManagementServer:
             and type(value["revision"]) is int
             and 0 <= value["revision"] < 2**53
         )
+        if pause_only and not pause:
+            raise UnavailableError("management reservation accepts Pause only")
         self.limit_requests(self.recent_pauses if pause else self.recent)
         if command in ("status", "history") and set(value) == {"id", "command"}:
             return self.read_only(value["id"], command)
@@ -179,21 +182,27 @@ class ManagementServer:
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:
         displaced = None
+        reserved = False
         if len(self.clients) >= 4:
             displaced = next(iter(self.idle), None)
             if displaced is None:
-                await connection.close(1013, "Busy")
-                return
-            self.idle.pop(displaced)
-            self.clients.remove(displaced)
+                if self.pause_client is not None:
+                    await connection.close(1013, "Busy")
+                    return
+                self.pause_client = connection
+                reserved = True
+            else:
+                self.idle.pop(displaced)
+                self.clients.remove(displaced)
         self.clients.add(connection)
         try:
             if displaced is not None:
                 await displaced.close(1013, "Idle connection replaced")
             while connection in self.clients:
-                self.idle[connection] = None
+                if not reserved:
+                    self.idle[connection] = None
                 try:
-                    async with asyncio.timeout(30):
+                    async with asyncio.timeout(2 if reserved else 30):
                         text = await connection.recv()
                 except TimeoutError:
                     await connection.close(1000, "Idle")
@@ -203,16 +212,21 @@ class ManagementServer:
                 if connection not in self.clients:
                     return  # A displaced reader cannot admit work after releasing its slot.
                 try:
-                    response = await self.dispatch(text)
+                    response = await self.dispatch(text, pause_only=reserved)
                 except SecurityError, DeniedError:
                     response = {"ok": False, "error": "invalid_request"}
                 except RecoveryRequiredError, UnavailableError:
                     response = {"ok": False, "error": "not_ready"}
-                await connection.send(json.dumps(response, allow_nan=False))
-        except ConnectionClosed:
+                async with asyncio.timeout(5):
+                    await connection.send(json.dumps(response, allow_nan=False))
+                if reserved:
+                    return
+        except ConnectionClosed, TimeoutError:
             pass  # A client disappearing cannot cancel an accepted physical Stop or change requested ownership.
         finally:
             self.clients.discard(connection)
+            if self.pause_client is connection:
+                self.pause_client = None
 
     # Management owns a separate loopback socket and cannot replace or retire either OCPP connection.
     async def start(self) -> None:

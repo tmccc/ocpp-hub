@@ -409,6 +409,17 @@ class NativeBoundedHandover:
             return measured.selected(selected)
         return measured
 
+    # The independent connector limit must agree after the station profile's presence has been verified.
+    def require_selected_output(self, native: HandoverEvidence) -> None:
+        gateway = self.gateway
+        if (
+            native.physical.transaction_open
+            and native.output_limit_a > gateway.controls.desired()
+            and gateway.journal.current_change.read().settled_or_missing
+        ):
+            self.last_verified_at = 0
+            raise NativeContentError("content", "actual native output limit exceeds the selected current")
+
     # Selected-limit enforcement gates every existing positive caller without any opt-out flag.
     def require_selected(self, native: HandoverEvidence) -> None:
         measured = self._selected_measurements(native, self._inspect(native))
@@ -429,6 +440,7 @@ class NativeBoundedHandover:
             for resource in native.physical.resources
         ):
             raise SecurityError("charger did not retain the commissioned station ceiling across Boot")
+        self.require_selected_output(native)
 
     # Only a copy of the already validated USER scalar is normalized; original admission bytes are never rewritten.
     def binding_digest(self, native: HandoverEvidence) -> str:
@@ -923,6 +935,7 @@ class NativeBoundedHandover:
         if action == "RemoteStartTransaction" and self.gateway.journal.get("managed_mode"):
             self.book.require_confirmed_station(native.physical.resources, self.gateway.controls.desired())
         self.require_selected(native)
+        self.require_selected_output(native)
         change = self.gateway.journal.current_change.read().value
         if action == "SetChargingProfile" and change.get("state") == "recovering":
             local = self.gateway.journal.active()

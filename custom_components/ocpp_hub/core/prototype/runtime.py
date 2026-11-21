@@ -440,14 +440,19 @@ class ConnectionRuntime:
         boot_revision = self.gateway.boot_metadata_revision
         fault_count = self.status.vendor_fault.count
 
-        # This exact charger introduction is the only one this cloud socket represents.
-        def charger_current() -> bool:
+        # An unchanged Boot may briefly withdraw control proof while its response is sent on the same connection.
+        def charger_present() -> bool:
             return (
                 self.vendor_session_enabled()
-                and self.gateway.current_boot_seen(charger_epoch)
+                and self.gateway._charger_epoch == charger_epoch
+                and self.gateway.charger.sender is not None
                 and self.gateway.journal.get("boot") == boot
                 and self.gateway.boot_metadata_revision == boot_revision
             )
+
+        # New work still needs the currently verified Boot on that connection.
+        def charger_current() -> bool:
+            return charger_present() and self.gateway.current_boot_seen(charger_epoch)
 
         # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
         async def receive() -> None:
@@ -462,7 +467,7 @@ class ConnectionRuntime:
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
-            while charger_current():
+            while charger_present():
                 await asyncio.sleep(self.settings.pump_interval)
             await self.gateway.finish_sent_start()
 
@@ -498,9 +503,9 @@ class ConnectionRuntime:
 
     # Registration retry and durable delivery are independent of heartbeat and local command handling.
     async def _pump(self, can_send: Callable[[], bool]) -> None:
-        while can_send():
+        while True:
             try:
-                if self.gateway.journal.get("boot") is None:
+                if not can_send():
                     await asyncio.sleep(self.settings.pump_interval)
                     continue
                 await self.gateway.flush(can_send=can_send)

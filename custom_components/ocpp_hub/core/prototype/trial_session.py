@@ -421,7 +421,7 @@ class TrialSession:
                     self.journal.get("managed_mode")
                     and self.journal.get("trial_binding")
                     and not self.journal.fault.latched()
-                    and history_recovery_idle(self.journal)
+                    and history_recovery_idle(self.journal, retain_queued_status=True)
                 ):
                     refusal = self._native_refusal(error)
                     diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}
@@ -470,7 +470,7 @@ class TrialSession:
                 "effective_ceiling_confirmed": self.gateway.controls.ready,
                 "native_bounded_handover": self.native_bounded.status(),
                 "station_capabilities": self.station.snapshot(),
-                "boot_observed": self.runtime.status.boot_observed,
+                "boot_observed": self.gateway.current_boot_seen(self.gateway._charger_epoch),
                 "vendor_registered": self.gateway.vendor_registration == "Accepted",
                 "delivery_blocked": self.runtime.status.delivery_blocked,
                 "failure_classification": self.runtime.status.last_failure,

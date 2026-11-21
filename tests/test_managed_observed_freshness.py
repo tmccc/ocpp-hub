@@ -15,6 +15,7 @@ from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.security import SecurityError, StaleEvidenceError
 
 from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
+from tests.current_rig import commissioned
 from tests.managed_rig import healthy, starts
 from tests.prototype_rig import START
 from tests.runtime_rig import until
@@ -119,6 +120,27 @@ async def test_send_rechecks_native_validation_after_new_strict_refusal(tmp_path
         c.command(identifier, "start", c.requests.intent().revision)
         await c.charging.settle()
         assert refused and not starts(b.rig)
+
+
+# Intent: a native output limit above the selected current invalidates an otherwise healthy active session.
+# Why: zero or low vehicle draw cannot confirm the ceiling the charger reports for its output.
+async def test_active_native_output_limit_must_match_selected_current(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
+        c = b.controller
+        await positive_flow(b, "daily")
+        assert (await healthy(c))["station_ceiling_a"] == 16
+        original = b.rig.peer.native
+
+        # Keep the actual profile and draw unchanged while the independent reader reports a higher output limit.
+        def higher_limit(key):
+            value = original(key)
+            if key == "CONNECTOR":
+                value[0]["outLimit"] = 240
+            return value
+
+        monkeypatch.setattr(b.rig.peer, "native", higher_limit)
+        status = await c.tick()
+        assert status["state"] == "degraded" and c.native.last_verified_at == 0
 
 
 # Intent: a later independent failed native audit withdraws the earlier healthy dashboard sample immediately.

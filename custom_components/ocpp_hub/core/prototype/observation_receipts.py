@@ -35,7 +35,7 @@ class ObservationReceipts:
         self.j.put("observation_boot_epoch", epoch)
 
     # The caller owns the transaction so a receipt can never survive without its corresponding accepted event.
-    def accept(self, epoch: int, token: str, action: str, payload: dict[str, Any]) -> bool:
+    def accept(self, epoch: int, generation: int, token: str, action: str, payload: dict[str, Any]) -> bool:
         if not self.j.db.in_transaction:
             raise ConflictError("observation receipt must share its acceptance transaction")
         digest = fingerprint([action, payload])
@@ -44,7 +44,6 @@ class ObservationReceipts:
         ).fetchone()
         if previous is not None and previous["digest"] != digest:
             raise ConflictError("observation CALL id names a different request on this connection")
-        generation = self.j.get("observation_generation", 0)
         timed = action == "MeterValues" or action == "StatusNotification" and "timestamp" in payload
         row = self.j.db.execute(
             "SELECT publication FROM observation_receipts WHERE generation=? AND token=? AND digest=?",

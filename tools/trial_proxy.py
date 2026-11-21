@@ -146,6 +146,8 @@ async def run(
     try:
         async with asyncio.timeout(duration):
             await session.start()
+            if not session.started:
+                raise RecoveryRequiredError("commissioning requires an open charger listener")
             emit({"trial_started": True, "maximum_duration_seconds": duration, "ceiling_a": 6})
             if terminal:
                 tasks.append(asyncio.create_task(interactive(session, stopped)))
@@ -172,7 +174,7 @@ async def run(
             finally:
                 for signum in (signal.SIGTERM, signal.SIGINT):
                     loop.remove_signal_handler(signum)
-    return 2 if session.final_status is None or session.final_status["shutdown_uncertain"] else 0
+    return 2 if not session.started or session.final_status is None or session.final_status["shutdown_uncertain"] else 0
 
 
 # A separate explicit action captures a fresh read-only baseline and original configuration backup.

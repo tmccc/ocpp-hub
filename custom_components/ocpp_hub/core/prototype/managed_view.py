@@ -537,7 +537,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     pause_pending = c.requests.pending_pause()
     station_lost = c.session.book.station_ceiling_lost()
     # A pending Pause may show the last sample for the same session, but a new lifecycle needs a new reading.
-    native = c.current_native_sample()
+    native = c.latest_native
     sample_available = (
         result.get("charger_connected") is True
         and current is not None
@@ -549,7 +549,12 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and pending_fault is None
         and not station_lost
     )
-    same_session = sample_available and native is not None and native.physical.native_transaction_id == j.active()
+    same_session = (
+        sample_available
+        and native is not None
+        and c.current_native_sample() is native
+        and native.physical.native_transaction_id == j.active()
+    )
     if not sample_available:
         clear_native_sample(result)
     elif not same_session:

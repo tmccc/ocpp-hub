@@ -91,9 +91,10 @@ async def test_management_status_limit_leaves_pause_available(tmp_path, tls, unu
             await api.close()
 
 
-# Intent: four reusable idle sockets cannot prevent an authenticated owner from pausing at once.
+# Intent: ordinary management connections leave an authenticated owner able to Pause.
 # Why: the reserved Pause budget only helps after the owner can reach the queue.
-async def test_idle_management_connections_leave_pause_available(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
+async def test_management_connections_leave_pause_available(tmp_path, tls, unused_tcp_port_factory, monkeypatch, busy):
     async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
         c = b.controller
         published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
@@ -106,21 +107,42 @@ async def test_idle_management_connections_leave_pause_available(tmp_path, tls, 
             "proxy": None,
         }
         url = f"ws://127.0.0.1:{port}/management"
+        release, entered = asyncio.Event(), asyncio.Event()
+        dashboard_requests, dispatch = 0, api.dispatch
+
+        # Hold ordinary dashboard work after it has a connection, leaving the real Pause admission in place.
+        async def delayed_dispatch(text, *, pause_only=False):
+            nonlocal dashboard_requests
+            if busy and json.loads(text).get("command") == "status":
+                dashboard_requests += 1
+                if dashboard_requests == 4:
+                    entered.set()
+                await release.wait()
+            return await dispatch(text, pause_only=pause_only)
+
+        monkeypatch.setattr(api, "dispatch", delayed_dispatch)
         try:
             async with AsyncExitStack() as clients:
-                idle = [await clients.enter_async_context(connect(url, **options)) for _ in range(4)]
-                for client in idle:
-                    assert (await call(client, "status"))["ok"]
-                await until(lambda: len(api.idle) == 4)
+                dashboards = [await clients.enter_async_context(connect(url, **options)) for _ in range(4)]
+                if busy:
+                    for client in dashboards:
+                        await client.send(json.dumps({"id": uuid.uuid4().hex, "command": "status"}))
+                    await asyncio.wait_for(entered.wait(), 2)
+                else:
+                    await until(lambda: len(api.idle) == 4)
                 identifier = uuid.uuid4().hex
                 async with connect(url, **options) as owner:
                     reply = await call(owner, "pause", id=identifier, revision=c.requests.intent().revision)
                     assert reply["ok"] and reply["result"]["state"] == "accepted"
                     assert (await healthy(c))["local_hold_verified"]
                     assert c.requests.receipt(identifier)["state"] == "completed"
-                    await asyncio.wait_for(idle[0].wait_closed(), 2)
-                    assert (await call(idle[-1], "status"))["ok"]
+                    if busy:
+                        await asyncio.wait_for(owner.wait_closed(), 2)
+                    else:
+                        await asyncio.wait_for(dashboards[0].wait_closed(), 2)
+                        assert (await call(dashboards[-1], "status"))["ok"]
         finally:
+            release.set()
             await api.close()
 
 
