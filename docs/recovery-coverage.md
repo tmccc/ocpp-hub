@@ -123,6 +123,10 @@ in either order using the same saved config entry and journal. It verifies that 
 unknown outcome, the original Pause completes and remains in force, and the charger stays at zero without a
 second Pause request. Return from Home Assistant allows two later scheduled charges to finish.
 
+The [fault recovery tests](../tests/test_managed_release_recovery.py) restart the proxy after saving a
+Pause while the separate acknowledgement write fails. Fresh charger checks can settle the same fault
+at zero. A newer fault requires its own Pause, even when it has the same classification.
+
 The [overlapping owner controls](../tests_ha_proxy/test_owner_overlap.py) verify that a delayed Return fails
 during current selection and a newer Pause survives proxy replacement at zero. They also check both sides of
 Return's success commit after the charger has applied the selected 16 A ceiling and Home Assistant loses confirmation.

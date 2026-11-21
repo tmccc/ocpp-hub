@@ -1008,9 +1008,9 @@ if it sent no positive profile and confirmed its own rollback zero; failed clean
 remains a failure. Before ownership, it may wait without borrowing physical proof. An earlier
 possibly dispatched positive write stays uncertain even after zero rollback.
 A real charger `Rejected` is distinct from an unknown applied outcome, and both
-retain the release fault. Recovery requires a new Pause, verified actual closure
-and a separate Return. A prior completed release does not impose that requirement
-on an unrelated new temporary hold. Explicit Return is separately accepted once.
+retain the release fault. Recovery requires a Pause for that fault and verified actual closure.
+An accepted Pause with saved evidence can finish after a proxy restart. Return is a separate request.
+A prior completed release does not impose that requirement on an unrelated new temporary hold.
 Unavailable native proof in Return's own release preflight records that the command
 did not reach the charger. Fresh proof alone does not grant
 another Return. Earlier Pause or test settlement retains its separate wait rules.
