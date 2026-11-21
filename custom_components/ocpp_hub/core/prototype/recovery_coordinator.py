@@ -409,6 +409,7 @@ class RecoveryCoordinator:
                 revision,
                 guard,
                 before_ticket=ticket,
+                request_id=return_request,
             )
 
         return c.commands.decide(lambda: prepare_release(native))

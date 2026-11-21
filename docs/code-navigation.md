@@ -76,7 +76,7 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
 | Native evidence and resources | [`native_bounded_handover.py`](../custom_components/ocpp_hub/core/prototype/native_bounded_handover.py), `NativeBoundedHandover`; `trial_evidence.py`, `NativeObserver`; `native_http.py`; `native_history.py`; `trial_resources.py`, `ResourceBook` | `test_native_read_supersession.py`, `test_native_optional_storage.py`, `test_native_repair_strict_conflict.py` |
 | Persistence and cloud replies | [`store.py`](../custom_components/ocpp_hub/core/prototype/store.py), `Journal`; `delivery_reply.py`; `managed_start_delivery.py`; `managed_stop_delivery.py`; `vendor_read_recovery.py` | `test_stop_saved_reply_recovery.py`, `test_worker_storage_recovery.py`, `test_managed_start_delivery_recovery.py` |
-| Charger replies to forwarded Start and Stop | [`forwarded_reply.py`](../custom_components/ocpp_hub/core/prototype/forwarded_reply.py), `Journal.forwarded`; the matching reply is saved before local settlement. `rpc.py` retries storing the response for duplicate requests on the same connection. | `test_vendor_dispatch.py`, `test_real_process_death.py` |
+| Command outcomes | [`command_outcomes.py`](../custom_components/ocpp_hub/core/prototype/command_outcomes.py), `Journal.outcomes`; exact owner and forwarded wire steps, reply settlement, independent session proof and the current cloud delivery outcome. | `test_vendor_dispatch.py`, `test_pause_stop_recovery.py`, `test_real_process_death.py` |
 | Pause, Return and recovery | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `maintain_pause()`, `return_requested()`, `tick()`; `recovery_coordinator.py`, `advance()` and `restore()`; `ordinary_recovery.py`; `managed_recovery.py`; specialized `managed_*_recovery.py` siblings | `test_pause_stop_recovery.py`, `test_managed_offline_recovery.py`, `test_combined_recovery_proofs.py` |
 | Status and diagnostics | [`managed_view.py`](../custom_components/ocpp_hub/core/prototype/managed_view.py), `health_snapshot()`; `managed_diagnostics.py`, `snapshot()`; [`tools/managed_reporting.py`](../tools/managed_reporting.py), `Reporting` | `test_managed_diagnostics.py`, `test_diagnostic_contracts.py`, `test_start_diagnostic_progress.py` |
 | HA API and lifecycle | [`ics_proxy/api.py`](../custom_components/ics_proxy/api.py), `ProxyClient`; `coordinator.py`, `ProxyCoordinator`; `notification.py`; entity and diagnostic modules | [`tests_ha_proxy/`](../tests_ha_proxy/): `test_freshness_recovery.py`, `test_current.py`, `test_diagnostics.py`, `test_inflight_lifecycle.py` |
@@ -91,6 +91,12 @@ queue order. Socket reads, sends and native HTTP waits run outside the queue. Th
 as it arrives. The queue then lets the request owner record the result and check the original Boot, ticket and
 session before publishing any change in authority. Start and Stop replies record what the peer confirmed.
 Lifecycle reports and independent observations establish what the charger actually did.
+
+`Journal.outcomes` supplies the same evidence to supervision, recovery and status. It preserves the original
+owner request, exact wire call, charger reply and the local session when a real lifecycle report binds it.
+An owner request can have several wire calls. The selected current and a rollback to zero have separate
+replies. A pending write, an unanswered call and a known reply waiting for physical proof have different meanings.
+Older receipts keep their original layout and are read with the evidence they actually contain.
 
 `Journal.control` is the only production writer of the existing physical-authority record. `ControlState` preserves
 raw extra fields and missing-key defaults; its shared/hold predicates distinguish legacy truthy flags from explicit

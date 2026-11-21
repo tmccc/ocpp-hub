@@ -331,20 +331,20 @@ class ManagedRequests:
 
     # Expose a redacted receipt rather than any protocol payload, identity or database row.
     def receipt(self, identifier: str, *, include_binding: bool = False) -> dict[str, Any]:
-        row = self.journal.db.execute("SELECT * FROM managed_requests WHERE id=?", (identifier,)).fetchone()
-        if row is None:
+        command = self.journal.outcomes.owner(identifier)
+        if command is None:
             return {"id": identifier, "state": "not_found"}
-        result = json.loads(row["result"])
-        if row["action"] == "pause" and isinstance(result, dict):
+        result = command.result
+        if command.action == "pause":
             result.pop("_pause", None)
             result.pop("_stop", None)
-        if row["action"] == "app_control" and isinstance(result, dict):
+        if command.action == "app_control":
             result.pop("_return", None)
             result.pop("_await_cloud", None)
-        receipt = {"id": identifier, "action": row["action"], "state": row["state"], "result": result}
+        receipt: dict[str, Any] = {"id": identifier, "action": command.action, "state": command.state, "result": result}
         if include_binding:
-            receipt["revision"] = row["revision"]
-            if row["action"] == "set_current":
+            receipt["revision"] = command.revision
+            if command.action == "set_current":
                 bound = self.journal.db.execute(
                     "SELECT current_a FROM managed_current_requests WHERE id=?", (identifier,)
                 ).fetchone()

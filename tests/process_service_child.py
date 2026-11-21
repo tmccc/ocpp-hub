@@ -56,6 +56,16 @@ class ObservedConnection(sqlite3.Connection):
         if Gate.phase == "none" or Gate.fired:
             return
         operation = sql.strip().upper()
+        if Gate.phase == "after-owner-start-reply-write":
+            if (
+                not before
+                and operation.startswith("INSERT INTO OWNER_COMMAND_WIRES")
+                and parameters[1] == Gate.identifier
+                and parameters[4] == "RemoteStartTransaction"
+                and parameters[7] == "Rejected"
+            ):
+                Gate.freeze(self, "after-owner-start-reply-write")
+            return
         if Gate.phase in ("before-forwarded-reply-commit", "after-forwarded-reply-commit"):
             if (
                 operation == "COMMIT"

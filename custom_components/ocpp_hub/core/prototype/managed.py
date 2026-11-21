@@ -294,7 +294,7 @@ class ManagedController:
                     g.controls._claim(True)
 
     # Explicit owner Pause can restrict the commissioned station even while a native HTTP read is unavailable.
-    async def ensure_pause_zero(self) -> None:
+    async def ensure_pause_zero(self, *, request_id: str | None = None) -> None:
         g, j = self.session.gateway, self.session.journal
         intent = self.requests.intent()
         if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
@@ -319,7 +319,13 @@ class ManagedController:
                 ):
                     raise RecoveryRequiredError("owner Pause awaits the current commissioned station")
 
-            await g.controls.ensure_ceiling(guard=guard)
+            if request_id is None:
+                try:
+                    request = self.requests.pause_request()
+                    request_id = request.identifier if request is not None else None
+                except sqlite3.Error:
+                    pass  # The already requested zero does not depend on optional receipt correlation.
+            await g.controls.ensure_ceiling(guard=guard, request_id=request_id)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             return  # A failed attempt never confirms zero. The saved Pause can try again.
 
@@ -424,6 +430,7 @@ class ManagedController:
                     station_absent=station_absent,
                     on_claim=bind,
                     owner=("pause", intent, request, local, connection),
+                    request_id=request.identifier if request is not None else None,
                 )
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
@@ -455,7 +462,7 @@ class ManagedController:
             return "local_hold_missing"
         if j.get("control", {}).get("start_pending"):
             return "start_pending"
-        if j.get("uncertain_vendor_command"):
+        if g.vendor_write_evidence().unresolved:
             return "vendor_command_uncertain"
         if not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present):
             return "station_zero_receipt_missing"
@@ -821,7 +828,7 @@ class ManagedController:
             return "control operation is pending"
         if g.charger._pending:
             return "charger RPC is pending"
-        if j.get("uncertain_vendor_command"):
+        if g.vendor_write_evidence().unresolved:
             return "vendor command is uncertain"
         return None
 
@@ -1204,7 +1211,7 @@ class ManagedController:
             else:
                 evidence = g.vendor_write_evidence()
                 if evidence.unresolved:
-                    forwarded_timeout = g.sole_forwarded_timeout(evidence)
+                    forwarded_timeout = j.outcomes.sole_forwarded_timeout(evidence)
                     self.fault("owner_control_or_delivery_uncertain", forwarded_timeout=forwarded_timeout)
         if (proof.available and j.fault.latched()) or self.stopping:
             proof = ControlProof()

@@ -10,6 +10,7 @@ import uuid
 from contextlib import closing
 
 import pytest
+from ocpp_hub_core import commands
 
 from tests.cloud_start_helpers import StartReplyBench
 from tests.managed_rig import starts
@@ -90,6 +91,97 @@ async def test_process_cut_at_forwarded_start_reply(tmp_path, model_tls, monkeyp
             assert status["vendor_write_uncertain"] == 1 and not status["can_start"]
             assert bench.firmware.effective_limit() == 0
         assert len(starts(child.rig)) == 1
+
+
+# Intent: the saved exact owner reply recovers local Start when its older receipt update never happened.
+# Why: a real rejection survives process death without any automatic Start or change to the newer hold.
+@pytest.mark.recovery_replay
+async def test_process_recovers_saved_owner_start_reply(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, 16, timing="fast-poll"
+    ) as child:
+        bench = child.rig.bench
+        answer = bench.firmware.answer
+
+        # The independent charger issues a real rejection on the original wire request.
+        def reject(action, payload):
+            return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
+
+        monkeypatch.setattr(bench.firmware, "answer", reject)
+        await child.start()
+        state = await child.status()
+        pause = uuid.uuid4().hex
+        response = await child.request("pause", id=pause, revision=state["control_revision"])
+        assert response["ok"]
+        await child.completed_control(pause)
+        state = await child.status(lambda value: value.get("local_hold_verified") is True)
+        identifier = uuid.uuid4().hex
+        cut = "after-owner-start-reply-write"
+        await child.arm(cut, identifier)
+        request = asyncio.create_task(child.request("start", id=identifier, revision=state["control_revision"]))
+        try:
+            gate = await child.gate(cut, identifier)
+            assert not gate["transaction_open"]
+            held = child.durable()["metadata"]
+            assert held["local_start_receipt"]["stage"] == "issued" and len(starts(child.rig)) == 1
+            await child.kill()
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+
+        await child.start()
+        recovered = child.durable()["metadata"]
+        assert recovered["local_start_receipt"]["stage"] == "rejected"
+        assert recovered["managed_control_intent"] == held["managed_control_intent"]
+        status = await child.status(lambda value: value.get("local_hold_verified") is True)
+        assert status["requested_current_a"] == 16 and bench.firmware.effective_limit() == 0
+        assert len(starts(child.rig)) == 1
+
+
+# Intent: a profile answer saved before local resource settlement survives process death without retransmission.
+# Why: the actual reply and its originally translated resource are durable even when local publication is interrupted.
+@pytest.mark.recovery_replay
+async def test_process_finishes_saved_profile_acknowledgement(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, 16, timing="fast-poll"
+    ) as child:
+        bench = child.rig.bench
+        await child.start()
+        await child.status()
+        identifier, boundary = uuid.uuid4().hex, "after-forwarded-reply-commit"
+        profile = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 16, 111, stack_level=2)
+        await child.arm(boundary, identifier)
+        caller = asyncio.create_task(bench.cloud_call(identifier, "SetChargingProfile", profile))
+
+        # Read the exact command and physical resource through an independent read-only SQLite connection.
+        def saved():
+            path = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT m.state,v.wire_result,v.wire_request,v.profile,r.state FROM vendor_command_scope v "
+                    "JOIN mutations m ON v.mutation=m.token JOIN trial_resources r ON r.key='profile:'||v.profile "
+                    "WHERE v.request=?",
+                    (identifier,),
+                ).fetchone()
+
+        try:
+            await child.gate(boundary, identifier)
+            state, actual, wire, local, resource = saved()
+            assert (state, actual, resource) == ("pending", "Accepted", "pending")
+            assert local in bench.firmware.profiles
+            await child.kill()
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        await child.start()
+        assert saved() == ("confirmed", "Accepted", wire, local, "confirmed")
+        assert (await child.status())["requested_current_a"] == 16
+        assert sum(frame[1] == wire for frame in bench.device_calls) == 1
 
 
 # Intent: a saved forwarded Stop acknowledgement survives replacement with its original session still open.
@@ -685,5 +777,6 @@ async def test_process_unknown_issued_start_retains_debt(
             lambda value: value.get("can_start") is False and child.rig.bench.firmware.effective_limit() == 0
         )
         assert (await child.request("receipt", request_id=identifier))["result"]["state"] == "uncertain"
-        assert child.durable()["metadata"]["local_start_receipt"]["stage"] == "issued"
+        recovered = child.durable()["metadata"]["local_start_receipt"]["stage"]
+        assert recovered == ("accepted" if phase == "before-accepted-commit" else "issued")
         assert child.rig.bench.firmware.effective_limit() == 0 and len(starts(child.rig)) == sent

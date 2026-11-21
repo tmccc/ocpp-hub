@@ -10,7 +10,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -85,8 +85,8 @@ class Journal:
                 fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RecoveryRequiredError("journal already has an active owner") from None
+            from .command_outcomes import CommandOutcomes
             from .control_state import ControlAuthority
-            from .forwarded_reply import ForwardedReplies
             from .installation_lifecycle import InstallationLifecycle
             from .managed_records import CurrentChangeJournal, ManagedFaultJournal
             from .retired_schedules import schedule_history
@@ -104,10 +104,11 @@ class Journal:
             self.control = ControlAuthority(self)
             self.phase = InstallationLifecycle(self)
             self.starts = StartLifecycle(self)
-            self.forwarded = ForwardedReplies(self)
+            self.outcomes = CommandOutcomes(self)
             self.current_change = CurrentChangeJournal(self)
             self.fault = ManagedFaultJournal(self)
             self._initialize(path, identity)
+            self.outcomes.recover_owner_start()
             cleanup.pop_all()
 
     # Validate the private database and recover only known incomplete operations.
@@ -161,6 +162,7 @@ class Journal:
             if name not in columns:
                 self.db.execute("ALTER TABLE transactions ADD COLUMN " + name + " TEXT")
         self._migrate_vendor_ids()
+        self.outcomes.initialize()
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_open_vendor ON transactions(vendor) WHERE stop IS NULL")
         with self.atomic():
             old = self.get("identity")
@@ -182,7 +184,7 @@ class Journal:
                 "DELETE FROM mutations WHERE state='pending' AND token IN "
                 "(SELECT mutation FROM vendor_command_scope WHERE wire_result IN ('prepared','prepared_new_profile'))"
             )
-            self.forwarded.recover_saved()
+            self.outcomes.recover_saved()
             self.db.execute(
                 "UPDATE mutations SET state='uncertain' WHERE state='pending' AND token IN "
                 "(SELECT mutation FROM vendor_command_scope WHERE wire_result='dispatched')"
@@ -418,7 +420,7 @@ class Journal:
 
     # A changed body must not bypass uncertainty about an earlier write to the same remote device.
     def require_vendor_writes_reconciled(self) -> None:
-        if self.db.execute("SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed' LIMIT 1").fetchone():
+        if self.outcomes.vendor_evidence().unfinished:
             raise RecoveryRequiredError("an earlier vendor write requires explicit reconciliation")
 
     # Confirm only an actual peer response; uncertain writes are never automatically replayed after restart.
@@ -460,10 +462,12 @@ class Journal:
 
     # An explicit operator decision can release a quarantined digest after independently checking the peer.
     def reconcile_mutation(self, token: str) -> None:
-        row = self.db.execute("SELECT state FROM mutations WHERE token=?", (token,)).fetchone()
-        if row is None:
-            raise ConflictError("unknown mutation intent")
-        self.mutation_finished(token, True)
+        with nullcontext() if self.db.in_transaction else self.atomic():
+            row = self.db.execute("SELECT state FROM mutations WHERE token=?", (token,)).fetchone()
+            if row is None:
+                raise ConflictError("unknown mutation intent")
+            self.mutation_finished(token, True)
+            self.outcomes.clear_vendor_marker(token)
 
     # Return a previous critical response, rejecting a changed body under the same CALL id.
     def receipt(self, token: str, action: str, payload: dict[str, Any]) -> dict[str, Any] | None:

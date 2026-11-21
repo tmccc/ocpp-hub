@@ -159,6 +159,10 @@ async def test_cloud_stop_keeps_reply_while_waiting_for_storage_and_closure(
             ).fetchone()
             assert tuple(row) == ("pending", "Accepted", local)
             assert not journal.get("uncertain_vendor_command") and journal.active() == local
+            mutation = journal.db.execute("SELECT token FROM mutations").fetchone()[0]
+            outcome = journal.outcomes.vendor(mutation)
+            assert outcome.status == "Accepted" and not outcome.settled and outcome.saving_reply
+            assert outcome.session.local == local and not outcome.session.closed
             status = poll_base(b.controller)
             assert status["vendor_reply_storage_pending"] == 1 and status["vendor_write_uncertain"] == 0
             assert status["operator_reconciliation_required"] is False
@@ -176,6 +180,8 @@ async def test_cloud_stop_keeps_reply_while_waiting_for_storage_and_closure(
             {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
         )
         assert stopped[0] == 3 and journal.active() is None
+        outcome = journal.outcomes.vendor(mutation)
+        assert outcome.settled and outcome.status == "Accepted" and outcome.session.closed
         b.rig.peer.permission_enabled = False
         await until(lambda: journal.next_delivery() is None)
         assert sum(call[2] == "RemoteStopTransaction" for call in bench.device_calls) == 1
@@ -298,6 +304,9 @@ async def test_cloud_start_report_preserves_history_under_pause_while_reply_save
             report = await bench.call(b.charger, "start-at-zero", "StartTransaction", START | {"idTag": "CLOUD_OWNER"})
             assert report[0] == 3 and report[2]["idTagInfo"]["status"] == "Accepted"
             assert j.active() == report[2]["transactionId"]
+            mutation = j.get("vendor_start_grant", {})["mutation"]
+            outcome = j.outcomes.vendor(mutation)
+            assert outcome.status == "Accepted" and outcome.session.local == j.active() and not outcome.session.closed
             assert c.requests.intent() == paused and paused.mode == "paused"
             assert bench.firmware.effective_limit() == 0
         finally:

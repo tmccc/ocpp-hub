@@ -19,11 +19,18 @@ from typing import Any, Protocol
 from ..frames import ERROR_FORMATION_VIOLATION, Frame, build_call_error, build_call_result
 from .auth_info import InfoBook, expiry, validate_info
 from .authorisation import VendorAuthorisation
+from .command_outcomes import (
+    TRANSACTION_COMMANDS,
+    ForwardedReply,
+    VendorProfileReply,
+    VendorProfileWrite,
+    VendorWriteEvidence,
+    VendorWriteReply,
+)
 from .command_processor import CommandPriority, CommandProcessor
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
 from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
-from .forwarded_reply import TRANSACTION_COMMANDS, ForwardedReply
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, data_value, known_write
 from .local_control import LocalControl
@@ -43,7 +50,6 @@ from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, Unavaila
 from .security import SecurityError
 from .start_handoff import OwnedStartResult, StartHandoff
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
-from .trial_evidence import profile_projection
 from .vendor_read_recovery import recover_legacy_vendor_read
 
 PROFILE_COMMANDS = frozenset({"SetChargingProfile", "ClearChargingProfile"})
@@ -149,43 +155,6 @@ class StartReports(Protocol):
     def recorded(self, local: int, payload: dict[str, Any]) -> None: ...
 
 
-@dataclass(frozen=True)
-class VendorProfileWrite:
-    """The exact translated profile awaiting a real acceptance, including a new alias reservation."""
-
-    vendor: str
-    local: int
-    transaction: int | None
-    allocated: bool
-
-
-@dataclass
-class VendorProfileReply:
-    """A received profile answer retains the exact translated resource and original mutation."""
-
-    mutation: str
-    wire: str
-    action: str
-    payload: dict[str, Any]
-    answer: Frame
-    profile: VendorProfileWrite | None
-    resource_saved: bool = False
-
-
-@dataclass(frozen=True)
-class VendorWriteEvidence:
-    """The same evidence distinguishes live waiting, received answers, and missing outcomes."""
-
-    received: int
-    uncertain: tuple[str, ...]
-    legacy_marker: bool
-
-    # A marker without a matching row can still require independent recovery.
-    @property
-    def unresolved(self) -> bool:
-        return bool(self.uncertain) or self.legacy_marker
-
-
 class Gateway:
     """One admitted charger, independent local control, and one fixed vendor mirror."""
 
@@ -212,8 +181,6 @@ class Gateway:
         self._reserved_stops: dict[str, asyncio.Task[None]] = {}
         self._refusals: dict[str, asyncio.Task[None]] = {}
         self._flush_lock = asyncio.Lock()
-        self._delivery_reply: DeliveryReply | None = None
-        self.delivery_outcome_uncertain = False
         self._boot_lock = asyncio.Lock()
         self._start_renewals: dict[tuple[str, int, int, str | None, str | None], asyncio.Future[bool]] = {}
         self._vendor_ready = False
@@ -229,9 +196,6 @@ class Gateway:
         self._boot_retry = asyncio.Event()
         self._vendor_epoch = 0
         self._inbound = InboundCache(journal=journal)
-        self._unsent_vendor_cleanup: dict[str, tuple[str | None, VendorProfileWrite | None]] = {}
-        self._uncertain_vendor_writes: dict[str, tuple[str, str]] = {}
-        self._profile_replies: dict[str, VendorProfileReply] = {}
         self._observations = ObservationReceipts(journal)
         self._start_retry_waits: dict[str, tuple[str, float]] = {}
         self._late_delivery_token: str | None = None
@@ -260,54 +224,13 @@ class Gateway:
     # Retry the original recorded response and its independent connection receipt without sending either command again.
     def retry_reply_writes(self) -> None:
         self.controls.retry_unsent_release()
-        for mutation, (grant, profile) in tuple(self._unsent_vendor_cleanup.items()):
-            self._retire_unsent_vendor(mutation, grant, profile)
-        self.journal.forwarded.retry()
-        for reply in tuple(self._profile_replies.values()):
-            self._publish_profile_reply(reply)
-        for mutation, (action, digest) in tuple(self._uncertain_vendor_writes.items()):
-            self._record_uncertain_vendor(mutation, action, digest)
+        self.journal.outcomes.retry()
+        self.journal.outcomes.retry_owner_writes()
         self._inbound.retry()
 
-    # Classify each unfinished vendor write using its issued identity and its live reply owner.
+    # The outcome owner uses the current peer only to distinguish a live wait from an abandoned dispatch.
     def vendor_write_evidence(self) -> VendorWriteEvidence:
-        j = self.journal
-        rows = j.db.execute(
-            "SELECT token,state,wire_request,wire_result FROM mutations "
-            "LEFT JOIN vendor_command_scope ON mutation=token WHERE origin='vendor' AND state!='confirmed'"
-        )
-        received = 0
-        uncertain = []
-        for row in rows:
-            if j.forwarded.awaits_storage(row["token"]) or row["token"] in self._profile_replies:
-                received += 1
-            elif row["state"] == "uncertain" or (
-                row["wire_result"] not in ("prepared", "prepared_new_profile")
-                and not self.charger.has_pending_call(row["wire_request"])
-            ):
-                uncertain.append(row["token"])
-        marker = j.get("uncertain_vendor_command")
-        reference = marker.get("mutation") if isinstance(marker, dict) else None
-        legacy_marker = (
-            bool(marker)
-            and reference not in uncertain
-            and j.forwarded.status(reference) is None
-            and reference not in self._profile_replies
-        )
-        return VendorWriteEvidence(received, tuple(uncertain), legacy_marker)
-
-    # Only the sole missing forwarded Start/Stop wire answer can establish this narrowly recoverable fault.
-    def sole_forwarded_timeout(self, evidence: VendorWriteEvidence) -> str | None:
-        if evidence.legacy_marker or len(evidence.uncertain) != 1:
-            return None
-        mutation = evidence.uncertain[0]
-        row = self.journal.db.execute(
-            "SELECT action,wire_result FROM mutations JOIN vendor_command_scope ON mutation=token WHERE token=?",
-            (mutation,),
-        ).fetchone()
-        if row is not None and row["action"] in TRANSACTION_COMMANDS and row["wire_result"] == "dispatched":
-            return mutation
-        return None
+        return self.journal.outcomes.vendor_evidence(self.charger.has_pending_call)
 
     # Restrict new transports or changed introductions before they can authorize any charging-capable request.
     def _restrict_trial_introduction(self) -> None:
@@ -830,7 +753,9 @@ class Gateway:
                 raise DeniedError("authorization changed before accepting the new session")
             if historical is None and not self._local_tag(tag):
                 self.auth_info.require_dynamic(info)
-        return self.journal.start(token, payload, accepted, info)
+        answer = self.journal.start(token, payload, accepted, info)
+        self.journal.outcomes.retain_bound_owner_start()
+        return answer
 
     # Commit the newest Boot in arrival order, with no task or await able to publish older proof over it.
     def _boot_reply(self, token: str, payload: dict[str, Any]) -> str:
@@ -1144,6 +1069,8 @@ class Gateway:
         translated: dict[str, Any] | None = None
         profile_reply: VendorProfileReply | None = None
         forwarded_reply: ForwardedReply | None = None
+        other_reply: VendorWriteReply | None = None
+        other_answer: Frame | None = None
         dispatched = False
         charger_epoch = self._charger_epoch
         wire = "c-" + uuid.uuid4().hex
@@ -1161,24 +1088,64 @@ class Gateway:
 
         # The peer records the actual answer before another owner or a failed local write can supersede it.
         def received(received_action: str, answer: Frame) -> None:
-            nonlocal forwarded_reply, profile_reply
-            if dispatched and mutation is not None:
-                if received_action in TRANSACTION_COMMANDS:
-                    forwarded_reply = self.journal.forwarded.capture(mutation, received_action, wire, answer)
-                elif translated is not None and profile_status(received_action, answer) == "Accepted":
+            nonlocal forwarded_reply, profile_reply, other_reply, other_answer
+            if not dispatched or mutation is None:
+                return
+            if received_action in TRANSACTION_COMMANDS and answer[0] == 3:
+                forwarded_reply = self.journal.outcomes.capture(mutation, received_action, wire, answer)
+                if forwarded_reply is not None:
+                    self.journal.outcomes.publish(forwarded_reply)
+                return
+            if received_action in PROFILE_COMMANDS and answer[0] == 3:
+                status = profile_status(received_action, answer)
+                if status is None:
+                    return
+                if status == "Accepted" and translated is not None:
                     profile_reply = VendorProfileReply(
-                        mutation, wire, received_action, translated, answer, profile_write
+                        mutation,
+                        wire,
+                        received_action,
+                        translated,
+                        answer,
+                        profile_write,
+                        self.charger.after_result is not None,
                     )
+                    self.journal.outcomes.save_profile_reply(profile_reply)
+                    return
+            try:
+                plan_accepted = ics_write is not None and ics_write.accepted(answer)
+            except UnavailableError:
+                return
+            status = "call_error"
+            if answer[0] == 3:
+                reported = answer[2].get("status")
+                status = reported if reported in ("Accepted", "Rejected", "NotSupported", "Unknown") else "reply"
+            other_answer = answer
+            other_reply = VendorWriteReply(
+                mutation,
+                received_action,
+                wire,
+                status,
+                ics_write.plans if plan_accepted and ics_write is not None else (),
+                ics_write.clearing if ics_write is not None else False,
+            )
+            self.journal.outcomes.save_vendor_write(other_reply)
+
+        # The outcome owner handles an accepted forwarded profile, including its resource update.
+        def owns_profile_reply(_action: str, _answer: Frame) -> bool:
+            return profile_reply is not None
 
         # Finalize captured replies independently of the handler's ability to return on the original socket.
         def finish() -> None:
             if profile_reply is not None:
-                self._profile_replies[profile_reply.mutation] = profile_reply
-                self._publish_profile_reply(profile_reply)
+                self.journal.outcomes.publish_profile(profile_reply)
+            elif other_reply is not None:
+                if self.journal.outcomes.awaits_storage(other_reply.mutation):
+                    self.journal.outcomes.save_vendor_write(other_reply)
             elif forwarded_reply is None:
                 self._finish_vendor_dispatch(action, original, mutation, grant, profile_write, dispatched)
-            elif not self.journal.forwarded.publish(forwarded_reply):
-                self.journal.forwarded.publish(forwarded_reply)
+            elif not self.journal.outcomes.publish(forwarded_reply):
+                self.journal.outcomes.publish(forwarded_reply)
 
         try:
             self.policy.kind(action, original)
@@ -1332,55 +1299,13 @@ class Gateway:
                 token=wire,
                 before_send=prepare_clear if action == "ClearChargingProfile" else None,
                 on_dispatch=on_dispatch,
-                on_receive=received if action in TRANSACTION_COMMANDS or action in PROFILE_COMMANDS else None,
+                on_reply=owns_profile_reply if action in PROFILE_COMMANDS else None,
+                on_receive=received if write else None,
                 keep_late_reply=action in TRANSACTION_COMMANDS,
             )
-            if forwarded_reply is not None:
-                return reply_as(answer, token)
-            if profile_reply is not None:
-                profile_reply.resource_saved = True
-                return reply_as(answer, token)
-
-            # Apply the translated reply to the request that actually reached the charger.
-            def settle(answer: Frame) -> str:
-                if action in ("SetChargingProfile", "ClearChargingProfile") and answer[0] == 3:
-                    if profile_status(action, answer) is None:
-                        raise UnavailableError("unobserved charging profile response")
-                if action in TRANSACTION_COMMANDS and answer[0] == 3:
-                    raise UnavailableError("unobserved remote transaction command response")
-                if query is not None:
-                    answer = query.response(answer)
-                with self.journal.atomic():
-                    if profile_write is not None and answer[0] == 3 and answer[2] == {"status": "Accepted"}:
-                        self._accepted_vendor_profile(profile_write)
-                    if ics_write is not None and ics_write.accepted(answer):
-                        self.plans.accepted(ics_write.plans, ics_write.clearing)
-                    if mutation:
-                        confirmed = answer[0] != 4
-                        self.journal.mutation_finished(mutation, confirmed)
-                        reply_status = answer[2].get("status") if answer[0] == 3 else None
-                        self.journal.record_vendor_result(
-                            mutation,
-                            reply_status
-                            if reply_status in ("Accepted", "Rejected", "NotSupported", "Unknown")
-                            else "reply"
-                            if confirmed
-                            else "call_error",
-                        )
-                        if not confirmed:
-                            self.journal.put(
-                                "uncertain_vendor_command",
-                                {"mutation": mutation, "action": action, "digest": fingerprint(original)},
-                            )
-                return reply_as(answer, token)
-
-            try:
-                text = self.decide(lambda: settle(answer), priority=priority)
-            except sqlite3.Error:
-                if self.journal.db.in_transaction:
-                    raise
-                # Replay only the rolled-back publication of this reply, never the charger command.
-                text = self.decide(lambda: settle(answer), priority=priority)
+            if write and forwarded_reply is None and profile_reply is None and other_reply is None:
+                raise UnavailableError("charger write did not return a recognized outcome")
+            return reply_as(query.response(answer) if query is not None else answer, token)
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
@@ -1389,48 +1314,12 @@ class Gateway:
 
             if profile_reply is not None:
                 return reply_as(profile_reply.answer, token)
+            if other_answer is not None:
+                return reply_as(other_answer, token)
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
         finally:
             self.decide(finish, priority=priority)
         return text
-
-    # Finish the accepted definition without repeating its command or inventing physical absence.
-    def _publish_profile_reply(self, reply: VendorProfileReply) -> None:
-        j = self.journal
-        try:
-            with j.atomic():
-                row = j.db.execute(
-                    "SELECT action,wire_request,wire_result,profile FROM mutations "
-                    "JOIN vendor_command_scope ON mutation=token WHERE token=? AND origin='vendor' AND state='pending'",
-                    (reply.mutation,),
-                ).fetchone()
-                if row is None or tuple(row)[:3] != (reply.action, reply.wire, "dispatched"):
-                    raise RecoveryRequiredError("profile reply no longer owns its original command")
-                if self._profile_reply_current(reply, row["profile"]):
-                    if not reply.resource_saved and self.charger.after_result is not None:
-                        self.charger.after_result(reply.action, reply.payload, reply.answer)
-                    if reply.profile is not None:
-                        self._accepted_vendor_profile(reply.profile)
-                j.record_vendor_result(reply.mutation, "Accepted")
-                j.mutation_finished(reply.mutation, True)
-        except sqlite3.Error:
-            if j.db.in_transaction:
-                raise
-            return
-        self._profile_replies.pop(reply.mutation, None)
-
-    # A Stop or cleanup can retire a resource while its earlier answer is waiting to be saved.
-    def _profile_reply_current(self, reply: VendorProfileReply, identifier: int) -> bool:
-        if self.charger.after_result is None:
-            return True
-        row = self.journal.db.execute(
-            "SELECT state,desired FROM trial_resources WHERE key=?", ("profile:" + str(identifier),)
-        ).fetchone()
-        return (
-            row is not None
-            and row["state"] != "absent_verified"
-            and (reply.action == "ClearChargingProfile" or row["desired"] == encoded(profile_projection(reply.payload)))
-        )
 
     # Retire only proven-unsent work; cancellation or any error after dispatch retains physical uncertainty.
     def _finish_vendor_dispatch(
@@ -1445,74 +1334,11 @@ class Gateway:
         if mutation is None and grant is None and profile is None:
             return
         if not dispatched:
-            self._retire_unsent_vendor(mutation, grant, profile)
-            return
-        if mutation is not None:
-            self._record_uncertain_vendor(mutation, action, fingerprint(original))
-
-    # The durable issued row and live caller tell the same story even while this marker cannot be saved.
-    def _record_uncertain_vendor(self, mutation: str, action: str, digest: str) -> None:
-        j = self.journal
-        try:
-            with j.atomic():
-                row = j.db.execute("SELECT state FROM mutations WHERE token=?", (mutation,)).fetchone()
-                if (
-                    row is not None
-                    and row[0] == "pending"
-                    and not j.forwarded.awaits_storage(mutation)
-                    and mutation not in self._profile_replies
-                ):
-                    j.mutation_finished(mutation, False)
-                    j.put("uncertain_vendor_command", {"mutation": mutation, "action": action, "digest": digest})
-        except sqlite3.Error:
-            if j.db.in_transaction:
-                raise
-            self._uncertain_vendor_writes[mutation] = action, digest
+            saved = self.journal.outcomes.retire_unsent(mutation, grant, profile)
+        else:
+            saved = mutation is None or self.journal.outcomes.record_unanswered(mutation, action, fingerprint(original))
+        if not saved:
             self._record_failure("JournalUnavailable")
-        else:
-            self._uncertain_vendor_writes.pop(mutation, None)
-
-    # A known unsent request retains its exact cleanup until the local write can commit.
-    def _retire_unsent_vendor(
-        self, mutation: str | None, grant: str | None, profile: VendorProfileWrite | None
-    ) -> None:
-        try:
-            with self.journal.atomic():
-                if mutation is not None:
-                    self.journal.db.execute("DELETE FROM mutations WHERE token=?", (mutation,))
-                if grant is not None:
-                    self.authorisation.revoke(grant)
-                if profile is not None and profile.allocated:
-                    profiles = self.journal.get("vendor_profiles", {})
-                    if profiles.get(profile.vendor) == profile.local:
-                        profiles.pop(profile.vendor)
-                        self.journal.put("vendor_profiles", profiles)
-        except sqlite3.Error:
-            if self.journal.db.in_transaction:
-                raise
-            if mutation is not None:
-                self._unsent_vendor_cleanup[mutation] = grant, profile
-            self._record_failure("JournalUnavailable")
-        else:
-            if mutation is not None:
-                self._unsent_vendor_cleanup.pop(mutation, None)
-
-    # Commit the last accepted definition even if the old transaction stopped while its reply was in flight.
-    def _accepted_vendor_profile(self, profile: VendorProfileWrite) -> None:
-        profiles = self.journal.get("vendor_profiles", {})
-        transactions = self.journal.get("vendor_profile_transactions", {})
-        if profile.transaction is None:
-            profiles[profile.vendor] = profile.local
-            transactions.pop(profile.vendor, None)
-        elif self.journal.active() == profile.transaction:
-            profiles[profile.vendor] = profile.local
-            transactions[profile.vendor] = profile.transaction
-        else:
-            if profiles.get(profile.vendor) == profile.local:
-                profiles.pop(profile.vendor)
-                transactions.pop(profile.vendor, None)
-        self.journal.put("vendor_profiles", profiles)
-        self.journal.put("vendor_profile_transactions", transactions)
 
     # Recheck priority, owner and current transaction after acquiring the outgoing CALL gate.
     def _check_vendor(
@@ -1757,16 +1583,17 @@ class Gateway:
         epoch = self._vendor_epoch
         async with self._flush_lock:
             self.decide(self.retry_reply_writes)
-            self.decide(self._refresh_delivery_uncertainty)
             self._require_epoch("vendor", epoch)
             await self._ensure_vendor_boot()
             while can_send is None or can_send():
                 head = self.decide(self._prepare_delivery)
                 if head is None:
-                    self.decide(self._clear_delivery_reply)
+                    self.decide(lambda: self.journal.outcomes.retain_delivery(None))
                     return
                 item = head
-                if self._delivery_reply is None and retry_deferred(self.journal, item, self._start_retry_waits):
+                if self.journal.outcomes.delivery_reply is None and retry_deferred(
+                    self.journal, item, self._start_retry_waits
+                ):
                     return
                 payload = dict(item.payload)
                 if item.action in ("MeterValues", "StopTransaction") and "transactionId" in payload:
@@ -1774,7 +1601,7 @@ class Gateway:
                     if vendor is None:
                         raise RecoveryRequiredError("transaction mapping is not known; event retained")
                     payload["transactionId"] = vendor
-                if self._delivery_reply is None:
+                if self.journal.outcomes.delivery_reply is None:
                     try:
                         current = item
                         sent = False
@@ -1790,7 +1617,6 @@ class Gateway:
                                 raise RegistrationDeferredError(0)
                             self.journal.mark_sent(current)
                             sent = True
-                            self.delivery_outcome_uncertain = item.action in ("StartTransaction", "StopTransaction")
 
                         # Retain the exact reply and its order before the vendor gate can pass to another caller.
                         def received(_action: str, answer: Frame) -> None:
@@ -1804,8 +1630,7 @@ class Gateway:
                             ):
                                 authorization = self.auth_info.observe()
                             received_reply = DeliveryReply.received(current, answer, authorization)
-                            if self._late_delivery_token == current.token:
-                                self._retain_delivery(received_reply)
+                            self.journal.outcomes.capture_delivery(current, received_reply)
 
                         answer = await self.vendor.call(
                             item.action,
@@ -1825,8 +1650,9 @@ class Gateway:
                     except asyncio.CancelledError:
                         self.decide(lambda: self._interrupted_delivery(item, received_reply, sent))
                         raise
-                    reply = received_reply or DeliveryReply.received(item, answer)
-                    self.decide(lambda: self._retain_delivery(reply))
+                    if received_reply is None:
+                        reply = DeliveryReply.received(item, answer)
+                        self.decide(lambda: self.journal.outcomes.capture_delivery(item, reply))
                 try:
                     disposition = self.decide(lambda: self._settle_delivery(item))
                 except sqlite3.Error:
@@ -1866,28 +1692,20 @@ class Gateway:
         except TimeoutError:
             pass  # Cancellation will leave an unanswered Start in the existing ambiguous state.
 
-    # Refresh the transport's delivery diagnosis from the retained receipt.
-    def _refresh_delivery_uncertainty(self) -> None:
-        self.delivery_outcome_uncertain = bool(
-            self._delivery_reply and not self._delivery_reply.storage_only(self.journal)
-        )
-
-    # An empty outbox has no receipt to carry to the next delivery run.
-    def _clear_delivery_reply(self) -> None:
-        self._delivery_reply = None
+    # A pump failure describes availability. The exact retained report and its reply describe its outcome.
+    @property
+    def delivery_outcome_uncertain(self) -> bool:
+        outcome = self.journal.outcomes.delivery()
+        return outcome is not None and outcome.uncertain
 
     # Recover the exact head before deciding whether its original request can be sent.
     def _prepare_delivery(self) -> Delivery | None:
-        item = self.journal.next_delivery()
-        if item is None:
+        outcome = self.journal.outcomes.delivery()
+        if outcome is None:
             return None
-        if self._delivery_reply is None:
-            self._delivery_reply = DeliveryReply.restore(self.journal, item)
-            self.delivery_outcome_uncertain = bool(
-                self._delivery_reply and not self._delivery_reply.storage_only(self.journal)
-            )
-        if self._delivery_reply is not None:
-            self._delivery_reply.require(item)
+        item = outcome.item
+        if outcome.reply is not None:
+            self.journal.outcomes.retain_delivery(outcome.reply)
         elif item.state == "inflight" and item.action != "StartTransaction":
             # A failed cleanup write can retain an unanswered retryable head in this process too.
             with self.journal.atomic():
@@ -1902,7 +1720,6 @@ class Gateway:
                 item = current_head
         elif item.state in ("ambiguous", "inflight", "rejected"):
             if item.action == "StartTransaction" and item.state in ("ambiguous", "inflight"):
-                self.delivery_outcome_uncertain = True
                 with self.journal.atomic():
                     if item.state == "inflight":
                         self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
@@ -1916,11 +1733,6 @@ class Gateway:
                     latch_start_delivery_fault(self.journal)
             raise RecoveryRequiredError("cloud delivery requires explicit reconciliation")
         return item
-
-    # The bounded in-memory receipt is retained before any attempt to write it to storage.
-    def _retain_delivery(self, reply: DeliveryReply) -> None:
-        self._delivery_reply = reply
-        self.delivery_outcome_uncertain = not reply.storage_only(self.journal)
 
     # Preserve provenance only for the exact Start that can still receive its original cloud reply.
     def _latch_late_delivery(self, item: Delivery) -> None:
@@ -1937,12 +1749,7 @@ class Gateway:
     # Retain an actual interrupted reply, or distinguish a safely retryable unanswered request.
     def _interrupted_delivery(self, item: Delivery, received_reply: DeliveryReply | None, sent: bool) -> None:
         if received_reply is not None:
-            self._delivery_reply = received_reply
-            try:
-                self.delivery_outcome_uncertain = not received_reply.storage_only(self.journal)
-                received_reply.save(self.journal, self.journal.next_delivery() or item)
-            except sqlite3.Error:
-                pass  # Retry saving this same reply in the next delivery run.
+            self.journal.outcomes.capture_delivery(item, received_reply)
         elif sent:
             try:
                 with self.journal.atomic():
@@ -1960,7 +1767,7 @@ class Gateway:
 
     # Persist the actual receipt before applying it so either storage boundary can be retried.
     def _settle_delivery(self, item: Delivery) -> str:
-        reply = self._delivery_reply
+        reply = self.journal.outcomes.delivery_reply
         assert reply is not None
         try:
             reply.save(self.journal, self.journal.next_delivery() or item)
@@ -1974,10 +1781,9 @@ class Gateway:
                         current_head = self.journal.next_delivery()
                         assert current_head is not None
                         supersede_unknown_start_retry(self.journal, current_head)
-            self._delivery_reply = None
+            self.journal.outcomes.retain_delivery(None)
             raise RecoveryRequiredError("cloud reply requires exact delivery reconciliation") from None
-        self._delivery_reply = None
-        self.delivery_outcome_uncertain = False
+        self.journal.outcomes.retain_delivery(None)
         return disposition
 
     # Keep a failed Start delivery under a durable hold before verifying the physical ceiling.

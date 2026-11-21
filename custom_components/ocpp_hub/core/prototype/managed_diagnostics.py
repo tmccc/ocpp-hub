@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import sqlite3
 import time
@@ -132,18 +131,21 @@ def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, A
     ]
     commands = []
     for row in rows[:5]:
-        result = json.loads(row["result"])
-        if not isinstance(result, dict):
+        command = c.session.journal.outcomes.owner(row["id"], include_wires=True, row=row)
+        if command is None:
             raise ValueError("diagnostic receipt metadata is unavailable")
-        accepted = timestamp(result.get("accepted_at"))
+        accepted = timestamp(command.result.get("accepted_at"))
         age = now - accepted if accepted is not None and accepted <= now else None
+        confirmation = (
+            "reply_received" if command.reply_known else "unknown" if command.state == "uncertain" else "pending"
+        )
         commands.append(
             {
-                "action": row["action"] if row["action"] in ACTIONS else "other",
-                "state": row["state"],
+                "action": command.action if command.action in ACTIONS else "other",
+                "state": command.state,
                 "accepted_at": accepted,
                 "age_seconds": age,
-                "confirmation": "unknown" if row["state"] == "uncertain" else "pending",
+                "confirmation": confirmation,
             }
         )
     return commands, len(rows)

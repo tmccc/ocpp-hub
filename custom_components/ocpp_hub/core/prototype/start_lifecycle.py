@@ -145,7 +145,7 @@ class StartLifecycle:
             worker_pending=worker_pending,
             active=j.active() if generic else None,
             vendor_pending=bool(j.get("vendor_start_grant")) if generic else False,
-            uncertain_vendor=bool(j.get("uncertain_vendor_command")),
+            uncertain_vendor=j.outcomes.vendor_evidence().unresolved,
             mutation_pending=bool(j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone())
             if generic
             else False,

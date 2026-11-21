@@ -94,16 +94,22 @@ class ManagedCharging:
             with self.journal.atomic():
                 ownership = controller.requests.pause_ownership()
                 intent = ownership.intent
+                receipt = self.journal.starts.receipt()
+                refused = (
+                    receipt.get("request_id") == saved["id"]
+                    and receipt.get("stage") == "rejected"
+                    and receipt.get("local") is None
+                )
                 preserve = (
                     saved.get("kind") == "normal"
                     and intent.mode == "app"
                     and self.journal.get("control", {}).get("start_pending") is True
-                    and local_start_receipt(self.journal).get("local") is None
-                    and local_start_receipt(self.journal).get("stage") in ("issued", "accepted")
+                    and receipt.get("local") is None
+                    and receipt.get("stage") in ("issued", "accepted")
                 )
                 if not ownership.supersedes(saved.get("revision")):
                     if not preserve:
-                        write_intent(self.journal, intent, "paused")
+                        write_intent(self.journal, intent, "paused", coalesce=refused)
                     claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.retire_refused_unsent()

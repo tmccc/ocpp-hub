@@ -68,9 +68,14 @@ async def test_second_pause_sends_its_stop_without_waiting_for_poll(tmp_path, tl
         assert stop == [{"transactionId": local}]
         assert c.requests.receipt(first)["state"] == "failed"
         assert c.requests.receipt(second)["state"] == "accepted"
+        outcome = b.session.journal.outcomes.owner(second, include_wires=True)
+        assert outcome.reply_known and outcome.sessions[0].local == local and not outcome.sessions[0].closed
+        assert c.session.gateway.controls.stop_acknowledged(local)
         await genuine_stop(b, local)
         assert (await mp.healthy(c))["local_hold_verified"]
         assert c.requests.receipt(second)["state"] == "completed"
+        outcome = b.session.journal.outcomes.owner(second, include_wires=True)
+        assert outcome.sessions[0].closed
 
 
 # Intent: an actual identical Boot retires an earlier Stop ACK, including a reply arriving after that Boot.

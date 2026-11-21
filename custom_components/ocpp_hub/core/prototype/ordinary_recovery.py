@@ -13,7 +13,7 @@ from .command_processor import CommandPriority
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
-from .managed_sources import recorded_station_profile
+from .managed_sources import confirmed_vendor_start, recorded_station_profile
 from .managed_start_binding import known_plan_source
 from .native_bounded import NativeReadinessError
 from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite, require_allowed
@@ -157,15 +157,7 @@ class OrdinaryRecovery:
             }
         if native.session_plan_id is not None and (known_plan_source(j, native) or attested is None):
             return None  # An unknown marker needs the exact command-source attestation made during binding.
-        if (
-            grant.get("local") == local
-            and grant.get("digest") == digest
-            and j.db.execute(
-                "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
-                "AND action='RemoteStartTransaction' AND state='confirmed'",
-                (grant.get("mutation"),),
-            ).fetchone()
-        ):
+        if confirmed_vendor_start(j, digest, local, settled=True):
             return {"kind": "vendor", "tag": digest, "mutation": grant["mutation"]}
         return None
 
@@ -318,7 +310,7 @@ class OrdinaryRecovery:
             or not 0 <= time.time() - source.get("observed_at", 0) <= 5
             or j.get("trial_preservation_fault")
             or j.get("trial_inventory_fault")
-            or j.get("uncertain_vendor_command")
+            or g.vendor_write_evidence().unresolved
             or j.get("control", {}).get("start_pending")
             or grant
             and (local is None or grant.get("local") != local)

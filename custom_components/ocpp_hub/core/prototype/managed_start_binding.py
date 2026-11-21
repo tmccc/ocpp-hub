@@ -6,6 +6,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
+from .managed_sources import confirmed_vendor_start
 from .store import Journal, fingerprint
 
 if TYPE_CHECKING:
@@ -120,6 +121,7 @@ class ManagedStartBinding:
                     },
                 )
             j.put("managed_deferred_start", {})
+        j.outcomes.retain_bound_owner_start()
 
     # Distinct tags bind at allocation; their first complete native read must pin the same source as deferred tags.
     def attest_bound_vendor(self, n: HandoverEvidence, schedule: str | None) -> None:
@@ -140,14 +142,7 @@ class ManagedStartBinding:
         if row is None:
             return
         start = json.loads(row["start"])
-        if (
-            grant.get("digest") != fingerprint(start["idTag"].casefold())
-            or not j.db.execute(
-                "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
-                "AND action='RemoteStartTransaction' AND state='confirmed'",
-                (grant.get("mutation"),),
-            ).fetchone()
-        ):
+        if not confirmed_vendor_start(j, fingerprint(start["idTag"].casefold()), local, settled=True):
             return
         j.put(
             "vendor_start_grant",

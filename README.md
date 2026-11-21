@@ -61,6 +61,10 @@ For up to 30 seconds after the normal deadline, the proxy can still match a late
 a forwarded Start or Stop, or a Start report sent to the cloud. The original connection must remain open.
 A missing answer can hold charging at zero. A subsequent matching answer can settle that hold, and the
 proxy then checks the current charger evidence and owner choice before allowing charging.
+
+The command journal keeps the original request, the charger reply, and the verified result available to
+control, recovery and Home Assistant. A command can have multiple charger replies, such as one for a new
+current and another for restoring zero. The charge history supplies actual session start and closure.
 If the proxy restarts with a saved reply still waiting for its final update, let this version finish that update
 before rolling back to an earlier version. The rollback check requires a settled journal.
 

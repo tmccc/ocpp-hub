@@ -11,7 +11,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
@@ -36,7 +36,6 @@ from .recovery_contracts import (
     ReleaseHandoff,
     Reply,
     ResultCall,
-    WireReply,
     require_allowed,
 )
 from .release_attempt import ReleaseAttempt
@@ -50,6 +49,9 @@ from .start_handoff import (
 )
 from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, StationZeroStorageError, fingerprint
+
+if TYPE_CHECKING:
+    from .command_outcomes import OwnerWireScope
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
 type StopProof = Callable[[int, bool], Awaitable[Callable[[], None]]]
@@ -102,14 +104,15 @@ async def join_retirement[T](task: asyncio.Task[T]) -> T:
 
 
 @dataclass(frozen=True)
-class StopAcknowledgement:
-    """An actual accepted Stop remains tied to its exact live control claim and local session."""
+class StopScope:
+    """Live ownership of a Stop. The journal owns its actual reply."""
 
     epoch: int
     revision: int
     ticket: str
     local: int
     generation: int
+    evidence: OwnerWireScope
 
 
 # Read compatibility evidence through the journal's sole Start lifecycle owner.
@@ -148,7 +151,7 @@ class LocalControl:
         self._release_ticket: str | None = None
         self._unsent_release: tuple[str, dict[str, Any]] | None = None
         self.release_attempt: ReleaseAttempt | None = None
-        self._stop_ack: StopAcknowledgement | None = None
+        self._issued_stop: StopScope | None = None
         self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
         self.prepare_station: Callable[[ResultCall, int], Awaitable[StationChoice | NotSent]] | None = None
@@ -437,7 +440,7 @@ class LocalControl:
         raise UnavailableError("composite schedule remains outside present coverage")
 
     # Establish or restore the desired ceiling before a start, native plan or new authenticated connection is used.
-    async def ensure_ceiling(self, *, guard: Callable[[], None] | None = None) -> None:
+    async def ensure_ceiling(self, *, guard: Callable[[], None] | None = None, request_id: str | None = None) -> None:
         if guard is not None:
             guard()
         phase = self.journal.phase.read()
@@ -464,7 +467,10 @@ class LocalControl:
                 raise DeniedError("desired ceiling changed during preparation")
             return ALLOW
 
-        async with self.peer.sequence_results(0 if limit == 0 else 1, check) as call:
+        scope = (
+            self.journal.outcomes.owner_scope(request_id, ticket, boot) if request_id is not None and ticket else None
+        )
+        async with self.peer.sequence_results(0 if limit == 0 else 1, check, owner_scope=scope) as call:
             check()
             if self.ready:
                 return
@@ -494,10 +500,16 @@ class LocalControl:
         shared: bool = False,
         on_restrictive_claim: Callable[[str | None, str], None] | None = None,
         on_claim: Callable[[str], None] | None = None,
+        request_id: str | None = None,
     ) -> Frame:
         return await self._owned(
             self._set_limit(
-                value, guard=guard, shared=shared, on_restrictive_claim=on_restrictive_claim, on_claim=on_claim
+                value,
+                guard=guard,
+                shared=shared,
+                on_restrictive_claim=on_restrictive_claim,
+                on_claim=on_claim,
+                request_id=request_id,
             )
         )
 
@@ -510,6 +522,7 @@ class LocalControl:
         shared: bool = False,
         on_restrictive_claim: Callable[[str | None, str], None] | None = None,
         on_claim: Callable[[str], None] | None = None,
+        request_id: str | None = None,
     ) -> Frame:
         limit = number(value, self.policy.max_current_a)
         limit = 0.0 if limit < 6 else limit
@@ -542,7 +555,10 @@ class LocalControl:
             if guard is not None:
                 guard()
 
-        async with self.peer.sequence(0 if limit == 0 else 1, check) as call:
+        scope = self.journal.outcomes.owner_scope(request_id, ticket, self.boot())
+        async with self.peer.sequence(
+            0 if limit == 0 else 1, check, owner_scope=scope, late_reply_action="SetChargingProfile"
+        ) as call:
             answer = await self._cap(call, limit, epoch)
 
         # Leave the result with the ticket that produced the verified ceiling.
@@ -556,11 +572,11 @@ class LocalControl:
     # Every actual Boot retires Stop acknowledgements even when its metadata is unchanged.
     def forget_stop_ack(self) -> None:
         self._stop_generation += 1
-        self._stop_ack = None
+        self._issued_stop = None
 
     # An accepted known-session Stop waits for its genuine closure instead of repeating after each native poll.
     def stop_acknowledged(self, local: int | None) -> bool:
-        ack = self._stop_ack
+        ack = self._issued_stop
         return (
             ack is not None
             and local is not None
@@ -569,6 +585,10 @@ class LocalControl:
             and ack.revision == self._revision
             and ack.generation == self._stop_generation
             and ack.ticket == self.journal.get("control", {}).get("ticket")
+            and any(
+                wire.action == "RemoteStopTransaction" and wire.local == local and wire.reply == "Accepted"
+                for wire in ack.evidence.wires.values()
+            )
         )
 
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
@@ -582,8 +602,11 @@ class LocalControl:
         on_claim: Callable[[str], None] | None = None,
         owner: tuple[object, ...] | None = None,
         priority: CommandPriority = CommandPriority.RESTRICT,
+        request_id: str | None = None,
     ) -> Frame:
-        claim = partial(self._claim_stop, expected_local, guard, station_absent, prove_stop, on_claim, owner)
+        claim = partial(
+            self._claim_stop, expected_local, guard, station_absent, prove_stop, on_claim, owner, request_id
+        )
         task = claim() if self.command_processor is None else await self.command_processor.run(claim, priority=priority)
         return await asyncio.shield(task)
 
@@ -596,6 +619,7 @@ class LocalControl:
         prove_stop: StopProof | None,
         on_claim: Callable[[str], None] | None,
         owner: tuple[object, ...] | None,
+        request_id: str | None,
     ) -> asyncio.Task[Frame]:
         if station_absent and (expected_local is None or guard is None):
             raise RecoveryRequiredError("an absent station ceiling permits only an independently guarded Stop")
@@ -634,6 +658,7 @@ class LocalControl:
                     guard,
                     station_absent,
                     prove_stop,
+                    request_id,
                 )
             )
         return self._stopping
@@ -648,6 +673,7 @@ class LocalControl:
         guard: Callable[[], None] | None = None,
         station_absent: bool = False,
         prove_stop: StopProof | None = None,
+        request_id: str | None = None,
     ) -> Frame:
         revision, generation = self._revision, self._stop_generation
         stop_guard: Callable[[], None] | None = None
@@ -664,17 +690,15 @@ class LocalControl:
         answer: Frame | None = None
         local: int | None = None
 
-        # A real accepted Stop can arrive before the outgoing send finishes draining.
-        def received_stop(action: str, frame: Frame) -> None:
-            if (
-                action == "RemoteStopTransaction"
-                and local is not None
-                and frame[0] == 3
-                and frame[2] == {"status": "Accepted"}
-            ):
-                self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
+        # Only a Stop dispatched on this live scope can suppress a later retry.
+        def issued_stop(action: str) -> None:
+            if action == "RemoteStopTransaction" and local is not None:
+                self._issued_stop = StopScope(epoch, revision, ticket, local, generation, scope)
 
-        async with self.peer.sequence(0, check, on_receive=received_stop) as call:
+        scope = self.journal.outcomes.owner_scope(request_id, ticket, self.boot())
+        async with self.peer.sequence(
+            0, check, on_dispatch=issued_stop, owner_scope=scope, late_reply_action="RemoteStopTransaction"
+        ) as call:
             if station_absent:
                 cap_error = UnavailableError("the missing station ceiling cannot establish a zero hold")
             else:
@@ -881,6 +905,7 @@ class LocalControl:
             on_receive=received,
             on_sent=sent,
             late_reply_action="RemoteStartTransaction",
+            owner_scope=self.journal.outcomes.owner_scope(request_id, ticket, self.boot()),
         ) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
@@ -1080,18 +1105,18 @@ class LocalControl:
                     else:
                         attempt.positive_may_have_dispatched = True
 
-            # Record the actual reply before resource ACK persistence, which can itself fail.
-            def received(action: str, frame: Frame) -> None:
-                if attempt is not None and not restoring_zero and action == "SetChargingProfile":
-                    attempt.positive_reply = (
-                        WireReply.ACCEPTED
-                        if frame[0] == 3 and frame[2].get("status") == "Accepted"
-                        else WireReply.REJECTED
-                        if frame[0] == 3 and frame[2].get("status") == "Rejected"
-                        else WireReply.ERROR
-                    )
-
-            async with self.peer.sequence_results(1, check, on_dispatch=dispatched, on_receive=received) as call:
+            scope = self.journal.outcomes.owner_scope(
+                attempt.request_id if attempt is not None else None, ticket, self.boot()
+            )
+            if attempt is not None:
+                attempt.wires = scope
+            async with self.peer.sequence_results(
+                1,
+                check,
+                on_dispatch=dispatched,
+                owner_scope=scope,
+                late_reply_action="SetChargingProfile",
+            ) as call:
                 # Both failure and pending rollback retain the same ticket, Boot and observed zero sequence.
                 async def rollback_zero() -> None:
                     # Only the current ticket may withdraw positive control before the zero write.

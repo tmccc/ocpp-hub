@@ -209,7 +209,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or j.get("native_bounded_handover", {}).get("fault")
             or j.get("trial_preservation_fault")
             or j.get("trial_inventory_fault")
-            or j.get("uncertain_vendor_command")
+            or g.vendor_write_evidence().unresolved
             or j.get("vendor_start_grant")
             or control.get("ticket") != ticket
             or not ticket

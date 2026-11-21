@@ -39,7 +39,7 @@ class VendorAuthorisation:
         return (
             bool(grant)
             and grant.get("local") is None
-            and self.journal.forwarded.status(grant.get("mutation")) != "Rejected"
+            and self.journal.outcomes.status(grant.get("mutation")) != "Rejected"
         )
 
     # A grant authorises only its bounded pending start or the currently open transaction bound to that grant.
@@ -48,7 +48,7 @@ class VendorAuthorisation:
         if (
             grant.get("digest") != tag_key(tag)
             or (grant.get("prepared") is True and grant.get("token") != issuing)
-            or self.journal.forwarded.status(grant.get("mutation")) == "Rejected"
+            or self.journal.outcomes.status(grant.get("mutation")) == "Rejected"
         ):
             return False
         local = grant.get("local")
@@ -67,7 +67,13 @@ class VendorAuthorisation:
     # Bind once; a subsequent transaction cannot reuse the pending grant after its original session stops.
     def consume(self, tag: str, local: int) -> None:
         grant = self.journal.get("vendor_start_grant", {})
-        if grant.get("digest") == tag_key(tag) and grant.get("prepared") is not True:
+        if (
+            grant.get("digest") == tag_key(tag)
+            and grant.get("prepared") is not True
+            and grant.get("local") in (None, local)
+            and self.journal.outcomes.status(grant.get("mutation")) != "Rejected"
+        ):
+            self.journal.outcomes.bind_vendor_start(grant.get("mutation"), local)
             self.journal.put("vendor_start_grant", {**grant, "local": local})
 
     # An actual refusal revokes this request only, never a replacement's newer grant.

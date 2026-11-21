@@ -243,7 +243,7 @@ class ManagedCurrentLimits:
             and not control.get("start_pending")
             and not j.fault.latched()
             and not j.get("vendor_start_grant")
-            and not j.get("uncertain_vendor_command")
+            and not g.vendor_write_evidence().unresolved
             and not c.requests.return_in_progress()
             and c.charging.lease is None
             and c.charging.state().get("state") in (None, "completed", "failed", "cancelled")
@@ -328,7 +328,7 @@ class ManagedCurrentLimits:
             return "current_selection_authority_unconfirmed"
         if j.get("vendor_start_grant"):
             return "vendor_start_pending"
-        if j.get("uncertain_vendor_command"):
+        if g.vendor_write_evidence().unresolved:
             return "vendor_command_uncertain"
         if j.active() is not None:
             return "transaction_open"
@@ -433,7 +433,7 @@ class ManagedCurrentLimits:
             if expected.mode == "app":
                 await c.native.read(closed=True)
                 guard()
-                await g.controls.set_limit(value, guard=guard, shared=True, on_claim=bind)
+                await g.controls.set_limit(value, guard=guard, shared=True, on_claim=bind, request_id=identifier)
             guard()
             native = await c.native.read(closed=True)
 
@@ -488,7 +488,9 @@ class ManagedCurrentLimits:
                         pass  # Durable operation recovery retries zero; a lost acknowledgement never grants Stop.
                 else:
                     try:
-                        await c.ensure_pause_zero()
+                        await c.ensure_pause_zero(
+                            request_id=identifier if outcome is CurrentFailure.HOLD_IDLE else None
+                        )
                     except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError, sqlite3.Error:
                         pass  # The durable hold remains pending; ordinary Pause supervision retries its zero.
                     c.schedule_pause()
@@ -533,7 +535,7 @@ class ManagedCurrentLimits:
         try:
             if hold_ticket is None:
                 hold_ticket = c.commands.decide(claim, priority=CommandPriority.RESTRICT)
-            await g.controls.ensure_ceiling(guard=lambda: guard(hold_ticket))
+            await g.controls.ensure_ceiling(guard=lambda: guard(hold_ticket), request_id=identifier)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             pass  # The same current worker retries while an exact owner still permits zero.
         return hold_ticket
@@ -611,7 +613,7 @@ class ManagedCurrentLimits:
 
         guard()
         ticket = j.get("control", {}).get("ticket")
-        await g.controls.ensure_ceiling(guard=guard)
+        await g.controls.ensure_ceiling(guard=guard, request_id=change["id"])
 
         # This zero verifies only the hold that requested it.
         def settle() -> None:

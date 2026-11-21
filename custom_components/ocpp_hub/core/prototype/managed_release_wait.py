@@ -28,7 +28,7 @@ def awaiting_known_stops(journal: Journal) -> bool:
         not rows
         or journal.active() is not None
         or awaiting_owner_start(journal)
-        or journal.get("uncertain_vendor_command")
+        or journal.outcomes.vendor_evidence().unfinished
         or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
     ):
         return False

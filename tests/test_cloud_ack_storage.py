@@ -22,7 +22,6 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_start_delivery import DENIALS
 from ocpp_hub_core.prototype.managed_stop_delivery import REJECTION
-from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.runtime import ConnectionRuntime
 from ocpp_hub_core.prototype.store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
@@ -84,16 +83,19 @@ async def test_correlated_start_reply_survives_delivery_retirement(tmp_path, exi
         assert rig.store.next_delivery().state == "inflight"
         response = {"transactionId": 9100, "idTagInfo": {"status": "Accepted"}}
         await rig.gateway.receive("vendor", build_call_result(request[1], response), epoch)
+        saved = DeliveryReply.restore(rig.store, rig.store.next_delivery())
+        assert saved is not None and saved.answer == [3, request[1], response]
         if exit_kind == "cancel":
             pump.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await pump
+            saved = DeliveryReply.restore(rig.store, rig.store.next_delivery())
+            assert saved is not None and saved.answer == [3, request[1], response]
         else:
             close_send.set()
-            with pytest.raises(UnavailableError, match="closed during send"):
-                await pump
-        saved = DeliveryReply.restore(rig.store, rig.store.next_delivery())
-        assert saved is not None and saved.answer == [3, request[1], response]
+            await pump
+            assert rig.store.vendor_id(local) == 9100
+            assert rig.store.next_delivery() is None
     finally:
         if not pump.done():
             pump.cancel()
@@ -430,7 +432,7 @@ async def storage_recovery_case(
                 await until(lambda: b.session.runtime.status.delivery_blocked)
                 assert b.session.runtime.status.delivery_blocked_cause == "storage"
                 assert j.next_delivery().token == held.token and j.next_delivery().state == "inflight"
-                assert b.session.gateway._delivery_reply is not None
+                assert b.session.journal.outcomes.delivery_reply is not None
                 assert_retained(j, held, saved=failure != "begin")
                 assert wire_count(b.rig, held.token) == 1 and not j.db.in_transaction
                 assert [tuple(row) for row in j.db.execute("SELECT * FROM transactions ORDER BY local")] == before
@@ -564,7 +566,7 @@ async def test_negative_cloud_reply_storage_keeps_quarantine(
             held.release.set()
             await until(lambda: b.session.runtime.status.delivery_blocked)
             assert b.session.runtime.status.delivery_blocked_cause == "storage"
-            assert b.session.gateway._delivery_reply is not None
+            assert b.session.journal.outcomes.delivery_reply is not None
             assert_retained(j, held, saved=failure != "begin")
             assert wire_count(b.rig, held.token) == 1
             if failure != "begin":
@@ -719,7 +721,7 @@ async def test_malformed_start_reply_cache_quarantines_without_replay(
         await until(lambda: b.rig.bench.firmware.effective_limit() == 0)
         assert j.get("managed_control_fault") and j.vendor_id(local) is None
         assert j.next_delivery().state == "ambiguous" and wire_count(b.rig, held.token) == 1
-        assert b.session.gateway._delivery_reply is None
+        assert b.session.journal.outcomes.delivery_reply is None
         assert j.db.execute("SELECT COUNT(*) FROM delivery_replies").fetchone()[0] == 0
         assert str(local) not in j.get(DENIALS, {})
         heartbeats = sum(frame[0] == 2 and frame[2] == "Heartbeat" for frame in b.rig.bench.calls)

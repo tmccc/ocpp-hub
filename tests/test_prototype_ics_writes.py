@@ -74,6 +74,33 @@ async def test_ics_actual_writes_translate_and_commit(tmp_path: Path) -> None:
     await rig.close()
 
 
+# Intent: a definite plan reply survives temporary refusal of its local publication.
+# Why: retrying the outcome must activate the original plan without sending the command twice.
+async def test_plan_outcome_retries_its_publication(tmp_path: Path) -> None:
+    rig = await ready(tmp_path / "journal.db")
+    journal = rig.store
+    try:
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_plan_update BEFORE UPDATE ON plans "
+            "BEGIN SELECT RAISE(ABORT,'plan update unavailable'); END"
+        )
+        response = await rig.vendor("accepted-plan", "DataTransfer", PLAN)
+        assert response[2] == {"status": "Accepted", "data": ""}
+        token = journal.db.execute("SELECT token FROM mutations WHERE action='DataTransfer'").fetchone()[0]
+        outcome = journal.outcomes.vendor(token)
+        assert outcome.status == "Accepted" and outcome.saving_reply and not outcome.settled
+        assert journal.db.execute("SELECT state FROM plans").fetchone()[0] == "reserved"
+
+        journal.db.execute("DROP TRIGGER refuse_plan_update")
+        rig.gateway.retry_reply_writes()
+        outcome = journal.outcomes.vendor(token)
+        assert outcome.status == "Accepted" and outcome.settled
+        assert journal.db.execute("SELECT state FROM plans").fetchone()[0] == "active"
+        assert sum(frame[2] == "DataTransfer" for frame in rig.charger_frames) == 1
+    finally:
+        await rig.close()
+
+
 # Intent: known mutation names cannot be misclassified as reads by an external mutable policy dictionary.
 # Why: otherwise local ownership and a persisted stop could be bypassed after policy construction.
 async def test_ics_intrinsic_write_classification_and_owner(tmp_path: Path) -> None:
@@ -110,7 +137,9 @@ async def test_ics_plan_ownership_and_restart(tmp_path: Path) -> None:
     assert mapped != 8000001
     await rig.close()
     rig = Rig(path, POLICY)
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.boot()
+    await rig.cloud()
+    rig.charger_frames.clear()
     rig.charger_result = {"status": "Accepted", "data": ""}
     assert (await rig.vendor("after-restart", "DataTransfer", clear))[0] == 3
     assert json.loads(rig.charger_frames[-1][3]["data"]) == [mapped]
@@ -131,7 +160,9 @@ async def test_ics_write_uncertainty_blocks_changed_bodies_across_restart(tmp_pa
     assert (await rig.vendor("lost", "DataTransfer", PLAN))[0] == 4
     await rig.close()
     rig = Rig(path, POLICY)
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.boot()
+    await rig.cloud()
+    rig.charger_frames.clear()
     rig.charger_result = {"status": "Accepted", "data": ""}
     assert (await rig.vendor("changed", "DataTransfer", plan(limitCurrent=6)))[0] == 4
     assert not rig.charger_frames
@@ -164,8 +195,17 @@ async def test_ics_write_peer_results_and_errors(tmp_path: Path) -> None:
             await rig.gateway.receive("charger", build_call_result(f[1], result))
 
     rig.gateway.attach_charger(peer_error)
+    rig.store.db.execute(
+        "CREATE TEMP TRIGGER refuse_call_error BEFORE UPDATE ON vendor_command_scope "
+        "WHEN NEW.wire_result='call_error' BEGIN SELECT RAISE(ABORT,'wire write unavailable'); END"
+    )
     answer = await rig.vendor("peer-error", "DataTransfer", PLAN)
     assert answer[2:] == ["InternalError", "actual failure", {"peer": 1}]
+    evidence = rig.gateway.vendor_write_evidence()
+    assert evidence.received == 0 and len(evidence.uncertain) == 1
+    assert rig.store.outcomes.vendor(evidence.uncertain[0]).status == "call_error"
+    rig.store.db.execute("DROP TRIGGER refuse_call_error")
+    rig.gateway.retry_reply_writes()
     assert rig.store.db.execute("SELECT COUNT(*) FROM mutations WHERE state='uncertain'").fetchone()[0] == 1
     await rig.close()
 

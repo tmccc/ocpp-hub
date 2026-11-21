@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Use one command outcome owner for the proxy, recovery and Home Assistant. Retain actual owner wire replies
+  and session links on the original commands, including separate replies for a current change and its zero rollback.
+- Finish saved forwarded profile replies and exact local Start replies after a restart.
 - Use the same unanswered-command evidence for status and zero protection. A matched late reply can
   resolve the hold caused by that exact command, then normal recovery checks current charging conditions.
 - Retain an accepted profile reply while its local records are being saved. Retry Pause recovery

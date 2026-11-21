@@ -13,7 +13,7 @@ from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSett
 from ocpp_hub_core.prototype.managed_charging import ManagedCharging
 from websockets.asyncio.client import connect
 
-from tests.charge_rig import owner_rig
+from tests.charge_rig import owner_rig, positive_flow
 from tests.managed_rig import healthy, starts
 from tests.management_peer import TOKEN, call
 from tests.native_fault_support import coroutine_locals
@@ -90,8 +90,52 @@ async def test_local_start_late_rejection_clears_only_its_receipt(tmp_path, tls,
         assert len(saved) == 1 and j.starts.receipt()["stage"] == "issued"
         await original_send(build_call_result(saved[0], {"status": "Rejected"}))
         await until(lambda: j.starts.receipt().get("stage") == "rejected")
+        outcome = j.outcomes.owner(identifier, include_wires=True)
+        assert outcome.reply_known and not outcome.sessions
+        assert [(wire.wire, wire.reply) for wire in outcome.wires if wire.action == "RemoteStartTransaction"] == [
+            (saved[0], "Rejected")
+        ]
         assert c.requests.intent().mode == "paused" and bench.firmware.effective_limit() == 0
         assert len(starts(b.rig)) == 1
+
+
+# Intent: a temporarily refused wire evidence write cannot affect a genuine Start report.
+# Why: the charging session has to remain linked to the original owner even when its reply saves later.
+async def test_start_session_binds_while_its_wire_evidence_cannot_save(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_start_wire BEFORE INSERT ON owner_command_wires "
+            "WHEN NEW.action='RemoteStartTransaction' BEGIN SELECT RAISE(ABORT,'wire write unavailable'); END"
+        )
+        identifier = uuid.uuid4().hex
+        assert c.command(identifier, "start", c.requests.intent().revision)["state"] == "accepted"
+        await c.charging.settle()
+        local = await positive_flow(b)
+        assert (
+            j.db.execute(
+                "SELECT 1 FROM owner_command_wires WHERE request=? AND action='RemoteStartTransaction'", (identifier,)
+            ).fetchone()
+            is None
+        )
+        outcome = j.outcomes.owner(identifier, include_wires=True)
+        assert outcome.reply_known and [(item.local, item.closed) for item in outcome.sessions] == [(local, False)]
+        assert [wire.local for wire in outcome.wires if wire.action == "RemoteStartTransaction"] == [local]
+
+        j.db.execute("DROP TRIGGER refuse_start_wire")
+        await c.tick()
+        assert (
+            j.db.execute(
+                "SELECT reply FROM owner_command_wires WHERE request=? AND action='RemoteStartTransaction'",
+                (identifier,),
+            ).fetchone()[0]
+            == "Accepted"
+        )
+        await natural_stop(b, local)
+        outcome = j.outcomes.owner(identifier, include_wires=True)
+        assert outcome.reply_known and [(item.local, item.closed) for item in outcome.sessions] == [(local, True)]
 
 
 # Exercise one explicit real TLS frame ordering while observing the actual atomic publication boundary.

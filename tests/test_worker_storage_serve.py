@@ -343,6 +343,10 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         assert zero, ("persistent diagnostic storage refusal must not delay protective zero", state)
                         assert rig.bench.firmware.current == 0
                         assert j.get("control")["resume_limit"] == 6
+                        outcome = j.outcomes.owner(identifier, include_wires=True)
+                        assert [
+                            (wire.limit_a, wire.reply) for wire in outcome.wires if wire.action == "SetChargingProfile"
+                        ] == [(16, "Accepted"), (0, "Accepted")]
 
                         # Require three engine HTTP failures and a fresh honest status with SQL still refused.
                         async with asyncio.timeout(18):

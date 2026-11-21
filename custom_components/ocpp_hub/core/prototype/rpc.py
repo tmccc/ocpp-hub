@@ -10,8 +10,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
 from .command_processor import CommandPriority, CommandProcessor
@@ -19,7 +18,11 @@ from .diagnostics import RpcDiagnostics
 from .recovery_contracts import CallResult, GateDecision, Guard, NotSent, Pending, Reply, ResultCall, require_reply
 from .store import Journal, RecoveryRequiredError, fingerprint
 
+if TYPE_CHECKING:
+    from .command_outcomes import OwnerWire, OwnerWireScope
+
 Sender = Callable[[str], Awaitable[None]]
+ReplyHandler = Callable[[str, Frame], bool | None]
 
 
 class UnavailableError(RuntimeError):
@@ -310,7 +313,7 @@ class Peer:
         before_send: Callable[[], None] | None = None,
         on_dispatch: Callable[[str], None] | None = None,
         *,
-        on_reply: Callable[[str, Frame], None] | None = None,
+        on_reply: ReplyHandler | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
         keep_late_reply: bool = False,
     ) -> Frame:
@@ -340,7 +343,7 @@ class Peer:
         before_send: Guard | None = None,
         on_dispatch: Callable[[str], None] | None = None,
         *,
-        on_reply: Callable[[str, Frame], None] | None = None,
+        on_reply: ReplyHandler | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
         keep_late_reply: bool = False,
     ) -> CallResult:
@@ -366,10 +369,11 @@ class Peer:
         check: Callable[[], None],
         *,
         on_dispatch: Callable[[str], None] | None = None,
-        on_reply: Callable[[str, Frame], None] | None = None,
+        on_reply: ReplyHandler | None = None,
         on_sent: Callable[[str], None] | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
         late_reply_action: str | None = None,
+        owner_scope: OwnerWireScope | None = None,
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
         async with self.sequence_results(
             priority,
@@ -379,6 +383,7 @@ class Peer:
             on_sent=on_sent,
             on_receive=on_receive,
             late_reply_action=late_reply_action,
+            owner_scope=owner_scope,
         ) as result_call:
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
@@ -394,10 +399,11 @@ class Peer:
         check: Guard,
         *,
         on_dispatch: Callable[[str], None] | None = None,
-        on_reply: Callable[[str, Frame], None] | None = None,
+        on_reply: ReplyHandler | None = None,
         on_sent: Callable[[str], None] | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
         late_reply_action: str | None = None,
+        owner_scope: OwnerWireScope | None = None,
     ) -> AsyncIterator[ResultCall]:
         async with self.gate.enter(priority):
             # Each call revalidates after native waits and before recording any resource intent.
@@ -414,6 +420,7 @@ class Peer:
                     on_sent,
                     on_receive=on_receive,
                     keep_late_reply=action == late_reply_action,
+                    owner_scope=owner_scope,
                 )
 
             yield call
@@ -480,11 +487,12 @@ class Peer:
         before_send: Guard | None,
         on_dispatch: Callable[[str], None] | None = None,
         preemptible: bool = True,
-        on_reply: Callable[[str, Frame], None] | None = None,
+        on_reply: ReplyHandler | None = None,
         on_sent: Callable[[str], None] | None = None,
         *,
         on_receive: Callable[[str, Frame], None] | None = None,
         keep_late_reply: bool = False,
+        owner_scope: OwnerWireScope | None = None,
     ) -> CallResult:
         priority = CommandPriority.NORMAL if preemptible else CommandPriority.RESTRICT
         processor = self.command_processor
@@ -504,6 +512,7 @@ class Peer:
         self._pending[unique_id] = future
         dispatched = False
         processing_reply = False
+        owner_wire: OwnerWire | None = None
         try:
             actual = self.decide(payload, priority=priority) if callable(payload) else payload
             validation = await self._validate(action, actual, future, preemptible)
@@ -512,6 +521,7 @@ class Peer:
 
             # Guard and record the exact request immediately before its sender can transmit.
             def ready_to_send() -> str | Pending:
+                nonlocal owner_wire
                 if check is not None:
                     permitted = check()
                     if isinstance(permitted, Pending):
@@ -539,7 +549,16 @@ class Peer:
                 self.diagnostics.sending(action, len(unique_id))
                 if on_dispatch is not None:
                     on_dispatch(action)
+                if owner_scope is not None:
+                    owner_wire = owner_scope.sent(unique_id, action, actual)
                 return message
+
+            # Wire evidence is captured in the same receive turn as the action-specific callback.
+            def received(answer: Frame) -> None:
+                if owner_scope is not None and owner_wire is not None:
+                    owner_scope.received(owner_wire, answer)
+                if on_receive is not None:
+                    on_receive(action, answer)
 
             message = self.decide(ready_to_send, priority=priority)
             if isinstance(message, Pending):
@@ -547,8 +566,8 @@ class Peer:
             async with asyncio.timeout(self.timeout):
                 # Receipts can arrive while the original sender is still draining.
                 dispatched = True
-                if on_receive is not None:
-                    self._receivers[unique_id] = (priority, partial(on_receive, action))
+                if on_receive is not None or owner_wire is not None:
+                    self._receivers[unique_id] = (priority, received)
                 await sender(message)
                 if on_sent is not None:
                     sent = on_sent
@@ -597,11 +616,10 @@ class Peer:
         action: str,
         payload: dict[str, Any],
         answer: Frame,
-        on_reply: Callable[[str, Frame], None] | None,
+        on_reply: ReplyHandler | None,
     ) -> Reply:
-        if on_reply is not None:
-            on_reply(action, answer)
-        if self.after_result is not None:
+        handled = on_reply is not None and on_reply(action, answer)
+        if self.after_result is not None and not handled:
             self.after_result(action, payload, answer)
         return Reply(answer)
 

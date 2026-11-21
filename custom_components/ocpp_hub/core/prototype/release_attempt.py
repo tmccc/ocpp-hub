@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from .connection_scope import CloudAttemptScope
 from .managed_intent import ControlIntent
@@ -16,6 +16,9 @@ from .recovery_contracts import (
     ReleaseEffects,
     WireReply,
 )
+
+if TYPE_CHECKING:
+    from .command_outcomes import OwnerWireScope
 
 
 @dataclass
@@ -37,13 +40,28 @@ class ReleaseAttempt:
     failure: BaseException | None = None
     positive_failure: BaseException | None = None
     pending: Pending | None = None
-    positive_reply: WireReply = WireReply.MISSING
     cleanup_failed: bool = False
     before_ticket: str | None = None
     initial_failure_kind: FailureKind | None = None
     failure_kind: FailureKind | None = None
     published: bool = False
     published_authority: AuthorityStamp | None = None
+    request_id: str | None = None
+    wires: OwnerWireScope | None = None
+
+    # The positive reply belongs to the exact issued Set, even if rollback later sends a different Set to zero.
+    @property
+    def positive_reply(self) -> WireReply:
+        if self.wires is None:
+            return WireReply.MISSING
+        for wire in self.wires.wires.values():
+            if wire.action == "SetChargingProfile" and wire.limit_a is not None and wire.limit_a > 0:
+                if wire.reply == "Accepted":
+                    return WireReply.ACCEPTED
+                if wire.reply == "Rejected":
+                    return WireReply.REJECTED
+                return WireReply.MISSING if wire.reply is None else WireReply.ERROR
+        return WireReply.MISSING
 
     # Freeze actual owned facts after cleanup; current authority is checked independently by the coordinator.
     def result(self) -> OwnedReleaseResult:

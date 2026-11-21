@@ -161,6 +161,18 @@ async def test_diagnostic_explanations_keep_evidence_categories_distinct(
     assert data == before
 
 
+# Intent: a known charging reply remains visible while the actual outcome is still pending.
+# Why: a reply to Stop is not evidence that the charger has closed the session.
+async def test_pending_charger_reply_does_not_explain_a_completed_command(actual_hass):
+    from custom_components.ics_proxy.diagnostic_view import diagnostics, explanation
+
+    value = detail()
+    value["pending_commands"][0].update(confirmation="reply_received")
+    data = {"healthy": False, "diagnostics": value}
+    assert diagnostics(value)["pending_commands"][0]["confirmation"] == "reply_received"
+    assert "still checking the outcome" in explanation(data, fresh=True, native_fresh=True)
+
+
 # Intent: unsupported or malformed optional diagnostic fields do not leak arbitrary data or create positive authority.
 # Why: a compatible older proxy remains usable, and diagnostic parsing must handle real bounded JSON edge shapes.
 @pytest.mark.parametrize(

@@ -129,8 +129,9 @@ def command(value: Any) -> dict[str, Any] | None:
     if action is None or state is None:
         return None
     expected = "unknown" if state == "uncertain" else "pending"
+    confirmation = label(value.get("confirmation"), {expected, "reply_received"})
     if (
-        value.get("confirmation") != expected
+        confirmation is None
         or "accepted_at" not in value
         or "age_seconds" not in value
         or any(value[key] is not None and number(value[key]) is None for key in ("accepted_at", "age_seconds"))
@@ -143,7 +144,7 @@ def command(value: Any) -> dict[str, Any] | None:
         "state": state,
         "accepted_at": number(value.get("accepted_at")),
         "age_seconds": number(value.get("age_seconds")),
-        "confirmation": "unknown" if state == "uncertain" else "pending",
+        "confirmation": confirmation,
     }
 
 
@@ -321,6 +322,8 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
         rows = detail["pending_commands"]
         if any(row["confirmation"] == "pending" for row in rows):
             return "A recorded command is still awaiting its confirmed outcome."
+        if any(row["confirmation"] == "reply_received" for row in rows):
+            return "The charger replied. The proxy is still checking the outcome."
         if (
             data.get("desired_control") == "paused"
             and rows
