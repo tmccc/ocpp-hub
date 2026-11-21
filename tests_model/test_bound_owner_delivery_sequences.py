@@ -44,8 +44,8 @@ async def test_bound_owner_delivery_sequences(
             request = asyncio.create_task(child.request("start", id=identifier, revision=state["control_revision"]))
             events.append("request")
             await child.gate(case.phase, identifier)
-            stage = child.durable()["metadata"]["local_start_receipt"]["stage"]
-            assert stage == ("issued" if case.phase == "before-accepted-commit" else "accepted")
+            before = child.durable()["metadata"]["local_start_receipt"]
+            assert before["stage"] == ("issued" if case.phase == "before-accepted-commit" else "accepted")
             tag = starts(child.rig)[-1][3]["idTag"]
             await child.kill()
             actual_sigkill = child.kills[-1]["returncode"] == -9
@@ -55,6 +55,9 @@ async def test_bound_owner_delivery_sequences(
             await child.start()
             await child.status(lambda value: value.get("charger_connected") is True)
             restarted = child.durable()
+            # The real charger reply survives either kill boundary, without publishing management success.
+            recovered = {**before, "stage": "accepted"}
+            assert restarted["metadata"]["local_start_receipt"] == recovered
             assert next(row for row in restarted["requests"] if row["id"] == identifier)["state"] == "uncertain"
             assert restarted["metadata"]["managed_test_charge"]["start_rpc_accepted"] is False
             child.rig.bench.start_replies = ["silent"] if case.cloud == "silent" else ["error"] * 3
@@ -64,7 +67,8 @@ async def test_bound_owner_delivery_sequences(
             assert result[0] == 3
             local = result[2]["transactionId"]
             child.rig.peer.plan_session, child.rig.peer.permission_enabled = (local, 987654), False
-            assert child.durable()["metadata"]["local_start_receipt"]["local"] == local
+            bound = child.durable()["metadata"]["local_start_receipt"]
+            assert {key: bound[key] for key in recovered} == {**recovered, "local": local}
             events.append("late-start")
             expected = "ambiguous" if case.cloud == "silent" else "rejected"
             async with asyncio.timeout(230):
@@ -105,7 +109,7 @@ async def test_bound_owner_delivery_sequences(
             settled = child.durable()
             assert settled["metadata"]["managed_test_charge"]["state"] == "completed"
             assert settled["metadata"]["managed_test_charge"]["start_rpc_accepted"] is False
-            assert settled["metadata"]["local_start_receipt"]["stage"] == stage
+            assert settled["metadata"]["local_start_receipt"] == bound
             assert settled["outbox"][0] == head and settled["metadata"].get("managed_control_fault") == fault
             assert next(row for row in settled["transactions"] if row["local"] == local)["vendor"] is None
             assert child.rig.bench.firmware.effective_limit() == 0
