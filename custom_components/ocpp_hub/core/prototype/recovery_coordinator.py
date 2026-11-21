@@ -37,6 +37,7 @@ from .release_attempt import ReleaseAttempt
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import RecoveryRequiredError
+from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -74,6 +75,10 @@ class RecoveryCoordinator:
 
     # Keep the exact disposition until the receipt update commits or a newer Pause supersedes the request.
     def _settle_return(self, settlement: ReturnSettlement, *, retry: bool = False) -> None:
+        self.c.commands.decide(lambda: self._write_return_settlement(settlement, retry))
+
+    # The same decision handles the first write and any retained storage retry.
+    def _write_return_settlement(self, settlement: ReturnSettlement, retry: bool) -> None:
         try:
             requests = self.c.requests
             if not retry or requests.return_current(settlement.identifier, settlement.intent):
@@ -367,41 +372,46 @@ class RecoveryCoordinator:
                 return RestoreProgress(RestoreState.WAITING, resumed)
         ticket = j.get("control", {}).get("ticket")
         native = await c.native.read_result(closed=continuing_local is None)
-        decision = guard()
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        if isinstance(native, Pending):
-            return RestoreProgress(RestoreState.WAITING, native)
-        decision = c.zero_decision(native, continuing_local=continuing_local)
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        if (
-            c.stopping
-            or not control_scope_matches(g, connection)
-            or epoch != g._charger_epoch
-            or revision != g.controls._revision
-            or ticket != j.get("control", {}).get("ticket")
-            or not j.phase.read().active
-            or j.get("control", {}).get("uncertain")
-        ):
-            raise UnavailableError("managed release authority changed during its native check")
-        decision = guard()
-        if isinstance(decision, Pending):
-            return RestoreProgress(RestoreState.WAITING, decision)
-        if expected_intent.mode == "paused":
-            c.complete_pause_observation(native, expected_intent, connection)
-            if return_request is not None:
-                if not isinstance(ticket, str):
-                    raise RecoveryRequiredError("Return requires its current zero hold ticket")
-                c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
-        return ReleaseAttempt(
-            "automatic" if expected_intent.mode == "app" else "explicit",
-            expected_intent,
-            connection[0],
-            revision,
-            guard,
-            before_ticket=ticket,
-        )
+
+        # Verify the final sample and bind Return to the hold it actually proved.
+        def prepare_release(native: HandoverEvidence | Pending) -> RestoreProgress | ReleaseAttempt:
+            decision = guard()
+            if isinstance(decision, Pending):
+                return RestoreProgress(RestoreState.WAITING, decision)
+            if isinstance(native, Pending):
+                return RestoreProgress(RestoreState.WAITING, native)
+            decision = c.zero_decision(native, continuing_local=continuing_local)
+            if isinstance(decision, Pending):
+                return RestoreProgress(RestoreState.WAITING, decision)
+            if (
+                c.stopping
+                or not control_scope_matches(g, connection)
+                or epoch != g._charger_epoch
+                or revision != g.controls._revision
+                or ticket != j.get("control", {}).get("ticket")
+                or not j.phase.read().active
+                or j.get("control", {}).get("uncertain")
+            ):
+                raise UnavailableError("managed release authority changed during its native check")
+            decision = guard()
+            if isinstance(decision, Pending):
+                return RestoreProgress(RestoreState.WAITING, decision)
+            if expected_intent.mode == "paused":
+                c.complete_pause_observation(native, expected_intent, connection)
+                if return_request is not None:
+                    if not isinstance(ticket, str):
+                        raise RecoveryRequiredError("Return requires its current zero hold ticket")
+                    c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
+            return ReleaseAttempt(
+                "automatic" if expected_intent.mode == "app" else "explicit",
+                expected_intent,
+                connection[0],
+                revision,
+                guard,
+                before_ticket=ticket,
+            )
+
+        return c.commands.decide(lambda: prepare_release(native))
 
     # The wire child records possible dispatch and publishes the result under the original scope.
     async def _run_release(self, attempt: ReleaseAttempt, return_request: str | None) -> RestoreProgress:
@@ -441,53 +451,58 @@ class RecoveryCoordinator:
             rollback_guard=rollback_guard,
             handoff=ReleaseHandoff(publish, committed),
         )
-        decision = ALLOW if result.published else guard()
-        disposition = release_disposition(
-            attempt.purpose,
-            result,
-            c.authority(),
-            zero_ready=g.controls.ready and g.controls.desired() == 0,
-            faulted=j.fault.latched(),
-            publication_allowed=not isinstance(decision, Pending),
-        )
-        if disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT) and result.claimed:
-            with j.atomic():
-                if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
-                    raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
-                assert attempt.ticket is not None
-                g.controls._complete(attempt.ticket, uncertain=False)
-        if disposition is ReleaseDisposition.FAULT:
-            if not c.stopping and c.requests.intent() == expected_intent:
-                c.fault("owner_release_unconfirmed")
-                failure = result.failure
-                try:
-                    j.put(
-                        "managed_release_failure",
-                        {
-                            "type": type(failure).__name__ if failure is not None else "prerequisite_after_release",
-                            "detail": str(failure)[:1024]
-                            if failure is not None
-                            else result.pending.detail
-                            if result.pending
-                            else "release unconfirmed",
-                            "at_epoch": time.time(),
-                            "charger_rpc": g.charger.diagnostics.snapshot(),
-                        },
-                    )
-                except sqlite3.Error:
-                    pass  # The required fault already committed and the command still reports its actual failure.
-            if (
-                return_request is not None
-                and isinstance(result.failure, sqlite3.Error)
-                and result.effects.zero_verified
-                and not result.cleanup_failed
-                and not j.db.in_transaction
-                and j.fault.classification() == "owner_release_unconfirmed"
-            ):
-                raise RecoveryRequiredError(
-                    "Return kept the verified zero hold after a storage failure"
-                ) from result.failure
-            if result.failure is not None:
-                raise result.failure
-            raise RecoveryRequiredError("owned release did not establish shared authority")
-        return restore_progress(disposition, result)
+
+        # Resolve the child's actual reply and rollback against the original Return authority.
+        def settle() -> RestoreProgress:
+            decision = ALLOW if result.published else guard()
+            disposition = release_disposition(
+                attempt.purpose,
+                result,
+                c.authority(),
+                zero_ready=g.controls.ready and g.controls.desired() == 0,
+                faulted=j.fault.latched(),
+                publication_allowed=not isinstance(decision, Pending),
+            )
+            if disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT) and result.claimed:
+                with j.atomic():
+                    if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
+                        raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
+                    assert attempt.ticket is not None
+                    g.controls._complete(attempt.ticket, uncertain=False)
+            if disposition is ReleaseDisposition.FAULT:
+                if not c.stopping and c.requests.intent() == expected_intent:
+                    c.fault("owner_release_unconfirmed")
+                    failure = result.failure
+                    try:
+                        j.put(
+                            "managed_release_failure",
+                            {
+                                "type": type(failure).__name__ if failure is not None else "prerequisite_after_release",
+                                "detail": str(failure)[:1024]
+                                if failure is not None
+                                else result.pending.detail
+                                if result.pending
+                                else "release unconfirmed",
+                                "at_epoch": time.time(),
+                                "charger_rpc": g.charger.diagnostics.snapshot(),
+                            },
+                        )
+                    except sqlite3.Error:
+                        pass  # The required fault already committed and the command still reports its actual failure.
+                if (
+                    return_request is not None
+                    and isinstance(result.failure, sqlite3.Error)
+                    and result.effects.zero_verified
+                    and not result.cleanup_failed
+                    and not j.db.in_transaction
+                    and j.fault.classification() == "owner_release_unconfirmed"
+                ):
+                    raise RecoveryRequiredError(
+                        "Return kept the verified zero hold after a storage failure"
+                    ) from result.failure
+                if result.failure is not None:
+                    raise result.failure
+                raise RecoveryRequiredError("owned release did not establish shared authority")
+            return restore_progress(disposition, result)
+
+        return c.commands.decide(settle)

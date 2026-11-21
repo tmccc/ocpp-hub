@@ -349,19 +349,41 @@ class LocalControl:
         )
         if isinstance(answer, NotSent):
             return CapPending(answer.pending)
-        decision = check()
-        if isinstance(decision, Pending):
-            return CapPending(decision)
-        accepted = answer.frame[0] == 3 and answer.frame[2].get("status") == "Accepted"
-        if not accepted or (
-            self.journal.phase.read().supervised and profile_status("SetChargingProfile", answer.frame) != "Accepted"
-        ):
-            raise UnavailableError("charger did not confirm the station ceiling")
+
+        # Check that the actual Set reply still belongs to this ceiling before asking for its composite.
+        def accept_profile() -> Pending | None:
+            decision = check()
+            if isinstance(decision, Pending):
+                return decision
+            accepted = answer.frame[0] == 3 and answer.frame[2].get("status") == "Accepted"
+            if not accepted or (
+                self.journal.phase.read().supervised
+                and profile_status("SetChargingProfile", answer.frame) != "Accepted"
+            ):
+                raise UnavailableError("charger did not confirm the station ceiling")
+            return None
+
+        pending = self.peer.decide(accept_profile)
+        if pending is not None:
+            return CapPending(pending)
         verification = await self._verify_ceiling_result(call, limit, check)
         if verification is not None:
             return CapPending(verification)
-        self._confirmed = (epoch, boot, limit)
-        return answer
+        pending = self._confirm_ceiling(epoch, boot, limit, check)
+        return CapPending(pending) if pending is not None else answer
+
+    # Publish verified current only while both its wire result and its original owner still apply.
+    def _confirm_ceiling(self, epoch: int, boot: str | None, limit: float, check: Guard) -> Pending | None:
+        # Confirming zero is part of restrictive work.
+        def confirm() -> Pending | None:
+            pending = check()
+            if isinstance(pending, Pending):
+                return pending
+            self._confirmed = (epoch, boot, limit)
+            return None
+
+        priority = CommandPriority.RESTRICT if limit == 0 else CommandPriority.NORMAL
+        return self.peer.decide(confirm, priority=priority)
 
     # Each composite and retry revalidates current ownership and may return an ordinary prerequisite as data.
     async def _verify_ceiling_result(self, call: ResultCall, limit: float, check: Guard) -> Pending | None:
@@ -385,11 +407,18 @@ class LocalControl:
             completed_at = datetime.now(UTC)
             if isinstance(verification, NotSent):
                 return verification.pending
-            decision = check()
-            if isinstance(decision, Pending):
-                return decision
-            try:
+
+            # Use the schedule and exact owner together, with the receipt time captured before the decision.
+            def accept_composite(verification: Reply) -> Pending | None:
+                decision = check()
+                if isinstance(decision, Pending):
+                    return decision
                 verify_composite(verification.frame, limit, completed_at)
+                return None
+
+            try:
+                priority = CommandPriority.RESTRICT if limit == 0 else CommandPriority.NORMAL
+                return self.peer.decide(lambda: accept_composite(verification), priority=priority)
             except FutureScheduleError as error:
                 if error.ahead_seconds > 1 or attempt == 2:
                     raise UnavailableError("composite schedule remains outside present coverage") from None
@@ -404,8 +433,6 @@ class LocalControl:
                 decision = check()
                 if isinstance(decision, Pending):
                     return decision
-            else:
-                return None
         raise UnavailableError("composite schedule remains outside present coverage")
 
     # Establish or restore the desired ceiling before a start, native plan or new authenticated connection is used.
@@ -446,11 +473,12 @@ class LocalControl:
                     pending = await self._verify_ceiling_result(call, limit, check)
                 except ExcessiveCompositeError:
                     if self.retained_ceiling_exceeded is not None:
-                        self.retained_ceiling_exceeded()
+                        self.peer.decide(self.retained_ceiling_exceeded, priority=CommandPriority.RESTRICT)
                     raise
+                if pending is None:
+                    pending = self._confirm_ceiling(epoch, boot, limit, check)
                 if pending is not None:
                     require_allowed(pending)
-                self._confirmed = (epoch, boot, limit)
             else:
                 result = await self._cap_result(call, limit, epoch, guard=check)
                 if isinstance(result, CapPending):
@@ -482,23 +510,30 @@ class LocalControl:
         on_restrictive_claim: Callable[[str | None, str], None] | None = None,
         on_claim: Callable[[str], None] | None = None,
     ) -> Frame:
-        if guard is not None:
-            guard()
         limit = number(value, self.policy.max_current_a)
         limit = 0.0 if limit < 6 else limit
-        if limit > 0 and self.journal.phase.starting:
-            raise DeniedError("initial native admission has not completed")
-        previous = self.journal.get("control", {})
-        if previous.get("inhibit") and limit > 0:
-            raise DeniedError("resume or release explicitly before raising a stopped limit")
-        with self.journal.atomic() if on_claim is not None else nullcontext():
-            epoch, ticket = self._claim(previous.get("inhibit", False) or limit == 0)
-            if on_claim is not None:
-                on_claim(ticket)
-            if limit == 0 and on_restrictive_claim is not None:
-                on_restrictive_claim(previous.get("ticket"), ticket)
-            if limit > 0:
-                self._complete(ticket, resume_limit=limit)
+        priority = CommandPriority.RESTRICT if limit == 0 else CommandPriority.NORMAL
+
+        # Claim the slider request and bind its managed receipt together.
+        def claim() -> tuple[int, str]:
+            if guard is not None:
+                guard()
+            if limit > 0 and self.journal.phase.starting:
+                raise DeniedError("initial native admission has not completed")
+            previous = self.journal.get("control", {})
+            if previous.get("inhibit") and limit > 0:
+                raise DeniedError("resume or release explicitly before raising a stopped limit")
+            with self.journal.atomic() if on_claim is not None else nullcontext():
+                epoch, ticket = self._claim(previous.get("inhibit", False) or limit == 0)
+                if on_claim is not None:
+                    on_claim(ticket)
+                if limit == 0 and on_restrictive_claim is not None:
+                    on_restrictive_claim(previous.get("ticket"), ticket)
+                if limit > 0:
+                    self._complete(ticket, resume_limit=limit)
+            return epoch, ticket
+
+        epoch, ticket = self.peer.decide(claim, priority=priority)
 
         # The managed selector retains app authority only while its durable request generation still matches.
         def check() -> None:
@@ -508,8 +543,13 @@ class LocalControl:
 
         async with self.peer.sequence(0 if limit == 0 else 1, check) as call:
             answer = await self._cap(call, limit, epoch)
-        check()
-        self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
+
+        # Leave the result with the ticket that produced the verified ceiling.
+        def settle() -> None:
+            check()
+            self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
+
+        self.peer.decide(settle, priority=priority)
         return answer
 
     # Every actual Boot retires Stop acknowledgements even when its metadata is unchanged.
@@ -651,18 +691,26 @@ class LocalControl:
                     if cap_error is not None:
                         raise cap_error from error
                     raise StopReplyUnconfirmedError("transaction stop reply was unavailable") from error
-                if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
-                    if cap_error is not None:
-                        raise cap_error
-                    raise StopReplyUnconfirmedError("transaction stop was not confirmed")
-                self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
-                # The actual StopTransaction may already have retired the live session while its reply was in flight.
-                stop_guard = None
-                check()
+
+                # Keep an actual acknowledgement for the exact transaction it addressed.
+                def accept_stop(answer: Frame) -> None:
+                    nonlocal stop_guard
+                    if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
+                        if cap_error is not None:
+                            raise cap_error
+                        raise StopReplyUnconfirmedError("transaction stop was not confirmed")
+                    self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
+                    # The StopTransaction report may already have closed this session.
+                    stop_guard = None
+                    check()
+
+                self.peer.decide(lambda: accept_stop(answer), priority=CommandPriority.RESTRICT)
             if cap_error is not None:
                 raise cap_error
         assert answer is not None
-        self._complete(ticket, uncertain=bool(pending_start))
+        self.peer.decide(
+            lambda: self._complete(ticket, uncertain=bool(pending_start)), priority=CommandPriority.RESTRICT
+        )
         return answer
 
     # Keep any previous lower ceiling; a rejected or uncertain start reasserts zero before returning failure.
@@ -735,28 +783,32 @@ class LocalControl:
         handoff: StartHandoff | None = None,
         attempt: StartAttempt | None = None,
     ) -> Frame:
-        if scope_guard is not None:
-            scope_guard()
-        if guard is not None:
-            guard()
-        if not self.policy.allow_local_start and guard is None:
-            raise DeniedError("local Start is disabled; charging remains under the app and charger schedule")
-        if self.journal.phase.starting:
-            raise DeniedError("initial native admission has not completed")
-        previous = self.journal.get("control", {})
-        if previous.get("uncertain") or previous.get("start_pending"):
-            raise RecoveryRequiredError("previous local outcome requires reconciliation")
-        if (
-            not any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
-            or self.journal.active() is not None
-        ):
-            raise DeniedError("tag is not allowed or a transaction is unresolved")
-        with self.journal.atomic():
-            epoch, ticket = self._claim(previous.get("inhibit", False))
-            self.journal.starts.prepare(ticket, fingerprint(tag.casefold()), request_id)
-            if on_prepared is not None:
-                on_prepared()
+        # Claim and prepare this Start before waiting for its independent evidence and wire result.
+        def claim() -> tuple[int, str, dict[str, Any]]:
+            if scope_guard is not None:
+                scope_guard()
+            if guard is not None:
+                guard()
+            if not self.policy.allow_local_start and guard is None:
+                raise DeniedError("local Start is disabled; charging remains under the app and charger schedule")
+            if self.journal.phase.starting:
+                raise DeniedError("initial native admission has not completed")
+            previous = self.journal.get("control", {})
+            if previous.get("uncertain") or previous.get("start_pending"):
+                raise RecoveryRequiredError("previous local outcome requires reconciliation")
+            if (
+                not any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
+                or self.journal.active() is not None
+            ):
+                raise DeniedError("tag is not allowed or a transaction is unresolved")
+            with self.journal.atomic():
+                epoch, ticket = self._claim(previous.get("inhibit", False))
+                self.journal.starts.prepare(ticket, fingerprint(tag.casefold()), request_id)
+                if on_prepared is not None:
+                    on_prepared()
+            return epoch, ticket, previous
 
+        epoch, ticket, previous = self.peer.decide(claim)
         restoring_zero = False
 
         # Positive permission may be revoked; the same exact ticket and Boot still permit its restrictive rollback.
@@ -807,43 +859,66 @@ class LocalControl:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
-                if self.authorize is not None and not self.authorize(tag):
-                    raise DeniedError("authorization changed before forwarding a local start")
-                with self.journal.atomic():
-                    self.journal.starts.armed(ticket)
-                answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
-                if attempt is not None:
-                    attempt.answer = answer
-                if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
-                    if answer[0] == 3 and answer[2] == {"status": "Rejected"}:
-                        record_stage("rejected")
-                    raise UnavailableError("transaction start was not confirmed")
-                record_stage("accepted")
-                check()
-                publication = None
-                with self.journal.atomic():
+
+                # Arm the exact attempt only after its ceiling and current authorization agree.
+                def arm() -> None:
                     check()
-                    if handoff is not None:
-                        if scope is None:
-                            raise RecoveryRequiredError("managed Start publication lacks its exact Boot scope")
-                        publication = handoff.write_in_transaction(
-                            StartHandoffContext(request_id, ticket, scope, self._revision, fingerprint(tag.casefold()))
-                        )
-                    self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
-                if publication is not None:
-                    assert handoff is not None
-                    handoff.committed(publication)
+                    if self.authorize is not None and not self.authorize(tag):
+                        raise DeniedError("authorization changed before forwarding a local start")
+                    with self.journal.atomic():
+                        self.journal.starts.armed(ticket)
+
+                self.peer.decide(arm)
+                answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
+
+                # Save the wire fact first, then grant control only if the same owner can still publish.
+                def settle(answer: Frame) -> None:
                     if attempt is not None:
-                        attempt.publication = publication
+                        attempt.answer = answer
+                    if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
+                        if answer[0] == 3 and answer[2] == {"status": "Rejected"}:
+                            record_stage("rejected")
+                        raise UnavailableError("transaction start was not confirmed")
+                    record_stage("accepted")
+                    check()
+                    publication = None
+                    with self.journal.atomic():
+                        check()
+                        if handoff is not None:
+                            if scope is None:
+                                raise RecoveryRequiredError("managed Start publication lacks its exact Boot scope")
+                            publication = handoff.write_in_transaction(
+                                StartHandoffContext(
+                                    request_id, ticket, scope, self._revision, fingerprint(tag.casefold())
+                                )
+                            )
+                        self._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
+                    if publication is not None:
+                        assert handoff is not None
+                        handoff.committed(publication)
+                        if attempt is not None:
+                            attempt.publication = publication
+
+                self.peer.decide(lambda: settle(answer))
             except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError, sqlite3.Error:
-                retire_unsent_local_start(self.journal, ticket)
-                self._complete(ticket, inhibit=True)
-                self._check(epoch, ticket)
-                restoring_zero = True
+                # A failed Start can restore only the zero hold owned by its original ticket.
+                def hold() -> None:
+                    nonlocal restoring_zero
+                    retire_unsent_local_start(self.journal, ticket)
+                    self._complete(ticket, inhibit=True)
+                    self._check(epoch, ticket)
+                    restoring_zero = True
+
+                self.peer.decide(hold, priority=CommandPriority.RESTRICT)
                 await self._cap(call, 0, epoch)
-                check()
-                if attempt is not None:
-                    attempt.zero_verified = True
+
+                # Retain verification only for the attempt whose rollback completed.
+                def confirm_rollback() -> None:
+                    check()
+                    if attempt is not None:
+                        attempt.zero_verified = True
+
+                self.peer.decide(confirm_rollback, priority=CommandPriority.RESTRICT)
                 raise
         return answer
 
@@ -911,27 +986,35 @@ class LocalControl:
         attempt: ReleaseAttempt | None = None,
         handoff: ReleaseHandoff | None = None,
     ) -> Pending | None:
-        if guard is not None:
-            pending = guard()  # A newer Pause must be checked before this child claims any ownership.
-            if isinstance(pending, Pending):
-                return pending
-        if self.journal.phase.starting:
-            raise DeniedError("initial native admission has not completed")
-        previous = self.journal.get("control", {})
-        if attempt is not None and rollback_guard is not None:
-            # A task can start after a new Boot or hold has replaced the verified preflight.
-            try:
-                rollback_guard()
-            except UnavailableError as error:
-                return Pending(Prerequisite.SUPERSEDED, "release Boot changed before the claim", error)
-            if previous.get("ticket") != attempt.before_ticket:
-                return Pending(Prerequisite.SUPERSEDED, "release hold changed before the claim")
-        if previous.get("uncertain") and not acknowledge_uncertainty:
-            raise RecoveryRequiredError("previous local outcome requires reconciliation")
-        epoch, ticket = self._claim(previous.get("inhibit", False))
-        if attempt is not None:
-            attempt.ticket = ticket
-        self._release_ticket = ticket
+        # Claim Release only while its preflight still describes this exact hold and connection.
+        def claim() -> tuple[int, str, dict[str, Any]] | Pending:
+            if guard is not None:
+                pending = guard()  # A newer Pause must be checked before this child claims any ownership.
+                if isinstance(pending, Pending):
+                    return pending
+            if self.journal.phase.starting:
+                raise DeniedError("initial native admission has not completed")
+            previous = self.journal.get("control", {})
+            if attempt is not None and rollback_guard is not None:
+                # A task can start after a new Boot or hold has replaced the verified preflight.
+                try:
+                    rollback_guard()
+                except UnavailableError as error:
+                    return Pending(Prerequisite.SUPERSEDED, "release Boot changed before the claim", error)
+                if previous.get("ticket") != attempt.before_ticket:
+                    return Pending(Prerequisite.SUPERSEDED, "release hold changed before the claim")
+            if previous.get("uncertain") and not acknowledge_uncertainty:
+                raise RecoveryRequiredError("previous local outcome requires reconciliation")
+            epoch, ticket = self._claim(previous.get("inhibit", False))
+            if attempt is not None:
+                attempt.ticket = ticket
+            self._release_ticket = ticket
+            return epoch, ticket, previous
+
+        claimed = self.peer.decide(claim)
+        if isinstance(claimed, Pending):
+            return claimed
+        epoch, ticket, previous = claimed
         try:
             restoring_zero = False
 
@@ -966,16 +1049,25 @@ class LocalControl:
             async with self.peer.sequence_results(1, check, on_dispatch=dispatched, on_reply=received) as call:
                 # Both failure and pending rollback retain the same ticket, Boot and observed zero sequence.
                 async def rollback_zero() -> None:
-                    nonlocal restoring_zero
-                    self._complete(ticket, inhibit=True)
-                    self._check(epoch, ticket)
-                    restoring_zero = True
+                    # Only the current ticket may withdraw positive control before the zero write.
+                    def hold() -> None:
+                        nonlocal restoring_zero
+                        self._complete(ticket, inhibit=True)
+                        self._check(epoch, ticket)
+                        restoring_zero = True
+
+                    self.peer.decide(hold, priority=CommandPriority.RESTRICT)
                     rollback = await self._cap_result(call, 0, epoch)
                     if isinstance(rollback, CapPending):
                         raise RecoveryRequiredError("owned release rollback did not reach verified zero")
-                    check()
-                    if attempt is not None:
-                        attempt.zero_confirmed = True
+
+                    # Own and publish this rollback's actual verified zero.
+                    def confirm_zero() -> None:
+                        check()
+                        if attempt is not None:
+                            attempt.zero_confirmed = True
+
+                    self.peer.decide(confirm_zero, priority=CommandPriority.RESTRICT)
 
                 try:
                     result = await self._cap_result(
@@ -983,43 +1075,55 @@ class LocalControl:
                         number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a),
                         epoch,
                     )
-                    pending = result.pending if isinstance(result, CapPending) else check()
-                    if attempt is not None and isinstance(result, Reply):
-                        attempt.positive_confirmed = True
-                    if not isinstance(pending, Pending):
-                        publication = None
-                        with self.journal.atomic():
-                            pending = check()
-                            if not isinstance(pending, Pending) and handoff is not None:
-                                if attempt is None:
-                                    raise RecoveryRequiredError("managed release publication lacks owned identity")
-                                publication = handoff.write_in_transaction(
-                                    AuthorityStamp(attempt.intent, attempt.scope, attempt.control_revision, ticket)
-                                )
-                                if isinstance(publication, Pending):
-                                    pending = publication
-                            if not isinstance(pending, Pending):
-                                self._complete(ticket, owner="shared", inhibit=False, uncertain=False)
+
+                    # The verified ceiling can publish shared ownership only in its guarded handoff.
+                    def settle(result: Reply | CapPending) -> Pending | None:
+                        pending = result.pending if isinstance(result, CapPending) else check()
+                        if attempt is not None and isinstance(result, Reply):
+                            attempt.positive_confirmed = True
                         if not isinstance(pending, Pending):
-                            if attempt is not None:
-                                attempt.published = True
-                                attempt.published_authority = (
-                                    publication if isinstance(publication, AuthorityStamp) else None
-                                )
-                            if handoff is not None:
-                                assert isinstance(publication, AuthorityStamp)
-                                handoff.committed(publication)
-                            return None
-                    if attempt is not None:
-                        attempt.pending = pending
+                            publication = None
+                            with self.journal.atomic():
+                                pending = check()
+                                if not isinstance(pending, Pending) and handoff is not None:
+                                    if attempt is None:
+                                        raise RecoveryRequiredError("managed release publication lacks owned identity")
+                                    publication = handoff.write_in_transaction(
+                                        AuthorityStamp(attempt.intent, attempt.scope, attempt.control_revision, ticket)
+                                    )
+                                    if isinstance(publication, Pending):
+                                        pending = publication
+                                if not isinstance(pending, Pending):
+                                    self._complete(ticket, owner="shared", inhibit=False, uncertain=False)
+                            if not isinstance(pending, Pending):
+                                if attempt is not None:
+                                    attempt.published = True
+                                    attempt.published_authority = (
+                                        publication if isinstance(publication, AuthorityStamp) else None
+                                    )
+                                if handoff is not None:
+                                    assert isinstance(publication, AuthorityStamp)
+                                    handoff.committed(publication)
+                                return None
+                        if attempt is not None:
+                            attempt.pending = pending
+                        return pending
+
+                    pending = self.peer.decide(lambda: settle(result))
+                    if pending is None:
+                        return None
                 except (UnavailableError, DeniedError, RecoveryRequiredError, SecurityError, sqlite3.Error) as error:
                     if attempt is not None:
                         attempt.positive_failure = error
                         attempt.initial_failure_kind = failure_kind(error)
                     await rollback_zero()
                     if attempt is None and isinstance(error, ReleaseDeferredError):
-                        check()
-                        self._complete(ticket, uncertain=False)
+                        # A deferred legacy release still settles only its own verified zero.
+                        def settle_deferred() -> None:
+                            check()
+                            self._complete(ticket, uncertain=False)
+
+                        self.peer.decide(settle_deferred, priority=CommandPriority.RESTRICT)
                     raise
                 await rollback_zero()
                 return pending

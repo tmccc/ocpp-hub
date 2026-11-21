@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .command_processor import CommandPriority
 from .control_state import ControlState
 from .gateway import NativeStartReport
 from .local_control import local_start_receipt
@@ -229,34 +230,40 @@ class OrdinaryRecovery:
     # Existing commissioned ownership and a current matching Boot permit only zero while native HTTP is unavailable.
     async def hold(self, reason: str) -> None:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        if not self.ordinary() or not g.current_boot_seen(g._charger_epoch):
-            raise RecoveryRequiredError("ordinary recovery awaits admitted current owner authority")
-        c.native.spec.require_boot(j.get("boot"))
-        if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
-            raise RecoveryRequiredError("ordinary zero hold requires the existing admitted station receipt")
-        current = j.get(KEY, {})
-        local = j.active()
-        if not self.active():
-            current = {
-                "state": "holding",
-                "revision": c.requests.intent().revision,
-                "local": local,
-                "start": self.start_digest(local),
-                "selected_a": c.current.selected(),
-                "reason": reason,
-                "at_epoch": time.time(),
-            }
-            j.put(KEY, current)
-        elif current.get("local") is not None and local is None:
-            old = j.db.execute("SELECT stop FROM transactions WHERE local=?", (current["local"],)).fetchone()
-            if old is not None and old["stop"] is not None:
-                current = {**current, "local": None, "start": None}
+
+        # Claim the exact current zero before the RPC, while keeping the call itself independent.
+        def claim() -> tuple[dict[str, Any], int, str | None]:
+            if not self.ordinary() or not g.current_boot_seen(g._charger_epoch):
+                raise RecoveryRequiredError("ordinary recovery awaits admitted current owner authority")
+            c.native.spec.require_boot(j.get("boot"))
+            if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
+                raise RecoveryRequiredError("ordinary zero hold requires the existing admitted station receipt")
+            current = j.get(KEY, {})
+            local = j.active()
+            if not self.active():
+                current = {
+                    "state": "holding",
+                    "revision": c.requests.intent().revision,
+                    "local": local,
+                    "start": self.start_digest(local),
+                    "selected_a": c.current.selected(),
+                    "reason": reason,
+                    "at_epoch": time.time(),
+                }
                 j.put(KEY, current)
-        epoch, boot = g._charger_epoch, g.boot_observation
-        if not j.get("control", {}).get("inhibit") or j.get("control", {}).get("owner") != "local":
-            g.controls._claim(True, stopping=True)
-        j.phase.recover()
-        c.released_epoch = None
+            elif current.get("local") is not None and local is None:
+                old = j.db.execute("SELECT stop FROM transactions WHERE local=?", (current["local"],)).fetchone()
+                if old is not None and old["stop"] is not None:
+                    current = {**current, "local": None, "start": None}
+                    j.put(KEY, current)
+            epoch, boot = g._charger_epoch, g.boot_observation
+            if not j.get("control", {}).get("inhibit") or j.get("control", {}).get("owner") != "local":
+                g.controls._claim(True, stopping=True)
+            j.phase.recover()
+            c.released_epoch = None
+            return current, epoch, boot
+
+        current, epoch, boot = c.commands.decide(claim, priority=CommandPriority.RESTRICT)
 
         # A new owner intent, source epoch or overlapping state machine cannot inherit this station write.
         def guard() -> None:
@@ -335,6 +342,10 @@ class OrdinaryRecovery:
 
     # A zero-only introduction acknowledges current proof without replaying Start, Stop or another domain's duty.
     def zero_introduction_decision(self, native: HandoverEvidence, local: int | None) -> GateDecision:
+        return self.c.commands.decide(lambda: self._accept_zero_introduction(native, local))
+
+    # Record the zero proof and publish its exact Boot revision together.
+    def _accept_zero_introduction(self, native: HandoverEvidence, local: int | None) -> GateDecision:
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         if c.native.introduction_pending or c.native.introduced_epoch != g._charger_epoch:
             return Pending(Prerequisite.ZERO_PROOF, "ordinary recovery awaits completed charger introduction")
@@ -492,6 +503,10 @@ class OrdinaryRecovery:
 
     # Retry the journal note under the exact release that already completed, without touching the charger.
     def finish_recovery(self) -> bool:
+        return self.c.commands.decide(self._settle_recovery)
+
+    # Settle the recovery receipt only for the release that completed.
+    def _settle_recovery(self) -> bool:
         completed = self.completion
         if completed is None:
             return False

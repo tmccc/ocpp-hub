@@ -203,8 +203,13 @@ class ManagedCharging:
             return
         try:
             native = await self.controller.native.read()
-            if not self.controller.stopping:
-                self.retire_closed_at_zero(native)
+
+            # Apply the exact closure while the controller still owns supervision.
+            def settle_closure() -> None:
+                if not self.controller.stopping:
+                    self.retire_closed_at_zero(native)
+
+            self.controller.commands.decide(settle_closure)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             return
 
@@ -508,47 +513,52 @@ class ManagedCharging:
 
     # Settle the exact failed operation before optional diagnostics; a newer restrictive winner remains intact.
     async def _failed_start(self, lease: ChargeLease, error: Exception, effects: bool) -> None:
-        c, j = self.controller, self.journal
+        c = self.controller
         while not self._closing and not c.stopping:
             try:
-                record = j.starts.load(wire=False, request_id=lease.identifier)
-                facts = StartFailureFacts(
-                    lease.identifier, "start" if lease.normal else "start_test", self.lease is lease, effects
-                )
-                decision = settle_start(record, facts)
-                if decision.action is StartFailureAction.UNRELATED:
-                    return
-                assert record is not None and record.request is not None
-                cause = {
-                    "id": lease.identifier,
-                    "action": record.request.action,
-                    "revision": record.request.revision,
-                    "type": type(error).__name__,
-                    "detail": str(error)[:1024],
-                    "at_epoch": time.time(),
-                    "effects_started": effects,
-                }
-                record = j.starts.load(ledger=False)
-                decision = settle_start(record, facts)
-                if decision.retire_prepared:
-                    assert record is not None
-                    retire_unsent_local_start(j, record.receipt.ticket)
-                if decision.action is StartFailureAction.DIAGNOSTIC_ONLY:
-                    self.record_failure_diagnostic(cause)
-                    return  # A deadline or later proof already owns the state and immutable terminal receipt.
-                if decision.action is StartFailureAction.FAIL_PREFLIGHT:
-                    j.starts.fail_preflight(lease.identifier, cause)
-                    self.changed.set()
-                    self.retire_refused_unsent()
-                else:
-                    self.stop(lease, "start_not_confirmed", failure=cause)
-                self.record_failure_diagnostic(cause)
+                c.commands.decide(lambda: self._settle_failed_start(lease, error, effects))
                 return
             except sqlite3.Error:
                 # Genuine critical storage failure retains the separate deadline's existing zero/Stop authority.
                 lease.deadline = min(lease.deadline, time.monotonic())
                 self.changed.set()
                 await asyncio.sleep(0.1)
+
+    # Use the failed reply's lease and actual recorded effects before settling Start.
+    def _settle_failed_start(self, lease: ChargeLease, error: Exception, effects: bool) -> None:
+        j = self.journal
+        record = j.starts.load(wire=False, request_id=lease.identifier)
+        facts = StartFailureFacts(
+            lease.identifier, "start" if lease.normal else "start_test", self.lease is lease, effects
+        )
+        decision = settle_start(record, facts)
+        if decision.action is StartFailureAction.UNRELATED:
+            return
+        assert record is not None and record.request is not None
+        cause = {
+            "id": lease.identifier,
+            "action": record.request.action,
+            "revision": record.request.revision,
+            "type": type(error).__name__,
+            "detail": str(error)[:1024],
+            "at_epoch": time.time(),
+            "effects_started": effects,
+        }
+        record = j.starts.load(ledger=False)
+        decision = settle_start(record, facts)
+        if decision.retire_prepared:
+            assert record is not None
+            retire_unsent_local_start(j, record.receipt.ticket)
+        if decision.action is StartFailureAction.DIAGNOSTIC_ONLY:
+            self.record_failure_diagnostic(cause)
+            return  # A deadline or later proof already owns the state and immutable terminal receipt.
+        if decision.action is StartFailureAction.FAIL_PREFLIGHT:
+            j.starts.fail_preflight(lease.identifier, cause)
+            self.changed.set()
+            self.retire_refused_unsent()
+        else:
+            self.stop(lease, "start_not_confirmed", failure=cause)
+        self.record_failure_diagnostic(cause)
 
     # Compatibility diagnostics cannot keep a settled worker alive or undo its request-bound durable cause.
     def record_failure_diagnostic(self, cause: dict[str, Any]) -> None:
@@ -802,8 +812,16 @@ class ManagedCharging:
             if expected.mode == "paused" or active is not None and not self.current_daily(active):
                 await self.hold_expired()
             native = await c.native.read()
-            unissued = self.retire_unissued_at_zero(native)
-            self.retire_closed_at_zero(native)
+
+            # Apply the native closure to the original outstanding owner Start.
+            def settle_at_zero() -> bool:
+                if c.requests.intent() != expected:
+                    raise RecoveryRequiredError("expired Start observation was superseded")
+                unissued = self.retire_unissued_at_zero(native)
+                self.retire_closed_at_zero(native)
+                return unissued
+
+            unissued = c.commands.decide(settle_at_zero)
             local, owner = j.active(), local_start_receipt(j)
             if expected.mode == "app" and local is not None and self.independent_daily(native, local):
                 if (
@@ -825,7 +843,14 @@ class ManagedCharging:
                     progress = await c.recovery.restore(expected)
                     if not progress.shared:
                         return True
-                j.starts.complete_metadata(self.state())
+
+                # A later restore or Pause can leave a different request as the current row.
+                def complete_expired_start() -> None:
+                    current = self.state()
+                    if current.get("id") == state.get("id"):
+                        j.starts.complete_metadata(current)
+
+                c.commands.decide(complete_expired_start)
                 return False
             if expected.mode == "app" and local is None and not native.physical.transaction_open:
                 if (

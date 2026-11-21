@@ -261,51 +261,55 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     common_guard()
     # Two fresh native proofs retain the original source-publication and final-publication boundaries.
     native = await c.native.read(closed=True)
-    require_original_zero(native)
+    c.commands.decide(lambda: require_original_zero(native))
     common_guard()
     native = await c.native.read(closed=True)
-    require_original_zero(native)
-    with j.atomic():
+
+    # Apply the second verified zero and its fault/receipt changes before publishing the recovered revision.
+    def settle() -> bool:
         require_original_zero(native)
-        control = j.get("control")
-        for record in terminal:
-            complete_record(c, record)
-        j.put(
-            PROOF,
-            {
-                "prior_fault": fault,
-                "prior_native_failure": ack.get("native_failure"),
-                "prior_current_failure": current,
-                "delivery_reconciliation": delivery_recovery_digest(delivery) if delivery is not None else None,
-                "operator_reconciliation": fingerprint(operator) if operator is not None else None,
-                "denied_start_reconciliation": fingerprint(denied) if denied is not None else None,
-                "pause_request": ack["pause_request"],
-                "revision": intent.revision,
-                "native_digest": native.digest,
-                "boot_observation": boot,
-                "at_epoch": time.time(),
-                "zero_hold_retained": True,
-                "charging_started": False,
-            },
-        )
-        j.fault.clear()
-        j.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
-        if delivery is not None:
-            complete_delivery_recovery(j, delivery, ack["pause_request"])
-        if operator is not None:
-            complete_operator_recovery(j, operator, ack["pause_request"])
-        if denied is not None:
-            complete_denied_start(j, denied, ack["pause_request"])
-        if current is not None:
-            control = {**control, "resume_limit": current["previous_a"]}
-            j.current_change.reconcile_at_zero(current["change"], current["previous_a"])
-        j.phase.recover_introduced(control)
-    # fault() invalidated the old revision. This complete closed proof re-establishes only current zero introduction.
-    # Never assign a newer revision before every binding/Boot/debt/closed-zero check and the durable commit succeed.
-    c.native.audited_epoch = epoch
-    c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
-    c.released_epoch = None
-    if terminal_test is not None:
-        c.session.journal.starts.set_lease(None)
-        c.charging.changed.set()
-    return True
+        with j.atomic():
+            require_original_zero(native)
+            control = j.get("control")
+            for record in terminal:
+                complete_record(c, record)
+            j.put(
+                PROOF,
+                {
+                    "prior_fault": fault,
+                    "prior_native_failure": ack.get("native_failure"),
+                    "prior_current_failure": current,
+                    "delivery_reconciliation": delivery_recovery_digest(delivery) if delivery is not None else None,
+                    "operator_reconciliation": fingerprint(operator) if operator is not None else None,
+                    "denied_start_reconciliation": fingerprint(denied) if denied is not None else None,
+                    "pause_request": ack["pause_request"],
+                    "revision": intent.revision,
+                    "native_digest": native.digest,
+                    "boot_observation": boot,
+                    "at_epoch": time.time(),
+                    "zero_hold_retained": True,
+                    "charging_started": False,
+                },
+            )
+            j.fault.clear()
+            j.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
+            if delivery is not None:
+                complete_delivery_recovery(j, delivery, ack["pause_request"])
+            if operator is not None:
+                complete_operator_recovery(j, operator, ack["pause_request"])
+            if denied is not None:
+                complete_denied_start(j, denied, ack["pause_request"])
+            if current is not None:
+                control = {**control, "resume_limit": current["previous_a"]}
+                j.current_change.reconcile_at_zero(current["change"], current["previous_a"])
+            j.phase.recover_introduced(control)
+        # Publish the current zero introduction after its evidence checks and durable commit.
+        c.native.audited_epoch = epoch
+        c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
+        c.released_epoch = None
+        if terminal_test is not None:
+            c.session.journal.starts.set_lease(None)
+            c.charging.changed.set()
+        return True
+
+    return c.commands.decide(settle)

@@ -42,7 +42,7 @@ from .station import StationChoice, StationDiscovery
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
 from .trial_evidence import NativeObserver
-from .trial_handover_evidence import ObserveHandover
+from .trial_handover_evidence import HandoverEvidence, ObserveHandover
 from .trial_resources import Baseline, ResourceBook
 from .trial_transport import TrialTransport
 
@@ -196,11 +196,13 @@ class TrialSession:
                 },
             )
             self.gateway = Gateway(self.journal, policy, timeout=5)
+            processor = self.gateway.use_command_processor()
             self._station_inventory = (sum(r.kind == "profile" for r in prepared.baseline.resources), False)
             self.station = StationDiscovery(
                 self.journal,
                 StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
                 lambda: self._station_inventory,
+                commands=processor,
             )
             self.gateway.controls.prepare_station = self.station.prepare_result
             self.gateway.controls.station_missing = self.book.station_ceiling_lost
@@ -262,10 +264,15 @@ class TrialSession:
         try:
             if self.connected_cleanup_only:
                 native = await self.native_bounded.read(closed=True)
-                present = self.book.owned_present(native.physical)
-                self.book.require_zero_station(present)
-                if not self.gateway.current_boot_seen(self.gateway._charger_epoch):
-                    raise SecurityError("bounded cleanup introduction needs actual Boot")
+
+                # Confirm cleanup introduction against the actual native inventory and current Boot.
+                def confirm_cleanup() -> None:
+                    present = self.book.owned_present(native.physical)
+                    self.book.require_zero_station(present)
+                    if not self.gateway.current_boot_seen(self.gateway._charger_epoch):
+                        raise SecurityError("bounded cleanup introduction needs actual Boot")
+
+                self.gateway.decide(confirm_cleanup, priority=CommandPriority.RESTRICT)
                 return
             try:
                 selected = self._commissioned_selection()
@@ -413,21 +420,7 @@ class TrialSession:
                     latch_managed_fault(self.gateway, refusal.classification, diagnostic=diagnostic)
                 raise
             else:
-                if self.journal.get("trial_binding") is None:
-                    self.native_bounded.require_known_session(native)
-                else:
-                    self.native_bounded.require_recovery_session(native)
-                self.book.owned_present(native.physical)
-                self.journal.control.hold(self.journal.get("control", {}))
-                if self.journal.get("trial_binding") is None:
-                    self.native_bounded.spec.require_admission(native, self.journal.identity)
-                    if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
-                        raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
-                    self.journal.require_allocation()
-                    self.journal.phase.activate()
-                    self.journal.phase.begin_introduction()
-                else:
-                    self.journal.phase.recover()
+                self.gateway.decide(lambda: self._accept_startup_observation(native), priority=CommandPriority.RESTRICT)
         elif phase.value == "rollback":
             native = await self.native_bounded.read(closed=True)
             if not self.book.owned_present(native.physical):
@@ -437,6 +430,24 @@ class TrialSession:
             raise RecoveryRequiredError("native bounded restoration requires no new listener")
         await self.runtime.start()
         self.started = True
+
+    # Establish startup's actual session and resources before publishing the restricted introduction.
+    def _accept_startup_observation(self, native: HandoverEvidence) -> None:
+        if self.journal.get("trial_binding") is None:
+            self.native_bounded.require_known_session(native)
+        else:
+            self.native_bounded.require_recovery_session(native)
+        self.book.owned_present(native.physical)
+        self.journal.control.hold(self.journal.get("control", {}))
+        if self.journal.get("trial_binding") is None:
+            self.native_bounded.spec.require_admission(native, self.journal.identity)
+            if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
+                raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
+            self.journal.require_allocation()
+            self.journal.phase.activate()
+            self.journal.phase.begin_introduction()
+        else:
+            self.journal.phase.recover()
 
     # A small explicit operator interface keeps all controls inside the original gateway ownership rules.
     async def command(self, value: dict[str, Any]) -> dict[str, Any]:

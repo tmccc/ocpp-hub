@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from ..frames import Frame, build_call, build_call_error, build_call_result
+from .command_processor import CommandPriority, CommandProcessor
 from .diagnostics import RpcDiagnostics
 from .recovery_contracts import CallResult, GateDecision, Guard, NotSent, Pending, Reply, ResultCall, require_reply
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -46,6 +47,7 @@ class InboundCache:
     # Only one Gateway owns a journal; prior-process connections cannot receive replies or retain live authority.
     def __init__(self, capacity: int = 32, *, journal: Journal | None = None) -> None:
         self.capacity = capacity
+        self.command_processor: CommandProcessor | None = None
         self.db = journal.db if journal is not None else sqlite3.connect(":memory:", isolation_level=None)
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS inbound_receipts("
@@ -96,15 +98,46 @@ class InboundCache:
     ) -> str:
         key = side, epoch, frame[1]
         digest = fingerprint(frame[2:])
+        priority = CommandPriority.RESTRICT if stop else CommandPriority.NORMAL
+        processor = self.command_processor
+
+        # Keep receipt admission and completion in the same order as other decisions.
+        def decide[T](decision: Callable[[], T]) -> T:
+            return decision() if processor is None else processor.decide(decision, priority=priority)
+
+        # Yield before claiming the receipt so cancellation always has a clear owner.
+        if processor is not None:
+            await processor.yield_to_restrictions(priority)
+        receipt = decide(lambda: self._admit(key, digest, stop, read))
+        if isinstance(receipt, str):
+            return receipt
+        future, owner = receipt
+        if not owner:
+            return await asyncio.shield(future)
+        try:
+            text = await handler()
+        except BaseException:
+            # Keep a terminal receipt even on cancellation after possible dispatch.
+            decide(lambda: self.complete(key, digest, future, self.unavailable(key[2]), read))
+            raise
+        return decide(lambda: self.complete(key, digest, future, text, read))
+
+    # Admit one owner for a new request or return the existing receipt for a duplicate.
+    def _admit(
+        self, key: tuple[str, int, str], digest: str, stop: bool, read: bool
+    ) -> str | tuple[asyncio.Future[str], bool]:
+        side, epoch, token = key
+        if self._epochs.get(side, epoch) != epoch:
+            return self.unavailable(token)
         previous = self._items.get(key)
         if previous is not None:
             if previous[0] != digest:
-                return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
-            return await asyncio.shield(previous[1])
+                return build_call_error(token, "FormationViolation", "CALL id has a different request body")
+            return previous[1], False
         recent = self._reads.get(key)
         if recent is not None:
             if recent[0] != digest:
-                return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
+                return build_call_error(token, "FormationViolation", "CALL id has a different request body")
             return recent[1]
         try:
             stored = self.db.execute(
@@ -112,24 +145,18 @@ class InboundCache:
             ).fetchone()
             if stored is not None:
                 if stored[0] != digest:
-                    return build_call_error(frame[1], "FormationViolation", "CALL id has a different request body")
-                return stored[1] if isinstance(stored[1], str) else self.unavailable(frame[1])
+                    return build_call_error(token, "FormationViolation", "CALL id has a different request body")
+                return stored[1] if isinstance(stored[1], str) else self.unavailable(token)
             if len(self._items) >= self.capacity + int(stop):
-                return build_call_error(frame[1], "OccurrenceConstraintViolation", "request queue is full")
+                return build_call_error(token, "OccurrenceConstraintViolation", "request queue is full")
             if not read:
                 self.db.execute("INSERT INTO inbound_receipts VALUES(?,?,?,?,NULL)", (*key, digest))
         except sqlite3.Error:
-            # Without a durable pre-handler receipt, no command may execute or be silently replayed.
-            return self.unavailable(frame[1])
+            # A command without a durable receipt must not execute.
+            return self.unavailable(token)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._items[key] = digest, future
-        try:
-            text = await handler()
-        except BaseException:
-            # Preserve a bounded terminal answer even on cancellation after a possibly dispatched command.
-            self.complete(key, digest, future, self.unavailable(frame[1]), read)
-            raise
-        return self.complete(key, digest, future, text, read)
+        return future, True
 
     # Replacement connections retire their own old results; in-flight old handlers cannot insert them again.
     def retire(self, side: str, epoch: int) -> None:
@@ -216,6 +243,7 @@ class Peer:
     def __init__(self, name: str, timeout: float) -> None:
         self.name = name
         self.timeout = timeout
+        self.command_processor: CommandProcessor | None = None
         self.validation_timeout = 15.0
         self.sender: Sender | None = None
         self.gate = PriorityGate()
@@ -224,6 +252,11 @@ class Peer:
         self.validate_send: Callable[[str, dict[str, Any]], Awaitable[GateDecision | None]] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
         self.diagnostics = RpcDiagnostics()
+
+    # Use the shared queue for state decisions made from replies, including during exception cleanup.
+    def decide[T](self, decision: Callable[[], T], *, priority: CommandPriority = CommandPriority.NORMAL) -> T:
+        processor = self.command_processor
+        return decision() if processor is None else processor.decide(decision, priority=priority)
 
     # Correlate replies by fresh, namespaced ids; unknown replies are ignored.
     def receive(self, frame: Frame) -> None:
@@ -394,8 +427,12 @@ class Peer:
         *,
         retain_reply_on_exit: bool = False,
     ) -> CallResult:
+        priority = CommandPriority.NORMAL if preemptible else CommandPriority.RESTRICT
+        processor = self.command_processor
+        if processor is not None:
+            await processor.yield_to_restrictions(priority)
         if check is not None:
-            decision = check()
+            decision = self.decide(check, priority=priority)
             if isinstance(decision, Pending):
                 return NotSent(decision)
         sender = self.sender
@@ -409,42 +446,54 @@ class Peer:
         dispatched = False
         noted_reply = False
         try:
-            actual = payload() if callable(payload) else payload
+            actual = self.decide(payload, priority=priority) if callable(payload) else payload
             decision = await self._validate(action, actual, future, preemptible)
             if isinstance(decision, Pending):
                 return NotSent(decision)
-            if check is not None:
-                decision = check()
-                if isinstance(decision, Pending):
-                    return NotSent(decision)
-            if self.sender is not sender:
-                raise UnavailableError("request was not sent; peer changed during outgoing validation")
-            if before_send is not None:
-                decision = before_send()
-                if isinstance(decision, Pending):
-                    return NotSent(decision)
-            if self.before_send is not None:
-                decision = self.before_send(action, actual)
-                if isinstance(decision, Pending):
-                    return NotSent(decision)
-            message = build_call(unique_id, action, actual)
-            self.diagnostics.sending(action, len(unique_id))
-            if on_dispatch is not None:
-                on_dispatch(action)
+
+            # Guard and record the exact request immediately before its sender can transmit.
+            def ready_to_send() -> str | Pending:
+                if check is not None:
+                    permitted = check()
+                    if isinstance(permitted, Pending):
+                        return permitted
+                if self.sender is not sender:
+                    raise UnavailableError("request was not sent; peer changed during outgoing validation")
+                if preemptible and self.gate.restrictive_waiting.is_set():
+                    raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
+                if future.done():
+                    future.result()
+                    raise UnavailableError("request was not sent; peer replied before dispatch")
+                if before_send is not None:
+                    permitted = before_send()
+                    if isinstance(permitted, Pending):
+                        return permitted
+                if self.before_send is not None:
+                    permitted = self.before_send(action, actual)
+                    if isinstance(permitted, Pending):
+                        return permitted
+                message = build_call(unique_id, action, actual)
+                self.diagnostics.sending(action, len(unique_id))
+                if on_dispatch is not None:
+                    on_dispatch(action)
+                return message
+
+            message = self.decide(ready_to_send, priority=priority)
+            if isinstance(message, Pending):
+                return NotSent(message)
             async with asyncio.timeout(self.timeout):
                 dispatched = True
                 await sender(message)
                 if on_sent is not None:
-                    on_sent(action)
+                    sent = on_sent
+                    self.decide(lambda: sent(action), priority=priority)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 if on_reply is not None:
                     noted_reply = True
-                    on_reply(action, answer)
-                if self.after_result is not None:
-                    self.after_result(action, actual, answer)
+                result = self.decide(lambda: self._accept_reply(action, actual, answer, on_reply), priority=priority)
                 self.diagnostics.phase = "complete"
-                return Reply(answer)
+                return result
         except (TimeoutError, OSError, UnavailableError, asyncio.CancelledError) as error:
             # The delivery owner can retain a reply already accepted by the receiver before the task unwinds.
             if (
@@ -456,7 +505,8 @@ class Peer:
                 and not future.cancelled()
                 and future.exception() is None
             ):
-                on_reply(action, future.result())
+                remembered, observe = future.result(), on_reply
+                self.decide(lambda: observe(action, remembered), priority=priority)
             if isinstance(error, (UnavailableError, asyncio.CancelledError)):
                 raise
             detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
@@ -468,6 +518,20 @@ class Peer:
                 future.exception()
             elif not future.done():
                 future.cancel()
+
+    # Record the actual reply first, then let the resource owner interpret the result.
+    def _accept_reply(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        answer: Frame,
+        on_reply: Callable[[str, Frame], None] | None,
+    ) -> Reply:
+        if on_reply is not None:
+            on_reply(action, answer)
+        if self.after_result is not None:
+            self.after_result(action, payload, answer)
+        return Reply(answer)
 
     # Fail pending work immediately on a disconnect without affecting the other peer.
     def detach(self) -> None:

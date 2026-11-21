@@ -499,19 +499,22 @@ class ConnectionRuntime:
                     await asyncio.sleep(self.settings.pump_interval)
                     continue
                 await self.gateway.flush()
-                self.status.delivery_blocked = False
-                self.status.delivery_blocked_cause = None
+                self.gateway.decide(lambda: self._settle_delivery_status(None))
             except RegistrationDeferredError as error:
                 await asyncio.sleep(error.retry_after)
-            except (RecoveryRequiredError, ConflictError) as error:
-                self.status.delivery_blocked = True
-                self.status.delivery_blocked_cause = "reconciliation"
-                self.status.last_failure = type(error).__name__
-            except sqlite3.Error as error:
-                self.status.delivery_blocked = True
-                self.status.delivery_blocked_cause = "storage"
-                self.status.last_failure = type(error).__name__
+            except (RecoveryRequiredError, ConflictError, sqlite3.Error) as error:
+                failure = error
+                self.gateway.decide(lambda: self._settle_delivery_status(failure))
             await asyncio.sleep(self.settings.pump_interval)
+
+    # The delivery outcome affects local supervision as well as the displayed diagnosis.
+    def _settle_delivery_status(self, failure: Exception | None) -> None:
+        self.status.delivery_blocked = failure is not None
+        if failure is None:
+            self.status.delivery_blocked_cause = None
+        else:
+            self.status.delivery_blocked_cause = "storage" if isinstance(failure, sqlite3.Error) else "reconciliation"
+            self.status.last_failure = type(failure).__name__
 
     # OCPP data-frame heartbeats are distinct from websocket Ping/Pong and continue through journal quarantine.
     async def _heartbeat(self) -> None:
@@ -521,7 +524,11 @@ class ConnectionRuntime:
                 continue
             await asyncio.sleep(self.gateway.vendor_interval)
             await self.gateway.heartbeat()
-            self.status.heartbeats += 1
+            self.gateway.decide(self._count_heartbeat)
+
+    # Count only a correlated and validated cloud heartbeat.
+    def _count_heartbeat(self) -> None:
+        self.status.heartbeats += 1
 
     # Bound shutdown and leave journal ownership to the caller; no connection survives its runtime.
     async def close(self) -> None:

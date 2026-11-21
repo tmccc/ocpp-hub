@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .command_processor import CommandPriority
 from .connection_scope import control_scope_matches, current_control_scope
 from .gateway import Gateway
 from .native_bounded import readiness_decision
@@ -32,17 +33,21 @@ class ManagedRefusal:
 
 # Keep the first proved refusal and its diagnostic atomic, including when introduction precedes the first poll.
 def latch_managed_fault(gateway: Gateway, reason: str, *, diagnostic: dict[str, Any] | None = None) -> None:
-    journal = gateway.journal
-    if not journal.fault.latched():
-        with journal.atomic():
-            fault: dict[str, Any] = {"classification": reason, "at_epoch": time.time()}
-            if diagnostic is not None:
-                journal.put("managed_native_failure", diagnostic)
-                fault["native_failure_digest"] = fingerprint(diagnostic)
-            journal.fault.replace(fault)
-            control = journal.get("control", {})
-            journal.phase.fault(control)
-        gateway.controls.invalidate()
+    # Save and withdraw authority at the same restrictive turn.
+    def latch() -> None:
+        journal = gateway.journal
+        if not journal.fault.latched():
+            with journal.atomic():
+                fault: dict[str, Any] = {"classification": reason, "at_epoch": time.time()}
+                if diagnostic is not None:
+                    journal.put("managed_native_failure", diagnostic)
+                    fault["native_failure_digest"] = fingerprint(diagnostic)
+                journal.fault.replace(fault)
+                control = journal.get("control", {})
+                journal.phase.fault(control)
+            gateway.controls.invalidate()
+
+    gateway.decide(latch, priority=CommandPriority.RESTRICT)
 
 
 # An independently absent ceiling allows Stop of the same known charge and cannot establish a zero hold.
@@ -72,23 +77,34 @@ async def stop_for_missing_station(controller: ManagedController) -> None:
                 return
             sample = error.native
             require_allowed(readiness_decision(sample, False, native.allow_unplugged, local))
-        if (
-            not control_scope_matches(gateway, connection)
-            or controller.requests.intent() != intent
-            or controller.stopping
-            or journal.active() != local
-            or not sample.physical.transaction_open
-            or sample.physical.native_transaction_id != local
-            or sample.physical.history is None
-            or any(resource.key == f"profile:{HUB_PROFILE_ID}" for resource in sample.physical.resources)
-            or not session.book.station_ceiling_lost()
-            or not native.commissioned_binding_matches(sample)
-        ):
-            return
+        sequence = native.last_resolved_read
 
-        controller.fault(STATION_CEILING_LOST)
-        # Fault publication withdraws old positive authority. The restrictive claim has its own ticket.
-        connection = current_control_scope(gateway)
+        # Only this observation may withdraw authority before taking its scoped Stop claim.
+        def accept_absence() -> bool:
+            nonlocal connection
+            if native.last_resolved_read != sequence:
+                return False
+            if (
+                not control_scope_matches(gateway, connection)
+                or controller.requests.intent() != intent
+                or controller.stopping
+                or journal.active() != local
+                or not sample.physical.transaction_open
+                or sample.physical.native_transaction_id != local
+                or sample.physical.history is None
+                or any(resource.key == f"profile:{HUB_PROFILE_ID}" for resource in sample.physical.resources)
+                or not session.book.station_ceiling_lost()
+                or not native.commissioned_binding_matches(sample)
+            ):
+                return False
+
+            controller.fault(STATION_CEILING_LOST)
+            # Fault publication withdraws old positive authority. The restrictive claim has its own ticket.
+            connection = current_control_scope(gateway)
+            return True
+
+        if not controller.commands.decide(accept_absence, priority=CommandPriority.RESTRICT):
+            return
         fault, sequence = journal.fault.read(), native.last_resolved_read
         control = journal.control.read()
         stop_epoch, prior_ticket = control.values.get("stop_epoch", 0), control.values.get("ticket")

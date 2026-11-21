@@ -165,7 +165,7 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 fresh_code = trial_evidence.Evidence.require_fresh.__code__
                 pause_code = type(c).require_paused.__code__
                 tick_code = type(c)._tick.__code__
-                supervise_code = type(c)._supervise.__code__
+                supervise_code = type(c)._accept_supervision.__code__
                 observed_code = type(c.charging).observed.__code__
 
                 # Supply wall time only; inspect real call/sample identity without replacing a validator.

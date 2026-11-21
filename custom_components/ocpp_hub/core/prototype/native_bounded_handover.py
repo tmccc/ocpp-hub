@@ -11,13 +11,14 @@ from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
+from .command_processor import CommandPriority
 from .connection_scope import ConnectionLineage, control_scope_matches, current_scope
 from .control_state import ControlState
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
 from .managed_current import current_session_decision, managed_current_ceiling, record_current_source
-from .managed_native_repair import NativeRepairAudits
+from .managed_native_repair import NativeRepairAudits, RepairAttempt
 from .managed_recovery import local_recovery_binding
 from .managed_sources import recorded_station_profile
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready, readiness_decision
@@ -189,29 +190,173 @@ class NativeBoundedHandover:
         selected_current: int | None = None,
         stop_only: bool = False,
     ) -> HandoverEvidence | Pending:
-        self.read_sequence += 1
-        sequence, before = self.read_sequence, self.authority()
         repair, gateway = None if stop_only else self.repair_audits, self.gateway
-        attempt = (
-            repair.begin(before, sequence, gateway._charger_epoch, gateway.boot_observation, gateway.controls._revision)
-            if repair is not None
-            else None
-        )
-        content_current = False
-        strict_complete = False
-        resource_error: NativeContentError | None = None
 
-        # Only the newest resolved read may invalidate freshness; an older outcome cannot erase its successor.
-        def invalidate() -> None:
-            if sequence >= self.last_resolved_read:
-                self.last_verified_at = 0
+        # Stamp the original authority before the observation leaves for the station.
+        def begin() -> tuple[int, str, RepairAttempt | None]:
+            self.read_sequence += 1
+            sequence, before = self.read_sequence, self.authority()
+            attempt = (
+                repair.begin(
+                    before, sequence, gateway._charger_epoch, gateway.boot_observation, gateway.controls._revision
+                )
+                if repair is not None
+                else None
+            )
+            return sequence, before, attempt
 
-        # Resolve failed or complete reads without letting an older HTTP result publish newer authority.
-        def current() -> bool:
-            if sequence < self.last_resolved_read:
-                return False
-            self.last_resolved_read = sequence
-            return before == self.authority()
+        sequence, before, attempt = gateway.decide(begin)
+
+        # Interpret a complete HTTP result or failure in the decision that can publish its evidence.
+        def settle(sample: HandoverEvidence | BaseException) -> HandoverEvidence | Pending:
+            content_current = False
+            strict_complete = False
+            resource_error: NativeContentError | None = None
+
+            # Only the newest resolved read may invalidate freshness; an older outcome cannot erase its successor.
+            def invalidate() -> None:
+                if sequence >= self.last_resolved_read:
+                    self.last_verified_at = 0
+
+            # Resolve failed or complete reads without letting an older HTTP result publish newer authority.
+            def current() -> bool:
+                if sequence < self.last_resolved_read:
+                    return False
+                self.last_resolved_read = sequence
+                return before == self.authority()
+
+            try:
+                if isinstance(sample, BaseException):
+                    raise sample
+                native = sample
+                if not current():
+                    raise AuditSupersededError("native bounded audit was superseded by local authority")
+                content_current = True
+                measured = self._inspect(native, route=route)
+                if (
+                    selected_current is not None
+                    and gateway.journal.current_change.read().settled_or_missing
+                    and managed_current_ceiling(gateway.journal, self.spec) == 32
+                ):
+                    measured = measured.selected(selected_current)
+                try:
+                    inspect_history(
+                        gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start
+                    )
+                except MissingOriginalHistoryError as error:
+                    # A repairable omission must not hide a simultaneous contradiction in the same native sample.
+                    if resource_error := self.book.native_conflict(native.physical, owned=True):
+                        raise resource_error from error
+                    raise
+                if initial:
+                    if native.physical.history is None:
+                        raise SecurityError("actual Boot introduction requires complete current history")
+                    verify_initial_history(
+                        gateway.journal, native.physical.history, gateway.journal.identity, self.spec.hardware_identity
+                    )
+                if attempt is not None and (gateway.controls._operations or gateway.charger._pending):
+                    raise RecoveryRequiredError("native repair awaits settled resource operations")
+                resource_error = self.book.native_conflict(
+                    native.physical, owned=owned or stop_only or attempt is not None
+                )
+                strict_complete = True
+                self.book.check_originals(native.physical)
+                if not stop_only and (owned or attempt is not None):
+                    self.book.owned_present(native.physical)
+                if resource_error is not None:
+                    raise resource_error
+                # Restrictive Stop only needs the independent comparisons above and its own command record.
+                if not stop_only:
+                    audit_history(
+                        gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start
+                    )
+                    if self.command_source_observer is not None:
+                        self.command_source_observer(native)
+                    record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
+                    if self.ordinary_source_observer is not None:
+                        self.ordinary_source_observer(native)
+                if measured.exceeded:
+                    raise _NativeMeasurementError(native, measured, self.authority(), sequence)
+                _require_ready(native, False, self.allow_unplugged, closing_local)
+            except NativeContentError as error:
+                invalidate()
+                # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
+                if not content_current and not current():
+                    if repair is not None:
+                        repair.finish(attempt, "superseded")
+                    raise AuditSupersededError("native content refusal was superseded by local authority") from error
+                if repair is not None:
+                    repair.finish(attempt, "strict", error)
+                raise
+            except _NativeMeasurementError:
+                invalidate()
+                if repair is not None:
+                    repair.finish(attempt, "measurement")
+                raise
+            except (NativeTransportUnavailableError, StaleEvidenceError) as error:
+                invalidate()
+                applicable = current()
+                if repair is not None:
+                    repair.finish(attempt, "availability" if applicable else "superseded")
+                if not applicable:
+                    raise AuditSupersededError("native availability result was superseded") from error
+                if as_result:
+                    return Pending(Prerequisite.NATIVE, "recovery awaits fresh complete native evidence", error)
+                if self.gateway.journal.current_change.read().recovering:
+                    raise UnavailableError("current selection hold awaits fresh native evidence") from error
+                ordinary = self.gateway.journal.get("managed_ordinary_recovery", {})
+                intent = self.gateway.journal.get("managed_control_intent", {})
+                if (
+                    ordinary.get("state") == "holding"
+                    and intent == {"mode": "app", "revision": ordinary.get("revision")}
+                    and not (gateway.controls.ready and gateway.controls.desired() > 0)
+                ):
+                    raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
+                raise
+            except (SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
+                invalidate()
+                applicable = current()
+                if repair is not None:
+                    repair.finish(attempt, "readiness" if applicable else "superseded")
+                if (
+                    applicable
+                    and as_result
+                    and isinstance(error, NativeReadinessError)
+                    and error.unplugged_at_zero
+                    and error.native.physical.native_transaction_id == gateway.journal.active()
+                ):
+                    return Pending(Prerequisite.LIFECYCLE, str(error), error)
+                raise
+            except sqlite3.Error as error:
+                invalidate()
+                # Pure content comparisons precede publication; a proved resource refusal cannot become a storage wait.
+                if repair is not None and resource_error is not None:
+                    repair.defer(attempt, "strict", resource_error)
+                    raise resource_error from error
+                if repair is not None and strict_complete:
+                    repair.defer(attempt, "readiness", storage_error=error)
+                # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
+                raise
+            except asyncio.CancelledError:
+                invalidate()
+                if repair is not None:
+                    repair.finish(attempt, "availability")
+                raise
+            if repair is not None:
+                repair.finish(attempt, "validated")
+            self.last_verified_at = native.physical.observed_at
+            if not stop_only and self.observation_listener is not None:
+                self.observation_listener(native)
+            # A valid open source remains fresh while this particular operation awaits a closed station.
+            if closed:
+                if as_result:
+                    self._inspect(native, route=route).require()
+                    decision = readiness_decision(native, True, self.allow_unplugged, None)
+                    if isinstance(decision, Pending):
+                        return decision
+                else:
+                    self.require(native, route=route, closed=True)
+            return native
 
         try:
             try:
@@ -219,130 +364,20 @@ class NativeBoundedHandover:
                     native = await self.observe()
             except TimeoutError as error:
                 raise NativeTransportUnavailableError("complete native observation exceeded its deadline") from error
-            if not current():
-                raise AuditSupersededError("native bounded audit was superseded by local authority")
-            content_current = True
-            measured = self._inspect(native, route=route)
-            if (
-                selected_current is not None
-                and gateway.journal.current_change.read().settled_or_missing
-                and managed_current_ceiling(gateway.journal, self.spec) == 32
-            ):
-                measured = measured.selected(selected_current)
-            try:
-                inspect_history(
-                    gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start
-                )
-            except MissingOriginalHistoryError as error:
-                # A repairable omission must not hide a simultaneous contradiction in the same native sample.
-                if resource_error := self.book.native_conflict(native.physical, owned=True):
-                    raise resource_error from error
-                raise
-            if initial:
-                if native.physical.history is None:
-                    raise SecurityError("actual Boot introduction requires complete current history")
-                verify_initial_history(
-                    gateway.journal, native.physical.history, gateway.journal.identity, self.spec.hardware_identity
-                )
-            if attempt is not None and (gateway.controls._operations or gateway.charger._pending):
-                raise RecoveryRequiredError("native repair awaits settled resource operations")
-            resource_error = self.book.native_conflict(native.physical, owned=owned or stop_only or attempt is not None)
-            strict_complete = True
-            self.book.check_originals(native.physical)
-            if not stop_only and (owned or attempt is not None):
-                self.book.owned_present(native.physical)
-            if resource_error is not None:
-                raise resource_error
-            # Restrictive Stop only needs the independent comparisons above and its own command record.
-            if not stop_only:
-                audit_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
-                if self.command_source_observer is not None:
-                    self.command_source_observer(native)
-                record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
-                if self.ordinary_source_observer is not None:
-                    self.ordinary_source_observer(native)
-            if measured.exceeded:
-                raise _NativeMeasurementError(native, measured, self.authority(), sequence)
-            _require_ready(native, False, self.allow_unplugged, closing_local)
-        except NativeContentError as error:
-            invalidate()
-            # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
-            if not content_current and not current():
-                if repair is not None:
-                    repair.finish(attempt, "superseded")
-                raise AuditSupersededError("native content refusal was superseded by local authority") from error
-            if repair is not None:
-                repair.finish(attempt, "strict", error)
-            raise
-        except _NativeMeasurementError:
-            invalidate()
-            if repair is not None:
-                repair.finish(attempt, "measurement")
-            raise
-        except (NativeTransportUnavailableError, StaleEvidenceError) as error:
-            invalidate()
-            applicable = current()
-            if repair is not None:
-                repair.finish(attempt, "availability" if applicable else "superseded")
-            if not applicable:
-                raise AuditSupersededError("native availability result was superseded") from error
-            if as_result:
-                return Pending(Prerequisite.NATIVE, "recovery awaits fresh complete native evidence", error)
-            if self.gateway.journal.current_change.read().recovering:
-                raise UnavailableError("current selection hold awaits fresh native evidence") from error
-            ordinary = self.gateway.journal.get("managed_ordinary_recovery", {})
-            intent = self.gateway.journal.get("managed_control_intent", {})
-            if (
-                ordinary.get("state") == "holding"
-                and intent == {"mode": "app", "revision": ordinary.get("revision")}
-                and not (gateway.controls.ready and gateway.controls.desired() > 0)
-            ):
-                raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
-            raise
-        except (SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
-            invalidate()
-            applicable = current()
-            if repair is not None:
-                repair.finish(attempt, "readiness" if applicable else "superseded")
-            if (
-                applicable
-                and as_result
-                and isinstance(error, NativeReadinessError)
-                and error.unplugged_at_zero
-                and error.native.physical.native_transaction_id == gateway.journal.active()
-            ):
-                return Pending(Prerequisite.LIFECYCLE, str(error), error)
-            raise
-        except sqlite3.Error as error:
-            invalidate()
-            # Pure content comparisons precede publication; a proved resource refusal cannot become a storage wait.
-            if repair is not None and resource_error is not None:
-                repair.defer(attempt, "strict", resource_error)
-                raise resource_error from error
-            if repair is not None and strict_complete:
-                repair.defer(attempt, "readiness", storage_error=error)
-            # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
-            raise
-        except asyncio.CancelledError:
-            invalidate()
-            if repair is not None:
-                repair.finish(attempt, "availability")
-            raise
-        if repair is not None:
-            repair.finish(attempt, "validated")
-        self.last_verified_at = native.physical.observed_at
-        if not stop_only and self.observation_listener is not None:
-            self.observation_listener(native)
-        # A valid open source remains fresh while this particular operation awaits a closed station.
-        if closed:
-            if as_result:
-                self._inspect(native, route=route).require()
-                decision = readiness_decision(native, True, self.allow_unplugged, None)
-                if isinstance(decision, Pending):
-                    return decision
-            else:
-                self.require(native, route=route, closed=True)
-        return native
+        except (
+            NativeContentError,
+            NativeTransportUnavailableError,
+            StaleEvidenceError,
+            SecurityError,
+            DeniedError,
+            RecoveryRequiredError,
+            UnavailableError,
+            sqlite3.Error,
+            asyncio.CancelledError,
+        ) as error:
+            failure = error
+            return gateway.decide(lambda: settle(failure))
+        return gateway.decide(lambda: settle(native))
 
     # Compose immutable checks before a private measured verdict; it is never usable positive authority.
     def _inspect(self, native: HandoverEvidence, *, route: str = "trial") -> MeasuredValues:
@@ -428,6 +463,13 @@ class NativeBoundedHandover:
         if journal.phase.read().value != "prepared":
             raise RecoveryRequiredError("native bounded admission requires a fresh prepared journal")
         native = await self.observe()
+        self.gateway.decide(lambda: self._accept_admission(native), priority=CommandPriority.RESTRICT)
+
+    # Admit the observed station against the prepared journal in one decision.
+    def _accept_admission(self, native: HandoverEvidence) -> None:
+        journal = self.gateway.journal
+        if journal.phase.read().value != "prepared":
+            raise RecoveryRequiredError("native bounded admission requires a fresh prepared journal")
         self.spec.require_admission(native, journal.identity, route="original")
         self.book.require_profile_free_baseline()
         if native.physical.history is None:
@@ -490,8 +532,13 @@ class NativeBoundedHandover:
             ) as error:
                 # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
                 raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
-            try:
+            read_sequence = self.last_resolved_read
+
+            # Install the binding and require the original station hold before any zero verification.
+            def prepare() -> bool:
                 gateway._require_epoch("charger", epoch)
+                if current_scope(gateway) != scope or self.last_resolved_read != read_sequence:
+                    raise UnavailableError("introduction evidence belongs to a superseded Boot or observation")
                 if binding is None:
                     if (
                         not journal.phase.read().active
@@ -530,6 +577,12 @@ class NativeBoundedHandover:
                 if binding is not None or journal.get("control", {}).get("uncertain"):
                     control = journal.get("control", {})
                     journal.control.hold(control)
+                    return True
+                return False
+
+            try:
+                recovering = gateway.decide(prepare, priority=CommandPriority.RESTRICT)
+                if recovering:
                     if first_zero:
                         # Stay in initial admission until its first zero succeeds,
                         # including a genuinely unapplied refusal.
@@ -562,11 +615,20 @@ class NativeBoundedHandover:
                             raise IntroductionDeferredError(
                                 "initial zero was superseded by a newer owner Pause"
                             ) from error
-                        gateway._require_epoch("charger", epoch)
-                    journal.phase.recover()
-                self.audited_epoch = epoch
-                verified_revision = gateway.controls._revision
-                journal.phase.introduced()
+
+                # Apply the introduction to the same Boot after its optional zero RPC.
+                def confirm() -> int:
+                    gateway._require_epoch("charger", epoch)
+                    if current_scope(gateway) != scope:
+                        raise UnavailableError("the verified charger introduction was superseded")
+                    if recovering:
+                        journal.phase.recover()
+                    self.audited_epoch = epoch
+                    revision = gateway.controls._revision
+                    journal.phase.introduced()
+                    return revision
+
+                verified_revision = gateway.decide(confirm, priority=CommandPriority.RESTRICT)
             except sqlite3.Error as error:
                 # This prefix owns only metadata and restrictive zero; later Stop-capable work is not replayed.
                 raise IntroductionDeferredError("introduction awaits required journal storage") from error
@@ -589,10 +651,15 @@ class NativeBoundedHandover:
                         pass
                 elif journal.active() is not None:
                     await gateway.stop()
-            gateway._require_epoch("charger", epoch)
-            if verified_revision != gateway.controls._revision:
-                raise UnavailableError("the verified charger introduction was superseded")
-            self.introduced_epoch, self.introduced_revision = epoch, verified_revision
+
+            # Keep the audited metadata and revision. The runtime checks zero against the latest actual Boot.
+            def publish() -> None:
+                gateway._require_epoch("charger", epoch)
+                if verified_revision != gateway.controls._revision:
+                    raise UnavailableError("the verified charger introduction was superseded")
+                self.introduced_epoch, self.introduced_revision = epoch, verified_revision
+
+            gateway.decide(publish, priority=CommandPriority.RESTRICT)
             return native
 
     # Finish a paused introduction only from a fresh complete closed-zero proof, never a failed RPC or marker alone.
@@ -725,68 +792,76 @@ class NativeBoundedHandover:
             native = await self.read_result(closed=continuing_local is None)
             if isinstance(native, Pending):
                 return native
-            if continuing_local is not None:
-                if self.continuation_guard is None:
-                    decision: GateDecision = Pending(
-                        Prerequisite.SOURCE, "continuation requires a managed source guard"
-                    )
-                else:
-                    decision = self.continuation_guard(native, continuing_local)
+            sequence = self.last_resolved_read
+
+            # Commit the resume acknowledgement against the exact closed or continuing source.
+            def acknowledge(native: HandoverEvidence) -> dict[str, Any] | Pending:
+                if not control_scope_matches(gateway, (scope, revision)) or self.last_resolved_read != sequence:
+                    return Pending(Prerequisite.SUPERSEDED, "resume observation was superseded")
+                if continuing_local is not None:
+                    if self.continuation_guard is None:
+                        decision: GateDecision = Pending(
+                            Prerequisite.SOURCE, "continuation requires a managed source guard"
+                        )
+                    else:
+                        decision = self.continuation_guard(native, continuing_local)
+                    if isinstance(decision, Pending):
+                        return decision
+                    if local_only or any(v != 0 for v in native.currents_a + native.powers_w):
+                        raise RecoveryRequiredError("original session continuation requires online verified zero")
+                gateway._require_epoch("charger", epoch)
+                self.spec.require_boot(journal.get("boot"))
+                if journal.get("trial_binding") != {
+                    "configuration_digest": self.binding_digest(native),
+                    "station": self.choice.value(),
+                    "boot_digest": self.spec.boot_digest,
+                }:
+                    raise SecurityError("bounded recovery binding changed before acknowledgement")
+                present = self.book.owned_present(native.physical)
+                receipt = journal.db.execute(
+                    "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+                ).fetchone()
+                station = [r for r in present if r.identifier == HUB_PROFILE_ID]
+                control = journal.get("control", {})
+                # Evaluate managed debt against this read, after any waits; an earlier source cannot permit recovery.
+                decision = lifecycle_decision(
+                    gateway,
+                    continuing_local=continuing_local,
+                    preserve_expired_start=not local_only
+                    and preserve_expired_start is not None
+                    and preserve_expired_start(native, continuing_local),
+                )
                 if isinstance(decision, Pending):
                     return decision
-                if local_only or any(v != 0 for v in native.currents_a + native.powers_w):
-                    raise RecoveryRequiredError("original session continuation requires online verified zero")
-            gateway._require_epoch("charger", epoch)
-            self.spec.require_boot(journal.get("boot"))
-            if journal.get("trial_binding") != {
-                "configuration_digest": self.binding_digest(native),
-                "station": self.choice.value(),
-                "boot_digest": self.spec.boot_digest,
-            }:
-                raise SecurityError("bounded recovery binding changed before acknowledgement")
-            present = self.book.owned_present(native.physical)
-            receipt = journal.db.execute(
-                "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-            ).fetchone()
-            station = [r for r in present if r.identifier == HUB_PROFILE_ID]
-            control = journal.get("control", {})
-            # Evaluate managed debt against this read, after any waits; an earlier source cannot permit recovery.
-            decision = lifecycle_decision(
-                gateway,
-                continuing_local=continuing_local,
-                preserve_expired_start=not local_only
-                and preserve_expired_start is not None
-                and preserve_expired_start(native, continuing_local),
-            )
-            if isinstance(decision, Pending):
-                return decision
-            if (
-                journal.phase.read().value != "recovering"
-                or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
-                or not control_scope_matches(gateway, (scope, revision))
-                or ticket != control.get("ticket")
-                or not gateway.current_boot_seen(epoch)
-                or not control.get("inhibit")
-                or gateway.controls.desired() != 0
-                or not gateway.controls.ready
-                or not self.book.confirmed_station_zero(station, receipt)
-                or not local_only
-                and journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-                or gateway.controls._operations
-                or gateway.charger._pending
-                or gateway.vendor._pending
-                or journal.get("uncertain_vendor_command")
-            ):
-                return Pending(
-                    Prerequisite.ZERO_PROOF, "bounded recovery awaits confirmed zero and history reconciliation"
-                )
-            if local_only and local_recovery_binding(gateway, self.spec.digest) != local_binding:
-                raise RecoveryRequiredError("local recovery intent changed during native verification")
-            journal.require_allocation()
-            with journal.atomic():
-                journal.phase.resume(control)
-            self.acknowledged_lineage = scope.lineage
-            return {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}
+                if (
+                    journal.phase.read().value != "recovering"
+                    or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
+                    or not control_scope_matches(gateway, (scope, revision))
+                    or ticket != control.get("ticket")
+                    or not gateway.current_boot_seen(epoch)
+                    or not control.get("inhibit")
+                    or gateway.controls.desired() != 0
+                    or not gateway.controls.ready
+                    or not self.book.confirmed_station_zero(station, receipt)
+                    or not local_only
+                    and journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                    or gateway.controls._operations
+                    or gateway.charger._pending
+                    or gateway.vendor._pending
+                    or journal.get("uncertain_vendor_command")
+                ):
+                    return Pending(
+                        Prerequisite.ZERO_PROOF, "bounded recovery awaits confirmed zero and history reconciliation"
+                    )
+                if local_only and local_recovery_binding(gateway, self.spec.digest) != local_binding:
+                    raise RecoveryRequiredError("local recovery intent changed during native verification")
+                journal.require_allocation()
+                with journal.atomic():
+                    journal.phase.resume(control)
+                self.acknowledged_lineage = scope.lineage
+                return {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}
+
+            return gateway.decide(lambda: acknowledge(native))
 
     # Read the station profile independently of an incoming report's still-unassigned transaction number.
     async def require_reported_start_ceiling(self) -> None:
@@ -818,6 +893,15 @@ class NativeBoundedHandover:
             native = await self.read(
                 closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
             )
+        authority, sequence = self.authority(), self.last_resolved_read
+        return self.gateway.decide(lambda: self._accept_send_observation(action, payload, native, authority, sequence))
+
+    # Apply the independent send evidence before the final wire guard and resource receipt.
+    def _accept_send_observation(
+        self, action: str, payload: dict[str, Any], native: HandoverEvidence, authority: str, sequence: int
+    ) -> GateDecision | None:
+        if authority != self.authority() or sequence != self.last_resolved_read:
+            raise AuditSupersededError("outgoing validation crossed a newer native observation or authority")
         if action in (
             "RemoteStartTransaction",
             "SetChargingProfile",
@@ -922,24 +1006,37 @@ class NativeBoundedHandover:
                                 pass
                         await asyncio.sleep(0.1)
             native = await self.read(closed=True)
-            require_lifecycle_idle(gateway)
-            self.book.owned_present(native.physical)
-            journal.phase.begin_cleanup()
-            self.save("clearing")
-            gateway.controls.invalidate()
+
+            # Move to cleanup only after the actual closed read and its inventory agree.
+            def begin_cleanup() -> None:
+                require_lifecycle_idle(gateway)
+                self.book.owned_present(native.physical)
+                journal.phase.begin_cleanup()
+                self.save("clearing")
+                gateway.controls.invalidate()
+
+            gateway.decide(begin_cleanup, priority=CommandPriority.RESTRICT)
             await quiesce()
             epoch = gateway._charger_epoch
             async with gateway.charger.sequence(0, lambda: gateway._require_epoch("charger", epoch)) as call:
                 while True:
                     native = await self.read(closed=True)
-                    require_lifecycle_idle(gateway)
-                    present = self.book.owned_present(native.physical)
-                    if not present:
+
+                    # Record which verified resource the next clear is allowed to address.
+                    def prepare_clear() -> Resource | None:
+                        require_lifecycle_idle(gateway)
+                        present = self.book.owned_present(native.physical)
+                        if not present:
+                            return None
+                        resource = present[0]
+                        if resource.kind != "profile":
+                            raise SecurityError("native bounded cleanup cannot automatically delete native plans")
+                        self.save("clearing", clear_intent={"key": resource.key, "digest": resource.digest})
+                        return resource
+
+                    resource = gateway.decide(prepare_clear, priority=CommandPriority.RESTRICT)
+                    if resource is None:
                         break
-                    resource = present[0]
-                    if resource.kind != "profile":
-                        raise SecurityError("native bounded cleanup cannot automatically delete native plans")
-                    self.save("clearing", clear_intent={"key": resource.key, "digest": resource.digest})
                     try:
                         answer = await call(
                             "ClearChargingProfile", commands.clear_charging_profile(resource.identifier)
@@ -950,11 +1047,22 @@ class NativeBoundedHandover:
                         # Only independently verified absence resolves a lost reply; never infer a command retry.
                         pass
                     verification = await self.read(closed=True)
-                    if any(row.key == resource.key for row in self.book.owned_present(verification.physical)):
-                        raise UnavailableError("native bounded cleanup has not established physical profile absence")
-            self.save("awaiting_backend", clear_intent={})
-            journal.phase.await_backend()
+                    gateway.decide(
+                        lambda: self._require_clear_observation(verification, resource),
+                        priority=CommandPriority.RESTRICT,
+                    )
+            gateway.decide(self._complete_cleanup, priority=CommandPriority.RESTRICT)
             return {"profiles_restored": True, "native_limit_a": 6, "complete": False}
+
+    # A reply alone cannot settle a clear. Check the exact resource in the independent inventory.
+    def _require_clear_observation(self, native: HandoverEvidence, resource: Resource) -> None:
+        if any(row.key == resource.key for row in self.book.owned_present(native.physical)):
+            raise UnavailableError("native bounded cleanup has not established physical profile absence")
+
+    # Persist cleanup only after every intended resource is independently absent.
+    def _complete_cleanup(self) -> None:
+        self.save("awaiting_backend", clear_intent={})
+        self.gateway.journal.phase.await_backend()
 
     # A route intent is durable and narrowly scoped; a native adapter performs only this exact four-field patch.
     async def restore_route(self, patch: NativePatch, retire: Callable[[], Awaitable[None]]) -> None:
@@ -965,7 +1073,7 @@ class NativeBoundedHandover:
         current = await self.observe()
         if state.get("stage") == "route_intent" and current.configuration == self.spec.configuration("original"):
             await self.read(route="original", closed=True)
-            self.save("awaiting_backend", route_restored=True)
+            self.gateway.decide(self._confirm_restored_route)
             return
         native = await self.read(closed=True)
         require_lifecycle_idle(self.gateway)
@@ -979,6 +1087,10 @@ class NativeBoundedHandover:
         self.save("route_intent", backend_outage_at=disconnected.physical.observed_at)
         await patch({key: self.spec.original_configuration[key] for key in self.spec.trial_route})
         await self.read(route="original", closed=True)
+        self.gateway.decide(self._confirm_restored_route)
+
+    # The original route is confirmed only by an actual post-change read.
+    def _confirm_restored_route(self) -> None:
         self.save("awaiting_backend", route_restored=True)
 
     # Reconnection requires an actual fresh offline view followed by online, after the original route was restored.
@@ -990,6 +1102,13 @@ class NativeBoundedHandover:
         if self.gateway.charger.sender is not None:
             raise SecurityError("proxy transport remains attached during original-backend verification")
         native = await self.read(route="original")
+        return self.gateway.decide(lambda: self._accept_backend_observation(state, native))
+
+    # Store the original backend's actual observed transition against its saved route.
+    def _accept_backend_observation(self, state: dict[str, Any], native: HandoverEvidence) -> dict[str, Any]:
+        journal = self.gateway.journal
+        if journal.get("native_bounded_handover", {}) != state or self.gateway.charger.sender is not None:
+            raise RecoveryRequiredError("backend observation was superseded during verification")
         if not native.physical.upstream_connected:
             self.save("awaiting_backend", backend_outage_at=native.physical.observed_at)
             return {"original_backend_connected": False, "native_limit_a": 6, "complete": False}
@@ -1018,13 +1137,20 @@ class NativeBoundedHandover:
             self.require_restore_idle(idle)
             await patch({"AmpLmt": self.spec.original_configuration["AmpLmt"]})
             native = await self.observe()
+        self.gateway.decide(lambda: self._complete_settings_restoration(native), priority=CommandPriority.RESTRICT)
+        return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}
+
+    # Complete restoration only from verified settings, history and original-backend connection.
+    def _complete_settings_restoration(self, native: HandoverEvidence) -> None:
+        journal = self.gateway.journal
+        if self.gateway.charger.sender is not None:
+            raise RecoveryRequiredError("settings restoration was superseded during verification")
         self.require_normal_restoration(native)
         require_lifecycle_idle(self.gateway)
         with journal.atomic():
             self.save("complete", clear_intent={}, fault=None)
             journal.phase.complete()
         self.last_verified_at = 0
-        return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}
 
     # No unknown native profile or newly active session may release the independent limit during restoration.
     def require_restore_idle(self, native: HandoverEvidence) -> None:

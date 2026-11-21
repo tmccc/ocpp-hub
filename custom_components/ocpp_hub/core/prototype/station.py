@@ -12,6 +12,7 @@ from typing import Any
 from .. import commands
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
+from .command_processor import CommandProcessor
 from .policy import DeniedError, integer
 from .recovery_contracts import NotSent, Reply, ResultCall, require_allowed
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -138,8 +139,16 @@ class StationDiscovery:
     """Fresh generation-scoped reads precede the first station write; selected semantics never change silently."""
 
     # The caller supplies the independent current inventory; this object never opens a transport or native connection.
-    def __init__(self, journal: Journal, choice: StationChoice, inventory: Callable[[], tuple[int, bool]]) -> None:
+    def __init__(
+        self,
+        journal: Journal,
+        choice: StationChoice,
+        inventory: Callable[[], tuple[int, bool]],
+        *,
+        commands: CommandProcessor | None = None,
+    ) -> None:
         self.journal, self.choice, self.inventory = journal, choice, inventory
+        self.commands = commands
         self.epoch = -1
         self.capabilities: StationCapabilities | None = None
 
@@ -172,6 +181,12 @@ class StationDiscovery:
             if isinstance(result, NotSent):
                 return result
             values[key] = configuration_value(result.frame, key)
+        if self.commands is None:
+            return self._accept_capabilities(epoch, boot_digest, values)
+        return self.commands.decide(lambda: self._accept_capabilities(epoch, boot_digest, values))
+
+    # Commit the discovered capability set against the Boot it was read from.
+    def _accept_capabilities(self, epoch: int, boot_digest: str, values: dict[str, str]) -> StationChoice:
         if fingerprint(self.journal.get("boot")) != boot_digest:
             raise RecoveryRequiredError("device introduction changed during capability discovery; results discarded")
         capabilities = StationCapabilities.parse(values, self.choice)

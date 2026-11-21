@@ -435,16 +435,21 @@ class ManagedCurrentLimits:
                 await g.controls.set_limit(value, guard=guard, shared=True, on_claim=bind)
             guard()
             native = await c.native.read(closed=True)
-            guard()
-            present = c.session.book.owned_present(native.physical)
-            target = 0 if expected.mode == "paused" else value
-            if not g.controls.ready or not any(
-                r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == target for r in present
-            ):
-                raise RecoveryRequiredError("selected current has not been independently verified")
-            with j.atomic():
+
+            # Verify and finish the exact current request against its independent native reply.
+            def complete() -> None:
                 guard()
-                j.current_change.complete(identifier, value)
+                present = c.session.book.owned_present(native.physical)
+                target = 0 if expected.mode == "paused" else value
+                if not g.controls.ready or not any(
+                    r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == target for r in present
+                ):
+                    raise RecoveryRequiredError("selected current has not been independently verified")
+                with j.atomic():
+                    guard()
+                    j.current_change.complete(identifier, value)
+
+            c.commands.decide(complete)
         except (
             DeniedError,
             SecurityError,
@@ -459,7 +464,7 @@ class ManagedCurrentLimits:
     async def _failed_apply(
         self, identifier: str, value: int, previous_value: int, expected: ControlIntent, error: Exception
     ) -> None:
-        c, j = self.controller, self.journal
+        c = self.controller
         cause = {
             "id": identifier,
             "revision": expected.revision - 1,
@@ -469,37 +474,50 @@ class ManagedCurrentLimits:
         }
         while not self._closing and not c.stopping:
             try:
-                change = j.current_change.read()
-                if change.identifier != identifier or not change.selecting:
+                outcome = c.commands.decide(
+                    lambda: self._settle_failed_apply(identifier, value, previous_value, expected, cause)
+                )
+                if outcome is None:
                     return
-                intent = c.requests.intent()
-                outcome = change.failure_outcome(expected, intent, j.active() is not None)
                 if outcome is CurrentFailure.PROTECT_OPEN_SESSION:
-                    self.cancel_overlap(identifier, previous_value, "session_opened", failure=cause)
                     try:
                         await self.protect_overlap()
                     except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError:
                         pass  # Durable operation recovery retries zero; a lost acknowledgement never grants Stop.
-                    self.record_failure_diagnostic(cause)
-                    return
-                with j.atomic():
-                    if outcome is CurrentFailure.HOLD_IDLE:
-                        write_intent(j, intent, "paused")
-                        claim_internal_pause(c, "current", identifier)
-                    control = j.get("control", {})
-                    if control.get("inhibit") is True and j.current_change.read().identifier == identifier:
-                        j.control.project(control, resume_limit=previous_value)
-                    j.current_change.fail(identifier, value, previous_value, expected.mode, cause, outcome)
-                try:
-                    await c.ensure_pause_zero()
-                except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError, sqlite3.Error:
-                    pass  # The durable hold remains pending; ordinary Pause supervision retries its zero.
-                c.schedule_pause()
-                self.record_failure_diagnostic(cause)
+                else:
+                    try:
+                        await c.ensure_pause_zero()
+                    except DeniedError, UnavailableError, RecoveryRequiredError, TimeoutError, sqlite3.Error:
+                        pass  # The durable hold remains pending; ordinary Pause supervision retries its zero.
+                    c.schedule_pause()
+                c.commands.decide(lambda: self.record_failure_diagnostic(cause))
                 return
             except sqlite3.Error:
                 # A later Pause is read again on every retry and retains its own revision and control ticket.
                 await asyncio.sleep(0.1)
+
+    # Decide which hold or overlapping session still owns this failed current selection.
+    def _settle_failed_apply(
+        self, identifier: str, value: int, previous: int, expected: ControlIntent, cause: dict[str, Any]
+    ) -> CurrentFailure | None:
+        c, j = self.controller, self.journal
+        change = j.current_change.read()
+        if change.identifier != identifier or not change.selecting:
+            return None
+        intent = c.requests.intent()
+        outcome = change.failure_outcome(expected, intent, j.active() is not None)
+        if outcome is CurrentFailure.PROTECT_OPEN_SESSION:
+            self.cancel_overlap(identifier, previous, "session_opened", failure=cause)
+        else:
+            with j.atomic():
+                if outcome is CurrentFailure.HOLD_IDLE:
+                    write_intent(j, intent, "paused")
+                    claim_internal_pause(c, "current", identifier)
+                control = j.get("control", {})
+                if control.get("inhibit") is True and j.current_change.read().identifier == identifier:
+                    j.control.project(control, resume_limit=previous)
+                j.current_change.fail(identifier, value, previous, expected.mode, cause, outcome)
+        return outcome
 
     # The cause is already durable with the restriction; a legacy diagnostic cannot delay zero or worker retirement.
     def record_failure_diagnostic(self, cause: dict[str, Any]) -> None:
@@ -550,10 +568,18 @@ class ManagedCurrentLimits:
                 raise RecoveryRequiredError("current recovery zero was superseded")
 
         guard()
+        ticket = j.get("control", {}).get("ticket")
         await g.controls.ensure_ceiling(guard=guard)
-        guard()
-        if j.phase.read().active:
-            g.controls._complete(j.get("control")["ticket"], uncertain=False)
+
+        # This zero verifies only the hold that requested it.
+        def settle() -> None:
+            guard()
+            if j.get("control", {}).get("ticket") != ticket or not g.controls.ready:
+                raise RecoveryRequiredError("current recovery zero no longer belongs to its hold")
+            if j.phase.read().active and isinstance(ticket, str):
+                g.controls._complete(ticket, uncertain=False)
+
+        c.commands.decide(settle)
 
     # Reconcile the failed selection under zero, then restore only the previous verified current without any Start.
     async def recover_overlap(self) -> Pending | None:
@@ -598,30 +624,43 @@ class ManagedCurrentLimits:
         native = await c.native.read_result()
         if isinstance(native, Pending):
             return native
-        current = j.current_change.read()
-        if (
-            c.stopping
-            or c.requests.intent() != expected
-            or not current.recovering
-            or current.identifier != change["id"]
-        ):
-            return None
-        decision = c.native.session_decision(native)
-        if isinstance(decision, Pending):
-            return decision
-        if change.get("recovery_reason") == "process_replaced" and not current.value["observed_open"]:
-            # Preserve the existing fail-closed policy when replacement confirms there was no overlapping session.
-            with j.atomic():
-                write_intent(j, expected, "paused")
-                claim_internal_pause(c, "current", change["id"])
-                j.control.project(j.get("control"), resume_limit=change["previous_a"])
-                j.current_change.replace({**current.value, "state": "interrupted"})
-            return None
-        local = j.active()
-        if local is not None:
-            decision = current_session_decision(c.session.gateway, native, local)
+        native_authority, sequence = c.native.authority(), c.native.last_resolved_read
+
+        # An actual native report either keeps this recovery closed or identifies its original session.
+        def assess_overlap(native: HandoverEvidence) -> tuple[bool, int | Pending | None]:
+            if c.native.authority() != native_authority or c.native.last_resolved_read != sequence:
+                return False, Pending(Prerequisite.SUPERSEDED, "current recovery observation was superseded")
+            current = j.current_change.read()
+            if (
+                c.stopping
+                or c.requests.intent() != expected
+                or not current.recovering
+                or current.identifier != change["id"]
+            ):
+                return False, None
+            decision = c.native.session_decision(native)
             if isinstance(decision, Pending):
-                return decision
+                return False, decision
+            if change.get("recovery_reason") == "process_replaced" and not current.value["observed_open"]:
+                # Preserve the existing fail-closed policy when replacement confirms there was no overlapping session.
+                with j.atomic():
+                    write_intent(j, expected, "paused")
+                    claim_internal_pause(c, "current", change["id"])
+                    j.control.project(j.get("control"), resume_limit=change["previous_a"])
+                    j.current_change.replace({**current.value, "state": "interrupted"})
+                return False, None
+            local = j.active()
+            if local is not None:
+                decision = current_session_decision(c.session.gateway, native, local)
+                if isinstance(decision, Pending):
+                    return False, decision
+            return True, local
+
+        restore, outcome = c.commands.decide(lambda: assess_overlap(native))
+        if not restore:
+            return outcome if isinstance(outcome, Pending) else None
+        assert not isinstance(outcome, Pending)
+        local = outcome
         progress = await c.recovery.restore(continuing_local=local)
         if not progress.shared:
             return progress.pending
@@ -632,14 +671,20 @@ class ManagedCurrentLimits:
 
     # Retry the same receipt while the restored cap and session are still verified.
     def _settle_overlap(self, change: dict[str, Any], authority: AuthorityStamp, local: int | None) -> Pending | None:
-        try:
-            with self.journal.atomic():
-                self.returned_to_previous(recovery=change)
-        except sqlite3.Error as error:
-            self._settling_overlap = (change["id"], authority, local)
-            return Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
-        self._settling_overlap = None
-        return None
+        # The restored receipt may be retried only under the authority and session it verified.
+        def settle() -> Pending | None:
+            if self.controller.authority() != authority or self.journal.active() != local:
+                return Pending(Prerequisite.SUPERSEDED, "current recovery lost its confirmed authority")
+            try:
+                with self.journal.atomic():
+                    self.returned_to_previous(recovery=change)
+            except sqlite3.Error as error:
+                self._settling_overlap = (change["id"], authority, local)
+                return Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
+            self._settling_overlap = None
+            return None
+
+        return self.controller.commands.decide(settle)
 
     # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:

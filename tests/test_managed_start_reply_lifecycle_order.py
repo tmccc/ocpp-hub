@@ -34,6 +34,10 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
         lifecycle = asyncio.get_running_loop().create_future()
         lifecycle_id = uuid.uuid4().hex
         burst, entries, observer_errors = {}, [], []
+        decisions = {}
+        report_code = g._record_start.__code__
+        stage_code = j.starts.record.__code__
+        assert c.commands is g.command_processor is g.charger.command_processor is g.vendor.command_processor
 
         # Send two ordinary adjacent TLS frames, preserving the actual independent charger's Accepted reply.
         async def send_reply_then_lifecycle(raw):
@@ -60,6 +64,15 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
         # Observe real function entry without adding an await or changing any production method or verdict.
         def observe_entry(frame, event, arg):
             try:
+                if event == "call" and frame.f_code is report_code and frame.f_locals.get("self") is g:
+                    decisions["report"] = c.commands._deciding
+                if (
+                    event == "call"
+                    and frame.f_code is stage_code
+                    and frame.f_locals.get("self") is j.starts
+                    and frame.f_locals.get("stage") == "accepted"
+                ):
+                    decisions["accepted reply"] = c.commands._deciding
                 if (
                     event == "call"
                     and frame.f_code is ManagedCharging.prepare_owner_report.__code__
@@ -108,6 +121,7 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
                 answer = await asyncio.wait_for(asyncio.shield(lifecycle), 5)
                 sys.setprofile(previous_profile)
                 assert not observer_errors and len(entries) == 1, (entries, observer_errors)
+                assert decisions == {"report": True, "accepted reply": True}
                 entry = entries[0]
                 assert entry["positive"] and entry["pending_worker"], entry
                 assert burst["forwarded"] == (["report", "reply"] if report_first else ["reply", "report"])

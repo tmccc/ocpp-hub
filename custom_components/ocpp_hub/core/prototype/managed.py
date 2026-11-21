@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from ..control import HUB_PROFILE_ID
-from .command_processor import CommandPriority, CommandProcessor
+from .command_processor import CommandPriority
 from .composite import STATION_COMPOSITE_FAULT, ExcessiveCompositeError
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
@@ -83,10 +83,7 @@ class ManagedController:
             raise SecurityError("managed supervision requires completed allocation admission")
         self.session = session
         self.native = session.native_bounded
-        if session.gateway.command_processor is None:
-            session.gateway.command_processor = CommandProcessor()
-        self.commands = session.gateway.command_processor
-        session.gateway.controls.command_processor = self.commands
+        self.commands = session.gateway.use_command_processor()
         self.released_epoch: int | None = None
         self.failures = 0
         self.strict_failure_seen = False
@@ -272,7 +269,7 @@ class ManagedController:
         if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
             return
         try:
-            self.reclaim_failed_start_pause()
+            self.commands.decide(self.reclaim_failed_start_pause, priority=CommandPriority.RESTRICT)
             ticket = j.get("control", {}).get("ticket")
             connection = current_control_scope(g)
 
@@ -374,23 +371,32 @@ class ManagedController:
                     raise AuditSupersededError("owner Stop measurement crossed a newer authority or observation")
                 # Only measured excess may be ignored for Stop; identity, history and resources already passed.
                 native = candidate.native
-            guard()
-            native.physical.require_fresh(j.identity, 5)
-            self.native.require_known_session(native)
-            station_absent = local is not None and self.session.book.record_missing_station(native.physical)
-            if local is None:
-                self.session.book.owned_present(native.physical)
-            elif station_absent and not j.fault.latched():
-                # Own fault publication changes the control revision before taking the exact Stop claim.
-                self.fault(STATION_CEILING_LOST)
-                connection = current_control_scope(g)
             controls = g.controls
-            if not native.physical.transaction_open and controls.ready and controls.desired() == 0:
-                self.require_paused(native)
-                self.charging.observed(native)
-                controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
-                return
-            if not controls.stop_acknowledged(local):
+
+            # Interpret the live target or closed-zero report before issuing its exact Stop.
+            def accept_stop_observation() -> tuple[bool, bool]:
+                nonlocal connection
+                guard()
+                native.physical.require_fresh(j.identity, 5)
+                self.native.require_known_session(native)
+                station_absent = local is not None and self.session.book.record_missing_station(native.physical)
+                if local is None:
+                    self.session.book.owned_present(native.physical)
+                elif station_absent and not j.fault.latched():
+                    # Own fault publication changes the control revision before taking the exact Stop claim.
+                    self.fault(STATION_CEILING_LOST)
+                    connection = current_control_scope(g)
+                if not native.physical.transaction_open and controls.ready and controls.desired() == 0:
+                    self.require_paused(native)
+                    self.charging.observed(native)
+                    controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
+                    return False, station_absent
+                return not controls.stop_acknowledged(local), station_absent
+
+            stop_needed, station_absent = self.commands.decide(
+                accept_stop_observation, priority=CommandPriority.RESTRICT
+            )
+            if stop_needed:
                 await controls.stop(
                     expected_local=local,
                     guard=guard,
@@ -486,6 +492,27 @@ class ManagedController:
         connection = current_control_scope(self.session.gateway)
         # A still-open unplugged session must reach the guarded Stop retry below.
         native = await self.native.read(closing_local=self.session.journal.active())
+        if not self.commands.decide(
+            lambda: self._accept_pause_observation(native, intent, connection), priority=CommandPriority.RESTRICT
+        ):
+            await asyncio.shield(self.schedule_pause())
+            raise RecoveryRequiredError("requested pause awaits actual physical closure")
+        g, j = self.session.gateway, self.session.journal
+        if j.phase.read().value == "recovering":
+            cloud = self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"
+            if not cloud:
+                await self.native.resume(local_only=True)
+            elif not j.next_delivery():
+                await self.native.resume()
+        return native
+
+    # Settle closure, related receipts and the exact owner Pause together.
+    def _accept_pause_observation(
+        self, native: HandoverEvidence, intent: ControlIntent, connection: ControlScope | None
+    ) -> bool:
+        g, j = self.session.gateway, self.session.journal
+        if self.stopping or self.requests.intent() != intent or not control_scope_matches(g, connection):
+            raise RecoveryRequiredError("Pause observation no longer belongs to the current request and Boot")
         self.native.require_known_session(native)
         if (
             native.physical.transaction_open
@@ -493,14 +520,11 @@ class ManagedController:
             or self.session.gateway.controls.desired() != 0
             or not ControlState(self.session.journal.get("control", {})).local_hold
         ):
-            await asyncio.shield(self.schedule_pause())
-            raise RecoveryRequiredError("requested pause awaits actual physical closure")
+            return False
         self.settle_rejected_start_at_pause(native, intent, connection)
-        g = self.session.gateway
         if (self.native.introduced_epoch, self.native.introduced_revision) != (g._charger_epoch, g.controls._revision):
             self.native.confirm_paused_introduction(native)
         self.require_paused(native)
-        g, j = self.session.gateway, self.session.journal
         records = [record for record in (current_candidate(self), charge_test_candidate(self)) if record is not None]
         internal = internal_pause_matches(self)
         if records or internal:
@@ -525,13 +549,7 @@ class ManagedController:
             raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
         # Physical Pause is already proved. Cloud delivery debt can still block reactivation independently.
         self.complete_pause_observation(native, intent, connection)
-        if j.phase.read().value == "recovering":
-            cloud = self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"
-            if not cloud:
-                await self.native.resume(local_only=True)
-            elif not j.next_delivery():
-                await self.native.resume()
-        return native
+        return True
 
     # Pause alone settles its receipt, using current independent closure and the original paused generation.
     def complete_pause_observation(
@@ -695,6 +713,12 @@ class ManagedController:
     def zero_decision(
         self, native: HandoverEvidence, *, allow_offline: bool = False, continuing_local: int | None = None
     ) -> GateDecision:
+        return self.commands.decide(lambda: self._zero_decision(native, allow_offline, continuing_local))
+
+    # Keep resource observations and their zero verdict together.
+    def _zero_decision(
+        self, native: HandoverEvidence, allow_offline: bool, continuing_local: int | None
+    ) -> GateDecision:
         s, g, j = self.session, self.session.gateway, self.session.journal
         self.native.require(native)
         decision = readiness_decision(native, continuing_local is None, self.native.allow_unplugged)
@@ -848,40 +872,46 @@ class ManagedController:
                 await self.ordinary.hold("unplugged_session_pending")
             raise RecoveryRequiredError("unplugged session awaits exact lifecycle closure") from error
         async with asyncio.timeout(15):
-            if self.session._resource_mutation_inflight():
-                raise UnavailableError("managed native observation crossed a resource mutation")
-            if authority != self.native.authority() or sequence != self.native.last_resolved_read:
-                raise AuditSupersededError("settled native evidence crossed a newer authority or observation")
-            if self.ordinary.closure_gap(native):
+            # Check the audit and its exact authority before the final resource and session checks.
+            def accept() -> bool:
+                if self.session._resource_mutation_inflight():
+                    raise UnavailableError("managed native observation crossed a resource mutation")
+                if authority != self.native.authority() or sequence != self.native.last_resolved_read:
+                    raise AuditSupersededError("settled native evidence crossed a newer authority or observation")
+                if self.ordinary.closure_gap(native):
+                    return False
+                if (
+                    native.physical.transaction_open
+                    and native.physical.native_transaction_id != self.session.journal.active()
+                ):
+                    raise SecurityError("managed native transaction has no exact accepted local counterpart")
+                self.native.require_known_session(native)
+                present = self.session.book.owned_present(
+                    native.physical, record_unchanged=self.session.journal.active() is None
+                )
+                row = self.session.journal.db.execute(
+                    "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "confirmed"
+                    or not any(
+                        r.identifier == HUB_PROFILE_ID
+                        and r.canonical.get("limit") == self.session.gateway.controls.desired()
+                        for r in present
+                    )
+                ):
+                    if native.physical.transaction_open and self.session.book.station_ceiling_lost():
+                        raise StationCeilingLostError("the known charging session lost its owned station ceiling")
+                    raise SecurityError("managed local station ceiling is absent or unconfirmed")
+                native.physical.require_fresh(self.session.journal.identity, 5)
+                if measured.exceeded:
+                    raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
+                return True
+
+            if not self.commands.decide(accept):
                 await self.ordinary.hold("native_closure_pending")
                 raise RecoveryRequiredError("ordinary zero hold awaits exact lifecycle closure")
-            if (
-                native.physical.transaction_open
-                and native.physical.native_transaction_id != self.session.journal.active()
-            ):
-                raise SecurityError("managed native transaction has no exact accepted local counterpart")
-            self.native.require_known_session(native)
-            present = self.session.book.owned_present(
-                native.physical, record_unchanged=self.session.journal.active() is None
-            )
-            row = self.session.journal.db.execute(
-                "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-            ).fetchone()
-            if (
-                row is None
-                or row["state"] != "confirmed"
-                or not any(
-                    r.identifier == HUB_PROFILE_ID
-                    and r.canonical.get("limit") == self.session.gateway.controls.desired()
-                    for r in present
-                )
-            ):
-                if native.physical.transaction_open and self.session.book.station_ceiling_lost():
-                    raise StationCeilingLostError("the known charging session lost its owned station ceiling")
-                raise SecurityError("managed local station ceiling is absent or unconfirmed")
-            native.physical.require_fresh(self.session.journal.identity, 5)
-            if measured.exceeded:
-                raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
             return native
 
     # A refused archive transaction made no changes. Retry once using a complete fresh observation.
@@ -920,14 +950,19 @@ class ManagedController:
         observed = await self._supervise()
         if isinstance(observed, PollStatus):
             return render_poll(self, observed)
+        decided = self.commands.decide(lambda: self._settle_poll(observed))
+        return render_poll(self, decided)
+
+    # Decide health and Return completion before rendering the dashboard view.
+    def _settle_poll(self, observed: Observation) -> PollStatus | tuple[HandoverEvidence, HealthVerdict]:
         verdict = self._assess_observation(observed)
         if isinstance(verdict, PollStatus):
-            return render_poll(self, verdict)
+            return verdict
         if verdict.healthy and not self.ordinary.source_published and self.ordinary.ordinary():
-            return render_poll(self, PollStatus("degraded", "native_observation_unavailable"))
+            return PollStatus("degraded", "native_observation_unavailable")
         if verdict.healthy and self.requests.intent().mode == "app":
             self.requests.complete_legacy_return()
-        return render_poll(self, (observed.native, verdict))
+        return observed.native, verdict
 
     # Pending owned completions retain their existing settlement priority before any new native audit.
     async def _pending_work(self) -> str | None:
@@ -988,14 +1023,13 @@ class ManagedController:
             and (not self.ordinary.needed())
         ):
             return PollStatus("starting")
-        verified_pause = False
         try:
             try:
-                self.prepare_offline_pause()
+                self.commands.decide(self.prepare_offline_pause, priority=CommandPriority.RESTRICT)
             except JournalStartBusy:
                 self.latest_native = None
                 await asyncio.sleep(0.1)
-                self.prepare_offline_pause()
+                self.commands.decide(self.prepare_offline_pause, priority=CommandPriority.RESTRICT)
             recovery_pending = await self.recovery.advance()
             if j.fault.latched():
                 return PollStatus("attention", j.fault.classification())
@@ -1014,28 +1048,11 @@ class ManagedController:
                     await self.hold_fault()
                     return PollStatus("attention", STATION_COMPOSITE_FAULT)
                 native = await self._poll_native()
-            if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
-                raise RecoveryRequiredError("managed release awaits fresh app-control restoration")
-            if self.requests.intent().mode == "paused":
-                self.require_paused(native)
-                verified_pause = True
-            previous_intent = self.requests.intent()
-            self.charging.observed(native)
-            observed_intent = self.requests.intent()
-            intent_changed = observed_intent != previous_intent
+            authority, sequence = self.native.authority(), self.native.last_resolved_read
+            return self.commands.decide(lambda: self._accept_supervision(native, authority, sequence))
         except (NativeTransportUnavailableError, StaleEvidenceError) as error:
-            self.failures = 0
-            self.strict_failure_seen = False
-            self.history_omission_only = True
-            self.native_unavailable += 1
-            self.record_optional_native_failure(
-                {
-                    "type": type(error).__name__,
-                    "detail": str(error)[:1024],
-                    "at_epoch": time.time(),
-                    "availability_only": True,
-                },
-            )
+            failure = error
+            self.commands.decide(lambda: self._record_unavailable_observation(failure))
             if self.native_unavailable >= 3:
                 if self.ordinary.ordinary():
                     try:
@@ -1061,32 +1078,68 @@ class ManagedController:
             await stop_for_missing_station(self)
             return PollStatus("attention", j.fault.classification() if j.fault.latched() else STATION_CEILING_LOST)
         except (SecurityError, DeniedError) as error:
-            if self.stopping:
-                return PollStatus("stopping")
-            # Only a fully settled typed measurement can make this entire hard-failure run recoverable.
-            measured_only = isinstance(error, MeasuredOutputLimitError)
-            self.strict_failure_seen = self.strict_failure_seen or not measured_only
-            self.history_omission_only = self.history_omission_only and isinstance(error, MissingOriginalHistoryError)
-            diagnostic: dict[str, Any] = {
-                "type": diagnostic_type(error),
+            refusal = error
+            return self.commands.decide(lambda: self._record_refused_observation(refusal))
+
+    # A temporarily unavailable observation affects freshness without inventing new charger evidence.
+    def _record_unavailable_observation(self, error: Exception) -> None:
+        self.failures = 0
+        self.strict_failure_seen = False
+        self.history_omission_only = True
+        self.native_unavailable += 1
+        self.record_optional_native_failure(
+            {
+                "type": type(error).__name__,
                 "detail": str(error)[:1024],
                 "at_epoch": time.time(),
-            }
-            if isinstance(error, MeasuredOutputLimitError):
-                diagnostic["cause"] = error.cause
-            elif self.history_omission_only:
-                diagnostic["source"] = ORIGINAL_HISTORY_OMISSION
-            self.failures += 1
-            classification = (
-                MEASURED_FAULT
-                if measured_only and not self.strict_failure_seen
-                else ("native_authority_or_preservation_failed")
-            )
-            if self.failures >= 3:
-                self.fault(classification, diagnostic=diagnostic)
-            else:
-                self.record_optional_native_failure(diagnostic)
-            return PollStatus("degraded", classification)
+                "availability_only": True,
+            },
+        )
+
+    # A repeated independent strict refusal can latch a fault alongside its evidence.
+    def _record_refused_observation(self, error: Exception) -> PollStatus:
+        if self.stopping:
+            return PollStatus("stopping")
+        # Only a fully settled typed measurement can make this entire hard-failure run recoverable.
+        measured_only = isinstance(error, MeasuredOutputLimitError)
+        self.strict_failure_seen = self.strict_failure_seen or not measured_only
+        self.history_omission_only = self.history_omission_only and isinstance(error, MissingOriginalHistoryError)
+        diagnostic: dict[str, Any] = {
+            "type": diagnostic_type(error),
+            "detail": str(error)[:1024],
+            "at_epoch": time.time(),
+        }
+        if isinstance(error, MeasuredOutputLimitError):
+            diagnostic["cause"] = error.cause
+        elif self.history_omission_only:
+            diagnostic["source"] = ORIGINAL_HISTORY_OMISSION
+        self.failures += 1
+        classification = (
+            MEASURED_FAULT
+            if measured_only and not self.strict_failure_seen
+            else ("native_authority_or_preservation_failed")
+        )
+        if self.failures >= 3:
+            self.fault(classification, diagnostic=diagnostic)
+        else:
+            self.record_optional_native_failure(diagnostic)
+        return PollStatus("degraded", classification)
+
+    # Apply audited observations to Start and Pause state while the original evidence still owns its turn.
+    def _accept_supervision(self, native: HandoverEvidence, authority: str, sequence: int) -> Observation | PollStatus:
+        g = self.session.gateway
+        if authority != self.native.authority() or sequence != self.native.last_resolved_read:
+            raise AuditSupersededError("native supervision crossed a newer authority or observation")
+        verified_pause = False
+        if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
+            raise RecoveryRequiredError("managed release awaits fresh app-control restoration")
+        if self.requests.intent().mode == "paused":
+            self.require_paused(native)
+            verified_pause = True
+        previous_intent = self.requests.intent()
+        self.charging.observed(native)
+        observed_intent = self.requests.intent()
+        intent_changed = observed_intent != previous_intent
         self.failures = 0
         self.strict_failure_seen = False
         self.history_omission_only = True
