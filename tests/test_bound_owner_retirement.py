@@ -86,8 +86,20 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             assert not j.db.in_transaction and rig.bench.firmware.effective_limit() == 0
             native = await c.native.read()
             c.require_paused(native)
-            with pytest.raises(sqlite3.IntegrityError):
-                await c.tick()
+            failures = []
+            retire = c.charging.retire_closed_at_zero
+
+            def observe_retirement(native):
+                try:
+                    retire(native)
+                except RecoveryRequiredError as error:
+                    failures.append(error.__cause__)
+                    raise
+
+            monkeypatch.setattr(c.charging, "retire_closed_at_zero", observe_retirement)
+            assert (await c.tick())["state"] == "attention"
+            assert failures and all(isinstance(error, sqlite3.IntegrityError) for error in failures)
+            assert not j.db.in_transaction
             assert (
                 c.charging.lease is lease and c.charging.state() == state and c.requests.receipt(identifier) == receipt
             )
