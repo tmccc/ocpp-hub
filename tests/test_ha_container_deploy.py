@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import io
 import json
@@ -38,6 +39,31 @@ def test_install_and_backup_are_domain_scoped(tmp_path: Path) -> None:
     assert install(tmp_path, "ics_proxy", data, expected)["backup_created"]
     assert (tmp_path / "custom_components/ics_proxy/__init__.py").read_bytes() == second["__init__.py"]
     assert len(list((tmp_path / ".ics_proxy-backup").glob("*.tar.gz"))) == 1
+
+
+# Intent: the installed build stays exclusively owned through Core preflight and restart verification.
+# Why: two installs could otherwise make the first command verify a Core process that loaded the second build.
+def test_install_lock_covers_core_activation(tmp_path: Path) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    install(tmp_path, "ics_proxy", *archive(old))
+    installed = tmp_path / "custom_components/ics_proxy/__init__.py"
+    lock_path = tmp_path / ".ics_proxy-backup/.install.lock"
+    observations = []
+
+    # A separate opener cannot acquire the same real lock at either restart boundary.
+    def observe() -> None:
+        with lock_path.open("a") as competitor, pytest.raises(BlockingIOError):
+            fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observations.append(installed.read_bytes())
+
+    # Capture the old process baseline before publication and its replacement afterward.
+    def prepare_restart():
+        observe()
+        return observe
+
+    install(tmp_path, "ics_proxy", *archive(new), prepare_restart=prepare_restart)
+    assert observations == [old["__init__.py"], new["__init__.py"]]
 
 
 # Intent: unsafe names, incorrect hashes and syntax errors fail before an installed component is touched.
@@ -109,7 +135,10 @@ install(Path(sys.argv[1]), "ics_proxy", sys.stdin.buffer.read(), json.loads(sys.
 """
     execution = subprocess.run(
         [sys.executable, "-B", "-c", code, str(tmp_path), json.dumps(expected)],
-        input=data, cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=10,
+        input=data,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        timeout=10,
     )
     assert execution.returncode == 91, execution.stderr
     target = tmp_path / "custom_components/ics_proxy"

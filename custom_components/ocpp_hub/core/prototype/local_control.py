@@ -653,6 +653,7 @@ class LocalControl:
                 self._stop(
                     epoch,
                     ticket,
+                    self.boot(),
                     previous.get("start_pending", False),
                     expected_local,
                     guard,
@@ -668,6 +669,7 @@ class LocalControl:
         self,
         epoch: int,
         ticket: str,
+        boot: str | None,
         pending_start: bool,
         expected_local: int | None = None,
         guard: Callable[[], None] | None = None,
@@ -693,6 +695,8 @@ class LocalControl:
         # Only a Stop dispatched on this live scope can suppress a later retry.
         def issued_stop(action: str) -> None:
             if action == "RemoteStopTransaction" and local is not None:
+                if self.boot() != boot or self.journal.active() != local:
+                    raise UnavailableError("Stop lost its original charger Boot or open session")
                 self._issued_stop = StopScope(epoch, revision, ticket, local, generation, scope)
 
         scope = self.journal.outcomes.owner_scope(request_id, ticket, self.boot())
@@ -845,6 +849,7 @@ class LocalControl:
             return epoch, ticket, previous
 
         epoch, ticket, previous = self.peer.decide(claim)
+        boot = self.boot()
         restoring_zero = False
         saved_reply: bool | None = None
 
@@ -853,8 +858,13 @@ class LocalControl:
             self._check(epoch, ticket)
             if scope_guard is not None:
                 scope_guard()
-            if not restoring_zero and guard is not None:
-                guard()
+            if not restoring_zero:
+                if self.boot() != boot:
+                    raise UnavailableError("Start lost its original charger Boot")
+                if guard is not None:
+                    guard()
+                if self.authorize is not None and not self.authorize(tag):
+                    raise DeniedError("authorization changed before forwarding a local start")
 
         # Write dispatch and ACK independently of the control ticket a later Pause can supersede.
         def record_stage(stage: str) -> None:
@@ -905,7 +915,7 @@ class LocalControl:
             on_receive=received,
             on_sent=sent,
             late_reply_action="RemoteStartTransaction",
-            owner_scope=self.journal.outcomes.owner_scope(request_id, ticket, self.boot()),
+            owner_scope=self.journal.outcomes.owner_scope(request_id, ticket, boot),
         ) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
@@ -914,8 +924,6 @@ class LocalControl:
                 # Arm the exact attempt only after its ceiling and current authorization agree.
                 def arm() -> None:
                     check()
-                    if self.authorize is not None and not self.authorize(tag):
-                        raise DeniedError("authorization changed before forwarding a local start")
                     with self.journal.atomic():
                         self.journal.starts.armed(ticket)
 

@@ -346,31 +346,19 @@ def container_id(name: str) -> str:
     return value
 
 
-# Probe or restart Core through the selected container's own verified loopback connection.
-def container_core(container: str, access: RestartAccess, program: str, before: str | None = None) -> str:
-    port = access.container_port
-    if type(port) is not int or not 1 <= port <= 65535:
-        raise SystemExit("The Home Assistant container API port is invalid.")
-    command = [
-        "docker",
-        "exec",
-        "-i",
-        container,
-        "python",
-        "-B",
-        "-c",
-        program,
-        str(port),
-    ]
-    if before is not None:
-        command.append(before)
-    result = subprocess.run(command, input=access.token, capture_output=True, text=True, timeout=340)
-    if result.returncode:
-        raise SystemExit(result.stderr.strip() or "The selected Home Assistant Core could not be verified.")
-    value = result.stdout.strip()
-    if before is None and re.fullmatch(r"\[\d+, \"\d+\"\]", value) is None:
-        raise SystemExit("The selected Home Assistant Core did not report a verified lifetime.")
-    return value
+# Keep a container install and the optional restart in the same process and under the same lock.
+def deploy_container(
+    container: str, source: Path, domain: str, archive: bytes, expected: dict[str, str], access: RestartAccess | None
+) -> None:
+    installer = (source / "tools/ha_container_deploy.py").read_text()
+    command = ["docker", "exec", "-i", container, "python", "-c", installer, domain, json.dumps(expected)]
+    if access is not None:
+        port = access.container_port
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise SystemExit("The Home Assistant container API port is invalid.")
+        command.extend((str(port), (source / "tools/ha_restart.py").read_text()))
+        archive = access.token.encode() + b"\n" + archive
+    subprocess.run(command, input=archive, check=True)
 
 
 # Resolve the optional restart confirmation before modifying the selected installation.
@@ -419,18 +407,8 @@ def main() -> int:
             source, archive, expected = prepare_archive(
                 integration, Path(tmp), skip_checks=args.skip_checks, collection_executors=args.collection_executors
             )
-            installer = (source / "tools/ha_container_deploy.py").read_text()
-            program = (source / "tools/ha_restart.py").read_text() if access is not None else ""
-            before = container_core(selected, access, program) if access is not None else None
-            subprocess.run(
-                ["docker", "exec", "-i", selected, "python", "-c", installer, args.domain, json.dumps(expected)],
-                input=archive,
-                check=True,
-            )
+            deploy_container(selected, source, args.domain, archive, expected, access)
         if access is not None:
-            if not before:
-                raise SystemExit("The Home Assistant deployment has no verified restart baseline.")
-            container_core(selected, access, program, before)
             print("Verified Home Assistant is running in a new Core process.")
         return 0
     if args.domain != "ocpp_hub":

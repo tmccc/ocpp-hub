@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from ..frames import ERROR_FORMATION_VIOLATION, Frame, build_call_error, build_call_result
-from .auth_info import InfoBook, expiry, validate_info
+from .auth_info import AuthorizationObservation, InfoBook, expiry, validate_info
 from .authorisation import VendorAuthorisation
 from .command_outcomes import (
     TRANSACTION_COMMANDS,
@@ -1014,6 +1014,7 @@ class Gateway:
                 guard()
 
         info: dict[str, Any] | None = None
+        approval: AuthorizationObservation | None = None
 
         # A complete authorization result contains only the validated decision.
         def decision(answer: Frame) -> dict[str, Any]:
@@ -1021,16 +1022,18 @@ class Gateway:
                 raise UnavailableError("actual cloud authorization was unavailable")
             return validate_info(answer[2]["idTagInfo"])
 
-        # Capture an actual denial before the sending task can be cancelled or lose authority.
+        # Order each reply when it arrives. An approval still needs the sender's current authority before use.
         def capture(_action: str, answer: Frame) -> None:
-            nonlocal info
+            nonlocal info, approval
             if self._vendor_epoch != epoch:
                 return
             try:
                 actual = decision(answer)
             except UnavailableError, DeniedError:
                 return  # The caller still receives the ordinary validation failure.
-            if actual["status"] != "Accepted":
+            if actual["status"] == "Accepted":
+                approval = self.auth_info.observe()
+            else:
                 info = self.auth_info.deny(tag, actual)
 
         # Positive authorization still depends on the originating owner and connection.
@@ -1041,7 +1044,7 @@ class Gateway:
                 actual = decision(answer)
                 if actual["status"] == "Accepted":
                     check()
-                    info = self.auth_info.put(tag, actual)
+                    info = self.auth_info.put(tag, actual, approval)
                 else:
                     info = self.auth_info.deny(tag, actual)
             if info["status"] != "Accepted":

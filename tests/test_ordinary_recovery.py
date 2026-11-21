@@ -155,6 +155,36 @@ async def test_ocpp_first_mapped_closure_recovers_only_after_native_closure(
         )
 
 
+# Intent: a real Pause remains at zero while an unplugged charger reports the last closed session.
+# Why: the Stop report and the native confirmation can arrive several polls apart without a charger fault.
+async def test_pause_waits_for_unplugged_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        c, j, rig = b.controller, b.session.journal, b.rig
+        local = await positive_flow(b, "daily")
+        assert (await healthy(c))["charging_session_open"]
+        open_session = rig.peer.native("SESSION")
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+        await close_session(rig, b.session, b.charger, local)
+        assert j.vendor_id(local) is not None
+        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        native = rig.peer.native
+        mark = len(rig.bench.device_calls)
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
+            for _ in range(4):
+                status = await c.tick()
+                assert status["state"] == "reconciling" and not j.fault.latched()
+                assert rig.bench.firmware.effective_limit() == 0
+                assert not status.get("local_hold_verified")
+                assert c.requests.receipt(identifier)["state"] != "completed"
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        later_calls = rig.bench.device_calls[mark:]
+        assert not any(frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for frame in later_calls)
+
+
 # Intent: unrelated, unmapped and nonzero native reports remain strict refusals after OCPP closure.
 # Why: only zero flow from the latest exact mapped lifecycle can enter the ordinary closure wait.
 @pytest.mark.parametrize("sample", ["unknown", "older", "unmapped", "nonzero"])

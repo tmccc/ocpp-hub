@@ -295,9 +295,16 @@ def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
         journal.close()
 
 
-# Intent: a committed charger error is visible when the optional incident log is absent.
+# Intent: a committed charger refusal or error is visible when the optional incident log is absent.
 # Why: a real reply and actual session completion are separate evidence for the original request.
-def test_incident_reads_the_exact_saved_start_error(tmp_path):
+@pytest.mark.parametrize(
+    "wire_reply,shown,waiting",
+    [
+        ("error", "call_error", "start_outcome_or_lifecycle"),
+        ("Rejected", "rejected", "saved_start_reply_settlement"),
+    ],
+)
+def test_incident_reads_the_exact_saved_start_reply(tmp_path, wire_reply, shown, waiting):
     path = tmp_path / "journal.db"
     events = tmp_path / "journal.start-events.jsonl"
     journal = Journal(path, "OFFLINE001")
@@ -312,16 +319,17 @@ def test_incident_reads_the_exact_saved_start_error(tmp_path):
         )
         assert incident_report(path, events)["journal"]["start"]["saved_reply"] == "unknown"
         journal.db.execute(
-            "INSERT INTO owner_command_wires VALUES(?,?,?,NULL,'RemoteStartTransaction',NULL,NULL,'error')",
-            (uuid.uuid4().hex, request, ticket),
+            "INSERT INTO owner_command_wires VALUES(?,?,?,NULL,'RemoteStartTransaction',NULL,NULL,?)",
+            (uuid.uuid4().hex, request, ticket, wire_reply),
         )
     finally:
         journal.close()
 
     result = incident_report(path, events)
-    assert result["journal"]["start"]["saved_reply"] == "call_error"
+    assert result["journal"]["start"]["saved_reply"] == shown
     assert result["journal"]["start"]["lifecycle"] == "unbound"
     assert result["wire"]["send"] == "matching_reply" and result["wire"]["observed_reply"] == "unknown"
+    assert result["waiting_for_evidence"] == [waiting]
 
 
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.

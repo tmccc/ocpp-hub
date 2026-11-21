@@ -63,7 +63,7 @@ from .supervision import ControlProof, HealthVerdict, Observation, PollStatus, a
 from .trial_evidence import Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
 from .trial_rollback import lifecycle_decision
-from .trial_session import TrialSession
+from .trial_session import TrialSession, managed_service_mode
 
 
 class ManagedController:
@@ -95,7 +95,7 @@ class ManagedController:
         self.native_unavailable = 0
         self.fault_zero_retry: dict[str, float] = {}
         self.stopping = False
-        expected = {"mode": "app_schedule", "spec_digest": self.native.spec.digest, "local_start": False}
+        expected = managed_service_mode(self.native.spec)
         saved = session.journal.get("managed_mode")
         if saved is not None and saved != expected:
             raise SecurityError("managed policy changed across process replacement")
@@ -517,7 +517,11 @@ class ManagedController:
         intent = self.requests.intent()
         connection = current_control_scope(self.session.gateway)
         # A still-open unplugged session must reach the guarded Stop retry below.
-        native = await self.native.read(closing_local=self.session.journal.active())
+        native = await self.native.read_result(closing_local=self.session.journal.active())
+        if isinstance(native, Pending):
+            if native.reason is Prerequisite.NATIVE and native.cause is not None:
+                raise native.cause
+            raise RecoveryRequiredError(native.detail) from native.cause
         if not self.commands.decide(
             lambda: self._accept_pause_observation(native, intent, connection), priority=CommandPriority.RESTRICT
         ):

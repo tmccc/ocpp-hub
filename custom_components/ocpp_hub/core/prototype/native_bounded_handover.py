@@ -180,8 +180,10 @@ class NativeBoundedHandover:
         return result
 
     # Managed recovery receives native availability directly after the same full audit and durable publication.
-    async def read_result(self, *, closed: bool = False) -> HandoverEvidence | Pending:
-        return await self._read(closed=closed, as_result=True)
+    async def read_result(
+        self, *, closed: bool = False, closing_local: int | None = None
+    ) -> HandoverEvidence | Pending:
+        return await self._read(closed=closed, as_result=True, closing_local=closing_local)
 
     # One audit implementation owns strict verdicts, supersession, resource reconciliation and optional availability.
     async def _read(
@@ -324,14 +326,11 @@ class NativeBoundedHandover:
                 applicable = current()
                 if repair is not None:
                     repair.finish(attempt, "readiness" if applicable else "superseded")
-                if (
-                    applicable
-                    and as_result
-                    and isinstance(error, NativeReadinessError)
-                    and error.unplugged_at_zero
-                    and error.native.physical.native_transaction_id == gateway.journal.active()
-                ):
-                    return Pending(Prerequisite.LIFECYCLE, str(error), error)
+                if applicable and as_result and isinstance(error, NativeReadinessError) and error.unplugged_at_zero:
+                    local = error.native.physical.native_transaction_id
+                    active = gateway.journal.active()
+                    if local == active or active is None and gateway.journal.latest_mapped_stop(local):
+                        return Pending(Prerequisite.LIFECYCLE, str(error), error)
                 raise
             except sqlite3.Error as error:
                 invalidate()

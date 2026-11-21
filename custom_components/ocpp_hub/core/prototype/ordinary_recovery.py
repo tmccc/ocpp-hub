@@ -206,18 +206,10 @@ class OrdinaryRecovery:
                 ).fetchone()
                 is not None
             )
-        if not physical.transaction_open or known is not None or type(local) is not int:
+        if not physical.transaction_open or known is not None:
             return False
         # OCPP closed first. Only the latest connector lifecycle can explain an open native report at zero.
-        return (
-            j.db.execute(
-                "SELECT 1 FROM ("
-                "SELECT local, stop, vendor FROM transactions WHERE connector=1 ORDER BY local DESC LIMIT 1"
-                ") WHERE local=? AND stop IS NOT NULL AND vendor IS NOT NULL",
-                (local,),
-            ).fetchone()
-            is not None
-        )
+        return j.latest_mapped_stop(local)
 
     # Existing commissioned ownership and a current matching Boot permit only zero while native HTTP is unavailable.
     async def hold(self, reason: str) -> None:

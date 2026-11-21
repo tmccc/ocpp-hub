@@ -13,7 +13,10 @@ import sys
 import tarfile
 import tempfile
 import time
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any
 
 
@@ -67,7 +70,14 @@ def exchange_directories(staged: Path, installed: Path) -> None:
 
 
 # Back up the previous directory and publish only a fully validated replacement.
-def install(config: Path, domain: str, archive: bytes, expected: dict[str, str]) -> dict[str, Any]:
+def install(
+    config: Path,
+    domain: str,
+    archive: bytes,
+    expected: dict[str, str],
+    *,
+    prepare_restart: Callable[[], Callable[[], None]] | None = None,
+) -> dict[str, Any]:
     files = validated_files(domain, archive, expected)
     parent = config / "custom_components"
     target, backups = parent / domain, config / ("." + domain + "-backup")
@@ -90,6 +100,7 @@ def install(config: Path, domain: str, archive: bytes, expected: dict[str, str])
 
         with (backups / ".install.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            restart = prepare_restart() if prepare_restart is not None else None
             if target.is_symlink() or (target.exists() and not target.is_dir()):
                 raise ValueError("component path must be a directory")
             replacing = target.exists()
@@ -110,12 +121,29 @@ def install(config: Path, domain: str, archive: bytes, expected: dict[str, str])
                 exchange_directories(staged, target)
             else:
                 staged.rename(target)
+            if restart is not None:
+                restart()
     return {"domain": domain, "verified_files": len(files), "backup_created": replacing}
 
 
-# The Docker transport supplies only a fixed component choice, digests and tar bytes; no credential is accepted.
+# Receive validated code and the optional private restart input without writing either to the container.
 def main() -> None:
-    result = install(Path("/config"), sys.argv[1], sys.stdin.buffer.read(), json.loads(sys.argv[2]))
+    stream = sys.stdin.buffer
+    if len(sys.argv) not in (3, 5):
+        raise SystemExit("The Home Assistant installer received invalid deployment arguments.")
+    prepare_restart = None
+    if len(sys.argv) == 5:
+        program = ModuleType("deployment_ha_restart")
+        sys.modules[program.__name__] = program
+        exec(compile(sys.argv[4], "ha_restart.py", "exec"), program.__dict__)
+        port = int(sys.argv[3])
+        token = stream.readline().decode().rstrip("\n")
+
+        prepare_restart = partial(program.prepare_container_restart, port, token)
+
+    result = install(
+        Path("/config"), sys.argv[1], stream.read(), json.loads(sys.argv[2]), prepare_restart=prepare_restart
+    )
     print(json.dumps(result, sort_keys=True))
 
 

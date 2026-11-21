@@ -100,14 +100,15 @@ class InfoBook:
         self._sequence += 1
         return AuthorizationObservation(self._sequence, time.time())
 
-    # Record actual Accepted and denied decisions alike so a denial cannot be hidden by an older positive entry.
+    # Publish a checked authorization reply by when it arrived, returning the latest decision for that tag.
     def put(self, tag: str, value: Any, observation: AuthorizationObservation | None = None) -> dict[str, Any]:
         info = validate_info(value)
-        key = tag_key(tag)
         observation = observation or self.observe()
         with nullcontext() if self.journal.db.in_transaction else self.journal.atomic():
-            self._put(key, info, observation)
-        return info
+            self.put_delivery(tag, info, observation, restored=False)
+            latest = self.stored(tag)
+        assert latest is not None
+        return latest
 
     # A matched denial remains effective even if the older cache row cannot be replaced.
     def deny(self, tag: str, info: dict[str, Any]) -> dict[str, Any]:
@@ -166,7 +167,7 @@ class InfoBook:
                 if j.db.in_transaction:
                     raise
 
-    # A saved acknowledgement can retire its event even when newer authorization already exists.
+    # Keep the newest actual decision, whether it came from Authorize or a saved lifecycle acknowledgement.
     def put_delivery(
         self, tag: str, info: dict[str, Any], observation: AuthorizationObservation | None, *, restored: bool
     ) -> None:

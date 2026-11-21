@@ -210,6 +210,51 @@ async def test_late_cloud_rejection_holds_zero_and_retains_original_receipt(tmp_
     await rig.close()
 
 
+# Intent: a late Start denial wins over an earlier Authorize approval on the same cloud connection.
+# Why: the approval handler can resume after the later reply, even though its frame arrived first.
+@pytest.mark.parametrize("settle_denial_first", [False, True])
+async def test_authorize_approval_keeps_its_original_reply_order(tmp_path: Path, settle_denial_first: bool) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    gateway, journal = rig.gateway, rig.store
+    await rig.boot()
+    local = (await rig.charger("start", "StartTransaction", START))[2]["transactionId"]
+    start_wires = []
+    tag = START["idTag"]
+
+    # Answer both actual calls under their own IDs, with the first sender still unwinding.
+    async def cloud_send(raw: str) -> None:
+        frame = decode(raw)
+        if frame[0] == 2 and frame[2] == "StartTransaction":
+            start_wires.append(frame[1])
+        elif frame[0] == 2 and frame[2] == "Authorize":
+            await rig.vendor_send(raw)
+            await gateway.receive(
+                "vendor",
+                build_call_result(start_wires[0], {"transactionId": 9001, "idTagInfo": info(status="Blocked")}),
+            )
+            if settle_denial_first:
+                with pytest.raises(RecoveryRequiredError, match="cloud denied"):
+                    await gateway.flush()
+        else:
+            await rig.vendor_send(raw)
+
+    gateway.attach_vendor(cloud_send)
+    try:
+        with pytest.raises(RecoveryRequiredError, match="awaiting its original reply"):
+            await gateway.flush(can_send=lambda: True)
+        approval = await gateway._cloud_authorize(tag)
+        if settle_denial_first:
+            assert approval["status"] == "Blocked"
+        else:
+            with pytest.raises(RecoveryRequiredError, match="cloud denied"):
+                await gateway.flush()
+        assert gateway.auth_info.stored(tag)["status"] == "Blocked"
+        assert journal.vendor_id(local) == 9001 and len(start_wires) == 1
+        assert journal.next_delivery() is None
+    finally:
+        await rig.close()
+
+
 # Intent: protected revocations cannot be evicted into a local fallback permission when the book is full.
 # Why: bounded storage must fail closed rather than silently forget the current owner's denied tag.
 async def test_metadata_capacity_protects_configured_revocations(tmp_path: Path) -> None:
@@ -503,14 +548,14 @@ async def test_bound_dynamic_grant_cannot_lose_expiry_restriction(tmp_path: Path
     await rig.close()
 
 
-# Intent: both initial revocation and revocation during cap readback prevent a local RemoteStart.
+# Intent: an authorization change before the last send prevents a local RemoteStart.
 # Why: local API calls must enforce the same metadata decision as a fresh charger Start/Authorize.
-@pytest.mark.parametrize("during_readback", [False, True])
-async def test_local_start_rechecks_revocation_in_sequence(tmp_path: Path, during_readback: bool) -> None:
+@pytest.mark.parametrize("boundary", ["entry", "readback", "native-send-check"])
+async def test_local_start_rechecks_revocation_in_sequence(tmp_path: Path, boundary: str) -> None:
     rig = StrictRig(tmp_path / "state.db")
-    if not during_readback:
+    if boundary == "entry":
         rig.gateway.auth_info.put("LOCAL_TEST", info(status="Blocked"))
-    else:
+    elif boundary == "readback":
         normal = rig.charger_send
 
         # Revoke in the independent peer exactly when the station's positive cap has just been installed.
@@ -521,10 +566,21 @@ async def test_local_start_rechecks_revocation_in_sequence(tmp_path: Path, durin
             await normal(raw)
 
         rig.gateway.attach_charger(revoke)
+    else:
+        await rig.boot()
+        await rig.cloud()
+        rig.actual_info = info(status="Blocked")
+
+        # An actual cloud refusal arrives while Start awaits its last independent observation.
+        async def validate_send(action: str, _payload: dict[str, Any]) -> None:
+            if action == "RemoteStartTransaction":
+                assert (await rig.gateway._cloud_authorize("LOCAL_TEST"))["status"] == "Blocked"
+
+        rig.gateway.charger.validate_send = validate_send
     with pytest.raises(DeniedError):
         await rig.gateway.start()
     assert not any(frame[0] == 2 and frame[2] == "RemoteStartTransaction" for frame in rig.charger_frames)
-    if during_readback:
+    if boundary != "entry":
         assert rig.firmware.effective_limit() == 0
     await rig.close()
 

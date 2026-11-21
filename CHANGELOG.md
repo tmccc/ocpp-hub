@@ -4,6 +4,9 @@
 
 - Recheck a scheduled Start's charger profile when a newer poll supersedes the reading under the same authority.
 - Use the original current-change sample to distinguish earlier idle attempts from new sessions.
+- Keep Pause and current recovery at zero while the charger finishes reporting a mapped, unplugged session.
+- Keep cloud tag decisions in reply arrival order. Recheck the current Boot and tag decision before a
+  commissioning Start, and recheck the original Boot and session before Stop.
 - Wait for real closure after a Stop reply, including an exact expired Start that has been unplugged.
 - Refresh Start availability and health after confirmed charger contradictions or an unresolved app command.
 - Read committed Start replies in incident reports and reject existing aliases of input and output files.
@@ -14,7 +17,9 @@
 - Refresh delivery counts, age certificate status, and report when a saved charger check is still being written.
 - Keep definite incompatible charger responses separate from a temporary lack of a response.
   Duplicate response framing headers count as an incompatibility.
-- Check the saved service mode before startup can change a journal.
+- Check the complete saved service mode before startup can change a journal.
+- Keep the Home Assistant Docker install lock through verification of the optional restart.
+- Distinguish a saved Start refusal awaiting local settlement and a Home Assistant receipt for another command.
 - Keep commissioning terminal controls available after a long pasted line.
 - Keep the fault evidence with the Pause that acknowledged it so recovery can still use that Pause after a restart.
 - Use one command outcome owner for the proxy, recovery and Home Assistant. Retain actual owner wire replies

@@ -64,6 +64,10 @@ class ReceiptUnavailableError(ProxyError):
     """A temporary receipt read failure can be retried without issuing another command."""
 
 
+class ReceiptMismatchError(ProxyError):
+    """The response cannot confirm the original request or its actual successor."""
+
+
 class ProxyClient:
     """Home Assistant shares the host network with the proxy; every connection is literal loopback only."""
 
@@ -211,7 +215,7 @@ class ProxyClient:
                         await asyncio.sleep(1)
                     elif action == "pause" and (newer := _newer_pause(receipt)) is not None:
                         if newer == identifier or newer in followed:
-                            raise ProxyError("A newer Pause could not be confirmed.")
+                            raise ReceiptMismatchError("A newer Pause could not be confirmed.")
                         followed.add(newer)
                         receipt_id = newer
                     else:
@@ -222,7 +226,9 @@ class ProxyClient:
                     else:
                         matched = receipt.get("id") == receipt_id and receipt.get("action") == "pause"
                     if not matched:
-                        raise ProxyError("The local charger proxy returned another command's receipt")
+                        raise ReceiptMismatchError("The local charger proxy returned another command's receipt")
+        except ReceiptMismatchError:
+            raise
         except TimeoutError, ProxyError:
             if receipt is None:
                 raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None

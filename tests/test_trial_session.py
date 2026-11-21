@@ -11,6 +11,7 @@ from contextlib import closing
 import pytest
 from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
+from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_session import TrialSession
@@ -123,6 +124,32 @@ async def test_managed_shutdown_does_not_stop_across_a_repeat_boot(tmp_path, tls
         await shutdown
         assert not [call for call in b.rig.bench.device_calls[mark:] if call[2] == "RemoteStopTransaction"]
         assert b.session.final_status["shutdown_attempt_uncertain"] is True
+
+
+# Intent: a commissioning Stop cannot target the old session after a new Boot on the same socket.
+# Why: an unconfirmed zero write may still permit Stop only while its original Boot remains current.
+async def test_commissioning_stop_does_not_cross_a_repeat_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
+    from tests.test_managed_boot_supersession import delay_reply
+    from tests.test_native_bounded_handover import native_ready
+
+    async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
+        await session.command({"command": "release"})
+        started = await rig.bench.call(charger, "commissioning-start", "StartTransaction", START)
+        assert started[0] == 3 and started[2]["idTagInfo"]["status"] == "Accepted"
+        local = started[2]["transactionId"]
+        boot = session.gateway.boot_observation
+        send, held, entered = delay_reply(monkeypatch, rig, charger, "GetCompositeSchedule")
+        mark = len(rig.bench.device_calls)
+        task = asyncio.create_task(session.command({"command": "stop"}))
+        await asyncio.wait_for(entered.wait(), 3)
+        assert (await rig.bench.call(charger, "new-commissioning-boot", "BootNotification", BOOT))[0] == 3
+        assert session.gateway.boot_observation not in (None, boot)
+        await send(held[0])
+        with pytest.raises(UnavailableError):
+            await task
+        stop = {"transactionId": local, "timestamp": "2026-01-01T00:01:00Z", "meterStop": 1100}
+        assert (await rig.bench.call(charger, "actual-commissioning-stop", "StopTransaction", stop))[0] == 3
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls[mark:])
 
 
 # Intent: close a transaction that reports a previously issued owner Start during shutdown.

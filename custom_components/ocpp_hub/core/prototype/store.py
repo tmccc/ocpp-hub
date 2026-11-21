@@ -584,6 +584,19 @@ class Journal:
         ).fetchone()
         return int(row[0]) if row else None
 
+    # Only the latest mapped Stop can explain a native report that still carries a closed session's ID.
+    def latest_mapped_stop(self, local: int | None) -> bool:
+        return (
+            type(local) is int
+            and self.db.execute(
+                "SELECT 1 FROM ("
+                "SELECT local, stop, vendor FROM transactions WHERE connector=1 ORDER BY local DESC LIMIT 1"
+                ") WHERE local=? AND stop IS NOT NULL AND vendor IS NOT NULL",
+                (local,),
+            ).fetchone()
+            is not None
+        )
+
     # A complete Start and Stop advances the allocation even when the connector is idle again.
     def lifecycle_position(self) -> tuple[int, int | None]:
         return self.get("next_transaction", 1000), self.active()

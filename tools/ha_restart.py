@@ -58,7 +58,7 @@ def restart(api: HomeAssistantAPI, before: object, lifetime: Callable[[], object
         raise RestartError("Home Assistant changed before the requested restart.")
     try:
         api.request("/services/homeassistant/restart", post=True)
-    except (OSError, http.client.HTTPException):
+    except OSError, http.client.HTTPException:
         pass  # Closing transport may race a successful request. Only lifetime evidence resolves it.
 
     deadline = time.monotonic() + timeout
@@ -66,7 +66,7 @@ def restart(api: HomeAssistantAPI, before: object, lifetime: Callable[[], object
         try:
             if lifetime() != before:
                 return
-        except (OSError, http.client.HTTPException, RestartError, ValueError):
+        except OSError, http.client.HTTPException, RestartError, ValueError:
             pass
         time.sleep(min(2, remaining))
     raise RestartError("The Home Assistant restart did not produce a verified new Core lifetime.")
@@ -102,7 +102,7 @@ def core_lifetime() -> tuple[int, str]:
             if (b"-m", b"homeassistant") in zip(args, args[1:]):
                 ticks = (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
                 matches.append((int(proc.name), ticks))
-        except (FileNotFoundError, ProcessLookupError):
+        except FileNotFoundError, ProcessLookupError:
             continue
     if len(matches) != 1:
         raise RestartError("The selected container has no unique Home Assistant Core process.")
@@ -113,7 +113,7 @@ def core_lifetime() -> tuple[int, str]:
 def tcp_address(endpoint: tuple[str, int], *, mapped: bool = False) -> str:
     host, port = endpoint
     packed = socket.inet_pton(socket.AF_INET6, f"::ffff:{host}") if mapped else socket.inet_aton(host)
-    words = "".join(f"{int.from_bytes(packed[i:i + 4], sys.byteorder):08X}" for i in range(0, len(packed), 4))
+    words = "".join(f"{int.from_bytes(packed[i : i + 4], sys.byteorder):08X}" for i in range(0, len(packed), 4))
     return f"{words}:{port:04X}"
 
 
@@ -152,7 +152,7 @@ def connect_to_core(port: int, expected: tuple[int, str]) -> http.client.HTTPCon
                 return connection
             time.sleep(0.05)
         raise RestartError("The local API socket does not belong to Home Assistant Core in the selected container.")
-    except (OSError, RestartError):
+    except OSError, RestartError:
         connection.close()
         raise
 
@@ -166,12 +166,33 @@ def container_lifetime(port: int, token: str) -> tuple[int, str]:
     return current
 
 
-# The deployer runs this entry point in the selected container and sends the token privately over stdin.
+# Bind the install and restart to one original Core lifetime.
+def prepare_container_restart(port: int, token: str) -> Callable[[], None]:
+    try:
+        before = container_lifetime(port, token)
+    except RestartError as error:
+        raise SystemExit(str(error)) from None
+    except OSError, http.client.HTTPException, ValueError:
+        raise SystemExit("The Home Assistant container's local API could not be verified.") from None
+
+    # The installer keeps its lock until the same checked build has had time to load.
+    def activate() -> None:
+        api = HomeAssistantAPI(lambda: connect_to_core(port, before), token)
+        try:
+            restart(api, before, lambda: container_lifetime(port, token))
+        except RestartError as error:
+            raise SystemExit(str(error)) from None
+        except OSError, http.client.HTTPException, ValueError:
+            raise SystemExit("The Home Assistant container's local API could not be verified.") from None
+
+    return activate
+
+
+# Keep the standalone process-lifetime probe and restart interface for existing callers.
 def container_command() -> None:
     port = int(sys.argv[1])
     token = sys.stdin.read()
     try:
-        # Baseline before install, or recheck that baseline immediately before issuing a restart request.
         before = container_lifetime(port, token)
         if len(sys.argv) == 2:
             print(json.dumps(before))
@@ -182,7 +203,7 @@ def container_command() -> None:
         restart(api, before, lambda: container_lifetime(port, token))
     except RestartError as error:
         raise SystemExit(str(error)) from None
-    except (OSError, http.client.HTTPException, ValueError):
+    except OSError, http.client.HTTPException, ValueError:
         raise SystemExit("The Home Assistant container's local API could not be verified.") from None
 
 

@@ -134,6 +134,11 @@ def preflight(path: Path) -> PreparedTrial:
     return PreparedTrial(native.config, native.baseline, native.observer, prepare_tls(native.config))
 
 
+# Give startup and the managed controller the same persisted service identity.
+def managed_service_mode(spec: NativeBoundedSpec) -> dict[str, str | bool]:
+    return {"mode": "app_schedule", "spec_digest": spec.digest, "local_start": False}
+
+
 # Refuse retired installations under the journal lock before normalizing interrupted operations.
 def require_supported_installation(
     db: sqlite3.Connection, spec: NativeBoundedSpec, *, allow_local_start: bool | None = None
@@ -160,13 +165,13 @@ def require_supported_installation(
         allow_local_start is not None
         and managed is not None
         and (
-            not isinstance(managed, dict)
-            or managed.get("mode") != "app_schedule"
+            allow_local_start
+            or not isinstance(managed, dict)
             or managed.get("local_start") is not False
-            or allow_local_start
+            or managed != managed_service_mode(spec)
         )
     ):
-        raise SecurityError("managed journal requires its saved local Start restriction")
+        raise SecurityError("managed journal requires its saved local Start restriction and exact specification")
 
 
 # Check the exact installation under the journal lock before any normalisation, including in offline tools.

@@ -346,7 +346,7 @@ async def test_lost_pause_reply_requires_a_matching_result(actual_hass, peer, lo
     messages = {
         "failed": "could not confirm the requested control state",
         "uncertain": "The proxy recorded the request. The charger outcome is uncertain",
-        "wrong-action-after-acceptance": "request was recorded; physical confirmation is still pending",
+        "wrong-action-after-acceptance": "returned another command's receipt",
     }
     message = messages.get(lookup_failure, "outcome is unknown")
     with pytest.raises(HomeAssistantError, match=message):

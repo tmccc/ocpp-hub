@@ -221,19 +221,25 @@ async def test_managed_restart_releases_after_fresh_zero_without_start(
 
 
 # Intent: the wrong service mode cannot change a saved unanswered Start during startup.
-# Why: just trying the commissioning command must leave the stopped managed journal untouched.
-async def test_refused_commissioning_does_not_normalize_managed_start(tmp_path, tls, unused_tcp_port):
+# Why: a refused start must leave the stopped managed journal untouched.
+@pytest.mark.parametrize("difference", ["commissioning", "specification", "extra-field"])
+async def test_refused_startup_does_not_normalize_managed_start(tmp_path, tls, unused_tcp_port, difference):
     async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         config = rig.prepared.config
         with closing(Journal(config.journal, config.identity)) as journal:
-            journal.put("managed_mode", {"mode": "app_schedule", "local_start": False})
+            saved = {"mode": "app_schedule", "local_start": False, "spec_digest": rig.spec.digest}
+            if difference == "specification":
+                saved["spec_digest"] = "different"
+            elif difference == "extra-field":
+                saved["unexpected"] = True
+            journal.put("managed_mode", saved)
             journal.start("wrong-mode-start", START)
             sent = journal.next_delivery()
             assert sent is not None and sent.action == "StartTransaction"
             journal.mark_sent(sent)
 
         with pytest.raises(SecurityError, match="saved local Start restriction"):
-            TrialSession(rig.prepared, FAST, native_bounded=rig.spec)
+            TrialSession(rig.prepared, FAST, native_bounded=rig.spec, allow_local_start=difference == "commissioning")
 
         with closing(sqlite3.connect(config.journal.as_uri() + "?mode=ro", uri=True)) as db:
             assert db.execute("SELECT state FROM outbox WHERE token=?", (sent.token,)).fetchone() == ("inflight",)

@@ -366,10 +366,13 @@ def incident_report(journal: Path, event_path: Path) -> dict[str, Any]:
         transport = "matching_reply"
     waiting = []
     if start.get("lifecycle") == "unbound":
-        if start.get("stage") == "issued" and start.get("saved_reply") != "accepted":
-            waiting.append("start_outcome_or_lifecycle")
-        elif start.get("stage") == "accepted" or start.get("saved_reply") == "accepted":
+        stage, saved_reply = start.get("stage"), start.get("saved_reply")
+        if stage == "accepted" or saved_reply == "accepted":
             waiting.append("start_lifecycle")
+        elif stage == "issued" and saved_reply == "rejected":
+            waiting.append("saved_start_reply_settlement")
+        elif stage == "issued":
+            waiting.append("start_outcome_or_lifecycle")
     if start.get("lifecycle") == "open" and (saved["intent"] or {}).get("mode") == "paused":
         waiting.append("session_closure")
     pending = start.get("pending_delivery", ())

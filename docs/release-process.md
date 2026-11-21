@@ -92,6 +92,7 @@ The helper runs the validation gate, creates an external backup, installs and ve
 domain it selects the older `ocpp_hub` integration. It does not deploy the standalone service. When separately
 authorized, `--restart --yes --ha-api-config "$HA_API_CONFIG"` performs the configuration check and HA restart.
 Docker verifies the selected Core process through its local API and waits for a new process to report running.
+The Docker installer holds the component lock from the Core preflight through restart verification.
 For the legacy SSH restart, the API hostname must match the SSH target. Use `ssh_host` in the private API
 configuration for an explicit SSH alias. Verification uses the configured Uptime timestamp entity, which
 defaults to `sensor.uptime` and can be set via `uptime_entity`.

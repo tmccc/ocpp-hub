@@ -613,7 +613,7 @@ async def test_idle_restart_keeps_existing_fail_closed_policy(tmp_path, tls, unu
 
 # Intent: either order of genuine daily closure remains at zero until both native and OCPP confirm closure.
 # Why: a StopTransaction alone or an idle native observation cannot release an unresolved operation hold.
-@pytest.mark.parametrize("first", ["native", "ocpp"])
+@pytest.mark.parametrize("first", ["native", "ocpp", "ocpp-unplugged"])
 async def test_closure_disagreement_stays_zero(tmp_path, tls, unused_tcp_port, monkeypatch, first):
     async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         original = copy.deepcopy(b.device.plans[9])
@@ -630,6 +630,8 @@ async def test_closure_disagreement_stays_zero(tmp_path, tls, unused_tcp_port, m
         else:
             await b.close_transaction(local)
             b.device.active = local
+            if first == "ocpp-unplugged":
+                b.rig.bench.cp, b.rig.bench.connection = "A", "Unplug"
         for _ in range(4):
             await b.c.tick()
             assert b.device.effective_limit() == 0 and not b.stops() and b.c.requests.intent().mode == "app"
@@ -637,6 +639,7 @@ async def test_closure_disagreement_stays_zero(tmp_path, tls, unused_tcp_port, m
             await b.close_transaction(local)
         else:
             b.device.active = None
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
         assert (await healthy(b.c))["station_ceiling_a"] == 6 and b.c.current.selected() == 6
         following = await b.advance_idle_to(int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp()))
         assert following not in (None, local) and (await healthy(b.c))["current_a"] == 6
