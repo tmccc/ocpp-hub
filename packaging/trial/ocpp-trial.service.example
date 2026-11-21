@@ -14,8 +14,8 @@ UMask=0077
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=TMPDIR=/var/lib/ocpp-trial/tmp
 ExecStartPre=/usr/bin/mkdir -p /var/lib/ocpp-trial/tmp
-ExecStartPre=/opt/ocpp-trial/venv/bin/python -B /opt/ocpp-trial/tools/trial_proxy.py check --config /etc/ocpp-trial/trial.json
-ExecStart=/opt/ocpp-trial/venv/bin/python -B /opt/ocpp-trial/tools/trial_proxy.py run --config /etc/ocpp-trial/trial.json --duration 900
+ExecStartPre=/opt/ocpp-trial/venv/bin/python -B /opt/ocpp-trial/tools/trial_proxy.py check --config /etc/ocpp-trial/trial.json --native-bounded-spec /etc/ocpp-trial/native-spec.json
+ExecStart=/opt/ocpp-trial/venv/bin/python -B /opt/ocpp-trial/tools/trial_proxy.py run --config /etc/ocpp-trial/trial.json --native-bounded-spec /etc/ocpp-trial/native-spec.json --duration 900
 Restart=no
 TimeoutStopSec=45
 KillSignal=SIGTERM

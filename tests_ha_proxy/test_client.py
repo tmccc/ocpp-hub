@@ -406,7 +406,7 @@ async def test_command_outcome_uses_saved_reason(actual_hass, peer, action):
             await asyncio.wait_for(press, 3)
         assert entry.runtime_data.data["local_hold_verified"]
     else:
-        with pytest.raises(ProxyError, match="stopped before sending"):
+        with pytest.raises(ProxyError, match="stopped before sending the release command"):
             await entry.runtime_data.client.command(action, 0)
     sent, lookup, *later = [request for request in peer["requests"] if request["command"] != "status"]
     assert sent["command"] == action and lookup["command"] == "receipt" and lookup["request_id"] == sent["id"]

@@ -311,3 +311,63 @@ def test_runtime_constructor_is_dormant_and_rejects_live_urls(
                 OfflineRuntime(gateway, admission, url, server, client)
         assert not caught
     store.close()
+
+
+# Intent: the socket keeps receiving genuine replies while a refusal send is waiting for the peer.
+# Why: a stalled reply to a malformed or excess report cannot hide the charger response to another command.
+@pytest.mark.parametrize("full", [False, True])
+async def test_runtime_reads_a_reply_while_a_refusal_send_waits(tmp_path, tls, admission, full):
+    bench = Bench(tmp_path / "reply-congestion.db", tls, admission)
+    release, refusing, full_queue = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    queued = set()
+    bench.gateway.use_command_processor()
+    try:
+        async with serve(
+            bench.vendor, "127.0.0.1", 0, ssl=bench.server_tls, subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG
+        ) as cloud:
+            await bench.start(cloud.sockets[0].getsockname()[1])
+            async with bench.charger() as charger:
+                await bench.boot(charger)
+                peer = bench.gateway.charger
+                sender = peer.sender
+                assert sender is not None
+                peer.timeout = 2
+
+                # Delay only the selected actual reply sends while leaving the websocket and reads intact.
+                async def congested(raw):
+                    frame = decode(raw)
+                    if frame[0] == 3 and frame[1].startswith("queued-"):
+                        queued.add(frame[1])
+                        if len(queued) == 32:
+                            full_queue.set()
+                        await release.wait()
+                    if frame[0] == 4 and frame[1] == "refused":
+                        refusing.set()
+                        await release.wait()
+                    await sender(raw)
+
+                peer.sender = congested
+                command = None
+                try:
+                    if full:
+                        for index in range(32):
+                            await charger.send(build_call(f"queued-{index}", "Heartbeat", {}))
+                        await asyncio.wait_for(full_queue.wait(), 1)
+                        await charger.send(build_call("refused", "Heartbeat", {}))
+                    else:
+                        await charger.send('[2,"refused","Heartbeat",[]]')
+                    await asyncio.wait_for(refusing.wait(), 1)
+                    command = asyncio.create_task(peer.call("GetConfiguration", {"key": ["HeartbeatInterval"]}))
+                    request = decode(await asyncio.wait_for(charger.recv(), 1))
+                    assert request[0] == 2 and request[2] == "GetConfiguration"
+                    actual = {"configurationKey": []}
+                    await charger.send(build_call_result(request[1], actual))
+                    assert (await asyncio.wait_for(command, 1))[2] == actual
+                    assert not release.is_set()
+                finally:
+                    release.set()
+                    if command is not None:
+                        await asyncio.gather(command, return_exceptions=True)
+                    await bench.gateway.drain()
+    finally:
+        await bench.close()

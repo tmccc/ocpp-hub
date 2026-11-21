@@ -49,7 +49,7 @@ retains its actual reply or unknown outcome.
 
 The proxy uses one queue to decide what to send and how incoming reports and replies change charging state.
 The charger and cloud connections keep reading while requests wait. A newer Pause can take effect while an
-earlier reply is outstanding. The earlier reply still belongs to the request and charging session that sent it.
+earlier reply is outstanding. The proxy applies that reply to its original request and charging session.
 
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
@@ -330,7 +330,9 @@ new admission until selective cleanup is proven. Actual Boot repeats the native 
 
 Only `run` opens the commissioning connections. It requires `--native-bounded-spec`, a 6 A ceiling and a
 60–1800 second duration, defaulting to 900 seconds. Its duration includes startup. Default `check` remains dormant
-and may validate the package without a specification; it opens no journal or socket.
+and may validate the package without a specification; it opens no journal or socket. The
+[commissioning unit example](packaging/trial/ocpp-trial.service.example) checks and runs with the same specification
+at `/etc/ocpp-trial/native-spec.json`.
 
 ```bash
 python3.14 tools/trial_proxy.py run --config /private/trial.json \

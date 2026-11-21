@@ -177,3 +177,35 @@ async def test_return_waits_for_actual_existing_restore(tmp_path, tls, unused_tc
             peer.release.set()
             await asyncio.wait_for(asyncio.gather(automatic, return_exceptions=True), 5)
         assert c.requests.intent().mode == "paused"
+
+
+# Intent: a failed physical Return claim ends that request before sending and retains the verified Pause.
+# Why: an unavailable journal write before dispatch does not create an unconfirmed charger operation.
+async def test_return_hold_claim_refusal_keeps_verified_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        expected, identifier = c.requests.intent(), uuid.uuid4().hex
+        c.command(identifier, "app_control", expected.revision)
+        before = list(b.rig.bench.device_calls)
+        ticket = j.get("control")["ticket"]
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_release_ticket BEFORE INSERT ON meta "
+            "WHEN NEW.key='control' AND json_extract(NEW.value, '$.uncertain')=1 "
+            "BEGIN SELECT RAISE(ABORT,'Return hold claim unavailable'); END"
+        )
+        try:
+            result = await c.recovery.restore(expected, return_request=identifier, claim_return=True)
+            assert not result.shared
+            receipt = c.requests.receipt(identifier)
+            assert receipt["state"] == "failed" and receipt["result"]["classification"] == "return_not_sent"
+            assert not j.fault.latched() and j.get("control")["ticket"] == ticket
+            assert (await healthy(c))["local_hold_verified"]
+        finally:
+            j.db.execute("DROP TRIGGER refuse_release_ticket")
+        assert not any(frame[2] == "SetChargingProfile" for frame in b.rig.bench.device_calls[len(before) :])
+        retry = uuid.uuid4().hex
+        c.command(retry, "app_control", c.requests.intent().revision)
+        assert (await healthy(c))["owner_control_enabled"]
+        assert c.requests.receipt(retry)["state"] == "completed"

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep the OCPP reader available when a refusal or routine reply takes too long to send. Skip unchanged inventory and
+  already-settled Start writes during supervision.
+- Keep verified Pause when a Return claim cannot be saved. Explain the release separately from a zero-current check.
+- Require the saved history fault to identify missing records before acknowledging it. Check the commissioned
+  specification before opening an existing journal for writes, and use that specification in the commissioning unit.
 - Use one command queue for charging decisions, incoming reports and reply outcomes. Keep network waits
   independent so a newer Pause can take effect while the proxy waits for an earlier reply.
 - Recover a vendor-confirmed Start whose reply went missing while later charge reports are queued. Keep the

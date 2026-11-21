@@ -460,7 +460,19 @@ def retire_start(
             and not record.pending
             and (lease is None or (lease.normal and lease.source == "local" and lease.identifier == record.identifier))
         )
-        return RetirementDecision(rule, local) if eligible else None
+        if not eligible:
+            return None
+        decision = RetirementDecision(rule, local)
+        if lease is None and request.state not in decision.states:
+            state = json.loads(record.body)
+            if (
+                state.get("state") == "completed"
+                and state.get("charging") is False
+                and state.get("local_transaction") == local
+                and state.get("recovery_reason") == decision.update(record).reason
+            ):
+                return None
+        return decision
     if rule is not RetirementRule.GENERIC:
         return None
     normal, cloud = record.kind == "normal", record.source == "cloud"

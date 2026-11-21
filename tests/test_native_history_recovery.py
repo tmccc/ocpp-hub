@@ -76,6 +76,7 @@ async def missing_history(
     monkeypatch: pytest.MonkeyPatch,
     *,
     paused: bool = False,
+    mixed: bool = False,
 ) -> AsyncIterator[HistoryFault]:
     async with managed_bench(directory, contexts, port) as rig:
         rig.bench.history = closed_records()
@@ -94,8 +95,14 @@ async def missing_history(
                 key: copy.deepcopy(first.journal.get(key))
                 for key in ("trial_allocation", "next_transaction", "managed_mode", "managed_control_intent")
             }
+            if mixed:
+                # Prove a configuration contradiction through the independent native peer first.
+                with monkeypatch.context() as config:
+                    config.setitem(rig.peer.configuration, "maxOutCurrent0", "31")
+                    assert (await controller.tick())["state"] == "degraded"
+                    assert "history" not in first.journal.get("managed_native_failure")["detail"]
             rig.bench.history = copy.deepcopy(original[2:])
-            for _ in range(3):
+            for _ in range(2 if mixed else 3):
                 assert (await controller.tick())["state"] == "degraded"
             assert (await controller.tick())["state"] == "attention"
             assert first.journal.get("managed_control_fault")["classification"] == (
@@ -759,3 +766,18 @@ async def test_recover_unassigned_start_to_verified_pause(
         finally:
             await replacement.close()
             fault.journal = Journal(journal.path, journal.identity)
+
+
+# Intent: a history repair cannot clear a fault whose earlier observation proved a different contradiction.
+# Why: the final missing-history message alone does not establish what the original fault covered.
+async def test_history_ack_refuses_a_mixed_native_fault(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with missing_history(tmp_path, tls, unused_tcp_port, monkeypatch, paused=True, mixed=True) as fault:
+        journal, rig = fault.journal, fault.rig
+        saved = journal.fault.read()
+        diagnostic = journal.get("managed_native_failure")
+        assert diagnostic.get("source") is None
+        native = await rig.prepared.observer.observe_handover()
+        with pytest.raises(RecoveryRequiredError, match="matching native fault"):
+            acknowledge_history_policy(journal, fault.book, rig.spec, native)
+        assert journal.fault.read() == saved and journal.get("managed_native_failure") == diagnostic
+        assert journal.get("native_history_policy") is None

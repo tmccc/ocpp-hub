@@ -1005,7 +1005,13 @@ class LocalControl:
                     return Pending(Prerequisite.SUPERSEDED, "release hold changed before the claim")
             if previous.get("uncertain") and not acknowledge_uncertainty:
                 raise RecoveryRequiredError("previous local outcome requires reconciliation")
-            epoch, ticket = self._claim(previous.get("inhibit", False))
+            try:
+                epoch, ticket = self._claim(previous.get("inhibit", False))
+            except sqlite3.Error as error:
+                if attempt is None or self.journal.db.in_transaction:
+                    raise
+                # The coordinator still compares the original verified zero, Boot and unchanged ticket.
+                return Pending(Prerequisite.RECONCILIATION, "release claim could not be saved", error)
             if attempt is not None:
                 attempt.ticket = ticket
             self._release_ticket = ticket

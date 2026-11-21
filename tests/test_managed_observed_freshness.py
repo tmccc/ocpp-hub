@@ -254,3 +254,26 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 g.vendor.timeout = old_timeout
     finally:
         release_ack.set()
+
+
+# Intent: ordinary idle and paused checks do not rewrite a digest they already recorded.
+# Why: a refusal of a redundant write cannot stop supervision of the same verified charger state.
+@pytest.mark.parametrize("paused", [False, True])
+async def test_unchanged_inventory_recheck_does_not_need_a_write(tmp_path, tls, unused_tcp_port, monkeypatch, paused):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        if paused:
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        verified = await healthy(c)
+        assert verified["local_hold_verified"] is paused
+        assert j.db.execute("SELECT observed_digest FROM trial_resources WHERE key='profile:7001'").fetchone()[0]
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_same_digest BEFORE UPDATE OF observed_digest ON trial_resources "
+            "WHEN OLD.observed_digest IS NEW.observed_digest "
+            "BEGIN SELECT RAISE(ABORT,'same observation needs no write'); END"
+        )
+        try:
+            status = await c.tick()
+            assert status["state"] == "healthy" and status["local_hold_verified"] is paused
+        finally:
+            j.db.execute("DROP TRIGGER refuse_same_digest")

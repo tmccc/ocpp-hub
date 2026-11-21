@@ -8,6 +8,7 @@ import uuid
 import pytest
 from ocpp_hub_core.frames import build_call_error
 from ocpp_hub_core.prototype.gateway import decode
+from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
 from tests import managed_rig as mp
 from tests.charge_rig import ChargeRig, positive_flow
@@ -171,12 +172,21 @@ async def test_closed_session_retirement_is_atomic(tmp_path, model_tls, monkeypa
                 + sql
                 + " BEGIN SELECT RAISE(ABORT,'synthetic closed retirement write failure'); END"
             )
-            with pytest.raises(sqlite3.IntegrityError, match="synthetic closed retirement"):
+            with pytest.raises(RecoveryRequiredError, match="closure awaits retirement") as failure:
                 c.charging.retire_closed_at_zero(native)
+            assert isinstance(failure.value.__cause__, sqlite3.IntegrityError)
             assert c.charging.state() == state and c.requests.receipt(identifier) == receipt
             assert rig.bench.firmware.effective_limit() == 0
             s.journal.db.execute("DROP TRIGGER fail_closed_retire")
             c.charging.retire_closed_at_zero(native)
             assert c.charging.state()["state"] == c.requests.receipt(identifier)["state"] == "completed"
+            s.journal.db.execute(
+                "CREATE TEMP TRIGGER no_repeat_closed_write BEFORE INSERT ON meta "
+                "WHEN NEW.key='managed_test_charge' BEGIN SELECT RAISE(ABORT,'Start is already settled'); END"
+            )
+            try:
+                c.charging.retire_closed_at_zero(native)
+            finally:
+                s.journal.db.execute("DROP TRIGGER no_repeat_closed_write")
             c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
             assert (await mp.healthy(c))["normal_start_ready"]

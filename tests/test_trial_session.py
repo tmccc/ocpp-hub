@@ -12,10 +12,11 @@ import pytest
 from ocpp_hub_core.frames import build_call
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import RecoveryRequiredError
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.trial_session import TrialSession
 
 from tests.charge_rig import owner_rig, positive_flow, ready
-from tests.managed_rig import healthy, starts
+from tests.managed_rig import healthy, managed_bench, starts
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
@@ -364,3 +365,20 @@ async def test_original_profile_blocks_fresh_trial_before_binding(tmp_path, tls,
         assert not session.started and not session.runtime.status.charger_connected
         assert not session.runtime.status.vendor_connected and not rig.bench.received_profiles
         assert session.journal.get("trial_phase") == "prepared"
+
+
+# Intent: refusing a changed commissioning specification leaves the previous delivery evidence untouched.
+# Why: the original installation owns restart decisions about a report whose reply was not recorded.
+async def test_different_commissioning_spec_does_not_recover_the_existing_journal(tmp_path, tls, unused_tcp_port):
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        path, identity = rig.prepared.config.journal, rig.prepared.config.identity
+        with closing(Journal(path, identity)) as j:
+            j.put("native_bounded_handover", {"stage": "admitted", "spec": rig.spec.value()})
+            token = j.enqueue("StartTransaction", START)
+            j.db.execute("UPDATE outbox SET state='inflight' WHERE token=?", (token,))
+        other_boot = "1" * 64 if rig.spec.boot_digest != "1" * 64 else "2" * 64
+        changed = rig.spec.parse(rig.spec.value() | {"boot_digest": other_boot})
+        with pytest.raises(SecurityError, match="specification changed"):
+            TrialSession(rig.prepared, native_bounded=changed)
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as stored:
+            assert stored.execute("SELECT state FROM outbox WHERE token=?", (token,)).fetchone()[0] == "inflight"

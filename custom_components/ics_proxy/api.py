@@ -234,7 +234,7 @@ class ProxyClient:
         result = receipt.get("result")
         if receipt.get("state") == "failed" and isinstance(result, dict):
             if action == "app_control" and result.get("classification") == "return_not_sent":
-                raise ProxyError("Return to app / schedule stopped before sending a command to the charger.")
+                raise ProxyError("Return to app / schedule stopped before sending the release command.")
         if receipt.get("state") != "completed":
             raise ProxyError("The charger could not confirm the requested control state")
 

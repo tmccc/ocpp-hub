@@ -76,6 +76,10 @@ def decode(raw: str | bytes) -> Frame:
         or not 1 <= len(frame[1]) <= 36
     ):
         raise DeniedError("invalid frame identifier")
+    try:
+        frame[1].encode("utf-8")
+    except UnicodeEncodeError:
+        raise UnreadableFrameError("frame identifier is not valid text") from None
     if frame[0] == 2:
         if len(frame) == 4 and isinstance(frame[2], str) and isinstance(frame[3], dict):
             return frame
@@ -174,6 +178,7 @@ class Gateway:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
         self._reserved_stops: dict[str, asyncio.Task[None]] = {}
+        self._refusals: dict[str, asyncio.Task[None]] = {}
         self._flush_lock = asyncio.Lock()
         self._delivery_reply: DeliveryReply | None = None
         self.delivery_outcome_uncertain = False
@@ -317,14 +322,15 @@ class Gateway:
 
         self.decide(disconnect, priority=CommandPriority.SHUTDOWN)
         await self.controls.close()
-        for task in self._tasks:
+        replies = self._tasks.union(self._refusals.values())
+        for task in replies:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*replies, return_exceptions=True)
 
-    # Drain request handlers in deterministic offline tests; receivers themselves never block on a bridge.
+    # Drain request handlers and their independent refusal replies in deterministic offline tests.
     async def drain(self) -> None:
-        while self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        while replies := self._tasks.union(self._refusals.values()):
+            await asyncio.gather(*replies, return_exceptions=True)
             # Python 3.14 can return a completed gather without yielding to the
             # task-done callbacks that remove these tasks from the set.
             await asyncio.sleep(0)
@@ -342,8 +348,7 @@ class Gateway:
         except UnreadableFrameError, MalformedReplyError:
             return  # Keep the socket and wait for a valid message or the existing reply deadline.
         except MalformedCallError as error:
-            if peer.sender is not None:
-                await peer.sender(build_call_error(str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape"))
+            self._refuse_call(side, current_epoch, str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape")
             return
         if frame[0] != 2:
             peer.receive(frame)
@@ -355,13 +360,20 @@ class Gateway:
         reserved = len(self._tasks) >= 32
         stop = frame[2] == ("StopTransaction" if side == "charger" else "RemoteStopTransaction")
         if reserved and (not stop or side in self._reserved_stops):
-            if peer.sender:
-                await peer.sender(build_call_error(frame[1], "OccurrenceConstraintViolation", "request queue is full"))
+            self._refuse_call(side, current_epoch, frame[1], "OccurrenceConstraintViolation", "request queue is full")
             return
         task = asyncio.create_task(self._answer(side, current_epoch, frame, current_control_scope(self)))
         self._tasks.add(task)
         if reserved:
             self._reserved_stops[side] = task
+        task.add_done_callback(self._finished)
+
+    # Limit refusals to one waiting send per peer while the reader keeps matching replies.
+    def _refuse_call(self, side: str, epoch: int, token: str, code: str, detail: str) -> None:
+        if side in self._refusals:
+            return
+        task = asyncio.create_task(self._send_reply(side, epoch, build_call_error(token, code, detail)))
+        self._refusals[side] = task
         task.add_done_callback(self._finished)
 
     # Deduplicate a peer's requests before execution and never send old replies onto a replacement connection.
@@ -400,8 +412,10 @@ class Gateway:
     async def _send_reply(self, side: str, epoch: int, text: str) -> None:
         current = self._charger_epoch if side == "charger" else self._vendor_epoch
         peer = self.charger if side == "charger" else self.vendor
-        if epoch == current and peer.sender:
-            await peer.sender(text)
+        sender = peer.sender
+        if epoch == current and sender is not None:
+            async with asyncio.timeout(peer.timeout):
+                await sender(text)
 
     # A blocked Boot response cannot hold the serial charger reader indefinitely.
     async def _send_boot_response(self, sender: Sender, text: str) -> None:
@@ -456,12 +470,18 @@ class Gateway:
     # Retrieve task exceptions without logging frame bodies, identities or credentials.
     def _finished(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
-        for side, stop in self._reserved_stops.items():
-            if stop is task:
-                del self._reserved_stops[side]
-                break
+        for group in (self._reserved_stops, self._refusals):
+            for side, answer in group.items():
+                if answer is task:
+                    del group[side]
+                    break
         if not task.cancelled() and (error := task.exception()) is not None:
-            self.failures.append(type(error).__name__)
+            self._record_failure(type(error).__name__)
+
+    # Retain only recent handler failures for the life of the process.
+    def _record_failure(self, kind: str) -> None:
+        self.failures.append(kind)
+        del self.failures[:-32]
 
     # Send a local result only after its storage commit; transport failure leaves the receipt available for retry.
     async def _charger_call(self, frame: Frame, epoch: int, boot: str | None) -> str:
@@ -546,7 +566,7 @@ class Gateway:
                     exact_mutation = mutation
                     self.decide(lambda: self.journal.mutation_finished(exact_mutation, False))
                 except sqlite3.Error:
-                    self.failures.append("JournalUnavailable")
+                    self._record_failure("JournalUnavailable")
             text = build_call_error(token, "InternalError", "outcome unavailable; success was not confirmed")
         return text
 
@@ -1175,7 +1195,7 @@ class Gateway:
                                 {"mutation": mutation, "action": action, "digest": fingerprint(original)},
                             )
                 except sqlite3.Error:
-                    self.failures.append("JournalUnavailable")
+                    self._record_failure("JournalUnavailable")
 
             self.decide(retain_uncertainty)
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
@@ -1218,7 +1238,7 @@ class Gateway:
                             {"mutation": mutation, "action": action, "digest": fingerprint(original)},
                         )
         except sqlite3.Error:
-            self.failures.append("JournalUnavailable")
+            self._record_failure("JournalUnavailable")
 
     # Commit the last accepted definition even if the old transaction stopped while its reply was in flight.
     def _accepted_vendor_profile(self, profile: VendorProfileWrite) -> None:

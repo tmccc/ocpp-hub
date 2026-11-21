@@ -411,7 +411,7 @@ class ManagedController:
     def require_paused(self, native: HandoverEvidence) -> None:
         self.native.require(native, closed=True)
         self.native.require_known_session(native)
-        present = self.session.book.owned_present(native.physical)
+        present = self.session.book.owned_present(native.physical, record_unchanged=False)
         reason = self._paused_refusal(present)
         if reason is not None:
             error = RecoveryRequiredError("requested pause awaits independently verified closed zero")
@@ -886,9 +886,7 @@ class ManagedController:
                 ):
                     raise SecurityError("managed native transaction has no exact accepted local counterpart")
                 self.native.require_known_session(native)
-                present = self.session.book.owned_present(
-                    native.physical, record_unchanged=self.session.journal.active() is None
-                )
+                present = self.session.book.owned_present(native.physical, record_unchanged=False)
                 row = self.session.journal.db.execute(
                     "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
                 ).fetchone()

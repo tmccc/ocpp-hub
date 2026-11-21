@@ -135,7 +135,7 @@ def preflight(path: Path) -> PreparedTrial:
 
 
 # Refuse retired installations under the journal lock before normalizing interrupted operations.
-def require_supported_installation(db: sqlite3.Connection) -> None:
+def require_supported_installation(db: sqlite3.Connection, spec: NativeBoundedSpec) -> None:
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
         return
     metadata = {
@@ -147,8 +147,11 @@ def require_supported_installation(db: sqlite3.Connection) -> None:
     retired = metadata.get("connected_handover")
     if retired is not None and (not isinstance(retired, dict) or retired.get("stage") != "complete"):
         raise SecurityError("retired vehicle-pause handover requires its original recovery implementation")
-    if not metadata.get("native_bounded_handover") and metadata.get("trial_phase") not in (None, "prepared"):
+    native = metadata.get("native_bounded_handover")
+    if not native and metadata.get("trial_phase") not in (None, "prepared"):
         raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
+    if native and (not isinstance(native, dict) or native.get("spec") != spec.value()):
+        raise SecurityError("native bounded specification changed across process replacement")
 
 
 class TrialSession:
@@ -171,7 +174,11 @@ class TrialSession:
             raise SecurityError("unplugged native monitoring requires bounded mode and disabled local Start")
         self.prepared = prepared
         config = prepared.config
-        self.journal = Journal(config.journal, config.identity, check_existing=require_supported_installation)
+        self.journal = Journal(
+            config.journal,
+            config.identity,
+            check_existing=lambda db: require_supported_installation(db, native_bounded),
+        )
         try:
             managed = self.journal.get("managed_mode")
             if managed is not None and (
