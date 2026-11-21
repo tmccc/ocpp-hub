@@ -88,6 +88,32 @@ async def test_regular_start_continues_until_explicit_pause(
         assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
 
 
+# Intent: an unsupported Start reply cannot publish app control from an existing Pause.
+# Why: the proxy must still treat the sent Start as unresolved and verify zero even if the body says Accepted.
+async def test_normal_start_reply_requires_exact_confirmation(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j = test.controller, test.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        mode = c.requests.intent()
+        firmware = test.rig.bench.firmware
+        answer = firmware.answer
+
+        # Alter only the simulated charger's actual Start result, preserving the rest of its device behavior.
+        def extra_start_result(action, payload):
+            result = answer(action, payload)
+            return {**result, "extra": True} if action == "RemoteStartTransaction" else result
+
+        monkeypatch.setattr(firmware, "answer", extra_start_result)
+        request = uuid.uuid4().hex
+        c.command(request, "start", mode.revision)
+        await c.charging.settle()
+        assert c.requests.intent() == mode and len(starts(test.rig)) == 1
+        assert j.get("local_start_receipt")["stage"] == "issued"
+        assert c.requests.receipt(request)["state"] == "uncertain"
+        assert test.rig.bench.firmware.effective_limit() == 0
+
+
 # Intent: a transient write refusal does not interrupt an exact running local Start.
 # Why: the next native sample must settle the same request without sending another charger command.
 async def test_running_start_receipt_retries_after_storage_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):

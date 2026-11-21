@@ -62,6 +62,7 @@ class FormatCloud:
             else:
                 answer = {}
             if self.incomplete_status_reply and frame[2] == "StatusNotification":
+                await connection.send("{")
                 await connection.send(json.dumps([3, frame[1], []]))
             await connection.send(build_call_result(frame[1], answer))
 
@@ -105,6 +106,7 @@ async def test_new_clock_replies_keep_format_sensitive_simulated_cloud_online(
                 await until(
                     lambda: bench.store.next_delivery() is None and bench.gateway.vendor_registration == "Accepted"
                 )
+                await charger.send("{")
                 await charger.send(build_call("heartbeat", "Heartbeat", {}))
                 clock_reply(decode(await charger.recv())[2]["currentTime"])
                 await asyncio.sleep(0.08)

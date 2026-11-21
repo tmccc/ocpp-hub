@@ -142,6 +142,9 @@ async def peer():
                 await socket.close()
                 return socket
         elif command == "receipt":
+            if control.get("close_first_receipt") and control["commands"].count("receipt") == 1:
+                await socket.close(code=1013, message=b"Busy")
+                return socket
             await asyncio.sleep(control["receipt_delay"])
             request_id = value["request_id"]
             result = receipts.get(request_id, {"id": request_id, "state": "not_found"})
@@ -292,7 +295,8 @@ async def test_lost_pause_reply_does_not_retry_control(actual_hass, peer, drop_r
 # Intent: a temporary receipt refusal can recover whether the original Pause reply arrived or was lost.
 # Why: the safe follow-up is another read of the same request, never a second charger command.
 @pytest.mark.parametrize("drop_reply", [False, True])
-async def test_temporary_pause_receipt_failure_retries_only_the_read(actual_hass, peer, drop_reply):
+@pytest.mark.parametrize("failure", ["not-ready", "socket-close"])
+async def test_temporary_pause_receipt_failure_retries_only_the_read(actual_hass, peer, drop_reply, failure):
     await setup(actual_hass, peer)
     peer["lose_reply"] = drop_reply
     peer["pending_receipt"] = True
@@ -303,7 +307,10 @@ async def test_temporary_pause_receipt_failure_retries_only_the_read(actual_hass
             return json.dumps({"ok": False, "error": "not_ready"})
         return None
 
-    peer["raw_response"] = first_read_unavailable
+    if failure == "socket-close":
+        peer["close_first_receipt"] = True
+    else:
+        peer["raw_response"] = first_read_unavailable
     await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
     pause, first, final = (request for request in peer["requests"] if request["command"] != "status")
     assert pause["command"] == "pause" and first["command"] == final["command"] == "receipt"

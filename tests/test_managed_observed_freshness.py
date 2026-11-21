@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from ocpp_hub_core.prototype import trial_evidence
 from ocpp_hub_core.prototype.managed_view import refresh_for_read
-from ocpp_hub_core.prototype.security import StaleEvidenceError
+from ocpp_hub_core.prototype.security import SecurityError, StaleEvidenceError
 
 from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
 from tests.managed_rig import healthy, starts
@@ -53,6 +53,23 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
         if event == "start":
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
             await actual_stop(b, local)
+
+
+# Intent: a later independent failed native audit withdraws the earlier healthy dashboard sample immediately.
+# Why: a known configuration contradiction cannot coexist with a fresh-looking control or power reading.
+async def test_strict_native_refusal_revokes_status_before_next_poll(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c = b.controller
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        with monkeypatch.context() as configuration:
+            configuration.setitem(b.rig.peer.configuration, "maxOutCurrent0", "31")
+            with pytest.raises(SecurityError):
+                await c.native.read()
+            assert c.native.last_verified_at == 0 and c.latest_native is not None
+            status = refresh_for_read(c, published)
+            assert not status["healthy"] and not status["owner_control_enabled"]
+            assert status["power_w"] is None and not status["can_start"]
+        assert (await healthy(c))["owner_control_enabled"]
 
 
 # Intent: the same actual native sample can expire at observed's final Pause check without ending supervision.

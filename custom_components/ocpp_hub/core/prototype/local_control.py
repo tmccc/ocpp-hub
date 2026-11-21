@@ -651,7 +651,7 @@ class LocalControl:
                     if cap_error is not None:
                         raise cap_error from error
                     raise StopReplyUnconfirmedError("transaction stop reply was unavailable") from error
-                if answer[0] != 3 or answer[2].get("status") != "Accepted":
+                if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
                     if cap_error is not None:
                         raise cap_error
                     raise StopReplyUnconfirmedError("transaction stop was not confirmed")
@@ -795,9 +795,9 @@ class LocalControl:
                 return
             if frame[0] == 4:
                 reply: ObservedReply = "call_error"
-            elif frame[2].get("status") == "Accepted":
+            elif frame[2] == {"status": "Accepted"}:
                 reply = "accepted"
-            elif frame[2].get("status") == "Rejected":
+            elif frame[2] == {"status": "Rejected"}:
                 reply = "rejected"
             else:
                 reply = "other"
@@ -814,8 +814,8 @@ class LocalControl:
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
                 if attempt is not None:
                     attempt.answer = answer
-                if answer[0] != 3 or answer[2].get("status") != "Accepted":
-                    if answer[0] == 3 and answer[2].get("status") == "Rejected":
+                if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
+                    if answer[0] == 3 and answer[2] == {"status": "Rejected"}:
                         record_stage("rejected")
                     raise UnavailableError("transaction start was not confirmed")
                 record_stage("accepted")

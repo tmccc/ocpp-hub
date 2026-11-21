@@ -92,7 +92,20 @@ class ProxyClient:
                 ) as connection:
                     sending = True
                     await connection.send_json({"id": identifier, "command": command, **fields})
-                    response = await connection.receive_json()
+                    if command == "receipt":
+                        message = await connection.receive()
+                        if message.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
+                            raise ReceiptUnavailableError("The saved command result is temporarily unavailable")
+                        if message.type is not aiohttp.WSMsgType.TEXT:
+                            raise TypeError("The local charger proxy returned a non-text receipt")
+                        response = message.json()
+                    else:
+                        response = await connection.receive_json()
         except (aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError) as error:
             if command == "receipt" and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
                 raise ReceiptUnavailableError("The saved command result is temporarily unavailable") from None

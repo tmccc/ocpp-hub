@@ -445,7 +445,7 @@ class Peer:
                     self.after_result(action, actual, answer)
                 self.diagnostics.phase = "complete"
                 return Reply(answer)
-        except (TimeoutError, OSError, asyncio.CancelledError) as error:
+        except (TimeoutError, OSError, UnavailableError, asyncio.CancelledError) as error:
             # The delivery owner can retain a reply already accepted by the receiver before the task unwinds.
             if (
                 retain_reply_on_exit
@@ -457,7 +457,7 @@ class Peer:
                 and future.exception() is None
             ):
                 on_reply(action, future.result())
-            if isinstance(error, asyncio.CancelledError):
+            if isinstance(error, (UnavailableError, asyncio.CancelledError)):
                 raise
             detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
             raise UnavailableError(detail) from error

@@ -22,8 +22,11 @@ from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_start_delivery import DENIALS
 from ocpp_hub_core.prototype.managed_stop_delivery import REJECTION
+from ocpp_hub_core.prototype.rpc import UnavailableError
+from ocpp_hub_core.prototype.runtime import ConnectionRuntime
 from ocpp_hub_core.prototype.store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
+from websockets.exceptions import ConnectionClosedOK
 
 from tests import managed_rig as mp
 from tests.charge_rig import ChargeRig, positive_flow
@@ -49,9 +52,10 @@ ACTIONS = (
 )
 
 
-# Intent: a real matched cloud Start reply survives cancellation before the delivery worker consumes it.
+# Intent: a matched cloud Start reply survives cancellation or closure while its send is still returning.
 # Why: reconnecting should use that reply after a process replacement and never send the Start again.
-async def test_correlated_start_reply_survives_delivery_retirement(tmp_path):
+@pytest.mark.parametrize("exit_kind", ["cancel", "socket-close"])
+async def test_correlated_start_reply_survives_delivery_retirement(tmp_path, exit_kind):
     path = tmp_path / "state.db"
     rig = Rig(path)
     await rig.boot()
@@ -59,25 +63,35 @@ async def test_correlated_start_reply_survives_delivery_retirement(tmp_path):
     assert start[0] == 3
     local = start[2]["transactionId"]
     sent = asyncio.get_running_loop().create_future()
+    close_send = asyncio.Event()
 
-    # Only the independent cloud delays its reply. The actual gateway and its delivery owner run unchanged.
-    async def vendor_send(raw):
-        frame = decode(raw)
-        if frame[0] == 2 and frame[2] == "StartTransaction":
-            sent.set_result(frame)
-        else:
-            await rig.vendor_send(raw)
+    class CloudTransport:
+        # Return the actual matched reply while the sender is still completing its own transport work.
+        async def send(self, raw):
+            frame = decode(raw)
+            if frame[0] == 2 and frame[2] == "StartTransaction":
+                sent.set_result(frame)
+                if exit_kind == "socket-close":
+                    await close_send.wait()
+                    raise ConnectionClosedOK(None, None)
+            else:
+                await rig.vendor_send(raw)
 
-    epoch = rig.gateway.attach_vendor(vendor_send)
+    epoch = rig.gateway.attach_vendor(ConnectionRuntime._sender(CloudTransport()))
     pump = asyncio.create_task(rig.gateway.flush())
     try:
         request = await asyncio.wait_for(sent, 2)
         assert rig.store.next_delivery().state == "inflight"
         response = {"transactionId": 9100, "idTagInfo": {"status": "Accepted"}}
         await rig.gateway.receive("vendor", build_call_result(request[1], response), epoch)
-        pump.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pump
+        if exit_kind == "cancel":
+            pump.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pump
+        else:
+            close_send.set()
+            with pytest.raises(UnavailableError, match="closed during send"):
+                await pump
         saved = DeliveryReply.restore(rig.store, rig.store.next_delivery())
         assert saved is not None and saved.answer == [3, request[1], response]
     finally:

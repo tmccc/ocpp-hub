@@ -45,6 +45,10 @@ from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, enco
 from .vendor_read_recovery import recover_legacy_vendor_read
 
 
+class UnreadableFrameError(DeniedError):
+    """An isolated malformed JSON message contains no usable OCPP request or reply."""
+
+
 class MalformedReplyError(DeniedError):
     """A recognizable reply envelope cannot complete a waiting call."""
 
@@ -63,7 +67,7 @@ def decode(raw: str | bytes) -> Frame:
         frame = json.loads(raw, object_pairs_hook=unique_object)
         encoded(frame)
     except ValueError, RecursionError:
-        raise DeniedError("invalid JSON frame") from None
+        raise UnreadableFrameError("invalid JSON frame") from None
     if (
         not isinstance(frame, list)
         or len(frame) < 2
@@ -295,8 +299,8 @@ class Gateway:
         peer = self.charger if side == "charger" else self.vendor
         try:
             frame = decode(raw)
-        except MalformedReplyError:
-            return  # Keep waiting for a valid reply on this connection or its ordinary deadline.
+        except UnreadableFrameError, MalformedReplyError:
+            return  # Keep the socket and wait for a valid message or the existing reply deadline.
         except MalformedCallError as error:
             if peer.sender is not None:
                 await peer.sender(build_call_error(str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape"))

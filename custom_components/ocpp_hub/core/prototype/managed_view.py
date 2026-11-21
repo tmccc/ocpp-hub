@@ -545,6 +545,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and current.scope == observed.scope
         and (current == observed or pause_pending and observed.intent.mode == "app")
         and native is not None
+        and c.native.last_verified_at != 0
         and pending_fault is None
         and not station_lost
     )
@@ -592,7 +593,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result["state"] = "pausing" if intent.mode == "paused" and not published_pending else "reconciling"
     proof = ControlProof(
         shared=result.get("owner_control_enabled") is True,
-        hold_verified=result.get("local_hold_verified") is True,
+        hold_verified=result.get("local_hold_verified") is True and result.get("charging_session_open") is False,
     ).retain(
         control,
         scope_current=scope_current and intent_current,

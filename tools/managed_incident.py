@@ -173,19 +173,17 @@ def metadata(db: sqlite3.Connection, key: str) -> dict[str, Any]:
 
 
 # Select a retained local Start by its exact management UUID, preserving unrelated historical receipts.
-def retained_start(
-    db: sqlite3.Connection, owner: dict[str, Any], wire: dict[str, Any]
-) -> tuple[str | None, dict[str, Any] | None]:
-    candidates = (owner.get("id") if owner.get("source") == "local" else None, wire.get("request_id"))
-    for value in candidates:
-        raw = identifier(value)
-        if raw is None:
-            continue
-        row = db.execute("SELECT action,revision,state FROM managed_requests WHERE id=?", (raw,)).fetchone()
-        if row is not None and row[0] in ("start", "start_test") and type(row[1]) is int and 0 <= row[1] < 2**53:
-            state = row[2] if row[2] in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN
-            return raw, {"request": reference(raw), "action": row[0], "revision": row[1], "state": state}
-    return None, None
+def retained_start(db: sqlite3.Connection) -> tuple[str | None, dict[str, Any] | None]:
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'").fetchone() is None:
+        return None, None
+    row = db.execute(
+        "SELECT id,action,revision,state FROM managed_requests "
+        "WHERE action IN ('start','start_test') ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None or (raw := identifier(row[0])) is None or type(row[2]) is not int or not 0 <= row[2] < 2**53:
+        return None, None
+    state = row[3] if row[3] in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN
+    return raw, {"request": reference(raw), "action": row[1], "revision": row[2], "state": state}
 
 
 # Only the transaction named by this receipt can establish lifecycle or cloud delivery evidence.
@@ -234,7 +232,7 @@ def journal_facts(path: Path) -> dict[str, Any]:
                 )
             wire = metadata(db, "local_start_receipt")
             owner = metadata(db, "managed_test_charge")
-            original, request = retained_start(db, owner, wire)
+            original, request = retained_start(db)
             if request is not None and original == owner.get("id"):
                 current = owner.get("current_a")
                 if type(current) in (int, float) and 6 <= current <= 32:

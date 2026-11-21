@@ -262,6 +262,36 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
     assert not config.journal.exists() and sorted(tmp_path.iterdir()) == before
 
 
+# Intent: a newer unsent local Start remains the incident selected after cloud test metadata replaces it.
+# Why: the report must never attach an older command's physical reply to the latest owner request.
+def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
+    path = tmp_path / "journal.db"
+    event_path = tmp_path / "journal.start-events.jsonl"
+    old, new, cloud, ticket = (uuid.uuid4().hex for _ in range(4))
+    journal = Journal(path, "OFFLINE001")
+    try:
+        requests = ManagedRequests(journal)
+        requests.accept(old, "start", 0)
+        requests.finish(old, "completed", {"local_session_verified": True})
+        journal.put("local_start_receipt", {"request_id": old, "ticket": ticket, "stage": "accepted"})
+        requests.accept(new, "start", 1)
+        requests.finish(new, "failed", {"classification": "preflight_refused_unsent"})
+        requests.accept(cloud, "arm_cloud_test", 1)
+        journal.put("managed_test_charge", {"id": cloud, "source": "cloud", "state": "armed"})
+        learned = incident_report(path, event_path)
+        saved = learned["journal"]
+        assert saved["request"] == {
+            "request": hashlib.sha256(new.encode()).hexdigest()[:32],
+            "action": "start",
+            "revision": 1,
+            "state": "failed",
+        }
+        assert saved["start"] is None
+        assert learned["wire"]["ticket"] is None and learned["wire"]["observed_reply"] == "unknown"
+    finally:
+        journal.close()
+
+
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.
 # Why: saved cloud reply settlement, unknown cloud delivery and unrelated stored observations mean different things.
 def test_incident_binds_only_exact_bounded_records(tmp_path):

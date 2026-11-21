@@ -523,13 +523,14 @@ class ManagedController:
             # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
             g.controls._complete(j.get("control")["ticket"], uncertain=False)
             raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
+        # Physical Pause is already proved. Cloud delivery debt can still block reactivation independently.
+        self.complete_pause_observation(native, intent, connection)
         if j.phase.read().value == "recovering":
             cloud = self.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"
             if not cloud:
                 await self.native.resume(local_only=True)
             elif not j.next_delivery():
                 await self.native.resume()
-        self.complete_pause_observation(native, intent, connection)
         return native
 
     # Pause alone settles its receipt, using current independent closure and the original paused generation.

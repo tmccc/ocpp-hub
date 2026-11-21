@@ -45,8 +45,9 @@ class OfflineRecovery:
 
 
 # Real previous Start/Stop facts at zero watts create historical delivery debt without ever drawing test current.
-async def prior_lifecycle_debt(test: ChargeRig) -> None:
-    await test.session.runtime.stop_vendor()
+async def prior_lifecycle_debt(test: ChargeRig, *, mapped_start: bool = False) -> None:
+    if not mapped_start:
+        await test.session.runtime.stop_vendor()
     answer = await test.rig.bench.call(test.charger, "prior-native-authorize", "Authorize", {"idTag": "NATIVE_TIMER"})
     assert answer[2]["idTagInfo"]["status"] == "Accepted"
     reply = await test.rig.bench.call(
@@ -54,6 +55,9 @@ async def prior_lifecycle_debt(test: ChargeRig) -> None:
     )
     local = reply[2]["transactionId"]
     assert reply[2]["idTagInfo"]["status"] == "Accepted"
+    if mapped_start:
+        await until(lambda: test.session.journal.vendor_id(local) is not None)
+        await test.session.runtime.stop_vendor()
     await test.rig.bench.call(
         test.charger,
         "prior-native-stop",
@@ -83,8 +87,8 @@ async def replacement_offline(
             first.controller.command(uuid.uuid4().hex, "pause", first.controller.requests.intent().revision)
             await healthy(first.controller)
         await until(lambda: first.session.journal.next_delivery() is None and not first.session.gateway.vendor._pending)
-        if debt == "lifecycle":
-            await prior_lifecycle_debt(first)
+        if debt in ("lifecycle", "mapped-stop"):
+            await prior_lifecycle_debt(first, mapped_start=debt == "mapped-stop")
         elif debt == "mutation":
             first.session.journal.mutation_intent(
                 "vendor", "ChangeConfiguration", {"key": "HeartbeatInterval", "value": "30"}
@@ -394,6 +398,27 @@ async def test_prior_lifecycle_or_mutation_debt_blocks_offline_readiness(
         assert test.session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == (
             recovery.prior_transaction_count
         )
+
+
+# Intent: verified zero can complete a Pause receipt even while a previous genuine Stop awaits the cloud.
+# Why: reporting the physical hold must not invent an acknowledgement or reactivate the installation.
+async def test_offline_replacement_confirms_pause_with_retained_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch, debt="mapped-stop") as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        debt = j.next_delivery()
+        assert debt is not None and debt.action == "StopTransaction" and debt.state == "queued"
+        assert j.active() is None and debt.transaction is not None and j.vendor_id(debt.transaction) is not None
+        mark = len(test.rig.bench.device_calls)
+        request = uuid.uuid4().hex
+        c.command(request, "pause", c.requests.intent().revision)
+        assert (await c.tick())["state"] == "reconciling"
+        receipt = c.requests.receipt(request)
+        assert receipt["state"] == "completed" and receipt["result"]["pause_verified"] is True
+        assert j.phase.read().value == "recovering" and j.next_delivery() == debt
+        assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls[mark:])
 
 
 # Intent: unknown native activity cannot be adopted or receive a guessed Stop merely to make offline recovery available.
