@@ -136,6 +136,11 @@ async def test_owner_pause_with_missing_reply_and_restarts(
         assert pause_again == pause and returned["command"] == "app_control" and returned["revision"] == revision
         (return_row,) = added_requests(proxy.durable(), baseline | {pause["id"]})
         assert return_row["id"] == returned["id"] and return_row["state"] == "completed"
+        await proxy.status(
+            lambda status: status.get("control_revision") == revision + 1
+            and status.get("owner_control_enabled") is True
+            and status.get("station_ceiling_a") == 6
+        )
         assert await hass.request("view") == {"entry_id": entry_id, "mode": "App / schedule", "return_available": False}
         assert len(await proxy.scheduled_sessions(6, True)) == 2
         assert await proxy.completed_control(pause["id"]) == original_receipt
