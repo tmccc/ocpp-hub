@@ -129,7 +129,7 @@ async def test_fresh_starts_wait_during_shutdown_storage_refusal(tmp_path, tls, 
         async def delay_dispatch(action, payload):
             result = await validate(action, payload)
             if action == "SetChargingProfile" and not validated.is_set():
-                assert result is None
+                assert callable(result)
                 validated.set()
                 await finish.wait()
             return result

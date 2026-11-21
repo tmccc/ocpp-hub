@@ -185,16 +185,26 @@ async def test_readonly_journal_never_forwards_write(tmp_path: Path) -> None:
     await rig.close()
 
 
-# Intent: a failure committing a real peer ACK returns an error and retains a global uncertainty barrier.
-# Why: publishing success without durable ownership would allow unsafe retries or clears after restart.
+# Intent: retain the real peer ACK and its pending plan update without sending the write again.
+# Why: a temporary journal failure must preserve the actual result while keeping new writes blocked.
 async def test_post_ack_plan_commit_failure_is_quarantined(tmp_path: Path) -> None:
     rig = await ready(tmp_path / "journal.db")
     rig.store.db.execute("CREATE TRIGGER fail_plan_update BEFORE UPDATE ON plans BEGIN SELECT RAISE(ABORT,'test'); END")
     answer = await rig.vendor("commit-failed", "DataTransfer", PLAN)
-    assert answer[0] == 4 and answer[2] == "InternalError"
-    assert rig.store.db.execute("SELECT state FROM mutations").fetchone()[0] == "uncertain"
+    assert answer[0] == 3 and answer[2]["status"] == "Accepted"
+    pending = rig.store.db.execute(
+        "SELECT state, wire_result FROM mutations JOIN vendor_command_scope ON mutation=token"
+    ).fetchone()
+    assert tuple(pending) == ("pending", "Accepted")
+    assert rig.store.db.execute("SELECT COUNT(*) FROM vendor_plan_effects").fetchone()[0] == 1
     count = len(rig.charger_frames)
+    assert await rig.vendor("commit-failed", "DataTransfer", PLAN) == answer
     assert (await rig.vendor("changed", "DataTransfer", plan(limitCurrent=6)))[0] == 4
+    assert len(rig.charger_frames) == count
+    rig.store.db.execute("DROP TRIGGER fail_plan_update")
+    rig.gateway.retry_reply_writes()
+    assert rig.store.db.execute("SELECT state FROM mutations").fetchone()[0] == "confirmed"
+    assert rig.store.db.execute("SELECT COUNT(*) FROM vendor_plan_effects").fetchone()[0] == 0
     assert len(rig.charger_frames) == count
     await rig.close()
 
