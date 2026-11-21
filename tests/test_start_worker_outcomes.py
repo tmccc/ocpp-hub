@@ -56,8 +56,8 @@ async def test_start_preflight_failure_settles_before_optional_diagnostic(tmp_pa
                 await asyncio.wait_for(asyncio.gather(c.charging.worker, return_exceptions=True), 3)
 
 
-# Intent: the same service reconciles a lost unsent task, while cancellation after real dispatch retains unknown debt.
-# Why: cancellation supplies no command outcome; exact unsent markers or genuine Start/Stop and ACKs must settle it.
+# Intent: the service reconciles a lost unsent task and saves the actual late reply after real dispatch.
+# Why: a late reply settles the wire outcome while the independent Start/Stop reports still have to prove closure.
 @pytest.mark.parametrize("issued", [False, True], ids=["before-task-execution", "after-real-Start-wire"])
 async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
     tmp_path, tls, unused_tcp_port, monkeypatch, issued
@@ -124,10 +124,12 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
             await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
         assert c.requests.intent().mode == "paused" and rig.bench.firmware.effective_limit() == 0
         if issued:
+            await until(lambda: s.journal.get("local_start_receipt")["stage"] == "accepted")
             for _ in range(2):
                 status = await c.tick()
                 assert not status.get("local_hold_verified")
-            assert s.journal.get("local_start_receipt")["stage"] == "issued"
+            assert s.journal.get("local_start_receipt")["request_id"] == request
+            assert c.charging.state()["start_rpc_accepted"] is False
             assert s.journal.get("control")["start_pending"] is True
             assert c.requests.receipt(request)["state"] in ("accepted", "running", "uncertain")
             assert len(starts(rig)) == 1
@@ -147,7 +149,7 @@ async def test_cancelled_start_worker_keeps_actual_dispatch_outcome(
         assert terminal["state"] == ("completed" if issued else "failed")
         if issued:
             assert terminal["result"] == {"local_session_verified": True, "charging": False, "timed": False}
-            assert s.journal.get("local_start_receipt")["stage"] == "issued"
+            assert s.journal.get("local_start_receipt")["stage"] == "accepted"
         c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
         assert (await healthy(c))["station_ceiling_a"] == 6
         await two_later_sessions(b, selected=6, original_starts=int(issued))

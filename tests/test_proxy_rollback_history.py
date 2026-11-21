@@ -91,7 +91,20 @@ async def test_migrated_snapshot_requires_intact_history_and_later_pause(
             check_snapshot(db, config, migrated_only=True)
         with closing(sqlite3.connect(config.journal)) as db, db:
             # Recreate the historical schema on this test journal after the candidate has stopped.
-            for table in ("auth_info_order", "delivery_reply_authorization", "vendor_command_scope"):
+            # The old build never recorded these per-wire or forwarded outcome rows.
+            for table in (
+                "vendor_plan_effects",
+                "vendor_profile_effects",
+                "owner_start_sessions",
+                "owner_command_wires",
+            ):
+                db.execute(f"DROP TABLE {table}")
+            for table in (
+                "auth_info_order",
+                "auth_denial_replies",
+                "delivery_reply_authorization",
+                "vendor_command_scope",
+            ):
                 assert db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None
                 db.execute(f"DROP TABLE {table}")
             shutdown = db.execute("SELECT value FROM meta WHERE key='trial_shutdown_attempt'").fetchone()

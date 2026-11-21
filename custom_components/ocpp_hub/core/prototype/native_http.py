@@ -52,7 +52,7 @@ async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
         key, value = line.split(b":", 1)
         key, value = key.strip().lower(), value.strip().lower()
         if key in headers and key in (b"content-length", b"transfer-encoding"):
-            raise ValueError("duplicate native framing header")
+            raise NativeContentError("content", "native response declared a duplicate framing header")
         headers[key] = value
     else:
         raise ValueError("too many native headers")

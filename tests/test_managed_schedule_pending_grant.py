@@ -438,6 +438,8 @@ async def test_late_or_rejected_local_start(tmp_path, tls, unused_tcp_port, monk
         await b.c.pause_task
         assert b.session.journal.get("control")["start_pending"] is (outcome == "late")
         assert b.device.effective_limit() == 0 and len(starts(b.rig)) == 1
+        if outcome == "late":
+            await until(lambda: b.session.journal.get("local_start_receipt")["stage"] == "accepted")
         await b.c.charging.close()
         await crash(b.session)
         if outcome == "late":
@@ -462,7 +464,7 @@ async def test_late_or_rejected_local_start(tmp_path, tls, unused_tcp_port, monk
             )
             assert b.device.effective_limit() == 0 and len(starts(b.rig)) == 1
             if outcome == "late":
-                assert result[0] == 3 and j.get("local_start_receipt")["stage"] == "issued"
+                assert result[0] == 3 and j.get("local_start_receipt")["stage"] == "accepted"
                 local = result[2]["transactionId"]
                 assert j.get("control")["start_pending"]
                 b.rig.peer.plan_session = (local, 987659)

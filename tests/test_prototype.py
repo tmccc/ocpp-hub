@@ -308,6 +308,10 @@ async def test_prototype_stop_priority_and_restart_inhibit(tmp_path: Path) -> No
     await rig.close()
     recovered = Rig(path)
     recovered.gateway.attach_vendor(recovered.vendor_send)
+    pending_stop = recovered.store.next_delivery()
+    assert pending_stop is not None and pending_stop.action == "StopTransaction"
+    await recovered.gateway._ensure_vendor_boot()
+    assert recovered.store.next_delivery() == pending_stop
     assert (await recovered.vendor("restart", "RemoteStartTransaction", {"idTag": "LOCAL_TEST"}))[0] == 4
     await recovered.gateway.release()
     assert (await recovered.vendor("released", "RemoteStartTransaction", {"idTag": "LOCAL_TEST"}))[0] == 3
@@ -343,7 +347,9 @@ async def test_prototype_invalid_local_limits(tmp_path: Path, value: Any) -> Non
 @pytest.mark.parametrize("change", ["watts", "phase", "boolean-phase", "descending", "late-first", "local-id"])
 async def test_prototype_cloud_profile_validation(tmp_path: Path, change: str) -> None:
     rig = Rig(tmp_path / "journal.db")
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.boot()
+    await rig.cloud()
+    before = list(rig.charger_frames)
     payload = commands.set_charging_profile(0, "ChargePointMaxProfile", 12, 11)
     profile = payload["csChargingProfiles"]
     schedule = profile["chargingSchedule"]
@@ -358,7 +364,7 @@ async def test_prototype_cloud_profile_validation(tmp_path: Path, change: str) -
     else:
         profile["chargingProfileId"] = 7001
     assert (await rig.vendor("invalid", "SetChargingProfile", payload))[0] == 4
-    assert not rig.charger_frames
+    assert rig.charger_frames == before
     await rig.close()
 
 
@@ -366,7 +372,8 @@ async def test_prototype_cloud_profile_validation(tmp_path: Path, change: str) -
 # Why: shared control needs to retain each controller's profiles rather than clearing everything.
 async def test_prototype_profile_ownership_and_clear(tmp_path: Path) -> None:
     rig = Rig(tmp_path / "journal.db")
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.boot()
+    await rig.cloud()
     payload = commands.set_charging_profile(0, "ChargePointMaxProfile", 12, 11)
     assert (await rig.vendor("limit", "SetChargingProfile", payload))[0] == 3
     assert rig.charger_frames[-1][3]["csChargingProfiles"]["chargingProfileId"] == 100000
@@ -497,7 +504,7 @@ async def test_prototype_invalid_status_rejected_before_ack(tmp_path: Path) -> N
 async def test_prototype_duplicate_rpc_executes_once(tmp_path: Path) -> None:
     rig = Rig(tmp_path / "journal.db", Policy(extensions={("SYNTHETIC", "Read"): "read"}))
     await rig.boot()
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.cloud()
     request = build_call("repeat", "RemoteStartTransaction", {"idTag": "LOCAL_TEST"})
     await rig.gateway.receive("vendor", request)
     await rig.gateway.receive("vendor", request)
@@ -514,7 +521,8 @@ async def test_prototype_duplicate_rpc_executes_once(tmp_path: Path) -> None:
 # Why: validation outside the outgoing gate previously created state for requests that were never allowed.
 async def test_prototype_denied_profile_does_not_allocate(tmp_path: Path) -> None:
     rig = Rig(tmp_path / "journal.db")
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.boot()
+    await rig.cloud()
     await rig.gateway.set_limit(12)
     payload = commands.set_charging_profile(0, "ChargePointMaxProfile", 12, 11)
     assert (await rig.vendor("denied", "SetChargingProfile", payload))[0] == 4
@@ -548,7 +556,8 @@ async def test_prototype_mutating_rpc_uncertainty_survives_restart(tmp_path: Pat
     path = tmp_path / "journal.db"
     policy = Policy(extensions={("SYNTHETIC", "Write"): "write"})
     rig = Rig(path, policy)
-    rig.gateway.attach_vendor(rig.vendor_send)
+    await rig.boot()
+    await rig.cloud()
     await rig.gateway.controls.ensure_ceiling()
     rig.drop_charger = True
     body = {"vendorId": "SYNTHETIC", "messageId": "Write", "data": "pretend-private-setting"}
@@ -558,6 +567,7 @@ async def test_prototype_mutating_rpc_uncertainty_survives_restart(tmp_path: Pat
     assert b"pretend-private-setting" not in path.read_bytes()
     recovered = Rig(path, policy)
     recovered.gateway.attach_vendor(recovered.vendor_send)
+    await recovered.gateway._ensure_vendor_boot()
     assert (await recovered.vendor("retry-new-id", "DataTransfer", body))[0] == 4
     assert not recovered.charger_frames
     await recovered.close()

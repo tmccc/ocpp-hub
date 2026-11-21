@@ -191,8 +191,8 @@ async def test_vendor_native503_has_stable_correlated_failure(tmp_path, tls, unu
             await session.close()
 
 
-# Intent: cancellation after an actual Start dispatch cannot replay the request or discard its unknown outcome.
-# Why: a late peer ACK cannot make a cancelled request id reusable for a second physical Start.
+# Intent: cancellation preserves a stable duplicate response while a late ACK settles the original Start.
+# Why: the wire outcome can become known without making the cancelled request id reusable for another physical Start.
 async def test_cancelled_dispatched_vendor_call_has_stable_no_replay_result(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -226,18 +226,31 @@ async def test_cancelled_dispatched_vendor_call_has_stable_no_replay_result(
                 task = tasks.pop()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-                release.set()
-                rig.bench.before_reply = None
+                journal = session.journal
+
+                # Observe the exact wire evidence independently of the cached answer on the cloud connection.
+                def saved_outcomes():
+                    return [
+                        tuple(row)
+                        for row in journal.db.execute(
+                            "SELECT state,wire_result FROM mutations JOIN vendor_command_scope ON mutation=token "
+                            "WHERE origin='vendor'"
+                        )
+                    ]
+
                 await rig.bench.cloud.send(raw)
                 await until(lambda: any(f[0] == 4 and f[1] == token for f in rig.bench.calls), timeout=2)
                 first = next(f for f in rig.bench.calls if f[0] == 4 and f[1] == token)
+                assert saved_outcomes() == [("uncertain", "dispatched")]
+                release.set()
+                rig.bench.before_reply = None
+                await until(lambda: saved_outcomes() == [("confirmed", "Accepted")])
+
                 await rig.bench.cloud.send(raw)
                 await until(lambda: len([f for f in rig.bench.calls if f[0] != 2 and f[1] == token]) == 2)
                 assert [f for f in rig.bench.calls if f[0] != 2 and f[1] == token] == [first, first]
-                assert len(starts(rig)) == 1 and session.journal.get("vendor_start_grant")
-                assert [
-                    r[0] for r in session.journal.db.execute("SELECT state FROM mutations WHERE origin='vendor'")
-                ] == ["uncertain"]
+                assert len(starts(rig)) == 1 and journal.get("vendor_start_grant")
+                assert saved_outcomes() == [("confirmed", "Accepted")]
         finally:
             release.set()
             await session.close()
