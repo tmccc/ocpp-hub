@@ -14,7 +14,7 @@ import pytest
 from ocpp_hub_core.frames import build_call, build_call_result
 from ocpp_hub_core.prototype.diagnostics import FaultDiagnostics
 from ocpp_hub_core.prototype.gateway import decode
-from ocpp_hub_core.prototype.rpc import Peer
+from ocpp_hub_core.prototype.rpc import Peer, UnavailableError
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, Admission
 from websockets.asyncio.server import ServerConnection, serve
 
@@ -209,6 +209,35 @@ async def test_rpc_diagnostics_only_retain_classifications() -> None:
     fault = FaultDiagnostics()
     fault.record(ValueError(SECRET), "untrusted-" + SECRET, SECRET)
     assert fault.stage == "session" and fault.action == "Other" and SECRET not in json.dumps(fault.snapshot())
+
+
+# Intent: settling a late reply updates the receipt without changing a newer completed exchange.
+# Why: the dashboard must not claim that a finished Heartbeat is still receiving its reply.
+async def test_late_reply_preserves_newer_rpc_diagnostics() -> None:
+    peer = Peer("vendor", 0.01)
+    sent = []
+    late_replies = []
+
+    # The peer delays the first response and finishes the immediately following Heartbeat.
+    async def sender(raw: str) -> None:
+        frame = decode(raw)
+        sent.append(frame)
+        if frame[2] == "Heartbeat":
+            peer.receive([3, frame[1], {}])
+
+    # Receipt consumers still receive the original matched reply.
+    def receive_late(action, reply):
+        late_replies.append((action, reply))
+
+    peer.sender = sender
+    with pytest.raises(UnavailableError):
+        await peer.call("StartTransaction", {}, on_receive=receive_late, keep_late_reply=True)
+    await peer.call("Heartbeat", {})
+    received = [3, sent[0][1], {}]
+    peer.receive(received)
+    sample = peer.diagnostics.snapshot()
+    assert sample["action"] == "Heartbeat" and sample["phase"] == "complete"
+    assert sample["matched_replies"] == 2 and late_replies == [("StartTransaction", received)]
 
 
 # Intent: an observed remote close remains printable before our own close echo exists.

@@ -111,9 +111,16 @@ def fault_summary(c: ManagedController) -> tuple[dict[str, Any] | None, list[str
         blockers.append("strict_native_refusal")
         recovery = "strict_refusal"
     if repair_pending(journal, fault):
-        blockers.append("native_audit_outcome_unknown")
+        audits = c.native.repair_audits
+        saving = (
+            audits is not None
+            and audits.pending is not None
+            and audits.pending_storage_error is not None
+            and audits.pending[0].fault in sources
+        )
+        blockers.append("native_repair_publication_pending" if saving else "native_audit_outcome_unknown")
         if recovery != "strict_refusal":
-            recovery = "audit_outcome_unknown"
+            recovery = "verification_pending" if saving else "audit_outcome_unknown"
     return summary, blockers, recovery
 
 

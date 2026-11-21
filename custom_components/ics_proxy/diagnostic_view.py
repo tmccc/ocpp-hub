@@ -10,6 +10,7 @@ REASONS = {
     "native_audit_outcome_unknown": (
         "An interrupted verification has an unknown outcome; ordinary recovery remains blocked."
     ),
+    "native_repair_publication_pending": "The proxy is saving the result of its charger check.",
     "native_observation_unavailable": "Fresh independent charger readings are unavailable.",
     "current_update_pending": "A current update is awaiting its required operation or recorded outcome.",
     "start_operation_pending": "A Start operation is awaiting its required operation or recorded outcome.",
@@ -47,7 +48,7 @@ FAULTS = {
     "owner_control_or_delivery_uncertain": "Control or command delivery has an uncertain outcome.",
     "operator_debt_reconciled_at_zero": "An operator reconciliation still requires its remaining verification.",
     "native_observation_unavailable": REASONS["native_observation_unavailable"],
-    "native_repair_publication_pending": "The proxy is saving the result of its charger check.",
+    "native_repair_publication_pending": REASONS["native_repair_publication_pending"],
     "owner_release_pending": "The proxy is finishing the return to app and schedule control.",
     "status_unavailable": "The proxy could not read its latest status.",
     "current_update_pending": REASONS["current_update_pending"],
@@ -300,8 +301,11 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
         return "Detailed diagnostic evidence is unavailable."
     if detail["recovery"] == "strict_refusal":
         return REASONS["strict_native_refusal"]
-    if detail["current_fault"] == "native_repair_publication_pending":
-        return FAULTS["native_repair_publication_pending"]
+    if (
+        detail["current_fault"] == "native_repair_publication_pending"
+        or "native_repair_publication_pending" in detail["blockers"]
+    ):
+        return REASONS["native_repair_publication_pending"]
     if detail["recovery"] == "audit_outcome_unknown":
         return REASONS["native_audit_outcome_unknown"]
     health = data.get("health_blockers")

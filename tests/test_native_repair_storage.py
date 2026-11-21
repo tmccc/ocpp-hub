@@ -6,6 +6,7 @@ import uuid
 from contextlib import contextmanager
 
 import pytest
+from ocpp_hub_core.prototype.managed_diagnostics import snapshot
 from ocpp_hub_core.prototype.managed_native_repair import (
     ACK,
     AUDITS,
@@ -159,6 +160,9 @@ async def test_actual_strict_result_survives_publication_refusal(
         with refused_write(j, REVOCATIONS, failure):
             status = await c.tick()
         assert (status["state"], status["fault"]) == ("attention", "native_repair_publication_pending")
+        diagnostic_status = snapshot(c, status)
+        assert diagnostic_status["recovery"] == "verification_pending"
+        assert "native_repair_publication_pending" in diagnostic_status["blockers"]
         assert repair_pending(j, fault) and not repair_revoked(j, fault) and j.get(ACK) == ack
         assert c.native.repair_audits.pending[1] == "strict"
 
@@ -201,6 +205,9 @@ async def test_valid_native_publication_sql_wait_recovers_same_process(
         with refused_write(j, "unused", failure, resource_update=True):
             status = await c.tick()
         assert (status["state"], status["fault"]) == ("attention", "native_repair_publication_pending")
+        diagnostic_status = snapshot(c, status)
+        assert diagnostic_status["recovery"] == "verification_pending"
+        assert "native_repair_publication_pending" in diagnostic_status["blockers"]
         assert repair_pending(j, fault) and not repair_revoked(j, fault) and j.get(ACK) == ack
         assert c.native.repair_audits.pending[1] == "readiness"
         assert j.get("managed_control_fault") == fault and j.get("managed_native_failure") == diagnostic

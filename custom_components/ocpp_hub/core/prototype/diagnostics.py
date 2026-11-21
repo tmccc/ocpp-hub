@@ -68,13 +68,15 @@ class RpcDiagnostics:
         self.send_attempts += 1
 
     # Unknown replies stay ignored by the engine but become visible without exposing their correlation values.
-    def reply(self, length: int, matched: bool) -> None:
-        self.reply_id_length, self.reply_matched = length, matched
+    def reply(self, length: int, matched: bool, *, late: bool = False) -> None:
         if matched:
             self.matched_replies += 1
-            self.phase = "reply_received"
         else:
             self.unmatched_replies += 1
+        if not late:
+            self.reply_id_length, self.reply_matched = length, matched
+            if matched:
+                self.phase = "reply_received"
 
     # Keep actual registration acceptance visible even after detach resets the gateway's current registration state.
     def registration(self, status: str) -> None:

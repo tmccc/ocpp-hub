@@ -295,7 +295,9 @@ class Peer:
         late = self._late_receivers.pop(wire, None)
         if receiver is None and late is not None and late[0] > time.monotonic():
             receiver = (late[1], late[2])
-        self.diagnostics.reply(len(wire), waiting or receiver is not None)
+            self.diagnostics.reply(len(wire), True, late=True)
+        else:
+            self.diagnostics.reply(len(wire), waiting or receiver is not None)
         if future is not None and waiting:
             future.set_result(frame)
         if receiver is not None:
