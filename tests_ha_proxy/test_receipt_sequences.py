@@ -66,7 +66,7 @@ async def test_receipt_identity_sequences(actual_hass, peer, control_peer, case,
             message = (
                 "invalid command receipt"
                 if case.boundary == 0 and case.identity != "matching"
-                else "physical confirmation is still pending"
+                else "returned another command's receipt"
                 if case.identity != "matching"
                 else "could not confirm the requested control state"
             )
