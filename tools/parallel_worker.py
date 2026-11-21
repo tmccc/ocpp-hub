@@ -550,7 +550,6 @@ def main():
                     *command,
                     "-p",
                     "qualification_evidence",
-                    "-x",
                     "--qualification-work-queue",
                     *scratch_option,
                     *config["specs"],
@@ -585,7 +584,13 @@ def main():
                 next_telemetry = now + 5
             if time.monotonic() >= deadline:
                 ABORT = ABORT or "qualification_timeout"
-            failed = [item for item in workers if item["process"].poll() not in (None, 0)]
+            # Pytest's failure exit after the final grant still rejects the release, but peers can finish.
+            failed = [
+                item
+                for item in workers
+                if (code := item["process"].poll()) not in (None, 0)
+                and (code != 1 or item["index"] not in queue.finished)
+            ]
             if failed and ABORT is None:
                 ABORT = "worker_" + str(failed[0]["index"]) + "_exit_" + str(failed[0]["process"].returncode)
             if not ABORT:

@@ -1,10 +1,10 @@
 """Gate independent real loopback peers across temporary recovery zero confirmation."""
 
 import asyncio
-from dataclasses import replace
 
 import pytest
 
+from tests.managed_rig import starts
 from tests.native_schedule_support import timer_bench
 from tests.prototype_rig import BOOT
 from tests.runtime_rig import until
@@ -17,33 +17,40 @@ async def test_intervening_boot_change_revokes_cloud(tmp_path, tls, unused_tcp_p
     async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         gateway, runtime = b.session.gateway, b.session.runtime
         epoch = gateway._vendor_epoch
-        settings, permitted = runtime.settings, runtime.vendor_session_enabled
-        runtime.settings = replace(settings, pump_interval=0.25)
-        observed = asyncio.Event()
-        polls = 0
+        assert runtime.status.vendor_connected and gateway.vendor_registration == "Accepted"
+        (presence,) = (
+            task for task in runtime._session_tasks if task.get_coro().__qualname__.endswith(".charger_presence")
+        )
+        parked, resume = asyncio.Event(), asyncio.Event()
+        sleep = asyncio.sleep
 
-        # Observe the real policy check without changing its decision, then use its configured sleeping interval.
-        def observe_presence():
-            nonlocal polls
-            polls += 1
-            observed.set()
-            return permitted()
+        # Hold just one real presence interval while both charger reports cross the independent receiver.
+        async def hold_presence_interval(delay, result=None):
+            if asyncio.current_task() is presence and not parked.is_set():
+                parked.set()
+                await resume.wait()
+                return result
+            return await sleep(delay, result)
 
-        runtime.vendor_session_enabled = observe_presence
-        try:
-            await asyncio.wait_for(observed.wait(), 1)
-            before = polls
-            changed = await b.rig.bench.call(
-                b.sock, "intervening-boot", "BootNotification", BOOT | {"chargePointModel": "Unapproved replacement"}
-            )
-            restored = await b.rig.bench.call(b.sock, "restored-boot", "BootNotification", BOOT)
-            assert polls == before, "the two genuine reports must fall between presence polls"
-            assert changed[0] == restored[0] == 3 and b.session.journal.get("boot") == BOOT
-            await until(lambda: not runtime.status.vendor_connected, timeout=1)
-            assert gateway._vendor_epoch != epoch and gateway.vendor_registration != "Accepted"
-            assert b.session.journal.get("trial_phase") == "recovering" and not gateway.controls.ready
-        finally:
-            runtime.settings, runtime.vendor_session_enabled = settings, permitted
+        with monkeypatch.context() as timing:
+            timing.setattr(asyncio, "sleep", hold_presence_interval)
+            try:
+                await asyncio.wait_for(parked.wait(), 3)
+                intervening = BOOT | {"chargePointModel": "Unapproved replacement"}
+                changed = await b.rig.bench.call(b.sock, "intervening-boot", "BootNotification", intervening)
+                restored = await b.rig.bench.call(b.sock, "restored-boot", "BootNotification", BOOT)
+                assert changed[0] == restored[0] == 3 and b.session.journal.get("boot") == BOOT
+                assert not presence.done() and gateway._vendor_epoch == epoch
+                before = starts(b.rig)
+                denied = await b.rig.bench.cloud_call(
+                    "start-on-old-boot", "RemoteStartTransaction", {"connectorId": 1, "idTag": "CLOUD_OWNER"}
+                )
+                assert denied[0] == 4 and starts(b.rig) == before
+            finally:
+                resume.set()
+        await until(lambda: not runtime.status.vendor_connected, timeout=1)
+        assert gateway._vendor_epoch != epoch and gateway.vendor_registration != "Accepted"
+        assert b.session.journal.get("trial_phase") == "recovering" and not gateway.controls.ready
 
 
 # Intent: changed Boot metadata revokes the accepted cloud introduction, while an identical retry retains it.
