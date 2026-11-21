@@ -14,6 +14,40 @@ The default output explicitly says **declared only**. Add
 `--qualification-report /absolute/task/qualification-bundle.json` to freshly re-audit the original raw evidence
 through the full validator before attaching execution claims. Generated reports belong outside the repository.
 
+## Interaction model
+
+[Control](../tests_model/interaction_model.py) follows the current owner and one earlier issued Start. It
+distinguishes an independent scheduled session, receipt capture and commit, the exact owner's Stop reply,
+native and ledger closure, verified zero, pending Return and current selection, and charger replacement.
+Cloud delivery can become blocking while any of those steps is pending. The
+[delivery model](../tests_model/interaction_delivery.py) follows the head of up to three waiting Start/Stop
+pairs through transmission, retry, a late reply on the original connection, mapping and retirement.
+
+The [explorer](../tests_model/test_interaction_model.py) follows every enabled edge until no new states remain
+and checks safety after each event. Repeated events returning to the same state need one visit. It also checks
+that every state has a recovery path when failures cease and the required exact charger and cloud evidence
+arrives. The model represents ownership by whether a report belongs to the tracked request or session.
+It groups current values into retained and changed selections. The separate current families test literal amps.
+
+The [held-Start replays](../tests_discovery/test_complete_overlap.py) run all 40 orders in their grammar
+against the standalone service. They cover a failed Pause write, a newer Pause, Return and its UUID replay,
+lost or delivered Start replies, and process replacement. Each finishes with real simulated lifecycle reports
+and a subsequent charge. The [daily replays](../tests_model/test_interaction_replay.py) run all six orders
+of a scheduled Start report, a newer Pause and the actual reply to an already issued owner Start. They compare
+the observed outcome and owner after every event. The [native read regression](../tests/test_native_read_supersession.py)
+checks the ceiling read against a newer poll, an inventory refresh after Return, and a newer owner Pause.
+A valid read and the resulting Start record share one turn in the decision queue.
+
+```sh
+TMPDIR=/absolute/task .venv/bin/python -B tools/offline_validate.py \
+    tests_model/test_interaction_model.py tests_model/test_interaction_replay.py \
+    tests_discovery/test_complete_overlap.py
+```
+
+This scope leaves the exact cross-product of live transports, storage and timers open. Multiple historical
+identities, all device and vendor commands, commissioning and the Home Assistant lifecycle still rely on the
+other test families. Hardware behavior and arbitrary amounts of pending history remain outside the model.
+
 ## Finite families
 
 | Family | Raw | Admitted per suite | Inputs and mandatory recovery |

@@ -128,8 +128,14 @@ class NativeBoundedHandover:
         )
 
     # Local changes invalidate a native read even when the charger returned a complete, individually valid body.
-    def authority(self) -> str:
+    def authority(self, *, include_observed_digests: bool = True) -> str:
         gateway, journal = self.gateway, self.gateway.journal
+        # A report checks the latest observed digest against its sample at commit. Its ownership uses the receipt.
+        resources = journal.db.execute(
+            "SELECT * FROM trial_resources ORDER BY key"
+            if include_observed_digests
+            else "SELECT key, desired, confirmed, state FROM trial_resources ORDER BY key"
+        )
         return fingerprint(
             {
                 "epoch": gateway._charger_epoch,
@@ -144,7 +150,7 @@ class NativeBoundedHandover:
                 "state": journal.get("native_bounded_handover"),
                 "current_capability": journal.get("managed_current_capability"),
                 "ordinary_recovery": journal.get("managed_ordinary_recovery"),
-                "resources": [tuple(row) for row in journal.db.execute("SELECT * FROM trial_resources ORDER BY key")],
+                "resources": [tuple(row) for row in resources],
             }
         )
 
@@ -876,30 +882,53 @@ class NativeBoundedHandover:
             return gateway.decide(lambda: acknowledge(native))
 
     # Read the station profile independently of an incoming report's still-unassigned transaction number.
-    async def require_reported_start_ceiling(self) -> None:
-        # Share the observation order with full native reads so a superseded result cannot revoke a newer proof.
-        def begin() -> tuple[int, str]:
-            self.read_sequence += 1
-            return self.read_sequence, self.authority()
+    async def commit_reported_start(self, commit: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        g, j = self.gateway, self.gateway.journal
 
-        sequence, authority = self.gateway.decide(begin)
-        try:
-            profiles = await self.observe_profiles()
-        except TimeoutError as error:
-            raise UnavailableError("the native station profile read timed out") from error
+        # An inventory readback can add a digest without changing the authority or the confirmed profile.
+        def report_scope() -> tuple[str, str]:
+            return self.authority(include_observed_digests=False), fingerprint(j.get("managed_control_intent"))
+
+        original_scope = g.decide(report_scope)
+
+        # Recheck both before starting a read and before using its result.
+        def require_original_scope() -> None:
+            if report_scope() != original_scope:
+                raise AuditSupersededError("reported Start crossed a change to its charging owner")
+
+        # Share the observation order with full native reads so a superseded result cannot revoke a newer proof.
+        def begin() -> int:
+            require_original_scope()
+            self.read_sequence += 1
+            return self.read_sequence
 
         # This profile alone cannot make a full native sample fresh. A current contradiction withdraws that proof.
-        def check() -> None:
-            if sequence < self.last_resolved_read or authority != self.authority():
-                raise AuditSupersededError("reported Start profile read was superseded")
+        def check(sequence: int, profiles: tuple[Resource, ...]) -> dict[str, Any] | None:
+            require_original_scope()
+            if sequence < self.last_resolved_read:
+                if self.last_verified_at > 0:
+                    return None
+                raise AuditSupersededError("a newer native read invalidated the reported Start proof")
             try:
-                self.book.require_confirmed_station(profiles, self.gateway.controls.desired())
+                self.book.require_confirmed_station(profiles, g.controls.desired())
             except DeniedError:
                 self.last_resolved_read = sequence
                 self.last_verified_at = 0
                 raise
+            return commit()
 
-        self.gateway.decide(check)
+        try:
+            async with asyncio.timeout(5):
+                # A newer poll may record inventory proof. Reread under the same owner within the deadline.
+                for _ in range(2):
+                    sequence = g.decide(begin)
+                    profiles = await self.observe_profiles()
+                    result = await g.decide_report(lambda: check(sequence, profiles))
+                    if result is not None:
+                        return result
+        except TimeoutError as error:
+            raise UnavailableError("the native station profile read timed out") from error
+        raise AuditSupersededError("reported Start profile read was superseded")
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
     async def validate_send(self, action: str, payload: dict[str, Any]) -> Guard | Pending | None:

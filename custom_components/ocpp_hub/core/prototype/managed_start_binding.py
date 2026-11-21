@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from .local_control import local_start_receipt
@@ -169,9 +170,9 @@ class ManagedStartReports:
     async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None:
         return await self.charging.prepare_native_report(payload)
 
-    # Check the owned station ceiling before accepting a Start report with no assigned transaction number.
-    async def verify_station(self) -> None:
-        await self.charging.controller.native.require_reported_start_ceiling()
+    # Check the owned station ceiling in the same decision that accepts the Start report.
+    async def commit_at_verified_ceiling(self, commit: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        return await self.charging.controller.native.commit_reported_start(commit)
 
     # A held report is allowed only for the existing operation.
     def permits_held(self, tag: str) -> bool:

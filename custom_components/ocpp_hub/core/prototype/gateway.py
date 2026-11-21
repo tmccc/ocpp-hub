@@ -143,7 +143,8 @@ class StartReports(Protocol):
     # Identify a delayed native or owner report using fresh independent evidence.
     async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None: ...
 
-    async def verify_station(self) -> None: ...
+    # Commit only when fresh station proof is current in the report's own decision turn.
+    async def commit_at_verified_ceiling(self, commit: Callable[[], dict[str, Any]]) -> dict[str, Any]: ...
 
     # Permit a proved owner report under a hold without authorizing any new Start.
     def permits_held(self, tag: str) -> bool: ...
@@ -707,7 +708,7 @@ class Gateway:
                 native_report = refreshed
             if native_report is None and not self.journal.known_start(payload):
                 try:
-                    await self.start_reports.verify_station()
+                    return await self.start_reports.commit_at_verified_ceiling(lambda: commit(None, ticket))
                 except DeniedError, UnavailableError, SecurityError:
                     if not self.journal.known_start(payload):
                         raise

@@ -21,23 +21,31 @@ def admissible(events):
     )
 
 
+# List every complete history in the held-Start fixture, independent of the implementation or sample seed.
+def complete_orders():
+    base = tuple(event for event in EVENTS[1:] if event != "reply")
+    return tuple(
+        ("pause", *suffix)
+        for delivered in (False, True)
+        for suffix in permutations((*base, "reply") if delivered else base)
+        if admissible(("pause", *suffix))
+    )
+
+
 # Distribute a bounded sample across different reply, restart and genuine write-failure positions.
 def selected_orders(seed, count):
     groups = defaultdict(list)
-    base = tuple(event for event in EVENTS[1:] if event != "reply")
-    for delivered in (False, True):
-        for suffix in permutations((*base, "reply") if delivered else base):
-            order = ("pause", *suffix)
-            if admissible(order):
-                restart = order.index("restart")
-                returned, newer = order.index("return"), order.index("newer_pause")
-                key = (
-                    delivered,
-                    (restart > returned) + (restart > newer),
-                    order.index("write_failure") < returned,
-                    delivered and order.index("reply") < newer,
-                )
-                groups[key].append(order)
+    for order in complete_orders():
+        delivered = "reply" in order
+        restart = order.index("restart")
+        returned, newer = order.index("return"), order.index("newer_pause")
+        key = (
+            delivered,
+            (restart > returned) + (restart > newer),
+            order.index("write_failure") < returned,
+            delivered and order.index("reply") < newer,
+        )
+        groups[key].append(order)
     rng = Random(seed)
     buckets = list(groups.values())
     rng.shuffle(buckets)

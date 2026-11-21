@@ -5,9 +5,10 @@ import copy
 import json
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
+from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError
@@ -16,7 +17,79 @@ from ocpp_hub_core.prototype.ordinary_recovery import SOURCE
 from tests import native_schedule_support as schedule_bench
 from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import ZONE, SchedulePeer, timer_bench
+from tests.prototype_rig import START
 from tests.tls_support import tls as tls
+
+
+# Intent: send a genuine daily Start while a newer audit completes or a new owner Pause commits.
+# Why: an ordinary poll may require fresh proof, whereas a change of authority must refuse the old report.
+@pytest.mark.parametrize("concurrent", ["poll", "inventory_refresh", "pause"])
+async def test_reported_start_rechecks_a_superseded_profile_read(
+    tmp_path, tls, unused_tcp_port, monkeypatch, concurrent
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        native = b.c.native
+        if concurrent == "inventory_refresh":
+            b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
+            assert (await healthy(b.c))["local_hold_verified"]
+            returning, revision = uuid.uuid4().hex, b.c.requests.intent().revision
+            b.c.command(returning, "app_control", revision)
+            await b.c.return_requested(returning, revision)
+            assert b.c.requests.receipt(returning)["state"] == "completed"
+            # Model the release receipt before its optional observation digest has been filled by a later poll.
+            b.session.journal.db.execute(
+                "UPDATE trial_resources SET observed_digest=NULL WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
+            )
+            earlier_sample = await native.observe()
+        observe = native.observe_profiles
+        observed, release = asyncio.Event(), asyncio.Event()
+        observations = []
+
+        # Delay the first actual native profile response at its delivery boundary and allow later reads through.
+        async def hold_first_profile_observation():
+            profiles = await observe()
+            observations.append(profiles)
+            if len(observations) == 1:
+                observed.set()
+                await release.wait()
+            return profiles
+
+        monkeypatch.setattr(native, "observe_profiles", hold_first_profile_observation)
+        body = START | {
+            "idTag": b.device.plans[9]["idTag"],
+            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+        }
+        start = asyncio.create_task(b.rig.bench.call(b.sock, uuid.uuid4().hex, "StartTransaction", body))
+        try:
+            await asyncio.wait_for(observed.wait(), 3)
+            before, sequence = native.authority(), native.read_sequence
+            if concurrent == "pause":
+                b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
+                await b.c.pause_task
+                assert native.authority() != before
+            elif concurrent == "inventory_refresh":
+                # The supervision turn can record this earlier sample after the report has begun.
+                b.session.gateway.decide(
+                    lambda: b.session.book.owned_present(earlier_sample.physical, record_unchanged=False)
+                )
+                assert native.authority() != before and native.last_resolved_read < sequence
+            else:
+                await native.read()
+                assert native.authority() == before
+                assert native.last_resolved_read > sequence
+        finally:
+            release.set()
+        answer = await start
+        if concurrent == "pause":
+            assert answer[0] == 4, answer
+            assert len(observations) == 1
+            assert b.session.journal.active() is None and b.device.effective_limit() == 0
+            return
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted", answer
+        local = answer[2]["transactionId"]
+        assert len(observations) == (2 if concurrent == "poll" else 1)
+        assert b.session.journal.active() == local and b.device.effective_limit() == 6
+        await b.close_transaction(local)
 
 
 class OrderedNativePeer(SchedulePeer):

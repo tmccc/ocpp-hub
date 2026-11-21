@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Recheck a scheduled Start's charger profile when a newer poll supersedes the reading under the same authority.
 - Use the original current-change sample to distinguish earlier idle attempts from new sessions.
 - Wait for real closure after a Stop reply, including an exact expired Start that has been unplugged.
 - Refresh Start availability and health after confirmed charger contradictions or an unresolved app command.

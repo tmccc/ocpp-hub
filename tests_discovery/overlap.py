@@ -8,9 +8,36 @@ from contextlib import closing
 from types import SimpleNamespace
 
 from tests.managed_rig import starts
+from tests.model_tls_support import tls_for_case
 from tests.peer_mutation_helpers import observe_device_replies
+from tests.process_helpers import process_rig
 from tests.prototype_rig import START
 from tests.runtime_rig import until
+
+CASE_SECONDS = 25
+
+
+# Run each proposed sequence from a fresh journal and independent simulated peers.
+async def simulate(directory, order, model_tls, ports, monkeypatch, observations, timeout):
+    directory.mkdir()
+    async with asyncio.timeout(timeout):
+        async with process_rig(
+            directory, tls_for_case(directory, model_tls), ports(), ports(), monkeypatch, timing="fast-poll"
+        ) as child:
+            case = Overlap(child, monkeypatch, observations)
+            try:
+                await case.prefix()
+                for event in order:
+                    await case.step(event)
+                await case.finish()
+            except BaseException:
+                # A failing test must retire its actual process before another replay can use fresh peers.
+                if child.process is not None and child.process.returncode is None:
+                    await child.kill()
+                raise
+            finally:
+                case.release.set()
+                child.rig.bench.before_reply = None
 
 
 class ViolationError(AssertionError):

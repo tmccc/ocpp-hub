@@ -1,21 +1,17 @@
 """Bounded search, exact replay and single-event reduction of real recovery histories."""
 
-import asyncio
 import json
 import time
 
 import pytest
 
 from tests.model_tls_support import model_tls as model_tls
-from tests.model_tls_support import tls_for_case
-from tests.process_helpers import process_rig
-from tests_discovery.overlap import Overlap, ViolationError
+from tests_discovery.overlap import CASE_SECONDS, ViolationError, simulate
 from tests_discovery.schedules import admissible, selected_orders
 
 SCHEMA_VERSION = 1
 # Reserve part of five minutes for a timed-out child's shutdown and the final summary.
 SEARCH_SECONDS = 270
-CASE_SECONDS = 25
 MAX_CASES = 24
 
 
@@ -43,29 +39,6 @@ def load_trace(path):
     if signature != (None, None) and not all(isinstance(field, str) and 0 < len(field) < 100 for field in signature):
         raise pytest.UsageError("discovery replay has a malformed failure signature")
     return tuple(body["events"]), signature if signature != (None, None) else None
-
-
-# Run each proposed sequence from a fresh journal and independent simulated peers.
-async def simulate(directory, order, model_tls, ports, monkeypatch, observations, timeout):
-    directory.mkdir()
-    async with asyncio.timeout(timeout):
-        async with process_rig(
-            directory, tls_for_case(directory, model_tls), ports(), ports(), monkeypatch, timing="fast-poll"
-        ) as child:
-            case = Overlap(child, monkeypatch, observations)
-            try:
-                await case.prefix()
-                for event in order:
-                    await case.step(event)
-                await case.finish()
-            except BaseException:
-                # A failing test must retire its actual process before another replay can use fresh peers.
-                if child.process is not None and child.process.returncode is None:
-                    await child.kill()
-                raise
-            finally:
-                case.release.set()
-                child.rig.bench.before_reply = None
 
 
 # Intent: explore new overlaps, then shorten a failing order while preserving the same rule failure.
