@@ -58,11 +58,16 @@ async def test_failed_terminal_receipt_commit_keeps_pending_no_replay_marker(tmp
             calls.append(True)
             return build_call_result(frame[1], {"status": "Accepted"})
 
-        failed = await cache.response("vendor", 1, frame, execute)
-        assert decode(failed)[2] == "InternalError" and len(calls) == 1 and not cache._items
+        accepted = await cache.response("vendor", 1, frame, execute)
+        assert decode(accepted)[2] == {"status": "Accepted"} and len(calls) == 1 and not cache._items
         assert j.db.execute("SELECT response FROM inbound_receipts").fetchone()[0] is None
+        assert await cache.response("vendor", 1, frame, execute) == accepted
+        assert len(calls) == 1
         j.db.execute("DROP TRIGGER fail_receipt_commit")
-        assert await cache.response("vendor", 1, frame, execute) == failed
+        cache.retry()
+        assert j.db.execute("SELECT response FROM inbound_receipts").fetchone()[0] == accepted
+        assert not cache._awaiting_write
+        assert await cache.response("vendor", 1, frame, execute) == accepted
         assert len(calls) == 1
     finally:
         j.close()

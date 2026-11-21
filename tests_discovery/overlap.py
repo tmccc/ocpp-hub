@@ -214,7 +214,9 @@ class Overlap:
         self.release.set()
         self.bench.before_reply = None
         await self.child.start()
-        await self.child.status(lambda value: value.get("charger_connected") is True)
+        await self.child.status(
+            lambda value: value.get("charger_connected") is True and value.get("boot_verified") is True
+        )
         after, current = self.snapshot()
         self.expect(after["local_start_receipt"] == actual, "restart_changed_original_start_outcome")
         self.expect((self.exact_reply in self.replies) is delivered, "retired_socket_delivered_reply")
