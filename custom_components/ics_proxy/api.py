@@ -98,9 +98,9 @@ class ProxyClient:
                             aiohttp.WSMsgType.CLOSE,
                             aiohttp.WSMsgType.CLOSING,
                             aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.ERROR,
                         ):
                             raise ReceiptUnavailableError("The saved command result is temporarily unavailable")
+                        # The WebSocket parser reports invalid or oversized frames as ERROR.
                         if message.type is not aiohttp.WSMsgType.TEXT:
                             raise TypeError("The local charger proxy returned a non-text receipt")
                         response = message.json()
