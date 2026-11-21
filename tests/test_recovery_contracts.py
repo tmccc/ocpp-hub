@@ -275,7 +275,7 @@ def test_effect_snapshot_is_immutable_and_fresh_operation_policy_is_independent(
     [
         (RestoreState.WAITING, False),
         (RestoreState.YIELDED, False),
-        (RestoreState.REQUEST_UNCONFIRMED, False),
+        (RestoreState.REQUEST_NOT_SENT, False),
         (RestoreState.SHARED, True),
     ],
 )
@@ -567,17 +567,17 @@ def test_legacy_frame_adapter_unwraps_only_the_typed_pending_edge():
     "purpose,reason,expected",
     [
         ("automatic", Prerequisite.NATIVE, PreflightDisposition.WAIT),
-        ("explicit", Prerequisite.NATIVE, PreflightDisposition.REQUEST_UNCONFIRMED),
+        ("explicit", Prerequisite.NATIVE, PreflightDisposition.NOT_SENT),
         ("explicit", Prerequisite.SOURCE, PreflightDisposition.WAIT),
         ("explicit", Prerequisite.CLOUD_ACK, PreflightDisposition.WAIT),
         ("explicit", Prerequisite.OWNER_RETURN, PreflightDisposition.WAIT),
-        ("explicit", Prerequisite.CLOUD, PreflightDisposition.REQUEST_UNCONFIRMED),
-        ("explicit", Prerequisite.ZERO_PROOF, PreflightDisposition.REQUEST_UNCONFIRMED),
-        ("explicit", Prerequisite.LIFECYCLE, PreflightDisposition.REQUEST_UNCONFIRMED),
-        ("explicit", Prerequisite.RECONCILIATION, PreflightDisposition.REQUEST_UNCONFIRMED),
-        ("explicit", Prerequisite.SUPERSEDED, PreflightDisposition.REQUEST_UNCONFIRMED),
-        ("explicit", Prerequisite.RESTRICTIVE_OPERATION, PreflightDisposition.REQUEST_UNCONFIRMED),
-        ("explicit", Prerequisite.OWNED_OPERATION, PreflightDisposition.REQUEST_UNCONFIRMED),
+        ("explicit", Prerequisite.CLOUD, PreflightDisposition.NOT_SENT),
+        ("explicit", Prerequisite.ZERO_PROOF, PreflightDisposition.NOT_SENT),
+        ("explicit", Prerequisite.LIFECYCLE, PreflightDisposition.NOT_SENT),
+        ("explicit", Prerequisite.RECONCILIATION, PreflightDisposition.NOT_SENT),
+        ("explicit", Prerequisite.SUPERSEDED, PreflightDisposition.NOT_SENT),
+        ("explicit", Prerequisite.RESTRICTIVE_OPERATION, PreflightDisposition.NOT_SENT),
+        ("explicit", Prerequisite.OWNED_OPERATION, PreflightDisposition.NOT_SENT),
     ],
 )
 def test_preflight_native_failure_does_not_grant_explicit_return_replay(purpose, reason, expected):

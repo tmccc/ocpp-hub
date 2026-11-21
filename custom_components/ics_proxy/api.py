@@ -187,5 +187,18 @@ class ProxyClient:
             raise ProxyError(
                 "The proxy recorded the request. The charger outcome is uncertain. Check the charger status."
             )
+        result = receipt.get("result")
+        if receipt.get("state") == "failed" and isinstance(result, dict):
+            classification = result.get("classification")
+            if (
+                action == "pause"
+                and classification == "superseded_by_pause"
+                and isinstance(newer := result.get("superseded_by"), str)
+                and newer != identifier
+                and re.fullmatch(r"[a-f0-9]{32}", newer)
+            ):
+                return  # The newer Pause owns confirmation. The button refreshes the live status.
+            if action == "app_control" and classification == "return_not_sent":
+                raise ProxyError("Return to app / schedule stopped before sending a command to the charger.")
         if receipt.get("state") != "completed":
             raise ProxyError("The charger could not confirm the requested control state")

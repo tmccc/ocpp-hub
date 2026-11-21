@@ -8,13 +8,16 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError
 
 OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
+OFFLINE_PAUSE = "managed_offline_pause"
+
+type ReturnFailure = Literal["return_not_sent", "return_not_confirmed"]
 
 
 # Use the same durable receipt format for each command; the domain owner supplies its acceptance evidence.
@@ -66,6 +69,8 @@ def decode_intent(value: object) -> ControlIntent:
 def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesce: bool = False) -> ControlIntent:
     intent = current.next(mode, coalesce=coalesce)
     journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
+    if current.mode == "paused" and mode == "app":
+        journal.db.execute("DELETE FROM meta WHERE key=?", (OFFLINE_PAUSE,))
     return intent
 
 
@@ -288,6 +293,7 @@ class ManagedRequests:
                     (json.dumps({"classification": "superseded_by_pause", "superseded_by": identifier}),),
                 )
                 write_intent(self.journal, current, "paused")
+                self.journal.db.execute("DELETE FROM meta WHERE key=?", (OFFLINE_PAUSE,))
                 if on_pause is not None:
                     on_pause()
                     hold = read_pause_claim(self.journal)
@@ -468,12 +474,19 @@ class ManagedRequests:
             is not None
         )
 
-    # Waiting never replays a claimed positive attempt or changes a newer superseding receipt.
-    def return_waiting(
-        self, identifier: str, expected: ControlIntent, *, unconfirmed: bool = False, await_cloud: bool = False
+    # Settle or park only the original Return. Neither outcome replays a device command.
+    def settle_return(
+        self,
+        identifier: str,
+        expected: ControlIntent,
+        *,
+        failure: ReturnFailure | None = None,
+        await_cloud: bool = False,
     ) -> None:
-        if unconfirmed:
-            self.finish(identifier, "uncertain", {"classification": "return_not_confirmed"})
+        if failure is not None:
+            self.finish(
+                identifier, "failed" if failure == "return_not_sent" else "uncertain", {"classification": failure}
+            )
         elif self.intent() == expected:
             self.journal.db.execute(
                 "UPDATE managed_requests SET state='accepted', "

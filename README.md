@@ -978,12 +978,12 @@ A real charger `Rejected` is distinct from an unknown applied outcome, and both
 retain the release fault. Recovery requires a new Pause, verified actual closure
 and a separate Return. A prior completed release does not impose that requirement
 on an unrelated new temporary hold. Explicit Return is separately accepted once.
-Unavailable native proof in Return's own release preflight makes that request
-unconfirmed, without silently replaying it; fresh proof alone does not grant
+Unavailable native proof in Return's own release preflight records that the command
+did not reach the charger. Fresh proof alone does not grant
 another Return. Earlier Pause or test settlement retains its separate wait rules.
 Named source, owner-return and actual cloud-acknowledgement waits
 can retain the same accepted Return. Connection failure, zero-proof debt and
-reconciliation blockage make it unconfirmed; a new Return is required after recovery.
+reconciliation blockage can end preflight before sending. A new Return is required after recovery.
 
 The iCS stores some unsuccessful scheduled starts with transaction number `-1`. The proxy retains their
 full native records when the single start sample shows zero current on all three phases, unchanged energy

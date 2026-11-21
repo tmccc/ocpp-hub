@@ -332,6 +332,40 @@ async def test_lost_pause_reply_requires_a_matching_result(actual_hass, peer, lo
     assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
 
 
+# Intent: a replaced Pause defers to the current status, while a Return stopped before send explains what happened.
+# Why: the client must read the exact outcome without repeating a command or claiming physical confirmation.
+@pytest.mark.parametrize("action", ["pause", "app_control"])
+async def test_command_outcome_uses_saved_reason(actual_hass, peer, action):
+    from custom_components.ics_proxy.api import ProxyError
+
+    entry = await setup(actual_hass, peer)
+    peer["lose_reply"] = True
+
+    # The independent peer retains Pause as requested while publishing the old command's separate outcome.
+    def saved_receipt(command, _request, result):
+        if command != "receipt":
+            return result
+        peer["state"].update(
+            desired_control="paused", local_hold_verified=False, owner_control_enabled=False, pause_pending=True
+        )
+        reason = (
+            {"classification": "superseded_by_pause", "superseded_by": "d" * 32}
+            if action == "pause"
+            else {"classification": "return_not_sent"}
+        )
+        return {**result, "state": "failed", "result": reason}
+
+    peer["result_filter"] = saved_receipt
+    if action == "pause":
+        await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+        assert entry.runtime_data.data["pause_pending"] and not entry.runtime_data.data["local_hold_verified"]
+    else:
+        with pytest.raises(ProxyError, match="stopped before sending"):
+            await entry.runtime_data.client.command(action, 0)
+    sent, lookup = [request for request in peer["requests"] if request["command"] != "status"]
+    assert sent["command"] == action and lookup["command"] == "receipt" and lookup["request_id"] == sent["id"]
+
+
 # Intent: a transport failure during sending can only be resolved by the matching saved receipt.
 # Why: send_json can fail before sending any bytes or after the complete request reached the real local peer.
 @pytest.mark.parametrize("after_send", [False, True])

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .managed_facts import ManagedFacts
+from .managed_intent import OFFLINE_PAUSE
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .native_faults import STATION_CEILING_LOST
 from .native_history import latest_completion_available
@@ -595,6 +596,10 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
     )
+    if intent.mode == "paused" and j.get(OFFLINE_PAUSE) is True:
+        result["pause_reason"] = "cloud_connection_failed"
+    else:
+        result.pop("pause_reason", None)
     result = health_snapshot(result, delivery_blocked=runtime.delivery_blocked)
     fresh = all(
         age is not None and 0 <= age <= 15 for age in (result["status_age_seconds"], result["native_age_seconds"])

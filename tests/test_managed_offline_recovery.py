@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import pytest
 from ocpp_hub_core.prototype import managed_charging as charge_tests
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
@@ -194,6 +195,8 @@ async def test_offline_replacement_recovers_verified_pause_without_start_or_new_
         status = await locally_ready(test.controller)
         assert status["phase"] == "active" and status["local_hold_verified"]
         assert status["desired_control"] == "paused" and not status["cloud_connected"]
+        reason = refresh_for_read(test.controller, status).get("pause_reason")
+        assert reason == ("cloud_connection_failed" if initial == "app" else None)
         assert status["requested_current_a"] == selected and status["native_limit_a"] == 32
         assert status["normal_start_ready"] and status["power_w"] == status["station_ceiling_a"] == 0
         assert test.controller.requests.intent().revision == recovery.prior_revision + (initial == "app")
@@ -298,11 +301,13 @@ async def test_delayed_online_boot_acknowledgement_does_not_force_offline_pause(
 
 # Intent: queued Status/Meter survives local recovery and later real ACK delivery while preserving the pause.
 # Why: readiness cannot erase history, invent acknowledgement, or let cloud reconnection release the pause.
+@pytest.mark.parametrize("confirm_pause", [False, True])
 async def test_observations_remain_queued_then_flush_on_reconnect_while_pause_remains(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
+    confirm_pause: bool,
 ) -> None:
     async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
         test = recovery.test
@@ -326,11 +331,23 @@ async def test_observations_remain_queued_then_flush_on_reconnect_while_pause_re
         )
         status = await healthy(test.controller)
         assert status["local_hold_verified"] and test.controller.requests.intent() == intent
+        assert refresh_for_read(test.controller, status)["pause_reason"] == "cloud_connection_failed"
         assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        await select(test, 20)
+        status = await healthy(test.controller)
+        assert refresh_for_read(test.controller, status)["pause_reason"] == "cloud_connection_failed"
+        intent = test.controller.requests.intent()
+        if confirm_pause:
+            test.controller.command(uuid.uuid4().hex, "pause", intent.revision)
+            status = await healthy(test.controller)
+            assert status["local_hold_verified"]
+            assert "pause_reason" not in refresh_for_read(test.controller, status)
+            intent = test.controller.requests.intent()
         request = uuid.uuid4().hex
         test.controller.command(request, "app_control", intent.revision)
         status = await healthy(test.controller)
-        assert status["desired_control"] == "app" and status["station_ceiling_a"] == 16
+        assert status["desired_control"] == "app" and status["station_ceiling_a"] == 20
+        assert "pause_reason" not in refresh_for_read(test.controller, status)
         assert test.controller.requests.receipt(request)["state"] == "completed" and not starts(test.rig)
 
 

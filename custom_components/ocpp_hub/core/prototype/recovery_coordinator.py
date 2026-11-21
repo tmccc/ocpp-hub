@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from .connection_scope import control_scope_matches, current_control_scope
 from .managed_current import current_source_decision
-from .managed_intent import ControlIntent
+from .managed_intent import ControlIntent, ReturnFailure
 from .policy import DeniedError
 from .recovery_contracts import (
     ALLOW,
@@ -48,7 +48,7 @@ class ReturnSettlement:
 
     identifier: str
     intent: ControlIntent
-    unconfirmed: bool = False
+    failure: ReturnFailure | None = None
     await_cloud: bool = False
 
 
@@ -77,10 +77,10 @@ class RecoveryCoordinator:
         try:
             requests = self.c.requests
             if not retry or requests.return_current(settlement.identifier, settlement.intent):
-                requests.return_waiting(
+                requests.settle_return(
                     settlement.identifier,
                     settlement.intent,
-                    unconfirmed=settlement.unconfirmed,
+                    failure=settlement.failure,
                     await_cloud=settlement.await_cloud,
                 )
         except sqlite3.Error:
@@ -219,7 +219,7 @@ class RecoveryCoordinator:
             )
         except DeniedError:
             if claim_return and return_request is not None:
-                self._settle_return(ReturnSettlement(return_request, expected, unconfirmed=True))
+                self._settle_return(ReturnSettlement(return_request, expected, failure="return_not_sent"))
             raise
         return self._task
 
@@ -227,34 +227,42 @@ class RecoveryCoordinator:
     async def _restore_owned(
         self, expected_intent: ControlIntent, *, continuing_local: int | None, return_request: str | None
     ) -> RestoreProgress:
+        attempt: ReleaseAttempt | None = None
         try:
-            progress = await self._run_restore(
-                expected_intent, continuing_local=continuing_local, return_request=return_request
-            )
+            prepared = await self._prepare_restore(expected_intent, continuing_local, return_request)
+            if isinstance(prepared, ReleaseAttempt):
+                attempt = prepared
+                progress = await self._run_release(attempt, return_request)
+            else:
+                progress = prepared
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             if return_request is not None:
-                self._settle_return(ReturnSettlement(return_request, expected_intent, unconfirmed=True))
+                failure: ReturnFailure = (
+                    "return_not_confirmed"
+                    if attempt is not None and attempt.positive_may_have_dispatched
+                    else "return_not_sent"
+                )
+                self._settle_return(ReturnSettlement(return_request, expected_intent, failure=failure))
             raise
         if return_request is not None and not progress.shared:
             operation = progress.operation
             await_cloud = False
             if (operation is None or not operation.claimed) and progress.pending is not None:
                 disposition = preflight_disposition("explicit", progress.pending)
-                if disposition is PreflightDisposition.REQUEST_UNCONFIRMED:
-                    self._settle_return(ReturnSettlement(return_request, expected_intent, unconfirmed=True))
-                    return RestoreProgress(RestoreState.REQUEST_UNCONFIRMED, progress.pending, operation)
+                if disposition is PreflightDisposition.NOT_SENT:
+                    self._settle_return(ReturnSettlement(return_request, expected_intent, failure="return_not_sent"))
+                    return RestoreProgress(RestoreState.REQUEST_NOT_SENT, progress.pending, operation)
                 await_cloud = progress.pending.reason is Prerequisite.CLOUD_ACK
             self._settle_return(ReturnSettlement(return_request, expected_intent, await_cloud=await_cloud))
         return progress
 
-    # All restoration callers consume this same prerequisite, operation-result and publication contract.
-    async def _run_restore(
+    # Check the current facts and bind the accepted request before a positive command can start.
+    async def _prepare_restore(
         self,
         expected_intent: ControlIntent,
-        *,
         continuing_local: int | None,
         return_request: str | None,
-    ) -> RestoreProgress:
+    ) -> RestoreProgress | ReleaseAttempt:
         c = self.c
         g, j = c.session.gateway, c.session.journal
         vendor_epoch = g._vendor_epoch
@@ -361,15 +369,21 @@ class RecoveryCoordinator:
                 if not isinstance(ticket, str):
                     raise RecoveryRequiredError("Return requires its current zero hold ticket")
                 c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
-        scope = connection[0]
-        attempt = ReleaseAttempt(
+        return ReleaseAttempt(
             "automatic" if expected_intent.mode == "app" else "explicit",
             expected_intent,
-            scope,
+            connection[0],
             revision,
             guard,
             before_ticket=ticket,
         )
+
+    # The wire child records possible dispatch and publishes the result under the original scope.
+    async def _run_release(self, attempt: ReleaseAttempt, return_request: str | None) -> RestoreProgress:
+        c = self.c
+        g, j = c.session.gateway, c.session.journal
+        expected_intent, scope, revision = attempt.intent, attempt.scope, attempt.control_revision
+        guard, epoch = attempt.positive_guard, scope.epoch
 
         # Restrictive rollback keeps its exact Boot proof even when the positive release permission is revoked.
         def rollback_guard() -> None:

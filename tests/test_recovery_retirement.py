@@ -75,9 +75,9 @@ async def test_cancelled_close_joins_held_return_before_closing_journal(tmp_path
             # Trace only the real request-specific terminal UPDATE; do not execute SQL or alter its result here.
             def trace(statement):
                 if (
-                    statement.startswith("UPDATE managed_requests SET state='uncertain'")
+                    statement.startswith("UPDATE managed_requests SET state='failed'")
                     and identifier in statement
-                    and "return_not_confirmed" in statement
+                    and "return_not_sent" in statement
                 ):
                     sql_witnesses.append(
                         {

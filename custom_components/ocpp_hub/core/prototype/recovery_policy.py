@@ -21,7 +21,7 @@ class PreflightDisposition(Enum):
     """Return can wait for named prerequisites before ownership; other refusals end the accepted request."""
 
     WAIT = "wait"
-    REQUEST_UNCONFIRMED = "request_unconfirmed"
+    NOT_SENT = "not_sent"
 
 
 # Only the named source, cleanup and actual acknowledgement waits retain the same explicit Return request.
@@ -32,7 +32,7 @@ def preflight_disposition(purpose: Literal["automatic", "explicit"], pending: Pe
         Prerequisite.OWNER_RETURN,
     ):
         return PreflightDisposition.WAIT
-    return PreflightDisposition.REQUEST_UNCONFIRMED
+    return PreflightDisposition.NOT_SENT
 
 
 class ReleaseDisposition(Enum):

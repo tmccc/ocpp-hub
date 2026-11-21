@@ -17,6 +17,33 @@ from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_client import setup
 
 
+# Intent: the first healthy status can still report a persistent Pause selected by the proxy.
+# Why: a fresh HA process may never have observed the cloud failure, and a normal manual Pause should clear the notice.
+async def test_healthy_proxy_pause_shows_notice_on_setup(actual_hass, peer):
+    peer["state"].update(
+        desired_control="paused",
+        owner_control_enabled=False,
+        local_hold_verified=True,
+        station_ceiling_a=0,
+        can_return=True,
+        pause_reason="cloud_connection_failed",
+    )
+    entry = await setup(actual_hass, peer)
+    coordinator = entry.runtime_data
+    await actual_hass.async_block_till_done()
+    notifications = _async_get_or_create_notifications(actual_hass)
+    assert coordinator.fresh_healthy and coordinator.notified
+    assert "scheduled charging are still paused" in notifications[coordinator.notification_id]["message"]
+    assert actual_hass.states.get("button.ics_proxy_app_control").state != "unavailable"
+
+    peer["state"].pop("pause_reason")
+    peer["state"]["control_revision"] += 1
+    await coordinator.async_refresh()
+    await actual_hass.async_block_till_done()
+    assert coordinator.fresh_healthy and coordinator.notification_id not in notifications
+    assert set(peer["commands"]) == {"status"}
+
+
 # Intent: expire native and service-only entities at their own boundaries while the next status is held.
 # Why: aging one half of a snapshot must not leave the other half visible indefinitely during a slow poll.
 async def test_app_connection_expires_after_native_reading_during_held_poll(actual_hass, peer, monkeypatch):

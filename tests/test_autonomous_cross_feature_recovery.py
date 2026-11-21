@@ -249,13 +249,15 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                 }
                 assert firmware.effective_limit() == selected
             else:
-                assert old_return["state"] in ("accepted", "running", "uncertain")
+                assert old_return["state"] in ("accepted", "running", "uncertain", "failed")
                 assert before_pause["metadata"]["managed_control_intent"] == {
                     "mode": "paused",
                     "revision": early_return_revision,
                 }
                 if old_return["state"] == "uncertain" and replaced_return is None:
                     assert old_return["result"] == {"classification": "return_not_confirmed"}
+                if old_return["state"] == "failed":
+                    assert old_return["result"] == {"classification": "return_not_sent"}
             current = (await child.request("status"))["result"]
             newer_pause = await child.request("pause", revision=current["control_revision"])
             assert newer_pause["ok"]
@@ -269,9 +271,13 @@ async def test_service_three_failures_pause_return_boot_and_later_sessions(
                 expected_pause_revision = early_return_revision + 2
             else:
                 assert old_return["state"] != "completed"
-                assert after_pause["state"] == "failed" and after_pause["result"] == {
-                    "classification": "superseded_by_pause"
-                }
+                if old_return["state"] == "failed":
+                    assert after_pause == old_return
+                else:
+                    assert after_pause["state"] == "failed" and after_pause["result"] in (
+                        {"classification": "superseded_by_pause"},
+                        {"classification": "return_not_sent"},
+                    )
                 expected_pause_revision = early_return_revision + 1
             snapshot = child.durable()
             assert snapshot["metadata"]["managed_control_intent"] == {

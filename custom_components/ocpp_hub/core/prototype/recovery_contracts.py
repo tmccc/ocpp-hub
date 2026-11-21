@@ -159,7 +159,7 @@ class RestoreState(Enum):
     SHARED = "shared"
     WAITING = "waiting"
     YIELDED = "yielded"
-    REQUEST_UNCONFIRMED = "request_unconfirmed"
+    REQUEST_NOT_SENT = "request_not_sent"
 
 
 @dataclass(frozen=True)

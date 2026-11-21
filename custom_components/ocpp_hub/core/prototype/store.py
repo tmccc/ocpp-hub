@@ -33,6 +33,10 @@ class StationZeroStorageError(sqlite3.Error):
     """Storing the reserved station-zero profile intent or reply failed."""
 
 
+class JournalStartBusy(sqlite3.OperationalError):
+    """The journal's write lock was busy before the requested transaction started."""
+
+
 # Encode deterministically and reject non-finite JSON before anything is accepted.
 def encoded(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -240,8 +244,17 @@ class Journal:
 
     # Commit all related facts together, or publish none of them.
     @contextmanager
-    def atomic(self) -> Iterator[None]:
-        self.db.execute("BEGIN IMMEDIATE")
+    def atomic(self, *, retry_busy: bool = False) -> Iterator[None]:
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            if (
+                retry_busy
+                and getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+                and not self.db.in_transaction
+            ):
+                raise JournalStartBusy(str(error)) from error
+            raise
         try:
             yield
             self.db.execute("COMMIT")

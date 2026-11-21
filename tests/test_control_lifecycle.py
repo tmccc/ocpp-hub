@@ -252,19 +252,19 @@ def test_owned_return_begin_keeps_terminal_bytes(owner, state):
     assert raw(owner, identifier) == ("running" if state == "accepted" else state, ORIGINAL)
 
 
-# Intent: waiting requeues only under the original intent, while unconfirmed completion retains its old ID-only filter.
+# Intent: waiting requeues only under the original intent; terminal disposition targets the original request.
 # Why: a newer Pause or domain revision must not be overwritten, and unknown outcomes cannot become replayable.
 @pytest.mark.parametrize("state", STATES)
 @pytest.mark.parametrize("current", [ControlIntent("paused", 7), ControlIntent("paused", 8), ControlIntent("app", 7)])
-@pytest.mark.parametrize("unconfirmed", [False, True])
-def test_owned_return_disposition(owner, state, current, unconfirmed):
+@pytest.mark.parametrize("failure", [None, "return_not_sent", "return_not_confirmed"])
+def test_owned_return_disposition(owner, state, current, failure):
     identifier = seed(owner, state=state)
     owner.journal.put("managed_control_intent", {"mode": current.mode, "revision": current.revision})
-    owner.return_waiting(identifier, ControlIntent("paused", 7), unconfirmed=unconfirmed)
+    owner.settle_return(identifier, ControlIntent("paused", 7), failure=failure)
     expected = (state, ORIGINAL)
-    if unconfirmed and state in ("accepted", "running"):
-        expected = ("uncertain", '{"classification": "return_not_confirmed"}')
-    elif not unconfirmed and state == "running" and current == ControlIntent("paused", 7):
+    if failure and state in ("accepted", "running"):
+        expected = ("failed" if failure == "return_not_sent" else "uncertain", json.dumps({"classification": failure}))
+    elif failure is None and state == "running" and current == ControlIntent("paused", 7):
         expected = ("accepted", ORIGINAL)
     assert raw(owner, identifier) == expected
     assert owner.intent() == current

@@ -28,7 +28,7 @@ class MissingOriginalHistoryError(NativeContentError):
 @contextmanager
 def history_savepoint(journal: Journal) -> Iterator[None]:
     if not journal.db.in_transaction:
-        with journal.atomic():
+        with journal.atomic(retry_busy=True):
             yield
         return
     journal.db.execute("SAVEPOINT native_history_observation")

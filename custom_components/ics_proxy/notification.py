@@ -132,7 +132,7 @@ class ProxyNotice:
             self.cancel_timer = async_call_later(self.hass, remaining, fire)
 
     # Only the current coordinator can establish recovery or extend this entry's outage evidence.
-    def update(self, okay: bool, generation: int, detail: str | None = None) -> None:
+    def update(self, okay: bool, generation: int, detail: str | None = None, *, immediate: bool = False) -> None:
         if generation != self.generation or not self.active:
             return
         if okay:
@@ -146,7 +146,12 @@ class ProxyNotice:
         self.detail = detail
         if self.problem_since is None:
             self.problem_since = self.clock()
-        self.arm()
+        if immediate and self.eligible():
+            self.cancel_deadline()
+            if not self.notified or self.detail != self.shown_detail:
+                self.show()
+        else:
+            self.arm()
 
     # Removal drops the bounded entry cache; HA shutdown retains an existing visible fault for next startup.
     def close(self, *, dismiss: bool) -> None:

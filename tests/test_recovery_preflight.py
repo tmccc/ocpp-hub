@@ -27,18 +27,18 @@ pytestmark = pytest.mark.asyncio
 
 
 # Verify the completed production preflight and its actual public receipt; no operation result is synthesized.
-def require_unconfirmed_preclaim(test, identifier, reason, intent, control, wire_mark):
+def require_unsent_preflight(test, identifier, reason, intent, control, wire_mark):
     c, j, g = test.controller, test.session.journal, test.session.gateway
     owned = c.recovery._task
     assert owned is not None and owned.done() and not owned.cancelled()
     assert owned.exception() is None
     progress = owned.result()
-    assert progress.state is RestoreState.REQUEST_UNCONFIRMED and not progress.shared
+    assert progress.state is RestoreState.REQUEST_NOT_SENT and not progress.shared
     assert progress.pending is not None and progress.pending.reason is reason
     assert progress.operation is None
     receipt = c.requests.receipt(identifier)
-    assert receipt["id"] == identifier and receipt["state"] == "uncertain"
-    assert receipt["result"] == {"classification": "return_not_confirmed"}
+    assert receipt["id"] == identifier and receipt["state"] == "failed"
+    assert receipt["result"] == {"classification": "return_not_sent"}
     assert c.requests.intent() == intent and j.get("control") == control
     assert not c.requests.return_in_progress() and c.requests.pending_return() is None
     assert g.controls.release_attempt is None and not g.controls._operations
@@ -76,7 +76,7 @@ async def new_return_after_preflight_recovery(test, identifier, original, intent
     return fresh, copy.deepcopy(c.requests.receipt(fresh))
 
 
-# Intent: a genuine HTTP503 in explicit Return preflight makes that UUID unconfirmed without a positive claim.
+# Intent: a genuine HTTP503 in explicit Return preflight settles that UUID without a positive claim.
 # Why: fresh telemetry cannot silently replay an accepted positive request whose preflight already terminated.
 @pytest.mark.parametrize("storage_refused", [False, True])
 async def test_explicit_return_native503_preflight_requires_a_new_request(
@@ -129,7 +129,8 @@ async def test_explicit_return_native503_preflight_requires_a_new_request(
             if storage_refused:
                 j.db.execute(
                     "CREATE TEMP TRIGGER refuse_return_settlement BEFORE UPDATE ON managed_requests "
-                    "WHEN NEW.action='app_control' AND NEW.state='uncertain' "
+                    "WHEN NEW.action='app_control' AND NEW.state='failed' "
+                    "AND json_extract(NEW.result,'$.classification')='return_not_sent' "
                     "BEGIN SELECT RAISE(ABORT,'Return outcome unavailable'); END"
                 )
             peer.release.set()
@@ -144,7 +145,7 @@ async def test_explicit_return_native503_preflight_requires_a_new_request(
                 finally:
                     j.db.execute("DROP TRIGGER refuse_return_settlement")
                 await c.tick()
-            original = require_unconfirmed_preclaim(test, identifier, Prerequisite.NATIVE, intent, control, wire_mark)
+            original = require_unsent_preflight(test, identifier, Prerequisite.NATIVE, intent, control, wire_mark)
             assert j.get("control")["uncertain"] is False
             peer.select = None
             fresh, fresh_receipt = await new_return_after_preflight_recovery(
@@ -187,7 +188,7 @@ async def test_explicit_return_refused_cloud_preflight_requires_a_new_request(
         assert c.command(identifier, "app_control", intent.revision)["state"] == "accepted"
         await asyncio.wait_for(c.return_requested(identifier, intent.revision), 5)
         # Current zero_decision groups the absent cloud connection into ZERO_PROOF, never CLOUD_ACK.
-        original = require_unconfirmed_preclaim(test, identifier, Prerequisite.ZERO_PROOF, intent, control, wire_mark)
+        original = require_unsent_preflight(test, identifier, Prerequisite.ZERO_PROOF, intent, control, wire_mark)
         assert g.controls.ready and g.controls.desired() == 0 and j.get("control")["uncertain"] is False
 
         # Restore only the actual external destination; normal runtime registration and queue ACKs do the recovery.

@@ -110,16 +110,29 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current = self.data or {} if data is None else data
         age = self.age("status_age_seconds") if data is None else data.get("status_age_seconds")
         native_age = self.age("native_age_seconds") if data is None else data.get("native_age_seconds")
-        detail = explanation(
-            current,
-            fresh=not unavailable
+        fresh = (
+            not unavailable
             and (data is not None or self.last_update_success)
             and current.get("running") is True
             and usable_age(age)
-            and 0 <= age <= 15,
+            and 0 <= age <= 15
+        )
+        offline_pause = (
+            fresh
+            and current.get("desired_control") == "paused"
+            and current.get("pause_reason") == "cloud_connection_failed"
+        )
+        detail = explanation(
+            current,
+            fresh=fresh,
             native_fresh=usable_age(native_age) and 0 <= native_age <= 15,
         )
-        self.notice.update(okay, self.notice_generation, detail)
+        if offline_pause:
+            detail = (
+                "The proxy paused after it could not connect to the charger cloud. "
+                "App and scheduled charging are still paused."
+            )
+        self.notice.update(okay and not offline_pause, self.notice_generation, detail, immediate=offline_pause)
 
     # API errors are classified before HA logs them; tokens and server payloads never appear in UpdateFailed.
     async def _async_update_data(self) -> dict[str, Any]:

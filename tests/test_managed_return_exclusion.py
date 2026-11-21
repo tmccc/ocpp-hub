@@ -35,7 +35,7 @@ class SlowSnapshotPeer(NativeVehiclePeer):
         await super().handle(reader, writer)
 
 
-# Intent: an aggregate native timeout terminates Return as uncertain and permits a new explicit request after recovery.
+# Intent: an aggregate native timeout ends Return before sending and permits a new request after recovery.
 # Why: leaving its receipt running forever hides healthy admission behind an operation that no longer exists.
 @pytest.mark.parametrize("slow", [False, True])
 async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_port, monkeypatch, slow):
@@ -51,7 +51,7 @@ async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_por
         finally:
             peer.slow = False
         status = await healthy(c)
-        assert c.requests.receipt(request)["state"] == ("uncertain" if slow else "completed")
+        assert c.requests.receipt(request)["state"] == ("failed" if slow else "completed")
         assert not c.requests.return_in_progress() and not starts(b.rig)
         if slow:
             assert peer.delayed_requests == 9 and status["local_hold_verified"]
@@ -60,7 +60,7 @@ async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_por
             c.command(fresh, "app_control", c.requests.intent().revision)
             assert (await healthy(c))["owner_control_enabled"]
             assert c.requests.receipt(fresh)["state"] == "completed"
-            assert c.requests.receipt(request)["state"] == "uncertain"
+            assert c.requests.receipt(request)["result"] == {"classification": "return_not_sent"}
         assert b.rig.bench.firmware.effective_limit() == 6 and not starts(b.rig)
 
 

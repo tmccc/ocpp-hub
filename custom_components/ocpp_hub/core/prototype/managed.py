@@ -21,7 +21,7 @@ from .managed_current import (
 from .managed_current_recovery import capture_interrupted_collision
 from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault, stop_for_missing_station
-from .managed_intent import ControlIntent, ManagedRequests, write_intent
+from .managed_intent import OFFLINE_PAUSE, ControlIntent, ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
@@ -54,7 +54,7 @@ from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .start_settlement import RetirementCandidate
-from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
+from .store import JournalStartBusy, RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .supervision import ControlProof, HealthVerdict, Observation, PollStatus, assess
 from .trial_evidence import Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence
@@ -563,8 +563,9 @@ class ManagedController:
             and self.native.acknowledged_lineage != scope.lineage
             and intent.mode == "app"
         ):
-            with j.atomic():
+            with j.atomic(retry_busy=True):
                 write_intent(j, intent, "paused")
+                j.put(OFFLINE_PAUSE, True)
                 g.controls._claim(True, stopping=True)
 
     # A newer stop ticket invalidates an awaited release before it can send a positive ceiling.
@@ -882,6 +883,18 @@ class ManagedController:
                 raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
             return native
 
+    # A refused archive transaction made no changes. Retry once using a complete fresh observation.
+    async def _poll_native(self) -> HandoverEvidence:
+        try:
+            return await self.settled_native()
+        except JournalStartBusy as error:
+            repair = self.native.repair_audits
+            if repair is not None and repair.pending_storage_error is error:
+                raise
+            self.latest_native = None
+            await asyncio.sleep(0.1)
+            return await self.settled_native()
+
     # Health is measured from a fresh native view and known session; a legitimate owner charge remains healthy.
     async def tick(self) -> dict[str, Any]:
         try:
@@ -976,7 +989,12 @@ class ManagedController:
             return PollStatus("starting")
         verified_pause = False
         try:
-            self.prepare_offline_pause()
+            try:
+                self.prepare_offline_pause()
+            except JournalStartBusy:
+                self.latest_native = None
+                await asyncio.sleep(0.1)
+                self.prepare_offline_pause()
             recovery_pending = await self.recovery.advance()
             if recovery_pending is not None:
                 if recovery_pending.reason is Prerequisite.NATIVE:
@@ -984,7 +1002,7 @@ class ManagedController:
                 return PollStatus(
                     "waiting_for_cloud" if recovery_pending.reason is Prerequisite.CLOUD else "reconciling"
                 )
-            native = await self.settled_native()
+            native = await self._poll_native()
             if g.controls.ceiling_needs_recheck():
                 try:
                     await g.controls.ensure_ceiling()
@@ -992,7 +1010,7 @@ class ManagedController:
                     # An actual unsafe offer requires the existing protective zero, even when the car is idle.
                     await self.hold_fault()
                     return PollStatus("attention", STATION_COMPOSITE_FAULT)
-                native = await self.settled_native()
+                native = await self._poll_native()
             if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
                 raise RecoveryRequiredError("managed release awaits fresh app-control restoration")
             if self.requests.intent().mode == "paused":

@@ -304,7 +304,8 @@ its Pause supersession and metadata publication. Return preserves the order of i
 and request completion. Its post-COMMIT memory notification stays with the existing handoff.
 
 Return's running claim follows the recovery owner's busy/stopping exits and precedes completion launch. Queue
-refusal retains `return_not_confirmed`; once launched, the owned completion alone requeues or records uncertainty.
+refusal records `return_not_sent`. Once launched, the owned completion retains a named wait or records whether
+preflight ended before sending or whether the outcome is uncertain.
 The management request driver selects this claim; direct restore retains its existing accepted-before-publication
 contract. Both entry points keep the same exact request guard and owned completion.
 Stale revision, domain admission, physical Pause/native proof and each send/publication recheck remain distinct

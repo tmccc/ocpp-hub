@@ -89,8 +89,8 @@ async def test_return_prelaunch_disposition_uses_actual_owner(tmp_path, tls, unu
             await c.return_requested(identifier, expected.revision)
             observed = c.requests.receipt(identifier)
             if boundary == "queue_full":
-                assert observed["state"] == "uncertain"
-                assert observed["result"] == {"classification": "return_not_confirmed"}
+                assert observed["state"] == "failed"
+                assert observed["result"] == {"classification": "return_not_sent"}
             else:
                 assert observed == before
             assert c.requests.intent() == expected

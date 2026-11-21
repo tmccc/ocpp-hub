@@ -5,14 +5,17 @@ import json
 import sqlite3
 import uuid
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 from ocpp_hub_core.prototype.native_history import NativeHistoryArchive
 from ocpp_hub_core.prototype.trial_session import TrialSession, save_private
 
+from tests.charge_rig import positive_flow
 from tests.connected_rig import strategy_file
 from tests.current_rig import commissioned
 from tests.handover_helpers import crash
+from tests.managed_rig import healthy
 from tests.management_peer import TOKEN
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import ServiceProcess
@@ -27,6 +30,7 @@ class HistoryFailureConnection(sqlite3.Connection):
     """A real failed SQL commit is observed after SQLite rejects it; only the fault's child row is repaired."""
 
     failure_observations = None
+    busy_begin = None
 
     # Preserve every actual engine SQL operation and its original failure while repairing only the injected refusal.
     def execute(self, sql, parameters=(), /):
@@ -36,6 +40,11 @@ class HistoryFailureConnection(sqlite3.Connection):
             if self.failure_observations is not None and sql in ("COMMIT", "RELEASE native_history_observation"):
                 self.failure_observations.append({"sql": sql, "transaction_open": self.in_transaction})
                 super().execute("DELETE FROM service_history_child")
+            raise
+        except sqlite3.OperationalError as error:
+            if self.busy_begin is not None and sql == "BEGIN IMMEDIATE":
+                self.busy_begin.set_result((error.sqlite_errorcode, self.in_transaction))
+                self.busy_begin = None
             raise
 
 
@@ -51,6 +60,47 @@ async def publication(service, status_path, predicate):
                 if status.get("running") and predicate(status):
                     return status
             await asyncio.sleep(0.05)
+
+
+# Intent: a real brief writer lock during archive preparation gets a fresh audit of the same running charge.
+# Why: an unavailable lock before any write has a different outcome from a refused required commit.
+async def test_busy_history_begin_retries_the_running_charge(tmp_path, tls, unused_tcp_port, monkeypatch):
+    connect = sqlite3.connect
+
+    # Observe the real journal connection while leaving the independent reader and writer unmodified.
+    def observe_journal(database, *args, **kwargs):
+        if isinstance(database, (Path, str)) and not str(database).startswith("file:"):
+            kwargs.setdefault("factory", HistoryFailureConnection)
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", observe_journal)
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as charge:
+        c, j, bench = charge.controller, charge.session.journal, charge.rig.bench
+        local = await positive_flow(charge, "daily")
+        assert (await healthy(c))["current_a"] == 32
+        NativeHistoryArchive(j)
+        before = len(bench.device_calls)
+        bench.history.append(unassigned("busy-history-begin.json"))
+        j.db.execute("PRAGMA busy_timeout=0")
+        busy = asyncio.get_running_loop().create_future()
+        j.db.busy_begin = busy
+        with closing(connect(j.path, isolation_level=None)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            task = asyncio.create_task(c.tick())
+            try:
+                assert await asyncio.wait_for(asyncio.shield(busy), 5) == (sqlite3.SQLITE_BUSY, False)
+                assert c.latest_native is None and not task.done()
+            finally:
+                writer.execute("ROLLBACK")
+        status = await task
+        assert status["state"] == "healthy" and status["current_a"] == 32
+        assert bench.firmware.current == 32 and j.active() == local
+        assert not [
+            frame
+            for frame in bench.device_calls[before:]
+            if frame[2] in ("SetChargingProfile", "RemoteStopTransaction")
+        ]
+        assert j.db.execute("SELECT COUNT(*) FROM native_start_attempts").fetchone()[0] == 1
 
 
 # Intent: a real history-commit refusal during actual32A service polling still sends zero/Stop and retains uncertainty.
