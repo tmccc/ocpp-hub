@@ -8,6 +8,12 @@ The repository has two deployment domains: the standalone iCS proxy with its thi
 older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
 Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
+## Shared command and report queue — 21 November 2026
+
+- [x] The standalone proxy and Home Assistant client are deployed at `7f47a83`. All 14,661 release cases and
+  the rollback rehearsal passed. Live checks confirmed app/schedule mode, a connected cloud, zero draw,
+  the selected 32 A ceiling and all 11 recorded transactions.
+
 ## Vendor catch-up and overnight observations — 19 November 2026
 
 - [x] Archived charger, proxy and Home Assistant histories agree for three midnight sessions on November 10, 12

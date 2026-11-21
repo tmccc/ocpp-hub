@@ -523,8 +523,9 @@ Verified local app/schedule control remains labelled as available during a cloud
 shown explicitly. Both native and status readings must still be fresh; an outage never extends their deadlines.
 The timeline retains cloud-wait and cleanup phases, protocol details retain Boot-probe and completed-RPC labels,
 and retained historical diagnostic labels remain readable. When the first reply to a control is lost, the client
-reads the saved receipt for that request. An unreadable or unconfirmed result stays unknown. The client sends the
-control once. Optional native observation notes can fail without terminating supervision. Required atomic fault
+reads the saved receipt for that request. It retries temporary read failures until the confirmation deadline.
+An invalid or oversized reply ends the lookup and leaves the outcome unconfirmed. The client sends the control once.
+Optional native observation notes can fail without terminating supervision. Required atomic fault
 proof and command settlement retain their storage checks.
 
 Software metadata distinguishes the actual HA/client version and an available installed client `BUILD` stamp from

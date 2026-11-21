@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Stop looking up a Home Assistant command receipt when the reply is invalid or oversized. Keep retrying temporary
+  read failures within the deadline without repeating the command.
 - Keep a scheduled session separate from an interrupted timed test during charger introduction. Hold zero while
   recovering the test without sending Stop to the schedule's transaction.
 - Withdraw live health and control proof after a Start or Stop changes the session. Show a pending command ahead
