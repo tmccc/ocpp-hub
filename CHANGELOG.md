@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Retain a newer cloud refusal when the old approval cannot be updated. Keep confirmed plan replies across restart.
-- Apply the normal retry limit to an exact late Start error. Keep the first complete incident entry after a partial write.
+- Handle late Start and Stop errors on their original connections. Retain the first complete incident entry after a partial write.
 - Refresh delivery counts, age certificate status, and report when a saved charger check is still being written.
 - Keep definite incompatible charger responses separate from a temporary lack of a response.
 - Check the saved service mode before startup can change a journal.

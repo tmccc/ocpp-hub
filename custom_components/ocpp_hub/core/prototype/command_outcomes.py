@@ -585,7 +585,13 @@ class CommandOutcomes:
                 ).fetchone()
                 if row is None or (row["action"], row["wire_request"]) != (reply.action, reply.wire):
                     raise RecoveryRequiredError("charger reply no longer owns its original vendor write")
-                if row["state"] != "pending" or row["wire_result"] not in ("dispatched", reply.status):
+                state = row["state"], row["wire_result"]
+                late_error = (
+                    state == ("uncertain", "dispatched")
+                    and reply.action in TRANSACTION_COMMANDS
+                    and reply.status == "call_error"
+                )
+                if not late_error and state not in (("pending", "dispatched"), ("pending", reply.status)):
                     raise RecoveryRequiredError("vendor write is no longer awaiting this reply")
                 if row["wire_result"] == "dispatched":
                     if reply.plans:
@@ -594,6 +600,8 @@ class CommandOutcomes:
                             (reply.mutation, encoded(reply.plans), reply.clearing),
                         )
                     j.record_vendor_result(reply.mutation, reply.status)
+                    if late_error:
+                        j.db.execute("UPDATE mutations SET state='pending' WHERE token=?", (reply.mutation,))
             with j.atomic():
                 self._settle_vendor_write(reply.mutation, reply.action, reply.status)
         except sqlite3.Error:

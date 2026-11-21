@@ -283,6 +283,41 @@ async def test_late_cloud_command_reply_settles_exactly_once(
             assert restored["desired_control"] == "app" and restored["station_ceiling_a"] == 6
 
 
+# Intent: a real late error stays tied to its original charger command and leaves the connection usable.
+# Why: an error confirms a reply arrived while physical completion remains unresolved.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("action", ["RemoteStartTransaction", "RemoteStopTransaction"])
+async def test_late_charger_error_does_not_interrupt_the_proxy(tmp_path, tls, unused_tcp_port, monkeypatch, action):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        g, j, bench = b.session.gateway, b.session.journal, b.rig.bench
+        g.charger.timeout = 0.25
+        epoch = g._charger_epoch
+        send = b.charger.send
+        local = await positive_flow(b, "daily") if action == "RemoteStopTransaction" else None
+        payload = {"transactionId": j.vendor_id(local)} if local is not None else {"idTag": "CLOUD_OWNER"}
+
+        # Retain the original wire request while the charger connection remains available for ordinary reports.
+        async def hold(raw):
+            frame = decode(raw)
+            if frame[0] != 3 or not any(call[1] == frame[1] and call[2] == action for call in bench.device_calls):
+                await send(raw)
+
+        monkeypatch.setattr(b.charger, "send", hold)
+        expired = await bench.cloud_call("late-charger-error", action, payload)
+        assert expired[:3] == [4, "late-charger-error", "InternalError"]
+        token, wire = j.db.execute(
+            "SELECT mutation,wire_request FROM vendor_command_scope WHERE request='late-charger-error'"
+        ).fetchone()
+        assert j.outcomes.vendor(token).state == "uncertain"
+        await send(build_call_error(wire, "InternalError", "synthetic late refusal"))
+        await until(lambda: j.outcomes.vendor(token).wire_result == "call_error")
+        await b.controller.tick()
+        outcome = j.outcomes.vendor(token)
+        assert outcome.status == "call_error" and outcome.state == "uncertain"
+        assert g._charger_epoch == epoch and g.charger.sender is not None
+        assert j.active() == local and sum(frame[2] == action for frame in bench.device_calls) == 1
+
+
 # Intent: an Accepted cloud Start can bind its real report under a newer verified Pause.
 # Why: the late lifecycle belongs in history even while storage cannot finish the command receipt.
 async def test_cloud_start_report_preserves_history_under_pause_while_reply_saves(
