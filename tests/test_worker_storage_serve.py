@@ -363,6 +363,15 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         response = await call(api, "status")
                         assert response["ok"] and response["result"]["healthy"] is False
 
+                        if failure == "statement":
+                            # A matching Boot replaces observation proof while the exact internal Pause stays.
+                            prior_boot = session.gateway.boot_observation
+                            marker = j.get("managed_internal_pause")
+                            assert marker["id"] == identifier and marker["boot"] == prior_boot
+                            renewed = await rig.bench.call(charger, uuid.uuid4().hex, "BootNotification", BOOT)
+                            assert renewed[0] == 3
+                            await until(lambda: session.gateway.boot_observation not in (None, prior_boot))
+
                         # Recover HTTP while diagnostic storage still refuses writes, before repair or owner controls.
                         rig.peer.unavailable = False
                         await read_native(

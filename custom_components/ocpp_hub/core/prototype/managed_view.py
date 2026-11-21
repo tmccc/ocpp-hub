@@ -238,29 +238,12 @@ def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]
 
 # Show evidence that has actually arrived, including replies which are still being saved.
 def vendor_command_status(c: ManagedController) -> dict[str, Any]:
-    g, j = c.session.gateway, c.session.journal
     try:
-        vendor_pending = j.db.execute(
-            "SELECT token,state,wire_request,wire_result FROM mutations "
-            "LEFT JOIN vendor_command_scope ON mutation=token WHERE origin='vendor' AND state!='confirmed'"
-        )
-        known, uncertain = 0, 0
-        for row in vendor_pending:
-            if j.forwarded.awaits_storage(row["token"]):
-                known += 1
-            elif row["state"] == "uncertain" or (
-                row["wire_result"] not in ("prepared", "prepared_new_profile")
-                and not g.charger.has_pending_call(row["wire_request"])
-            ):
-                uncertain += 1
-        marker = j.get("uncertain_vendor_command", {})
-        unmatched_marker = bool(marker) and (
-            not isinstance(marker, dict) or j.forwarded.status(marker.get("mutation")) is None
-        )
+        evidence = c.session.gateway.vendor_write_evidence()
         return {
-            "vendor_write_uncertain": uncertain,
-            "vendor_reply_storage_pending": known,
-            "operator_reconciliation_required": unmatched_marker or bool(uncertain),
+            "vendor_write_uncertain": len(evidence.uncertain),
+            "vendor_reply_storage_pending": evidence.received,
+            "operator_reconciliation_required": evidence.unresolved,
         }
     except sqlite3.Error:
         return dict.fromkeys(

@@ -5,7 +5,7 @@ import json
 from itertools import product
 
 import pytest
-from ocpp_hub_core.prototype.native_http import read_native, response_body
+from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError, read_native, response_body
 from ocpp_hub_core.prototype.security import SecurityError
 
 BODY = json.dumps({"code": 200, "data": {"synthetic": "native-evidence"}}).encode()
@@ -110,7 +110,7 @@ async def test_invalid_native_reply_is_classified_over_real_http(name, raw):
 
     server = await asyncio.start_server(peer, "127.0.0.1", 0)
     try:
-        with pytest.raises(SecurityError):
+        with pytest.raises(NativeTransportUnavailableError):
             await read_native("127.0.0.1", server.sockets[0].getsockname()[1], "Basic synthetic", "getConfig", None)
     finally:
         server.close()

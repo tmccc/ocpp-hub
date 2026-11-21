@@ -32,7 +32,7 @@ async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
     status = await framing_line(reader)
     fields = status.split()
     if len(status) > 8192 or len(fields) < 2 or fields[0] not in (b"HTTP/1.0", b"HTTP/1.1"):
-        raise NativeContentError("content", "native reader received an invalid HTTP status line")
+        raise NativeTransportUnavailableError("native reader received an invalid HTTP status line")
     code = fields[1]
     if code in (b"408", b"429") or len(code) == 3 and code.startswith(b"5") and code.isdigit():
         raise ConnectionError("native HTTP temporarily unavailable")
@@ -126,7 +126,12 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
             ).encode("ascii") + body
             writer.write(request)
             await writer.drain()
-            raw, _ = await framed_body(reader)
+            try:
+                raw, _ = await framed_body(reader)
+            except NativeContentError, NativeTransportUnavailableError:
+                raise
+            except ValueError:
+                raise NativeTransportUnavailableError("native HTTP framing is unavailable") from None
             value = decoded_native_json(raw)
             encoded(value)
             if (

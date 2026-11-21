@@ -92,7 +92,8 @@ class DeliveryReply:
 
     # A repaired database may retry only the exact received reply against its original sent head.
     def require(self, item: Delivery) -> None:
-        if item.state != "inflight" or (item.token, item.action, encoded(item.payload), item.transaction) != (
+        sent = item.state == "inflight" or item.action == "StartTransaction" and item.state == "ambiguous"
+        if not sent or (item.token, item.action, encoded(item.payload), item.transaction) != (
             self.token,
             self.action,
             self.payload,

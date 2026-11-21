@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Use the same unanswered-command evidence for status and zero protection. A matched late reply can
+  resolve the hold caused by that exact command, then normal recovery checks current charging conditions.
+- Retain an accepted profile reply while its local records are being saved. Retry Pause recovery
+  evidence for the same request and retire a Return claim that Boot superseded before dispatch.
+- Keep an outstanding cloud Start report on its original connection long enough to accept a late
+  answer. Defer queued reports during Boot and retry incomplete native readings during introduction.
 - Retain matching late charger replies on the same connection and distinguish a normal wait from an
   unknown outcome. Keep local Start and Stop answers when the outgoing send is still finishing.
 - Retry cleanup for commands that never went out. Keep Pause and protective zero independent of failed

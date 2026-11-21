@@ -226,6 +226,17 @@ async def test_pause_commits_while_fault_acknowledgement_write_fails(tmp_path, t
             assert b.rig.bench.firmware.effective_limit() == 0
         finally:
             j.db.execute("DROP TRIGGER refuse_fault_ack")
+        if c.pause_task is not None:
+            await c.pause_task
+        await c.hold_fault()
+        await c.tick()
+        if j.fault.latched():
+            assert j.get(ACK)["pause_request"] == identifier
+        for _ in range(10):
+            if not j.fault.latched():
+                break
+            await c.tick()
+        assert not j.fault.latched() and c.requests.intent().revision == before.revision + 1
 
 
 # Intent: the acknowledgement helper itself performs only native reads before recording successful recovery.

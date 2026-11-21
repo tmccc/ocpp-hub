@@ -349,6 +349,15 @@ async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, 
 
                 peer.sender = congested
                 command = None
+                cloud_slot = None
+                cloud_entered, release_cloud = asyncio.Event(), asyncio.Event()
+
+                # Occupy only the real cloud send gate while a routine report first reaches it.
+                async def reserve_cloud_slot():
+                    async with bench.gateway.vendor.gate.enter(0):
+                        cloud_entered.set()
+                        await release_cloud.wait()
+
                 try:
                     if blocked == "full_queue":
                         for index in range(32):
@@ -356,6 +365,13 @@ async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, 
                         await asyncio.wait_for(full_queue.wait(), 1)
                         await charger.send(build_call("held", "Heartbeat", {}))
                     elif blocked == "boot":
+                        cloud_slot = asyncio.create_task(reserve_cloud_slot())
+                        await asyncio.wait_for(cloud_entered.wait(), 1)
+                        bench.store.enqueue(
+                            "StatusNotification", {"connectorId": 1, "errorCode": "NoError", "status": "Available"}
+                        )
+                        await until(bench.gateway._flush_lock.locked)
+                        cloud_epoch = bench.gateway._vendor_epoch
                         command = asyncio.create_task(peer.call("GetConfiguration", {"key": ["HeartbeatInterval"]}))
                         request = decode(await asyncio.wait_for(charger.recv(), 1))
                         await charger.send(build_call("held", "BootNotification", BOOT))
@@ -363,6 +379,10 @@ async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, 
                         await charger.send('[2,"held","Heartbeat",[]]')
                     await asyncio.wait_for(refusing.wait(), 1)
                     if blocked == "boot":
+                        release_cloud.set()
+                        await until(lambda: not bench.gateway._flush_lock.locked())
+                        assert bench.gateway._vendor_epoch == cloud_epoch
+                        assert bench.store.next_delivery().state == "queued"
                         await bench.connections[-1].send(build_call("cloud-during-boot", "GetConfiguration", {}))
                         await until(lambda: any(frame[1] == "cloud-during-boot" for frame in bench.calls))
                         refusal = next(frame for frame in bench.calls if frame[1] == "cloud-during-boot")
@@ -378,6 +398,9 @@ async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, 
                     assert not release.is_set()
                 finally:
                     release.set()
+                    release_cloud.set()
+                    if cloud_slot is not None:
+                        await asyncio.gather(cloud_slot, return_exceptions=True)
                     if command is not None:
                         await asyncio.gather(command, return_exceptions=True)
                     await bench.gateway.drain()

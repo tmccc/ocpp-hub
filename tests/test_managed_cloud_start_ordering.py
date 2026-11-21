@@ -17,6 +17,44 @@ from tests.test_managed_stop_reply_recovery import pause, running
 from tests.tls_support import tls as tls
 
 
+# Intent: a late reply on the original cloud connection maps the saved Start once.
+# Why: the timeout can require zero immediately while independent charging history still awaits the original answer.
+@pytest.mark.recovery_replay
+async def test_late_cloud_start_acknowledgement_preserves_original_session(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, bench_type=StartReplyBench) as b:
+        bench, gateway, journal = b.rig.bench, b.session.gateway, b.session.journal
+        release = asyncio.Event()
+        bench.start_reply_gate = release
+        gateway.vendor.timeout = 0.25
+        epoch = gateway._vendor_epoch
+        try:
+            opened = await bench.call(
+                b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            assert opened[0] == 3
+            local = opened[2]["transactionId"]
+            await until(lambda: (head := journal.next_delivery()) is not None and head.state == "ambiguous")
+            assert journal.fault.read({}).get("late_delivery_token")
+            await b.controller.tick()
+            assert bench.firmware.effective_limit() == 0 and gateway._vendor_epoch == epoch
+            release.set()
+            await until(lambda: journal.vendor_id(local) is not None)
+            assert not journal.fault.latched() and gateway._vendor_epoch == epoch
+            assert sum(frame[2] == "StartTransaction" for frame in bench.lifecycle_wires) == 1
+            stopped = await bench.call(
+                b.charger,
+                uuid.uuid4().hex,
+                "StopTransaction",
+                {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"},
+            )
+            assert stopped[0] == 3
+            await until(lambda: journal.next_delivery() is None)
+            status = await mp.healthy(b.controller)
+            assert status["desired_control"] == "app" and status["station_ceiling_a"] == 6
+        finally:
+            release.set()
+
+
 # Intent: receive the outcome of a Start already sent to the cloud when the charger's socket closes.
 # Why: retiring the cloud socket immediately can leave a genuine scheduled charge unresolved.
 async def test_closed_charger_socket_allows_sent_start_reply_to_finish(tmp_path, tls, unused_tcp_port, monkeypatch):

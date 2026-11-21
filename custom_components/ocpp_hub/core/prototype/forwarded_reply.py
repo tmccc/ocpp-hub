@@ -119,3 +119,4 @@ class ForwardedReplies:
         if isinstance(marker, dict) and marker.get("mutation") == mutation:
             j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
         j.mutation_finished(mutation, True)
+        j.retire_reply_fault("forwarded_timeout", mutation)

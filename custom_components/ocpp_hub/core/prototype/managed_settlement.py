@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from .local_control import local_start_receipt
 from .managed_records import TerminalCurrent
 from .start_settlement import RetirementCandidate, RetirementRule
-from .store import RecoveryRequiredError
+from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -80,7 +80,7 @@ def claim_internal_pause(c: ManagedController, source: str, identifier: str) -> 
     )
 
 
-# Only this source's still-current paused claim may converge; a new Boot, request or owner ticket revokes it.
+# This restrictive claim can settle on the same connection after fresh zero proof of the current commissioned Boot.
 def internal_pause_matches(c: ManagedController) -> bool:
     g, j = c.session.gateway, c.session.journal
     marker = j.get("managed_internal_pause", {})
@@ -97,5 +97,6 @@ def internal_pause_matches(c: ManagedController) -> bool:
         and marker.get("revision") == c.requests.intent().revision
         and c.requests.intent().mode == "paused"
         and marker.get("epoch") == g._charger_epoch
-        and marker.get("boot") == g.boot_observation
+        and g.current_boot_seen(g._charger_epoch)
+        and fingerprint(j.get("boot")) == c.native.spec.boot_digest
     )

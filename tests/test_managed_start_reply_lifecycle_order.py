@@ -6,7 +6,7 @@ import json
 import sys
 import uuid
 
-from ocpp_hub_core.frames import build_call
+from ocpp_hub_core.frames import build_call, build_call_result
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.local_control import LocalControl
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
@@ -60,6 +60,38 @@ async def test_local_start_saves_rejection_before_send_finishes(tmp_path, tls, u
             assert c.requests.intent().mode == "paused" and bench.firmware.effective_limit() == 0
         finally:
             release.set()
+
+
+# Intent: a late local rejection retires its exact issued Start after the ordinary reply deadline.
+# Why: true uncertainty can hold zero while a valid late answer is still allowed to release its pending receipt.
+async def test_local_start_late_rejection_clears_only_its_receipt(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, j, bench = b.controller, b.session.gateway, b.session.journal, b.rig.bench
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        original_send = b.charger.send
+        saved = []
+        g.charger.timeout = 0.25
+
+        # Save the actual correlated wire identifier and delay its rejection without blocking the charger reader.
+        async def delay(raw):
+            answer = decode(raw)
+            if answer[0] == 3 and any(
+                call[1] == answer[1] and call[2] == "RemoteStartTransaction" for call in bench.device_calls
+            ):
+                saved.append(answer[1])
+                return
+            await original_send(raw)
+
+        monkeypatch.setattr(b.charger, "send", delay)
+        identifier = uuid.uuid4().hex
+        assert c.command(identifier, "start", c.requests.intent().revision)["state"] == "accepted"
+        await c.charging.settle()
+        assert len(saved) == 1 and j.starts.receipt()["stage"] == "issued"
+        await original_send(build_call_result(saved[0], {"status": "Rejected"}))
+        await until(lambda: j.starts.receipt().get("stage") == "rejected")
+        assert c.requests.intent().mode == "paused" and bench.firmware.effective_limit() == 0
+        assert len(starts(b.rig)) == 1
 
 
 # Exercise one explicit real TLS frame ordering while observing the actual atomic publication boundary.

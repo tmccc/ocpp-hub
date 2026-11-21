@@ -146,6 +146,7 @@ class LocalControl:
         self._stop_ticket: str | None = None
         self._stop_owner: tuple[object, ...] | None = None
         self._release_ticket: str | None = None
+        self._unsent_release: tuple[str, dict[str, Any]] | None = None
         self.release_attempt: ReleaseAttempt | None = None
         self._stop_ack: StopAcknowledgement | None = None
         self._stop_generation = 0
@@ -873,7 +874,14 @@ class LocalControl:
                 reply = "other"
             self.observe_incident("start_reply", request_id, ticket, reply)
 
-        async with self.peer.sequence(1, check, on_dispatch=dispatch, on_receive=received, on_sent=sent) as call:
+        async with self.peer.sequence(
+            1,
+            check,
+            on_dispatch=dispatch,
+            on_receive=received,
+            on_sent=sent,
+            late_reply_action="RemoteStartTransaction",
+        ) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
@@ -991,6 +999,21 @@ class LocalControl:
                 attempt.finished = True
                 if self.release_attempt is attempt:
                     self.release_attempt = None
+
+    # Retire an unsent release's claim without replacing any observations or the newer owner's control.
+    def retry_unsent_release(self) -> None:
+        if self._unsent_release is None:
+            return
+        ticket, previous = self._unsent_release
+        j = self.journal
+        try:
+            with j.atomic():
+                j.control.retire_unsent_claim(ticket, previous)
+        except sqlite3.Error:
+            if j.db.in_transaction:
+                raise
+            return
+        self._unsent_release = None
 
     # A failed physical release reinstalls zero instead of retaining only a misleading software hold.
     async def _release(
@@ -1142,6 +1165,8 @@ class LocalControl:
                             try:
                                 rollback_guard()
                             except UnavailableError as retired:
+                                self._unsent_release = ticket, previous
+                                self.peer.decide(self.retry_unsent_release, priority=CommandPriority.RESTRICT)
                                 return Pending(Prerequisite.SUPERSEDED, "release Boot changed before dispatch", retired)
                     await rollback_zero()
                     if attempt is None and isinstance(error, ReleaseDeferredError):

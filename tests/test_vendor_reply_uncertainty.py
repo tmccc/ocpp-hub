@@ -103,9 +103,9 @@ async def test_unsent_sql_failure_drops_reservation(tmp_path, tls, admission):
         assert (await vendor("after-sql-refusal", "SetChargingProfile", body))[2] == {"status": "Accepted"}
 
 
-# Intent: a storage failure after a genuine profile ACK keeps global uncertainty and the accepted alias reserved.
-# Why: physical acceptance must never be reported as durably owned when the ownership commit failed.
-async def test_profile_metadata_commit_failure_keeps_uncertainty(tmp_path, tls, admission):
+# Intent: keep the actual profile acknowledgement while its owner and mutation records await storage.
+# Why: the proxy can save the original ownership after repair without sending the profile again.
+async def test_profile_metadata_commit_failure_retries_exact_acknowledgement(tmp_path, tls, admission):
     async with connected(tmp_path, tls, admission) as (b, calls, reply, vendor):
         b.store.put("vendor_profile_transactions", {})
         b.store.db.execute(
@@ -114,15 +114,18 @@ async def test_profile_metadata_commit_failure_keeps_uncertainty(tmp_path, tls, 
         )
         body = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 111)
         result = await vendor("metadata-commit-failed", "SetChargingProfile", body)
-        assert result[0] == 4
+        assert result == [3, "metadata-commit-failed", {"status": "Accepted"}]
         assert [row[0] for row in b.store.db.execute("SELECT state FROM mutations WHERE origin='vendor'")] == [
-            "uncertain"
+            "pending"
         ]
         mapped = b.store.get("vendor_profiles")["111"]
         assert mapped in b.firmware.profiles
         before = len(calls)
         assert (await vendor("blocked-after-commit", "SetChargingProfile", body))[0] == 4
         assert len(calls) == before
+        b.store.db.execute("DROP TRIGGER fail_profile_metadata")
+        await until(lambda: b.store.db.execute("SELECT state FROM mutations").fetchone()[0] == "confirmed")
+        assert not b.store.get("uncertain_vendor_command") and len(calls) == before
 
 
 # Intent: exact Start acceptance retains its single-use grant, while exact refusal permits a separately requested retry.

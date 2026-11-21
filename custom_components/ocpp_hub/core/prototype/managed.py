@@ -23,7 +23,12 @@ from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault, stop_for_missing_station
 from .managed_intent import OFFLINE_PAUSE, ControlIntent, ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
-from .managed_release_recovery import reconcile_owner_release, record_release_pause, release_evidence
+from .managed_release_recovery import (
+    publish_release_pause,
+    reconcile_owner_release,
+    release_evidence,
+    release_pause_ack,
+)
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .managed_settlement import (
     charge_test_candidate,
@@ -77,6 +82,7 @@ class ManagedController:
 
     # Construct after admission so the allocation bootstrap cannot see unrelated managed-service metadata.
     def __init__(self, session: TrialSession) -> None:
+        self._pending_release_ack: dict[str, Any] | None = None
         if session.native_bounded is None or session.gateway.policy.allow_local_start:
             raise SecurityError("managed operation requires bounded native authority and disabled local Start")
         if session.journal.get("trial_allocation") is None:
@@ -182,12 +188,26 @@ class ManagedController:
             if ticket is not None:
                 controls.observe_incident("pause_committed", identifier, ticket)
             self.schedule_pause()
+            self._pending_release_ack = None
             try:
-                record_release_pause(self, identifier)
+                self._pending_release_ack = release_pause_ack(self, identifier)
             except sqlite3.Error:
                 if self.session.journal.db.in_transaction:
                     raise
+            self._retry_release_pause()
         return receipt
+
+    # Optional storage can recover while the durable Pause keeps its own control ticket.
+    def _retry_release_pause(self) -> None:
+        if self._pending_release_ack is None:
+            return
+        try:
+            publish_release_pause(self, self._pending_release_ack)
+        except sqlite3.Error:
+            if self.session.journal.db.in_transaction:
+                raise
+            return
+        self._pending_release_ack = None
 
     # A newer accepted hold must get a turn even if the previous Stop is still leaving the wire gate.
     def schedule_pause(self) -> asyncio.Task[None]:
@@ -596,8 +616,10 @@ class ManagedController:
         self.session.gateway.controls._claim(True, stopping=True)
 
     # A persistent failed restoration cannot be silently undone by another poll or a process restart.
-    def fault(self, reason: str, *, diagnostic: dict[str, Any] | None = None) -> None:
-        latch_managed_fault(self.session.gateway, reason, diagnostic=diagnostic)
+    def fault(
+        self, reason: str, *, diagnostic: dict[str, Any] | None = None, forwarded_timeout: str | None = None
+    ) -> None:
+        latch_managed_fault(self.session.gateway, reason, diagnostic=diagnostic, forwarded_timeout=forwarded_timeout)
 
     # Keep a proved excessive offer even if a command encounters it before the next supervision poll.
     def _retained_ceiling_exceeded(self) -> None:
@@ -941,6 +963,7 @@ class ManagedController:
     # A poll first joins owned work, then supervises, assesses current authority and publishes one view.
     async def _tick(self) -> dict[str, Any]:
         self.commands.decide(self.session.gateway.retry_reply_writes)
+        self.commands.decide(self._retry_release_pause)
         pending = await self._pending_work()
         if pending is not None:
             self.latest_native = None
@@ -1156,20 +1179,10 @@ class ManagedController:
         s, g, j = self.session, self.session.gateway, self.session.journal
         control = j.control.read()
 
-        # Check both the recorded vendor fault and the mutation ledger when the verdict needs vendor evidence.
-        def vendor_uncertain() -> bool:
-            return (
-                bool(j.get("uncertain_vendor_command"))
-                or j.db.execute(
-                    "SELECT 1 FROM mutations WHERE origin='vendor' AND state='uncertain' LIMIT 1"
-                ).fetchone()
-                is not None
-            )
-
         if (
             self.current.applying()
             and not s.runtime.status.delivery_blocked
-            and not vendor_uncertain()
+            and not g.vendor_write_evidence().unresolved
             and not j.fault.latched()
             and not j.get("trial_preservation_fault")
             and not j.get("trial_inventory_fault")
@@ -1184,9 +1197,15 @@ class ManagedController:
         delivery_uncertain = delivery_blocked and (
             s.runtime.status.delivery_blocked_cause != "storage" or g.delivery_outcome_uncertain
         )
-        # Publish a known fault even if the saved vendor marker cannot be read.
-        if not self.stopping and (not proof.available or delivery_uncertain or vendor_uncertain()):
-            self.fault("owner_control_or_delivery_uncertain")
+        if not self.stopping:
+            # Independent reasons must not be retired when one forwarded answer subsequently arrives.
+            if not proof.available or delivery_uncertain:
+                self.fault("owner_control_or_delivery_uncertain")
+            else:
+                evidence = g.vendor_write_evidence()
+                if evidence.unresolved:
+                    forwarded_timeout = g.sole_forwarded_timeout(evidence)
+                    self.fault("owner_control_or_delivery_uncertain", forwarded_timeout=forwarded_timeout)
         if (proof.available and j.fault.latched()) or self.stopping:
             proof = ControlProof()
         if proof.shared and not g.controls.ready:

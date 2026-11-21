@@ -15,6 +15,7 @@ from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from websockets.asyncio.server import serve
 
 from tests.charge_rig import positive_flow, ready
+from tests.managed_rig import healthy
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import Bench, until
 from tests.tls_support import admission as admission
@@ -183,13 +184,20 @@ async def test_cloud_stop_keeps_reply_while_waiting_for_storage_and_closure(
 # Intent: the same live charger can settle its exact reply after the request deadline.
 # Why: normal waiting, a missing answer, and a received answer still being saved have different outcomes.
 @pytest.mark.recovery_replay
-@pytest.mark.parametrize("action", ["RemoteStartTransaction", "RemoteStopTransaction"])
-async def test_late_cloud_command_reply_settles_exactly_once(tmp_path, tls, unused_tcp_port, monkeypatch, action):
+@pytest.mark.parametrize(
+    "action,poll_first",
+    [("RemoteStartTransaction", False), ("RemoteStartTransaction", True), ("RemoteStopTransaction", False)],
+)
+async def test_late_cloud_command_reply_settles_exactly_once(
+    tmp_path, tls, unused_tcp_port, monkeypatch, action, poll_first
+):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         g, j, bench = b.session.gateway, b.session.journal, b.rig.bench
         g.charger.timeout = 0.25
-        entered, release = asyncio.Event(), asyncio.Event()
+        entered = asyncio.Event()
         original_answer = bench.firmware.answer
+        send = b.charger.send
+        delayed = None
         local = None
         status = "Rejected"
         payload = {"idTag": "CLOUD_OWNER"}
@@ -198,23 +206,36 @@ async def test_late_cloud_command_reply_settles_exactly_once(tmp_path, tls, unus
             payload = {"transactionId": j.vendor_id(local)}
             status = "Accepted"
 
-        # Only this fake charger response is delayed beyond the normal command deadline.
-        async def before_reply(name, _payload):
-            if name == action:
+        # Delay one answer while leaving the actual charger reader free to apply protective zero.
+        async def delay_reply(raw):
+            nonlocal delayed
+            frame = decode(raw)
+            if (
+                frame[0] == 3
+                and any(call[1] == frame[1] and call[2] == action for call in bench.device_calls)
+                and delayed is None
+            ):
+                delayed = raw
                 entered.set()
-                await release.wait()
+                return
+            await send(raw)
 
         # A rejected Start releases only its grant. An accepted Stop still awaits closure.
         def answer(name, command):
             actual = original_answer(name, command)
             return {"status": status} if name == action else actual
 
-        monkeypatch.setattr(bench, "before_reply", before_reply)
+        monkeypatch.setattr(b.charger, "send", delay_reply)
         monkeypatch.setattr(bench.firmware, "answer", answer)
         j.db.execute(
             "CREATE TEMP TRIGGER hold_late_reply BEFORE UPDATE ON vendor_command_scope "
             "WHEN NEW.wire_result IN ('Accepted','Rejected') BEGIN SELECT RAISE(ABORT,'synthetic reply refusal'); END"
         )
+        if poll_first:
+            j.db.execute(
+                "CREATE TEMP TRIGGER hold_timeout_write BEFORE UPDATE ON mutations "
+                "WHEN NEW.state='uncertain' BEGIN SELECT RAISE(ABORT,'synthetic timeout refusal'); END"
+            )
         task = asyncio.create_task(bench.cloud_call("delayed-result", action, payload))
         try:
             await asyncio.wait_for(entered.wait(), 2)
@@ -223,15 +244,26 @@ async def test_late_cloud_command_reply_settles_exactly_once(tmp_path, tls, unus
             expired = await task
             assert expired[:3] == [4, "delayed-result", "InternalError"]
             assert poll_base(b.controller)["vendor_write_uncertain"] == 1
-            release.set()
+            if poll_first:
+                assert j.db.execute("SELECT state FROM mutations").fetchone()[0] == "pending"
+                await b.controller.tick()
+                assert j.fault.read({}).get("forwarded_timeout")
+                await b.controller.tick()
+                assert bench.firmware.effective_limit() == 0
+            assert delayed is not None
+            await send(delayed)
             await until(lambda: poll_base(b.controller)["vendor_reply_storage_pending"] == 1)
             evidence = poll_base(b.controller)
             assert not evidence["operator_reconciliation_required"] and not evidence["cloud_start_pending"]
             blockers = snapshot(b.controller, evidence)["blockers"]
             assert "vendor_reply_storage_pending" in blockers
             assert "cloud_start_pending" not in blockers and "command_outcome_unknown" not in blockers
+            if not poll_first:
+                await b.controller.tick()
+                assert not j.fault.latched()
         finally:
-            release.set()
+            if poll_first:
+                j.db.execute("DROP TRIGGER hold_timeout_write")
             j.db.execute("DROP TRIGGER hold_late_reply")
             await asyncio.gather(task, return_exceptions=True)
         await b.controller.tick()
@@ -239,6 +271,10 @@ async def test_late_cloud_command_reply_settles_exactly_once(tmp_path, tls, unus
         assert tuple(row.fetchone()) == ("confirmed", status)
         assert not j.get("uncertain_vendor_command") and not j.get("vendor_start_grant")
         assert j.active() == local and sum(frame[2] == action for frame in bench.device_calls) == 1
+        if poll_first:
+            assert not j.fault.latched()
+            restored = await healthy(b.controller)
+            assert restored["desired_control"] == "app" and restored["station_ceiling_a"] == 6
 
 
 # Intent: an Accepted cloud Start can bind its real report under a newer verified Pause.
@@ -304,6 +340,47 @@ async def test_start_report_waits_for_its_boot_send_to_finish(tmp_path, tls, unu
             finish_boot.set()
             if report is not None:
                 await asyncio.gather(report, return_exceptions=True)
+
+
+# Intent: repeated local write failures retain the original Set and Clear answers in the managed resource path.
+# Why: the proxy can finish ownership after storage returns, with no repeat transmission and no invented clear proof.
+async def test_cloud_profile_answers_survive_refused_resource_writes(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        j, bench = b.session.journal, b.rig.bench
+        profile = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 111, stack_level=2)
+        for action, expected, payload in (
+            ("SetChargingProfile", "confirmed", profile),
+            ("ClearChargingProfile", "clear_acknowledged", {"id": 111}),
+        ):
+            attempts = []
+
+            # Refuse publication of the actual resource acknowledgement as often as the proxy tries.
+            def refuse():
+                attempts.append(True)
+                return 1
+
+            j.db.create_function("refuse_profile_ack", 0, refuse)
+            j.db.execute(
+                f"CREATE TEMP TRIGGER refuse_profile_ack BEFORE UPDATE ON trial_resources "
+                f"WHEN NEW.key!='profile:7001' AND NEW.state='{expected}' AND refuse_profile_ack() "
+                "BEGIN SELECT RAISE(ABORT,'synthetic profile acknowledgement refusal'); END"
+            )
+            try:
+                answer = await bench.cloud_call(action, action, payload)
+                assert answer == [3, action, {"status": "Accepted"}] and len(attempts) >= 2
+                counts = poll_base(b.controller)
+                assert counts["vendor_reply_storage_pending"] == 1 and counts["vendor_write_uncertain"] == 0
+            finally:
+                j.db.execute("DROP TRIGGER refuse_profile_ack")
+            await b.controller.tick()
+            row = j.db.execute(
+                "SELECT state,wire_result,wire_request,profile FROM mutations "
+                "JOIN vendor_command_scope ON token=mutation WHERE action=?",
+                (action,),
+            ).fetchone()
+            assert tuple(row)[:2] == ("confirmed", "Accepted")
+            assert sum(call[1] == row["wire_request"] for call in bench.device_calls) == 1
+            assert (row["profile"] in bench.firmware.profiles) is (action == "SetChargingProfile")
 
 
 # Intent: an accepted profile replacement without a transaction remains clearable after the old session ends.

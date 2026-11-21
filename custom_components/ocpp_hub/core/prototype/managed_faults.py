@@ -32,13 +32,17 @@ class ManagedRefusal:
 
 
 # Keep the first proved refusal and its diagnostic atomic, including when introduction precedes the first poll.
-def latch_managed_fault(gateway: Gateway, reason: str, *, diagnostic: dict[str, Any] | None = None) -> None:
+def latch_managed_fault(
+    gateway: Gateway, reason: str, *, diagnostic: dict[str, Any] | None = None, forwarded_timeout: str | None = None
+) -> None:
     # Save and withdraw authority at the same restrictive turn.
     def latch() -> None:
         journal = gateway.journal
         if not journal.fault.latched():
             with journal.atomic():
                 fault: dict[str, Any] = {"classification": reason, "at_epoch": time.time()}
+                if forwarded_timeout is not None:
+                    fault["forwarded_timeout"] = forwarded_timeout
                 if diagnostic is not None:
                     journal.put("managed_native_failure", diagnostic)
                     fault["native_failure_digest"] = fingerprint(diagnostic)

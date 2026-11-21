@@ -253,7 +253,7 @@ class NativeObserver:
                 values[name] = await self._read("statistics", name)
             values["TRANSACTIONS"] = await self._read("getTransaction", {})
             if await self._read("getConfig") != config:
-                raise NativeContentError("configuration", "native configuration changed during the connected audit")
+                raise StaleEvidenceError("native configuration changed during the connected audit")
             return handover_evidence(config, values, started)
 
     # Recheck native identity and configuration around one complete bounded physical snapshot.

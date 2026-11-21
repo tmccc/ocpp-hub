@@ -660,6 +660,10 @@ async def test_matching_boot_after_return_claim_retires_unsent_return(tmp_path, 
             assert not positive_calls(b, before["wire"]) and not j.fault.latched()
             assert c.requests.receipt(returning)["result"] == {"classification": "return_not_sent"}
             assert c.requests.intent() == before["intent"] and b.rig.bench.firmware.effective_limit() == 0
+            assert (await healthy(c))["local_hold_verified"]
+            retry = accepted_return(b, before)
+            await completed_control(b, retry, mode="app", revision=before["intent"].revision + 1, ceiling=6)
+            assert len(positive_calls(b, before["wire"])) == 1
         finally:
             resume.set()
             await asyncio.gather(consumer, return_exceptions=True)

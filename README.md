@@ -57,8 +57,10 @@ When the cloud asks the charger to Start or Stop, the proxy records the charger'
 If saving the answer fails, the proxy retries the save without repeating the command. A saved answer survives
 a restart. An accepted Stop still needs the charger's session-end report. Home Assistant distinguishes an answer
 that is being saved from an unknown outcome that keeps charging on hold.
-The proxy can still match a late answer to the original command for up to 30 seconds after its normal
-deadline, while the same charger connection remains open.
+For up to 30 seconds after the normal deadline, the proxy can still match a late answer for a local Start,
+a forwarded Start or Stop, or a Start report sent to the cloud. The original connection must remain open.
+A missing answer can hold charging at zero. A subsequent matching answer can settle that hold, and the
+proxy then checks the current charger evidence and owner choice before allowing charging.
 If the proxy restarts with a saved reply still waiting for its final update, let this version finish that update
 before rolling back to an earlier version. The rollback check requires a settled journal.
 

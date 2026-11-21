@@ -119,6 +119,19 @@ class ControlAuthority:
         if state is not None:
             self._write(state)
 
+    # An exact claim that sent no command can restore its predecessor without changing other facts.
+    def retire_unsent_claim(self, ticket: str, previous: dict[str, Any]) -> None:
+        current = self.read().values
+        if current.get("ticket") != ticket:
+            return
+        state = dict(current)
+        for field in ("ticket", "uncertain"):
+            if field in previous:
+                state[field] = previous[field]
+            else:
+                state.pop(field, None)
+        self._write(ControlState(state))
+
     # Projection updates retain their original captured base and cannot select a different owner.
     def project(self, base: dict[str, Any], **changes: Unpack[ControlProjection]) -> None:
         self._write(ControlState(base).changed(**changes))

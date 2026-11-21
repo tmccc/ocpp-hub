@@ -650,6 +650,17 @@ class Journal:
         with self.atomic():
             self.acknowledge_in_transaction(item, result, acknowledged, allow_denied=allow_denied)
 
+    # A matching answer may retire only the fault that this exact unanswered command or report caused.
+    def retire_reply_fault(self, evidence_key: str, identity: str) -> None:
+        fault = self.fault.read({})
+        if (
+            fault.get("classification") == "owner_control_or_delivery_uncertain"
+            and fault.get(evidence_key) == identity
+            and self.phase.read().supervised
+        ):
+            self.phase.restrict(self.control.read().values)
+            self.fault.clear()
+
     # The exclusive caller must already own one transaction for a compound independently attested resolution.
     def acknowledge_in_transaction(
         self,

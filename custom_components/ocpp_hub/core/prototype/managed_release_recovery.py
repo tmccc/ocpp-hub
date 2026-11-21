@@ -109,20 +109,32 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
     return release_evidence(c, fault) is not None
 
 
-# Optional fault-release evidence belongs to the committed Pause and cannot prevent its protective hold.
-def record_release_pause(c: ManagedController, identifier: str) -> None:
+# Capture fault-release evidence only for this already committed Pause.
+def release_pause_ack(c: ManagedController, identifier: str) -> dict[str, Any] | None:
     j = c.session.journal
     fault = j.fault.read({})
     if not fault:
-        return
-    with j.atomic():
-        evidence = release_evidence(c, fault)
-        if evidence is None:
-            return
-        intent = c.requests.intent()
-        if intent.mode != "paused":
-            raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
-        j.put(ACK, {"fault": fault, "pause_request": identifier, "revision": intent.revision, **evidence})
+        return None
+    evidence = release_evidence(c, fault)
+    if evidence is None:
+        return None
+    intent = c.requests.intent()
+    if intent.mode != "paused":
+        raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
+    return {"fault": fault, "pause_request": identifier, "revision": intent.revision, **evidence}
+
+
+# A delayed write may acknowledge only the original Pause, fault and captured evidence.
+def publish_release_pause(c: ManagedController, ack: dict[str, Any]) -> None:
+    j, intent = c.session.journal, c.requests.intent()
+    fault = j.fault.read({})
+    if (
+        intent.mode == "paused"
+        and intent.revision == ack["revision"]
+        and fault == ack["fault"]
+        and acknowledged_evidence(c, fault, ack)
+    ):
+        j.put(ACK, ack)
 
 
 # Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.

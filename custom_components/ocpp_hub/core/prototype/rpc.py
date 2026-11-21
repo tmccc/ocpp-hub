@@ -369,9 +369,16 @@ class Peer:
         on_reply: Callable[[str, Frame], None] | None = None,
         on_sent: Callable[[str], None] | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
+        late_reply_action: str | None = None,
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
         async with self.sequence_results(
-            priority, check, on_dispatch=on_dispatch, on_reply=on_reply, on_sent=on_sent, on_receive=on_receive
+            priority,
+            check,
+            on_dispatch=on_dispatch,
+            on_reply=on_reply,
+            on_sent=on_sent,
+            on_receive=on_receive,
+            late_reply_action=late_reply_action,
         ) as result_call:
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
@@ -390,6 +397,7 @@ class Peer:
         on_reply: Callable[[str, Frame], None] | None = None,
         on_sent: Callable[[str], None] | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
+        late_reply_action: str | None = None,
     ) -> AsyncIterator[ResultCall]:
         async with self.gate.enter(priority):
             # Each call revalidates after native waits and before recording any resource intent.
@@ -405,6 +413,7 @@ class Peer:
                     on_reply,
                     on_sent,
                     on_receive=on_receive,
+                    keep_late_reply=action == late_reply_action,
                 )
 
             yield call
