@@ -164,8 +164,8 @@ class ProxyClient:
         receipt_id = identifier
         followed: set[str] = set()
         try:
-            # A normal Start can spend up to 60 seconds waiting for its local charging session.
-            async with asyncio.timeout(70 if action == "start" else 25):
+            # Both local Start commands can spend up to 60 seconds waiting for physical confirmation.
+            async with asyncio.timeout(70 if action in ("start", "start_test") else 25):
                 if receipt is None:
                     saved = await self.request("receipt", request_id=identifier)
                     if not matches(saved, lookup=True) or saved.get("state") not in (

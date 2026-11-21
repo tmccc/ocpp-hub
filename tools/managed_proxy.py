@@ -130,13 +130,18 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     api: ManagementServer | None = None
     incident: IncidentRecorder | None = None
     try:
+        ownership = None
         try:
+            ownership = session.journal.retain_ownership()
             writer = ReportWriter(
                 partial(
                     reporting.write, status_path=status_path, events_path=events_path, save=save_private, event=event
-                )
+                ),
+                ownership=ownership,
             )
         except OSError, RuntimeError:
+            if ownership is not None:
+                ownership.close()
             reporting.output_errors += 1
         await session.start()
         if not session.started:

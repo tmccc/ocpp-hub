@@ -76,14 +76,19 @@ async def test_same_connection_outage_hold_preserves_app_authority(
             try:
                 async with asyncio.timeout(5):
                     while c.ordinary.completion is None:
-                        status = await c.tick()
+                        await c.tick()
                         await asyncio.sleep(0.02)
-                assert status["state"] == "reconciling" and g.controls.ready and g.controls.desired() == 32
+                assert g.controls.ready and g.controls.desired() == 32
                 hold = j.get("managed_ordinary_recovery")
                 mark = list(b.rig.bench.received_limits)
-                assert (await c.tick())["state"] == "reconciling"
+                b.rig.peer.unavailable = True
+                status = await c.tick()
+                assert status["state"] == "degraded" and status["fault"] == "native_observation_unavailable"
+                assert not b.rig.peer.failed_reads.empty() and c.native_unavailable == 1
+                assert c.ordinary.completion is not None
                 assert j.get("managed_ordinary_recovery") == hold and b.rig.bench.received_limits == mark
             finally:
+                b.rig.peer.unavailable = False
                 j.db.execute("DROP TRIGGER refuse_recovery_completion")
         status = await healthy(c)
         assert c.requests.intent() == intent and status["station_ceiling_a"] == 32

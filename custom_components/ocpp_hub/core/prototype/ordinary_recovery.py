@@ -491,10 +491,10 @@ class OrdinaryRecovery:
         return NativeStartReport(None, None, None, accepted)
 
     # Retry the journal note under the exact release that already completed, without touching the charger.
-    def finish_recovery(self) -> Pending | None:
+    def finish_recovery(self) -> bool:
         completed = self.completion
         if completed is None:
-            return None
+            return False
         c, j, g = self.c, self.c.session.journal, self.c.session.gateway
         try:
             with j.atomic():
@@ -509,10 +509,10 @@ class OrdinaryRecovery:
                     and j.get(KEY) == completed.hold
                 ):
                     j.put(KEY, {**completed.hold, "state": "complete", "completed_at": completed.completed_at})
-        except sqlite3.Error as error:
-            return Pending(Prerequisite.RECONCILIATION, "ordinary recovery awaits its completion record", error)
+        except sqlite3.Error:
+            return True
         self.completion = None
-        return None
+        return False
 
     # Fresh zero/source proof restores only the original intent and never emits a Start or Stop.
     async def recover(self) -> Pending | None:
@@ -548,4 +548,5 @@ class OrdinaryRecovery:
             return progress.pending
         assert progress.operation is not None and progress.operation.published_authority is not None
         self.completion = OrdinaryCompletion(hold, progress.operation.published_authority, time.time())
-        return self.finish_recovery()
+        self.finish_recovery()
+        return None

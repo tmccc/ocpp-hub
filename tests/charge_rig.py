@@ -47,11 +47,18 @@ async def ready(
     startup: float = 3,
     owner_tag: str | None = None,
     cli_route: bool = False,
+    initial_history: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[ChargeRig]:
     monkeypatch.setattr(charge_tests, "DURATION", duration)
     monkeypatch.setattr(charge_tests, "STARTUP_BUDGET", startup)
     async with managed_bench(
-        directory, contexts, port, cli_route=cli_route, native_peer=native_peer, bench_type=bench_type
+        directory,
+        contexts,
+        port,
+        cli_route=cli_route,
+        native_peer=native_peer,
+        bench_type=bench_type,
+        initial_history=initial_history,
     ) as rig:
         session = managed_session(rig)
         if owner_tag is not None:

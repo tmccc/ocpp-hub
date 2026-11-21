@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from typing import Any
 
@@ -11,7 +10,7 @@ from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_debt_recovery import vendor_history_recovery_scope
-from .managed_intent import ControlIntent, unfinished_owner_requests, write_intent
+from .managed_intent import ControlIntent, unfinished_owner_requests, verified_pause_after, write_intent
 from .managed_native_repair import retire_history_omission_revocations
 from .managed_recovery_zero import require_paused_owned_zero
 from .native_bounded import NativeBoundedSpec
@@ -65,18 +64,13 @@ def _superseded_tests(journal: Journal, revision: int, fault_at: float) -> list[
         ):
             raise RecoveryRequiredError("a management request still needs reconciliation")
         pauses = journal.db.execute(
-            "SELECT id,result FROM managed_requests WHERE action='pause' AND state='completed' "
-            "AND rowid>? AND revision>? AND revision<? ORDER BY rowid",
-            (row["rowid"], row["revision"], revision),
+            "SELECT id,revision,result FROM managed_requests WHERE action='pause' AND state='completed' "
+            "AND rowid>? ORDER BY rowid",
+            (row["rowid"],),
         )
         for pause in pauses:
-            result = json.loads(pause["result"])
-            at = result.get("completed_at")
-            if (
-                result.get("pause_verified") is True
-                and type(at) in (int, float)
-                and math.isfinite(at)
-                and 0 < at <= fault_at
+            if verified_pause_after(
+                json.loads(pause["result"]), row["revision"], pause["revision"], revision, fault_at
             ):
                 proofs.append({"request_id": row["id"], "verified_pause_id": pause["id"]})
                 break
@@ -147,7 +141,7 @@ def record_history_policy(
     original = journal.get("native_bounded_handover")["original_history"]
     summary = NativeHistoryArchive(journal).observe(original, current, allow_missing=policy is not None)
     if policy is not None:
-        if not summary["missing_records"]:
+        if not (summary["missing_records"] or summary.get("missing_attempts")):
             raise RecoveryRequiredError("no missing historical records were independently observed")
         journal.put("native_history_policy", policy)
     journal.put(

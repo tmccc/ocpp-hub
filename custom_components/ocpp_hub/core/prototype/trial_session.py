@@ -387,8 +387,9 @@ class TrialSession:
             await self.native_bounded.admit()
         elif phase.supervised:
             selected = self._commissioned_selection()
+            known_local = self.journal.active() if self.journal.get("trial_binding") is not None else None
             try:
-                native = await self.native_bounded.read(selected_current=selected)
+                native = await self.native_bounded.read(selected_current=selected, closing_local=known_local)
             except _NativeMeasurementError as error:
                 refusal = self._measured_refusal(error, selected)
                 latch_managed_fault(self.gateway, refusal.classification, diagnostic=refusal.diagnostic)

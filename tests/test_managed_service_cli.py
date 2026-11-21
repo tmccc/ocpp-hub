@@ -8,6 +8,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import threading
 import time
 from contextlib import closing
 from dataclasses import replace
@@ -36,6 +37,36 @@ from tests.test_ordinary_legacy_transport_recovery import legacy_fault
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 from tools import managed_proxy, trial_proxy
+from tools.managed_reporting import ReportWriter
+
+
+# Intent: old reports cannot replace a new process's status when the old disk writer is briefly stalled.
+# Why: the existing process lock should allow replacement only once no previous writer can publish.
+async def test_delayed_final_report_owns_shared_output_until_finished(tmp_path):
+    journal = Journal(tmp_path / "state.db", "REPORT001")
+    entered, release = threading.Event(), threading.Event()
+    reports = []
+
+    # Let the worker take its last snapshot, then delay that write until after the async shutdown timeout.
+    def stalled(status):
+        entered.set()
+        if release.wait(5):
+            reports.append(status)
+
+    writer = ReportWriter(stalled, ownership=journal.retain_ownership())
+    try:
+        journal.close()
+        final = {"running": False}
+        await writer.close(final)
+        assert entered.is_set() and writer.thread.is_alive()
+        with pytest.raises(RecoveryRequiredError, match="active owner"):
+            Journal(journal.path, journal.identity)
+    finally:
+        release.set()
+        await until(lambda: not writer.thread.is_alive())
+    assert reports == [final]
+    with closing(Journal(journal.path, journal.identity)):
+        pass
 
 
 # A complete measured healthy status includes physical freshness and the service's local-Start restriction.

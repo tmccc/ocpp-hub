@@ -9,9 +9,10 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 
-from tests.charge_rig import ChargeRig
+from tests.charge_rig import ChargeRig, actual_stop, positive_flow
 from tests.current_rig import selected_ready
-from tests.managed_rig import healthy, managed_bench, managed_session, starts
+from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
@@ -97,6 +98,33 @@ async def test_first_boot_readiness_wait_recovers_on_same_boot(tmp_path, tls, un
             await c.charging.close()
             if c.pause_task is not None:
                 await asyncio.gather(c.pause_task, return_exceptions=True)
+            await session.close()
+
+
+# Intent: a stopped service can receive real closure for its known unplugged session at zero.
+# Why: requiring closure before opening the listener leaves the charger unable to report the very closure it needs.
+async def test_replacement_can_close_its_known_unplugged_session(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as test:
+        local = await positive_flow(test, "daily")
+        await healthy(test.controller)
+        rig = test.rig
+        await crash(test.session)
+        rig.peer.permission_enabled, rig.peer.paused = False, True
+        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        session = managed_session(rig)
+        try:
+            await session.start()
+            controller = ManagedController(session)
+            async with rig.charger(session) as charger:
+                await introduced(rig, session, charger, "unplugged-replacement")
+                assert not starts(rig) and session.journal.active() == local
+                identifier = uuid.uuid4().hex
+                controller.command(identifier, "pause", controller.requests.intent().revision)
+                recovered = ChargeRig(rig, session, controller, charger)
+                status = await actual_stop(recovered, local)
+                assert status["local_hold_verified"] and status["station_ceiling_a"] == 0
+                assert controller.requests.receipt(identifier)["state"] == "completed"
+        finally:
             await session.close()
 
 

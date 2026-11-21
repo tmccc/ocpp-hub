@@ -21,7 +21,7 @@ STARTUP_HISTORY_OMISSION = "startup_history_omission"
 
 
 class MissingOriginalHistoryError(NativeContentError):
-    """An admitted numbered record is absent and the retained originals still agree."""
+    """An admitted history record is absent and the retained originals still agree."""
 
 
 # Audits run both standalone and inside the operator's recovery transaction.
@@ -156,6 +156,8 @@ class NativeHistoryArchive:
                 row[0] for row in self.journal.db.execute("SELECT DISTINCT transaction_id FROM native_history_records")
             }
             summary = {"archived_records": len(identifiers), "missing_records": len(identifiers - present.keys())}
+            if missing_attempts := admitted_attempts.keys() - attempts.keys():
+                summary["missing_attempts"] = len(missing_attempts)
             self.journal.put("native_history_summary", summary)
         return summary
 
@@ -224,11 +226,9 @@ def inspect_history(journal: Journal, spec_digest: str, current: list[dict[str, 
         row["transactionId"] in present and encoded(present[row["transactionId"]]) != encoded(row) for row in originals
     ):
         raise NativeContentError("history", ORIGINAL_HISTORY_REFUSAL)
-    if any(row["transactionId"] not in present for row in originals):
+    if admitted_attempts.keys() - attempts.keys() or any(row["transactionId"] not in present for row in originals):
         _archive_view(journal, original, current, True)
         raise MissingOriginalHistoryError("history", ORIGINAL_HISTORY_REFUSAL)
-    if admitted_attempts.keys() - attempts.keys():
-        raise NativeContentError("history", ORIGINAL_HISTORY_REFUSAL)
 
 
 # An explicit persisted operator decision changes retention handling without changing any electrical authority.

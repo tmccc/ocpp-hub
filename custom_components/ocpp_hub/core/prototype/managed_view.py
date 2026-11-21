@@ -336,7 +336,7 @@ def observed_status(
     except sqlite3.Error:
         closed, archive, history_read = None, None, False
     history = summarize_charger_history(native.history, closed)
-    records_missing = bool(archive and archive.get("missing_records", 0))
+    records_missing = bool(archive and (archive.get("missing_records") or archive.get("missing_attempts")))
     # A previously completed charge can come back damaged or open under the same transaction ID.
     check_archive = archive and (
         records_missing

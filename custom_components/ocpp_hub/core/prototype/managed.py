@@ -996,6 +996,8 @@ class ManagedController:
                 await asyncio.sleep(0.1)
                 self.prepare_offline_pause()
             recovery_pending = await self.recovery.advance()
+            if j.fault.latched():
+                return PollStatus("attention", j.fault.classification())
             if recovery_pending is not None:
                 if recovery_pending.reason is Prerequisite.NATIVE:
                     return PollStatus("degraded", "native_observation_unavailable")

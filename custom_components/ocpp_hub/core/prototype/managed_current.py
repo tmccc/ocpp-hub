@@ -66,6 +66,11 @@ def _original_plan(n: HandoverEvidence, schedule_digest: str) -> dict[str, Any] 
     return next((p for p in (n.saved_schedule or {}).get("planList", []) if p["planId"] == n.session_plan_id), None)
 
 
+# A retained occurrence can gain metadata without becoming a new native attempt.
+def attempt_key(record: dict[str, Any]) -> str:
+    return fingerprint([record["filename"], record["startTime"], record["startMs"]])
+
+
 # Publish only validated native evidence; a later read must revoke an earlier independent-session identification.
 def record_current_source(j: Journal, n: HandoverEvidence, boot: str | None) -> None:
     change = j.current_change.read()
@@ -76,11 +81,14 @@ def record_current_source(j: Journal, n: HandoverEvidence, boot: str | None) -> 
     plan = _original_plan(n, original)
     row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
     reported_plan = change.value.get("reported_plan") if change.value.get("reported_local") == local else None
+    prior_attempts = set(change.value.get("prior_attempts", []))
     unnumbered = (
         local is None
         and plan is not None
         and any(
-            record["transactionId"] == -1 and record["idTagStart"].casefold() == plan["idTag"].casefold()
+            record["transactionId"] == -1
+            and record["idTagStart"].casefold() == plan["idTag"].casefold()
+            and attempt_key(record) not in prior_attempts
             for record in n.history
         )
     )
@@ -355,13 +363,20 @@ class ManagedCurrentLimits:
             return previous
         intent = c.requests.intent()
         g = c.session.gateway
-        connection = current_control_scope(g)
-        if connection is None or intent.revision != revision or not self.available(c.latest_native):
+        connection, native = current_control_scope(g), c.latest_native
+        if connection is None or intent.revision != revision or native is None or not self.available(native):
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
         previous_value = self.selected()
+        prior_attempts = [
+            attempt_key(record)
+            for record in native.history
+            if record["transactionId"] == -1 and record["startTime"] < native.physical.observed_at - 60
+        ]
         with j.atomic():
             expected = write_intent(j, intent, intent.mode)
-            j.current_change.accept(identifier, value, previous_value, intent, j.get("next_transaction"))
+            j.current_change.accept(
+                identifier, value, previous_value, intent, j.get("next_transaction"), prior_attempts
+            )
             control = j.get("control", {})
             j.control.select(control, value, app=intent.mode == "app")
             ticket = j.get("control", {}).get("ticket")

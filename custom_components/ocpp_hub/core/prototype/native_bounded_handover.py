@@ -253,12 +253,14 @@ class NativeBoundedHandover:
                 self.book.owned_present(native.physical)
             if resource_error is not None:
                 raise resource_error
-            audit_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
-            if self.command_source_observer is not None:
-                self.command_source_observer(native)
-            record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
-            if self.ordinary_source_observer is not None:
-                self.ordinary_source_observer(native)
+            # Restrictive Stop only needs the independent comparisons above and its own command record.
+            if not stop_only:
+                audit_history(gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start)
+                if self.command_source_observer is not None:
+                    self.command_source_observer(native)
+                record_current_source(self.gateway.journal, native, self.gateway.boot_observation)
+                if self.ordinary_source_observer is not None:
+                    self.ordinary_source_observer(native)
             if measured.exceeded:
                 raise _NativeMeasurementError(native, measured, self.authority(), sequence)
             _require_ready(native, False, self.allow_unplugged, closing_local)
@@ -290,7 +292,11 @@ class NativeBoundedHandover:
                 raise UnavailableError("current selection hold awaits fresh native evidence") from error
             ordinary = self.gateway.journal.get("managed_ordinary_recovery", {})
             intent = self.gateway.journal.get("managed_control_intent", {})
-            if ordinary.get("state") == "holding" and intent == {"mode": "app", "revision": ordinary.get("revision")}:
+            if (
+                ordinary.get("state") == "holding"
+                and intent == {"mode": "app", "revision": ordinary.get("revision")}
+                and not (gateway.controls.ready and gateway.controls.desired() > 0)
+            ):
                 raise UnavailableError("ordinary recovery awaits fresh native evidence") from error
             raise
         except (SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
@@ -325,7 +331,7 @@ class NativeBoundedHandover:
         if repair is not None:
             repair.finish(attempt, "validated")
         self.last_verified_at = native.physical.observed_at
-        if self.observation_listener is not None:
+        if not stop_only and self.observation_listener is not None:
             self.observation_listener(native)
         # A valid open source remains fresh while this particular operation awaits a closed station.
         if closed:
@@ -468,7 +474,11 @@ class NativeBoundedHandover:
             first_zero = binding is None or bool(journal.phase.starting)
             try:
                 native = await self.read(
-                    closed=first_zero, owned=True, initial=binding is None, selected_current=selected_current
+                    closed=first_zero,
+                    owned=True,
+                    initial=binding is None,
+                    selected_current=selected_current,
+                    closing_local=None if first_zero else journal.active(),
                 )
             except (
                 NativeReadinessError,

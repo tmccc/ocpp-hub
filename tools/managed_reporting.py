@@ -9,10 +9,10 @@ import platform
 import threading
 from collections import deque
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from ocpp_hub_core.prototype.managed_diagnostics import FAULTS
 from ocpp_hub_core.prototype.managed_view import ReportDetails
@@ -145,8 +145,9 @@ class ReportWriter:
     """Keep optional disk writes off the charger event loop with a bounded backlog."""
 
     # The worker receives only redacted snapshots and owns all writes, including the final stopped status.
-    def __init__(self, write: Callable[[dict[str, Any]], object]) -> None:
+    def __init__(self, write: Callable[[dict[str, Any]], object], *, ownership: BinaryIO | None = None) -> None:
         self.write = write
+        self.ownership = ownership
         self.pending: deque[dict[str, Any]] = deque(maxlen=20)
         self.changed = threading.Condition()
         self.closed = False
@@ -162,13 +163,14 @@ class ReportWriter:
 
     # Disk delay may discard the oldest queued reports, but it never holds the producer's lock.
     def _run(self) -> None:
-        while True:
-            with self.changed:
-                self.changed.wait_for(lambda: bool(self.pending) or self.closed)
-                if not self.pending:
-                    return
-                status = self.pending.popleft()
-            self.write(status)
+        with self.ownership if self.ownership is not None else nullcontext():
+            while True:
+                with self.changed:
+                    self.changed.wait_for(lambda: bool(self.pending) or self.closed)
+                    if not self.pending:
+                        return
+                    status = self.pending.popleft()
+                self.write(status)
 
     # A responsive sink records the final status in order. Shutdown can finish even if the sink is stalled.
     async def close(self, status: dict[str, Any]) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -393,12 +394,17 @@ class StartLifecycle:
         local, session = record.local, record.session
         if local is not None and not record.correlated():
             return False
-        if lease is not None and self.finish_closed(lease):
-            return True
-        if record.phase == "running":
-            if session is not None and session.stop is not None:
-                self.complete_normal(state, local, stopped_at=time.time(), finish_request=False)
-            return True
+        try:
+            if lease is not None and self.finish_closed(lease):
+                return True
+            if record.phase == "running":
+                if session is not None and session.stop is not None:
+                    self.complete_normal(state, local, stopped_at=time.time(), finish_request=False)
+                return True
+        except sqlite3.Error as error:
+            if j.db.in_transaction:
+                raise
+            raise RecoveryRequiredError("verified normal Start closure awaits publication") from error
         if not allow_open or lease is None or not lease.normal or record.published is not True or native is None:
             return False
         closed = session is not None and session.stop is not None
@@ -407,33 +413,41 @@ class StartLifecycle:
         )
         if (opened or closed) and session is not None:
             charging = opened and native.physical.power_w > 10
-            with nullcontext() if j.db.in_transaction else j.atomic():
-                j.put(
-                    "managed_test_charge",
-                    {
-                        **state,
-                        "state": "completed" if closed else "running",
-                        "local_transaction": local,
-                        "session_started_at": time.time(),
-                        "charging": charging,
-                        **(
-                            {
-                                "native_source": {
-                                    "marker": native.session_plan_id,
-                                    "start": fingerprint(json.loads(session.start)),
-                                    "schedule": native.saved_schedule_digest,
+            try:
+                with j.atomic():
+                    j.put(
+                        "managed_test_charge",
+                        {
+                            **state,
+                            "state": "completed" if closed else "running",
+                            "local_transaction": local,
+                            "session_started_at": time.time(),
+                            "charging": charging,
+                            **(
+                                {
+                                    "native_source": {
+                                        "marker": native.session_plan_id,
+                                        "start": fingerprint(json.loads(session.start)),
+                                        "schedule": native.saved_schedule_digest,
+                                    }
                                 }
-                            }
-                            if opened and not known_source
-                            else {}
-                        ),
-                    },
-                )
-                self._finish(
-                    lease.identifier,
-                    "completed",
-                    {"local_session_verified": True, "charging": charging, "timed": False},
-                )
+                                if opened and not known_source
+                                else {}
+                            ),
+                        },
+                    )
+                    self._finish(
+                        lease.identifier,
+                        "completed",
+                        {"local_session_verified": True, "charging": charging, "timed": False},
+                    )
+            except sqlite3.Error as error:
+                if j.db.in_transaction:
+                    raise
+                if opened:
+                    # Keep this lease for publication and require the next poll to refresh the evidence.
+                    lease.deadline = max(lease.deadline, time.monotonic() + 15)
+                raise RecoveryRequiredError("verified normal Start awaits receipt publication") from error
             self.lease = None
         return True
 

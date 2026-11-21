@@ -82,6 +82,30 @@ def finish_request(journal: Journal, identifier: str, state: str, result: dict[s
     )
 
 
+# Use the owning Pause revision for new receipts and the accepted legacy check for older unbound ones.
+def verified_pause_after(
+    result: object, start_revision: int, pause_revision: int, prior_revision: int, fault_at: float
+) -> bool:
+    if not isinstance(result, dict) or result.get("pause_verified") is not True:
+        return False
+    completed = result.get("completed_at")
+    if not isinstance(completed, (int, float)) or isinstance(completed, bool) or not 0 < completed <= fault_at:
+        return False
+    if "_pause" not in result:
+        return 0 <= start_revision < pause_revision < prior_revision
+    binding = result["_pause"]
+    if not isinstance(binding, dict) or set(binding) != {"revision", "local", "hold"}:
+        return False
+    revision, local, hold = binding["revision"], binding["local"], binding["hold"]
+    return (
+        type(revision) is int
+        and 0 <= start_revision < revision <= prior_revision
+        and (local is None or type(local) is int and local > 0)
+        and isinstance(hold, str)
+        and bool(hold)
+    )
+
+
 # Recognise an old timed Start only when the saved history repair proves its exact later, verified Pause.
 def resolved_timed_starts(
     db: sqlite3.Connection, proof: object, revision: int, active_test_id: object
@@ -116,24 +140,15 @@ def resolved_timed_starts(
         ):
             return frozenset()
         row = db.execute(
-            "SELECT start.result, pause.result FROM managed_requests start JOIN managed_requests pause ON pause.id=? "
+            "SELECT start.result, pause.result, start.revision, pause.revision "
+            "FROM managed_requests start JOIN managed_requests pause ON pause.id=? "
             "WHERE start.id=? AND start.action='start_test' AND start.state='uncertain' "
-            "AND pause.action='pause' AND pause.state='completed' AND start.rowid<pause.rowid "
-            "AND 0<=start.revision AND start.revision<pause.revision AND pause.revision<?",
-            (pause, request, prior.revision),
+            "AND pause.action='pause' AND pause.state='completed' AND start.rowid<pause.rowid",
+            (pause, request),
         ).fetchone()
         if row is None or json.loads(row[0]) != {"classification": "start_not_confirmed"}:
             return frozenset()
-        result = json.loads(row[1])
-        if not isinstance(result, dict):
-            return frozenset()
-        completed = result.get("completed_at")
-        if (
-            result.get("pause_verified") is not True
-            or not isinstance(completed, (int, float))
-            or isinstance(completed, bool)
-            or not 0 < completed <= fault_at
-        ):
+        if not verified_pause_after(json.loads(row[1]), row[2], row[3], prior.revision, fault_at):
             return frozenset()
         resolved.add(request)
     return frozenset(resolved)
@@ -542,26 +557,32 @@ class ManagedRequests:
     # After verified closed zero, save the matching hold and Start evidence before publishing Pause success.
     def complete_verified_pause(self) -> None:
         j = self.journal
-        control, receipt = j.get("control", {}), j.starts.receipt()
-        ownership = self.pause_ownership()
-        ticket = control.get("ticket")
-        if control.get("uncertain") and (
-            ownership.owns_ticket(ticket)
-            or self.stop_owns_ticket(ticket)
-            or receipt.get("stage") in ("unsent", "rejected")
-            and receipt.get("settled_ticket") == ticket
-            or receipt.get("bound_ticket") == ticket
-            and j.db.execute(
-                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (receipt.get("local"),)
-            ).fetchone()
-        ):
-            j.control.complete(control["ticket"], uncertain=False)
-        pause_revision = self.intent().revision
-        if receipt.get("pause_revision") == pause_revision and receipt.get("verified_pause_revision") != pause_revision:
-            j.starts.pause_verified(receipt, pause_revision)
         try:
-            self.confirm_pauses()
+            with j.atomic():
+                control, receipt = j.get("control", {}), j.starts.receipt()
+                ownership = self.pause_ownership()
+                ticket = control.get("ticket")
+                if control.get("uncertain") and (
+                    ownership.owns_ticket(ticket)
+                    or self.stop_owns_ticket(ticket)
+                    or receipt.get("stage") in ("unsent", "rejected")
+                    and receipt.get("settled_ticket") == ticket
+                    or receipt.get("bound_ticket") == ticket
+                    and j.db.execute(
+                        "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (receipt.get("local"),)
+                    ).fetchone()
+                ):
+                    j.control.complete(control["ticket"], uncertain=False)
+                pause_revision = self.intent().revision
+                if (
+                    receipt.get("pause_revision") == pause_revision
+                    and receipt.get("verified_pause_revision") != pause_revision
+                ):
+                    j.starts.pause_verified(receipt, pause_revision)
+                self.confirm_pauses()
         except sqlite3.Error as error:
+            if j.db.in_transaction:
+                raise
             # The saved hold lets the next poll verify zero and retry the receipt without another Stop.
             raise RecoveryRequiredError("verified Pause awaits receipt publication") from error
 

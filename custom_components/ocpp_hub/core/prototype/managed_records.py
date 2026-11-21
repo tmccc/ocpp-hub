@@ -116,7 +116,9 @@ class CurrentChangeJournal:
         return cast("dict[str, Any] | None", self.journal.get(_CURRENT))
 
     # Save the selection and bind its arguments and caller revision in the acceptance transaction.
-    def accept(self, identifier: str, target: int, previous: int, caller: ControlIntent, floor: int) -> None:
+    def accept(
+        self, identifier: str, target: int, previous: int, caller: ControlIntent, floor: int, prior_attempts: list[str]
+    ) -> None:
         self.replace(
             {
                 "id": identifier,
@@ -124,6 +126,7 @@ class CurrentChangeJournal:
                 "previous_a": previous,
                 "mode": caller.mode,
                 "floor": floor,
+                "prior_attempts": prior_attempts,
                 "state": "pending",
             }
         )

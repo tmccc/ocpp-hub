@@ -175,8 +175,13 @@ class ManagedCharging:
             self.controller.require_paused(native)
         except SecurityError, DeniedError, RecoveryRequiredError:
             return
-        with j.atomic():
-            j.starts.retire(candidate)
+        try:
+            with j.atomic():
+                j.starts.retire(candidate)
+        except sqlite3.Error as error:
+            if j.db.in_transaction:
+                raise
+            raise RecoveryRequiredError("verified normal Start closure awaits retirement") from error
         j.starts.set_lease(None)
         self.changed.set()
 
@@ -1113,6 +1118,8 @@ class ManagedCharging:
     def _expire(self, lease: ChargeLease) -> bool:
         if self.lease is not lease or self.state().get("state") == "stopping":
             return True
+        if time.monotonic() < lease.deadline:
+            return False  # A fresh physical confirmation can extend the exact pending publication.
         cancellation = retire_cancelled_start(self, lease)
         if cancellation is CancellationRetirement.PENDING:
             return False

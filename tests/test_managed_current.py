@@ -25,6 +25,7 @@ from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.management_peer import TOKEN, call
 from tests.prototype_rig import START
 from tests.runtime_rig import until
+from tests.test_native_history_archive import unassigned
 from tests.tls_support import tls as tls
 
 
@@ -58,6 +59,35 @@ async def test_current_selection_confirms_real_profile_and_persists_revision(
             assert not starts(test.rig) and test.session.journal.active() is None
             if current > 6:
                 assert not test.controller.charging.available(test.controller.latest_native)
+
+
+# Intent: a completed historical attempt cannot be mistaken for an overlap when the charger retains its plan marker.
+# Why: a new idle selection still needs to apply when the car has no real transaction or recent attempt.
+async def test_current_selection_ignores_already_observed_unassigned_attempt(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        rig = test.rig
+        rig.bench.history.append(unassigned())
+        native = rig.peer.native
+
+        # Reproduce firmware retaining the actual original plan marker after the car returned to idle.
+        def idle_plan(key):
+            sample = native(key)
+            if key == "SESSION":
+                sample["saveData"]["sessionList"][0]["_setPlanId"] = 9
+            return sample
+
+        monkeypatch.setattr(rig.peer, "native", idle_plan)
+        c = test.controller
+        await healthy(c)
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "set_current", c.requests.intent().revision, current_a=16)
+        rig.bench.history[-1]["MeterValues"][0]["Offer"] += 1
+        await c.current.settle()
+        status = await healthy(c)
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert status["station_ceiling_a"] == 16 and not status["charging_session_open"]
 
 
 # Intent: changing current during a verified pause changes the future setting without raising the actual zero hold.

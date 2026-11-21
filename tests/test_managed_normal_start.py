@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import ssl
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,68 @@ async def test_regular_start_continues_until_explicit_pause(
         controller.command(uuid.uuid4().hex, "pause", controller.requests.intent().revision)
         assert (await actual_stop(test, local))["local_hold_verified"]
         assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
+
+
+# Intent: a transient write refusal does not interrupt an exact running local Start.
+# Why: the next native sample must settle the same request without sending another charger command.
+async def test_running_start_receipt_retries_after_storage_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=2) as test:
+        c, j = test.controller, test.session.journal
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        assert c.charging.lease is not None
+        original_deadline = c.charging.lease.deadline
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_running_start BEFORE UPDATE OF state ON managed_requests "
+            f"WHEN NEW.id='{identifier}' AND NEW.state='completed' "
+            "BEGIN SELECT RAISE(ABORT,'Start confirmation write refused'); END"
+        )
+        try:
+            assert (await c.tick())["state"] == "reconciling"
+            assert c.requests.receipt(identifier)["state"] == "accepted"
+            assert test.rig.bench.firmware.current == 6 and j.active() == local
+            assert c.charging.lease is not None and c.charging.lease.deadline > original_deadline
+            await asyncio.sleep(max(0, original_deadline - time.monotonic()) + 0.05)
+            assert j.active() == local and not test.rig.bench.remote_stop.is_set()
+            assert c.requests.intent().mode == "app"
+        finally:
+            j.db.execute("DROP TRIGGER refuse_running_start")
+        assert (await healthy(c))["power_w"] == 1440
+        assert c.requests.receipt(identifier)["state"] == "completed" and c.charging.lease is None
+        assert len(starts(test.rig)) == 1 and not test.rig.bench.remote_stop.is_set()
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+
+
+# Intent: a failed closure write leaves an already verified session ended and retains its original Start outcome.
+# Why: an incidental metadata refusal cannot turn a natural charger Stop into a process shutdown.
+async def test_running_start_closure_retries_after_storage_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j = test.controller, test.session.journal
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        await healthy(c)
+        receipt = c.requests.receipt(identifier)
+        await natural_stop(test, local)
+        test.rig.bench.cp, test.rig.bench.connection = "B", "Plug"
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_closed_start BEFORE INSERT ON meta WHEN NEW.key='managed_test_charge' "
+            "AND json_extract(NEW.value,'$.state')='completed' "
+            "BEGIN SELECT RAISE(ABORT,'closed Start metadata refused'); END"
+        )
+        try:
+            assert (await c.tick())["state"] == "reconciling"
+            assert c.requests.receipt(identifier) == receipt and j.active() is None
+        finally:
+            j.db.execute("DROP TRIGGER refuse_closed_start")
+        assert (await healthy(c))["charging_session_open"] is False
+        assert c.charging.state()["state"] == "completed"
+        assert c.requests.receipt(identifier) == receipt
+        assert not test.rig.bench.remote_stop.is_set()
 
 
 # Intent: a known real session completes the Start receipt even when the car draws no current.

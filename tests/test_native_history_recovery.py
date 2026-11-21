@@ -30,6 +30,7 @@ from tests.managed_rig import healthy, introduced, managed_bench, managed_sessio
 from tests.prototype_rig import START
 from tests.recovery_barriers import completed_control
 from tests.test_native_bounded_handover import restore_original_route, verify_original_backend
+from tests.test_native_history_archive import unassigned
 from tests.tls_support import tls as tls
 from tools import acknowledge_native_history as history_tool
 
@@ -154,11 +155,13 @@ async def test_acknowledgement_archives_exact_bodies_and_preserves_authority(
 
 # Intent: history that disappears while the service is stopped gains the same recoverable fault on startup.
 # Why: the existing offline acknowledgment needs the fault even though the failing startup cannot open a listener.
-@pytest.mark.parametrize("case", ["missing", "changed", "restored", "app-intent"])
+@pytest.mark.parametrize("case", ["missing", "changed", "restored", "app-intent", "only-attempt-missing"])
 async def test_cold_start_history_loss_records_repair_before_listening(
     tmp_path, tls, unused_tcp_port, monkeypatch, case
 ):
     original = closed_records()
+    if case == "only-attempt-missing":
+        original.insert(0, unassigned())
     async with managed_bench(tmp_path, tls, unused_tcp_port, initial_history=original) as rig:
         strategy = strategy_file(rig, tmp_path)
         first = managed_session(rig)
@@ -226,7 +229,13 @@ async def test_cold_start_history_loss_records_repair_before_listening(
                 assert repaired.journal.get("native_history_summary") == {"archived_records": 3, "missing_records": 0}
             else:
                 assert status["history_warning"] == "records_absent_from_charger"
-                assert repaired.journal.get("native_history_summary") == {"archived_records": 3, "missing_records": 1}
+                summary = repaired.journal.get("native_history_summary")
+                if case == "only-attempt-missing":
+                    assert summary == {"archived_records": 3, "missing_records": 0, "missing_attempts": 1}
+                    retained = repaired.journal.db.execute("SELECT body FROM native_start_attempts").fetchone()
+                    assert json.loads(retained["body"]) == original[0]
+                else:
+                    assert summary == {"archived_records": 3, "missing_records": 1}
             b = ChargeRig(rig, repaired, controller, charger)
             request, revision = uuid.uuid4().hex, controller.requests.intent().revision
             controller.command(request, "pause", revision)
@@ -626,8 +635,6 @@ async def test_recover_unassigned_start_to_verified_pause(
 ) -> None:
     from ocpp_hub_core.prototype.native_history_recovery import acknowledge_start_attempts
 
-    from tests.test_native_history_archive import unassigned
-
     async with missing_history(tmp_path, tls, unused_tcp_port, monkeypatch) as fault:
         rig, journal = fault.rig, fault.journal
         native = await rig.prepared.observer.observe_handover()
@@ -696,7 +703,13 @@ async def test_recover_unassigned_start_to_verified_pause(
                 acknowledge_start_attempts(journal, fault.book, rig.spec, native)
             assert database(journal) == before
             journal.db.execute("DELETE FROM managed_requests WHERE id=?", (pause_id,))
-        journal.db.execute(insert_pause, (pause_id, 3, json.dumps({"completed_at": now - 1, "pause_verified": True})))
+        # An older dashboard sent revision 2, but the proxy bound this newer Pause to its actual generation.
+        pause_result = {
+            "completed_at": now - 1,
+            "pause_verified": True,
+            "_pause": {"revision": 5, "hold": uuid.uuid4().hex, "local": None},
+        }
+        journal.db.execute(insert_pause, (pause_id, 2, json.dumps(pause_result)))
         for action, state in (("start", "uncertain"), ("start_test", "accepted"), ("start_test", "running")):
             journal.db.execute("UPDATE managed_requests SET action=?,state=? WHERE id=?", (action, state, uncertain_id))
             with pytest.raises(RecoveryRequiredError):

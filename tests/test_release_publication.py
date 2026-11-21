@@ -17,7 +17,9 @@ import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.local_control import ControlSupersededError, LocalControl
 from ocpp_hub_core.prototype.managed_view import refresh_for_read
+from ocpp_hub_core.prototype.native_history import history_policy
 from ocpp_hub_core.prototype.recovery_contracts import FailureKind, Prerequisite, RestoreState, WireReply
+from ocpp_hub_core.prototype.store import fingerprint
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
 from tests.charge_rig import owner_rig
@@ -26,23 +28,43 @@ from tests.peer_mutation_helpers import observe_device_replies
 from tests.prototype_rig import BOOT
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
+from tests.test_native_history_archive import row
 from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
 
 
-# Intent: Return can settle an unsent failure when its own preparation write is refused.
-# Why: a refused request record must leave the verified hold available for polling and a new Return.
-async def test_return_binding_write_refusal_finishes_without_sending(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+# Intent: Return can settle an unsent failure when its own preparation or native proof write is refused.
+# Why: a refused write before dispatch must leave the verified hold available for polling and a new Return.
+@pytest.mark.parametrize("refused", ["binding", "native"])
+async def test_return_binding_write_refusal_finishes_without_sending(
+    tmp_path, tls, unused_tcp_port, monkeypatch, refused
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, initial_history=[row(9000000)]) as b:
         await pause_prefix(b)
         c, j = b.controller, b.session.journal
         mark = len(b.rig.bench.device_calls)
         identifier, revision = uuid.uuid4().hex, c.requests.intent().revision
+        if refused == "binding":
+            trigger = (
+                "BEFORE UPDATE ON managed_requests "
+                f"WHEN NEW.id='{identifier}' AND json_type(NEW.result,'$._return')='object'"
+            )
+        else:
+            policy = history_policy(j, c.native.spec.digest)
+            j.put("native_history_policy", policy)
+            j.put(
+                "native_history_policy_acknowledgement",
+                {"policy": policy, "at_epoch": 1, "native_digest": fingerprint([]), "charging_started": False},
+            )
+            trigger = (
+                "BEFORE INSERT ON meta WHEN NEW.key='native_history_archive_binding' AND EXISTS "
+                f"(SELECT 1 FROM managed_requests WHERE id='{identifier}' AND state='running')"
+            )
         j.db.execute(
-            "CREATE TEMP TRIGGER refuse_return_binding BEFORE UPDATE ON managed_requests "
-            "WHEN NEW.id='" + identifier + "' AND json_type(NEW.result,'$._return')='object' "
-            "BEGIN SELECT RAISE(ABORT,'Return preparation write refused'); END"
+            "CREATE TEMP TRIGGER refuse_return_binding "
+            + trigger
+            + " BEGIN SELECT RAISE(ABORT,'Return preparation write refused'); END"
         )
         try:
             c.command(identifier, "app_control", revision)
@@ -316,7 +338,7 @@ async def test_actual_positive_reply_survives_resource_ack_statement_refusal(
             assert j.get("control")["inhibit"] and j.get("control")["uncertain"]
             assert b.rig.bench.firmware.effective_limit() == 0
             assert j.fault.classification() == "owner_release_unconfirmed"
-            assert poll is result.failure
+            assert isinstance(poll, dict)  # Exact zero and the durable fault keep the service available.
             if not diagnostic_available:
                 assert diagnostic_writes == ["managed_release_failure"]
                 assert j.get("managed_release_failure") is None
@@ -369,7 +391,7 @@ async def test_actual_release_publication_failure_rolls_back_all_authority(
                 "SELECT RAISE(ABORT,'independent release publication unavailable'); END"
             )
         try:
-            await tick_with_storage_outcome(c)
+            assert isinstance(await tick_with_storage_outcome(c), dict)
             assert not errors and observations
             assert {cut["label"] for cut in observations} == (
                 {"receipt-completed", "shared-control"} if boundary == "receipt-commit" else {"owner-epoch"}

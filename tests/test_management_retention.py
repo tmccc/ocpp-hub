@@ -8,10 +8,12 @@ import uuid
 
 import pytest
 from ocpp_hub_core.prototype.managed_intent import ManagedRequests
-from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.native_history import history_policy
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 
-from tests.charge_rig import actual_stop, positive_flow, ready
+from tests.charge_rig import actual_stop, positive_flow, ready, report_actual_stop
 from tests.managed_rig import healthy
+from tests.test_native_history_archive import row
 from tests.tls_support import tls as tls
 
 
@@ -65,7 +67,8 @@ def test_terminal_history_retains_uuid_results_without_consuming_capacity(tmp_pa
 
 # Intent: a refused receipt update leaves verified zero in place and retries on the next poll.
 # Why: supervision must remain available after a Pause has already reached the physical hold.
-async def test_pause_receipt_refusal_retries_without_another_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("refused", ["receipt", "verified-start"])
+async def test_pause_receipt_refusal_retries_without_another_stop(tmp_path, tls, unused_tcp_port, monkeypatch, refused):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         c, j = test.controller, test.session.journal
         identifier = uuid.uuid4().hex
@@ -73,10 +76,18 @@ async def test_pause_receipt_refusal_retries_without_another_stop(tmp_path, tls,
         assert c.pause_task is not None
         await c.pause_task
         calls = list(test.rig.bench.device_calls)
+        if refused == "receipt":
+            trigger = "BEFORE UPDATE OF state ON managed_requests WHEN NEW.action='pause' AND NEW.state='completed'"
+        else:
+            j.put("local_start_receipt", {"pause_revision": c.requests.intent().revision})
+            trigger = (
+                "BEFORE INSERT ON meta WHEN NEW.key='local_start_receipt' "
+                "AND json_type(NEW.value,'$.verified_pause_revision')='integer'"
+            )
         j.db.execute(
-            "CREATE TEMP TRIGGER refuse_pause_receipt BEFORE UPDATE OF state ON managed_requests "
-            "WHEN NEW.action='pause' AND NEW.state='completed' "
-            "BEGIN SELECT RAISE(ABORT,'Pause receipt publication refusal'); END"
+            "CREATE TEMP TRIGGER refuse_pause_receipt "
+            + trigger
+            + " BEGIN SELECT RAISE(ABORT,'Pause receipt publication refusal'); END"
         )
         try:
             assert (await c.tick())["state"] == "reconciling"
@@ -87,6 +98,38 @@ async def test_pause_receipt_refusal_retries_without_another_stop(tmp_path, tls,
         assert (await healthy(c))["local_hold_verified"]
         assert c.requests.receipt(identifier)["state"] == "completed"
         assert test.rig.bench.device_calls == calls
+
+
+# Intent: the exact protective Stop uses independent native evidence even while archive writes are unavailable.
+# Why: an unrelated history update cannot keep the actual local session open indefinitely under Pause.
+async def test_protective_stop_proceeds_when_history_archive_cannot_write(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, initial_history=[row(9000000)]) as test:
+        c, j = test.controller, test.session.journal
+        local = await positive_flow(test, source="daily")
+        await healthy(c)
+        # This fixture's minimal OCPP history needs the native open-row marker used by archive policy.
+        record = next(record for record in test.rig.bench.history if record["transactionId"] == local)
+        record["stopTime"] = 0
+        policy = history_policy(j, c.native.spec.digest)
+        j.put("native_history_policy", policy)
+        j.put(
+            "native_history_policy_acknowledgement",
+            {"policy": policy, "at_epoch": 1, "native_digest": fingerprint([]), "charging_started": False},
+        )
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_archive BEFORE INSERT ON meta WHEN NEW.key='native_history_archive_binding' "
+            "BEGIN SELECT RAISE(ABORT,'archive write refused'); END"
+        )
+        identifier = uuid.uuid4().hex
+        try:
+            c.command(identifier, "pause", c.requests.intent().revision)
+            await report_actual_stop(test, local)
+            assert j.get("native_history_archive_binding") is None
+        finally:
+            j.db.execute("DROP TRIGGER refuse_archive")
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert j.get("native_history_archive_binding") is not None
 
 
 # Intent: every non-Pause command class reserves capacity for a later immediate restrictive intent.

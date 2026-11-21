@@ -14,7 +14,7 @@ from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 
 class RecoveryRequiredError(RuntimeError):
@@ -262,6 +262,10 @@ class Journal:
             if self.db.in_transaction:
                 self.db.execute("ROLLBACK")
             raise
+
+    # A final report may retain process ownership after SQLite has closed.
+    def retain_ownership(self) -> BinaryIO:
+        return os.fdopen(os.dup(self._lock.fileno()), "rb")
 
     # Close the durable store and release its single-owner lock.
     def close(self) -> None:

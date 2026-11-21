@@ -112,9 +112,8 @@ class RecoveryCoordinator:
     # Run one bounded recovery pass and rebuild obligations after every await.
     async def advance(self) -> Pending | None:
         c, g = self.c, self.c.session.gateway
-        if (completion := c.ordinary.finish_recovery()) is not None:
-            return completion
-        visited: frozenset[RecoveryWork] = frozenset()
+        # A refused note must not rerun the already released command or interrupt ordinary monitoring.
+        visited = frozenset({RecoveryWork.ORDINARY}) if c.ordinary.finish_recovery() else frozenset()
         while (work := next_recovery_work(self.obligations(), visited)) is not None:
             visited = visited | {work}
             if work is RecoveryWork.CURRENT:
@@ -128,6 +127,8 @@ class RecoveryCoordinator:
                 request = c.requests.pending_return()
                 if request is not None and c.requests.intent().mode == "paused":
                     await c.return_requested(*request)
+                    if c.session.journal.fault.latched():
+                        return Pending(Prerequisite.RECONCILIATION, "Return retained its protective fault")
             elif work is RecoveryWork.PAUSE:
                 await c.maintain_pause()
             elif work is RecoveryWork.ORDINARY:
@@ -231,7 +232,26 @@ class RecoveryCoordinator:
     ) -> RestoreProgress:
         attempt: ReleaseAttempt | None = None
         try:
-            prepared = await self._prepare_restore(expected_intent, continuing_local, return_request)
+            try:
+                prepared = await self._prepare_restore(expected_intent, continuing_local, return_request)
+            except sqlite3.Error as error:
+                c = self.c
+                g, j = c.session.gateway, c.session.journal
+                repair = c.native.repair_audits
+                if (
+                    return_request is None
+                    or j.db.in_transaction
+                    or not g.controls.ready
+                    or g.controls.desired() != 0
+                    or repair is not None
+                    and repair.pending_storage_error is error
+                ):
+                    raise
+                # Preparation cannot send a positive profile. This request can fail at already verified zero.
+                prepared = RestoreProgress(
+                    RestoreState.WAITING,
+                    Pending(Prerequisite.RECONCILIATION, "Return proof could not be saved before sending", error),
+                )
             if isinstance(prepared, ReleaseAttempt):
                 attempt = prepared
                 progress = await self._run_release(attempt, return_request)
@@ -370,17 +390,7 @@ class RecoveryCoordinator:
             if return_request is not None:
                 if not isinstance(ticket, str):
                     raise RecoveryRequiredError("Return requires its current zero hold ticket")
-                try:
-                    c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
-                except sqlite3.Error as error:
-                    return RestoreProgress(
-                        RestoreState.WAITING,
-                        Pending(
-                            Prerequisite.RECONCILIATION,
-                            "Return ended before sending because the journal could not save it",
-                            error,
-                        ),
-                    )
+                c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
         return ReleaseAttempt(
             "automatic" if expected_intent.mode == "app" else "explicit",
             expected_intent,
@@ -463,6 +473,17 @@ class RecoveryCoordinator:
                     )
                 except sqlite3.Error:
                     pass  # The required fault already committed and the command still reports its actual failure.
+            if (
+                return_request is not None
+                and isinstance(result.failure, sqlite3.Error)
+                and result.effects.zero_verified
+                and not result.cleanup_failed
+                and not j.db.in_transaction
+                and j.fault.classification() == "owner_release_unconfirmed"
+            ):
+                raise RecoveryRequiredError(
+                    "Return kept the verified zero hold after a storage failure"
+                ) from result.failure
             if result.failure is not None:
                 raise result.failure
             raise RecoveryRequiredError("owned release did not establish shared authority")
