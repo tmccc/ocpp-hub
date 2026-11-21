@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Retain a newer cloud refusal when the old approval cannot be updated. Keep confirmed plan replies across restart.
+- Apply the normal retry limit to an exact late Start error. Keep the first complete incident entry after a partial write.
+- Refresh delivery counts, age certificate status, and report when a saved charger check is still being written.
+- Keep definite incompatible charger responses separate from a temporary lack of a response.
+- Check the saved service mode before startup can change a journal.
 - Keep the fault evidence with the Pause that acknowledged it so recovery can still use that Pause after a restart.
 - Use one command outcome owner for the proxy, recovery and Home Assistant. Retain actual owner wire replies
   and session links on the original commands, including separate replies for a current change and its zero rollback.

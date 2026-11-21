@@ -49,7 +49,9 @@ class StartReplyBench(mp.OwnerBench):
                 answer = {"idTagInfo": {"status": "Accepted", "expiryDate": "2030-01-01T00:00:00Z"}}
             elif action == "StartTransaction":
                 mode = self.start_replies.pop(0) if self.start_replies else "Accepted"
-                if mode == "error":
+                if mode in ("error", "late-error"):
+                    if mode == "late-error" and self.start_reply_gate is not None:
+                        await self.start_reply_gate.wait()
                     reply = build_call_error(token, "InternalError", "synthetic preallocation refusal")
                     self.actual_start_replies.append(decode(reply))
                     await connection.send(reply)

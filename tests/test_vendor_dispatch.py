@@ -376,7 +376,11 @@ async def test_cloud_profile_answers_survive_refused_resource_writes(tmp_path, t
             )
             try:
                 answer = await bench.cloud_call(action, action, payload)
-                assert answer == [3, action, {"status": "Accepted"}] and len(attempts) >= 2
+                assert answer == [3, action, {"status": "Accepted"}] and attempts
+                initial_attempts = len(attempts)
+                g = b.session.gateway
+                g.decide(g.retry_reply_writes)
+                assert len(attempts) == initial_attempts + 1
                 counts = poll_base(b.controller)
                 assert counts["vendor_reply_storage_pending"] == 1 and counts["vendor_write_uncertain"] == 0
             finally:

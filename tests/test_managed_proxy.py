@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import sqlite3
 import ssl
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.store import Journal
 from ocpp_hub_core.prototype.trial_session import TrialSession
 
 from tests.managed_rig import OwnerBench, healthy, introduced, managed_bench, managed_session, starts
@@ -215,6 +218,26 @@ async def test_managed_restart_releases_after_fresh_zero_without_start(
             assert not any(
                 frame[0] == 2 and frame[2] in ("StartTransaction", "StopTransaction") for frame in rig.bench.calls
             )
+
+
+# Intent: the wrong service mode cannot change a saved unanswered Start during startup.
+# Why: just trying the commissioning command must leave the stopped managed journal untouched.
+async def test_refused_commissioning_does_not_normalize_managed_start(tmp_path, tls, unused_tcp_port):
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        config = rig.prepared.config
+        with closing(Journal(config.journal, config.identity)) as journal:
+            journal.put("managed_mode", {"mode": "app_schedule", "local_start": False})
+            journal.start("wrong-mode-start", START)
+            sent = journal.next_delivery()
+            assert sent is not None and sent.action == "StartTransaction"
+            journal.mark_sent(sent)
+
+        with pytest.raises(SecurityError, match="saved local Start restriction"):
+            TrialSession(rig.prepared, FAST, native_bounded=rig.spec)
+
+        with closing(sqlite3.connect(config.journal.as_uri() + "?mode=ro", uri=True)) as db:
+            assert db.execute("SELECT state FROM outbox WHERE token=?", (sent.token,)).fetchone() == ("inflight",)
+            assert db.execute("SELECT 1 FROM meta WHERE key='managed_control_fault'").fetchone() is None
 
 
 # Intent: a shutdown request revokes pending positive authority both during audit and at the actual send guard.

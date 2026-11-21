@@ -5,6 +5,7 @@ import uuid
 from contextlib import AsyncExitStack
 
 import pytest
+from ocpp_hub_core.prototype import managed_start_delivery
 
 from tests import managed_rig as mp
 from tests.charge_rig import ChargeRig, ready
@@ -51,6 +52,43 @@ async def test_late_cloud_start_acknowledgement_preserves_original_session(tmp_p
             await until(lambda: journal.next_delivery() is None)
             status = await mp.healthy(b.controller)
             assert status["desired_control"] == "app" and status["station_ceiling_a"] == 6
+        finally:
+            release.set()
+
+
+# Intent: an exact late error on the original cloud connection releases the documented retry.
+# Why: the saved reply must let the queue progress without inventing delivery or losing the genuine Stop.
+@pytest.mark.recovery_replay
+async def test_late_cloud_start_error_requeues_the_original_delivery(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, bench_type=StartReplyBench) as b:
+        bench, gateway, journal = b.rig.bench, b.session.gateway, b.session.journal
+        release = asyncio.Event()
+        bench.start_reply_gate = release
+        bench.start_replies[:] = ["late-error", "Accepted"]
+        monkeypatch.setattr(managed_start_delivery, "RETRY_INTERVAL", 0.05)
+        gateway.vendor.timeout = 0.25
+        try:
+            opened = await bench.call(
+                b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            assert opened[0] == 3
+            local = opened[2]["transactionId"]
+            await until(lambda: (head := journal.next_delivery()) is not None and head.state == "ambiguous")
+            await b.controller.tick()
+            assert bench.firmware.effective_limit() == 0
+            release.set()
+            await until(lambda: journal.vendor_id(local) is not None)
+            starts = [frame for frame in bench.lifecycle_wires if frame[2] == "StartTransaction"]
+            assert len(starts) == 2 and starts[0] == starts[1]
+            stopped = await bench.call(
+                b.charger,
+                uuid.uuid4().hex,
+                "StopTransaction",
+                {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"},
+            )
+            assert stopped[0] == 3
+            await until(lambda: journal.next_delivery() is None)
+            assert len(bench.backend_starts) == 1
         finally:
             release.set()
 

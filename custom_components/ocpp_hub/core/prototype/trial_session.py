@@ -135,13 +135,16 @@ def preflight(path: Path) -> PreparedTrial:
 
 
 # Refuse retired installations under the journal lock before normalizing interrupted operations.
-def require_supported_installation(db: sqlite3.Connection, spec: NativeBoundedSpec) -> None:
+def require_supported_installation(
+    db: sqlite3.Connection, spec: NativeBoundedSpec, *, allow_local_start: bool | None = None
+) -> None:
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
         return
     metadata = {
         key: json.loads(value)
         for key, value in db.execute(
-            "SELECT key,value FROM meta WHERE key IN ('connected_handover','native_bounded_handover','trial_phase')"
+            "SELECT key,value FROM meta WHERE key IN "
+            "('connected_handover','native_bounded_handover','trial_phase','managed_mode')"
         )
     }
     retired = metadata.get("connected_handover")
@@ -152,11 +155,29 @@ def require_supported_installation(db: sqlite3.Connection, spec: NativeBoundedSp
         raise RecoveryRequiredError("an existing ordinary journal cannot acquire connected admission")
     if native and (not isinstance(native, dict) or native.get("spec") != spec.value()):
         raise SecurityError("native bounded specification changed across process replacement")
+    managed = metadata.get("managed_mode")
+    if (
+        allow_local_start is not None
+        and managed is not None
+        and (
+            not isinstance(managed, dict)
+            or managed.get("mode") != "app_schedule"
+            or managed.get("local_start") is not False
+            or allow_local_start
+        )
+    ):
+        raise SecurityError("managed journal requires its saved local Start restriction")
 
 
 # Check the exact installation under the journal lock before any normalisation, including in offline tools.
-def open_native_journal(path: Path, identity: str, spec: NativeBoundedSpec) -> Journal:
-    return Journal(path, identity, check_existing=lambda db: require_supported_installation(db, spec))
+def open_native_journal(
+    path: Path, identity: str, spec: NativeBoundedSpec, *, allow_local_start: bool | None = None
+) -> Journal:
+    return Journal(
+        path,
+        identity,
+        check_existing=lambda db: require_supported_installation(db, spec, allow_local_start=allow_local_start),
+    )
 
 
 class TrialSession:
@@ -179,13 +200,10 @@ class TrialSession:
             raise SecurityError("unplugged native monitoring requires bounded mode and disabled local Start")
         self.prepared = prepared
         config = prepared.config
-        self.journal = open_native_journal(config.journal, config.identity, native_bounded)
+        self.journal = open_native_journal(
+            config.journal, config.identity, native_bounded, allow_local_start=allow_local_start
+        )
         try:
-            managed = self.journal.get("managed_mode")
-            if managed is not None and (
-                managed.get("mode") != "app_schedule" or managed.get("local_start") is not False or allow_local_start
-            ):
-                raise SecurityError("managed journal requires its saved local Start restriction")
             self.book = ResourceBook(self.journal, prepared.baseline)
             policy = Policy(
                 max_current_a=managed_current_ceiling(self.journal, native_bounded),

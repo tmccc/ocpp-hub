@@ -17,6 +17,7 @@ EMPTY_BOOTSTRAP_TABLES = frozenset(
         "mutations",
         "vendor_command_scope",
         "vendor_profile_effects",
+        "vendor_plan_effects",
         "owner_command_wires",
         "owner_start_sessions",
         "trial_resources",

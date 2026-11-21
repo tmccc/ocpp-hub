@@ -7,12 +7,13 @@ import uuid
 import pytest
 from ocpp_hub_core.prototype.managed_diagnostics import snapshot
 from ocpp_hub_core.prototype.managed_native_repair import AUDITS, REVOCATIONS, NativeRepairAudits
-from ocpp_hub_core.prototype.managed_view import health_snapshot, with_reporting
+from ocpp_hub_core.prototype.managed_view import health_snapshot, refresh_for_read, with_reporting
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.store import fingerprint
 
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy
+from tests.prototype_rig import START
 from tests.test_managed_service_cli import healthy_status
 from tests.tls_support import tls as tls
 from tools import managed_proxy
@@ -34,6 +35,41 @@ def test_health_explanation_retains_local_failure_during_cloud_outage(change):
     result = health_snapshot(healthy_status(10000) | {"cloud_connected": False} | change, 10000)
     assert result["healthy"] is False and result["local_healthy"] is False
     assert set(result["health_blockers"]) == {"cloud_disconnected", "local_health_unverified"}
+
+
+# Intent: a report stops claiming enough certificate validity as the sampled clock advances.
+# Why: a cached healthy report can cross the required time limit before the next supervision poll.
+def test_cached_health_ages_certificate_validity():
+    source = healthy_status(10000) | {"checked_at": 10000, "certificate_remaining_seconds": 1801}
+    assert health_snapshot(source, 10000)["healthy"]
+    current = health_snapshot(source, 10002)
+    assert not current["healthy"] and "certificate_validity_insufficient" in current["health_blockers"]
+
+
+# Intent: the status read uses the current delivery queue and cloud session acknowledgement together.
+# Why: an acknowledgement between polls must not leave the previous blocker in Home Assistant.
+async def test_status_refresh_projects_new_and_settled_lifecycle_queue(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, journal = b.controller, b.session.journal
+        published = await healthy(c)
+        published["diagnostics"] = snapshot(c, published)
+        local = journal.start("fresh-view-start", START)["transactionId"]
+        start = journal.next_delivery()
+        assert start is not None and start.action == "StartTransaction"
+        journal.mark_sent(start)
+        journal.acknowledge(start, {"transactionId": 9000, "idTagInfo": {"status": "Accepted"}})
+        journal.stop("fresh-view-stop", {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100})
+        stop = journal.next_delivery()
+        assert stop is not None and stop.action == "StopTransaction"
+        queued = refresh_for_read(c, published)
+        assert queued["pending_lifecycle_events"] == 1 and not queued["sessions"][0]["cloud_acknowledged"]
+        assert "lifecycle_acknowledgement_pending" in queued["diagnostics"]["blockers"]
+
+        journal.mark_sent(stop)
+        journal.acknowledge(stop, {})
+        current = refresh_for_read(c, queued)
+        assert current["pending_lifecycle_events"] == 0 and current["sessions"][0]["cloud_acknowledged"]
+        assert "lifecycle_acknowledgement_pending" not in current["diagnostics"]["blockers"]
 
 
 # Intent: strict/unknown audit markers affect only their exact fault, without authorizing any recovery action.

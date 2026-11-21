@@ -74,10 +74,12 @@ async def test_ics_actual_writes_translate_and_commit(tmp_path: Path) -> None:
     await rig.close()
 
 
-# Intent: a definite plan reply survives temporary refusal of its local publication.
-# Why: retrying the outcome must activate the original plan without sending the command twice.
-async def test_plan_outcome_retries_its_publication(tmp_path: Path) -> None:
-    rig = await ready(tmp_path / "journal.db")
+# Intent: a definite plan reply survives a refused plan update, including a restart between the two saves.
+# Why: recovery must activate the original plan without sending the command twice.
+@pytest.mark.parametrize("restart", [False, True])
+async def test_plan_outcome_retries_its_publication(tmp_path: Path, restart: bool) -> None:
+    path = tmp_path / "journal.db"
+    rig = await ready(path)
     journal = rig.store
     try:
         journal.db.execute(
@@ -91,12 +93,19 @@ async def test_plan_outcome_retries_its_publication(tmp_path: Path) -> None:
         assert outcome.status == "Accepted" and outcome.saving_reply and not outcome.settled
         assert journal.db.execute("SELECT state FROM plans").fetchone()[0] == "reserved"
 
-        journal.db.execute("DROP TRIGGER refuse_plan_update")
-        rig.gateway.retry_reply_writes()
+        assert sum(frame[2] == "DataTransfer" for frame in rig.charger_frames) == 1
+        if restart:
+            await rig.close()
+            rig = Rig(path, POLICY)
+            journal = rig.store
+            assert not rig.charger_frames
+        else:
+            journal.db.execute("DROP TRIGGER refuse_plan_update")
+            rig.gateway.retry_reply_writes()
+            assert sum(frame[2] == "DataTransfer" for frame in rig.charger_frames) == 1
         outcome = journal.outcomes.vendor(token)
         assert outcome.status == "Accepted" and outcome.settled
         assert journal.db.execute("SELECT state FROM plans").fetchone()[0] == "active"
-        assert sum(frame[2] == "DataTransfer" for frame in rig.charger_frames) == 1
     finally:
         await rig.close()
 

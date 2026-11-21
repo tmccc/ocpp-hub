@@ -125,7 +125,14 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
     }
     with j.atomic():
         head = j.next_delivery()
-        if head is None or head.token != item.token or head.state != "inflight" or head.payload != item.payload:
+        if (
+            head is None
+            or head.action != "StartTransaction"
+            or head.token != item.token
+            or head.transaction != item.transaction
+            or head.state not in ("inflight", "ambiguous")
+            or head.payload != item.payload
+        ):
             raise RecoveryRequiredError("Start refusal does not identify the exact sent delivery")
         j.put(RETRIES, {**records, item.token: record})
         j.db.execute("UPDATE outbox SET state=? WHERE token=?", ("rejected" if exhausted else "queued", item.token))

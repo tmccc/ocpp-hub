@@ -161,6 +161,18 @@ async def test_diagnostic_explanations_keep_evidence_categories_distinct(
     assert data == before
 
 
+# Intent: a known charger check awaiting storage has its own explanation.
+# Why: an interrupted audit and a received result awaiting a local write have different evidence.
+async def test_native_repair_publication_wait_has_a_distinct_explanation(actual_hass):
+    from custom_components.ics_proxy.diagnostic_view import explanation
+
+    value = detail() | {
+        "current_fault": "native_repair_publication_pending",
+        "recovery": "audit_outcome_unknown",
+    }
+    assert "saving the result" in explanation({"diagnostics": value}, fresh=True, native_fresh=True)
+
+
 # Intent: a known charging reply remains visible while the actual outcome is still pending.
 # Why: a reply to Stop is not evidence that the charger has closed the session.
 async def test_pending_charger_reply_does_not_explain_a_completed_command(actual_hass):

@@ -25,6 +25,8 @@ FAULTS = frozenset(
         "owner_control_or_delivery_uncertain",
         "operator_debt_reconciled_at_zero",
         "native_observation_unavailable",
+        "native_repair_publication_pending",
+        "owner_release_pending",
         "status_unavailable",
         "current_update_pending",
         "start_operation_pending",

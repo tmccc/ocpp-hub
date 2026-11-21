@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from .store import Journal
 
 TRANSACTION_COMMANDS = frozenset({"RemoteStartTransaction", "RemoteStopTransaction"})
+VENDOR_RESULTS = ("Accepted", "Rejected", "NotSupported", "Unknown", "reply")
 
 
 @dataclass(frozen=True)
@@ -262,6 +263,9 @@ class CommandOutcomes:
             CREATE TABLE IF NOT EXISTS vendor_profile_effects(
                 mutation TEXT PRIMARY KEY REFERENCES vendor_command_scope(mutation) ON DELETE CASCADE,
                 projected TEXT, vendor_alias TEXT, local_session INTEGER, tracked INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS vendor_plan_effects(
+                mutation TEXT PRIMARY KEY REFERENCES vendor_command_scope(mutation) ON DELETE CASCADE,
+                plans TEXT NOT NULL, clearing INTEGER NOT NULL);
         """)
 
     # Exact command claims retain their own wire correlation through every separately checked call in the sequence.
@@ -430,7 +434,7 @@ class CommandOutcomes:
         result = row["wire_result"]
         if pending is not None:
             status = pending.status
-        elif result in ("Accepted", "Rejected", "NotSupported", "Unknown"):
+        elif result in (*VENDOR_RESULTS, "call_error"):
             status = result
         else:
             status = None
@@ -473,9 +477,10 @@ class CommandOutcomes:
         for row in rows:
             token = row["token"]
             pending = self._received(token)
-            if pending is not None and pending.status == "call_error":
+            status = pending.status if pending is not None else row["wire_result"]
+            if status == "call_error":
                 uncertain.append(token)
-            elif pending is not None or row["wire_result"] in ("Accepted", "Rejected"):
+            elif status in VENDOR_RESULTS:
                 received.add(token)
             elif row["state"] == "uncertain" or (
                 row["wire_result"] not in ("prepared", "prepared_new_profile")
@@ -567,37 +572,49 @@ class CommandOutcomes:
         self._pending.pop(reply.mutation, None)
         return True
 
-    # Store the classified answer and any plan bookkeeping against the original issued identity.
+    # Save the exact reply before applying any plan changes or final outcome.
     def save_vendor_write(self, reply: VendorWriteReply) -> bool:
         self._pending[reply.mutation] = reply
         j = self.journal
         try:
             with j.atomic():
                 row = j.db.execute(
-                    "SELECT action,wire_request,wire_result,digest,state FROM mutations "
+                    "SELECT action,wire_request,wire_result,state FROM mutations "
                     "JOIN vendor_command_scope ON mutation=token WHERE token=? AND origin='vendor'",
                     (reply.mutation,),
                 ).fetchone()
                 if row is None or (row["action"], row["wire_request"]) != (reply.action, reply.wire):
                     raise RecoveryRequiredError("charger reply no longer owns its original vendor write")
-                if (row["state"], row["wire_result"]) != ("pending", "dispatched"):
+                if row["state"] != "pending" or row["wire_result"] not in ("dispatched", reply.status):
                     raise RecoveryRequiredError("vendor write is no longer awaiting this reply")
-                if reply.plans:
-                    PlanBook(j).accepted(reply.plans, reply.clearing)
-                j.record_vendor_result(reply.mutation, reply.status)
-                confirmed = reply.status != "call_error"
-                j.mutation_finished(reply.mutation, confirmed)
-                if not confirmed:
-                    j.put(
-                        "uncertain_vendor_command",
-                        {"mutation": reply.mutation, "action": reply.action, "digest": row["digest"]},
-                    )
+                if row["wire_result"] == "dispatched":
+                    if reply.plans:
+                        j.db.execute(
+                            "INSERT INTO vendor_plan_effects VALUES(?,?,?)",
+                            (reply.mutation, encoded(reply.plans), reply.clearing),
+                        )
+                    j.record_vendor_result(reply.mutation, reply.status)
+            with j.atomic():
+                self._settle_vendor_write(reply.mutation, reply.action, reply.status)
         except sqlite3.Error:
             if j.db.in_transaction:
                 raise
             return False
         self._pending.pop(reply.mutation, None)
         return True
+
+    # Finish a saved answer without either peer, preserving uncertainty from an actual error reply.
+    def _settle_vendor_write(self, mutation: str, action: str, status: str) -> None:
+        j = self.journal
+        saved = j.db.execute("SELECT plans,clearing FROM vendor_plan_effects WHERE mutation=?", (mutation,)).fetchone()
+        if saved is not None:
+            PlanBook(j).accepted(tuple(json.loads(saved["plans"])), bool(saved["clearing"]))
+            j.db.execute("DELETE FROM vendor_plan_effects WHERE mutation=?", (mutation,))
+        confirmed = status != "call_error"
+        j.mutation_finished(mutation, confirmed)
+        if not confirmed:
+            digest = j.db.execute("SELECT digest FROM mutations WHERE token=?", (mutation,)).fetchone()[0]
+            j.put("uncertain_vendor_command", {"mutation": mutation, "action": action, "digest": digest})
 
     # Checkpoint the matched answer before making any change to the profile's resource record.
     def save_profile_reply(self, reply: VendorProfileReply) -> bool:
@@ -781,6 +798,12 @@ class CommandOutcomes:
             "JOIN mutations ON token=mutation WHERE state='pending' AND wire_result='Accepted'"
         ).fetchall():
             self._settle_profile(row["mutation"])
+        for row in self.journal.db.execute(
+            "SELECT token,action,wire_result FROM mutations JOIN vendor_command_scope ON mutation=token "
+            "WHERE origin='vendor' AND state='pending' "
+            "AND wire_result IN ('Accepted','Rejected','NotSupported','Unknown','reply','call_error')"
+        ).fetchall():
+            self._settle_vendor_write(row["token"], row["action"], row["wire_result"])
 
     # A refusal revokes only its own Start grant. A Stop answer never closes the physical session.
     def _settle(self, mutation: str, action: str, status: str) -> None:

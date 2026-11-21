@@ -224,6 +224,7 @@ class Gateway:
     # Retry the original recorded response and its independent connection receipt without sending either command again.
     def retry_reply_writes(self) -> None:
         self.controls.retry_unsent_release()
+        self.auth_info.retry_denials()
         self.journal.outcomes.retry()
         self.journal.outcomes.retry_owner_writes()
         self._inbound.retry()
@@ -1013,21 +1014,41 @@ class Gateway:
 
         info: dict[str, Any] | None = None
 
-        # Interpret and persist the cloud decision while its reply still owns the vendor gate.
+        # A complete authorization result contains only the validated decision.
+        def decision(answer: Frame) -> dict[str, Any]:
+            if answer[0] != 3 or set(answer[2]) != {"idTagInfo"}:
+                raise UnavailableError("actual cloud authorization was unavailable")
+            return validate_info(answer[2]["idTagInfo"])
+
+        # Capture an actual denial before the sending task can be cancelled or lose authority.
+        def capture(_action: str, answer: Frame) -> None:
+            nonlocal info
+            if self._vendor_epoch != epoch:
+                return
+            try:
+                actual = decision(answer)
+            except UnavailableError, DeniedError:
+                return  # The caller still receives the ordinary validation failure.
+            if actual["status"] != "Accepted":
+                info = self.auth_info.deny(tag, actual)
+
+        # Positive authorization still depends on the originating owner and connection.
         def received(_action: str, answer: Frame) -> None:
             nonlocal info
             self._require_epoch("vendor", epoch)
-            if answer[0] != 3 or set(answer[2]) != {"idTagInfo"}:
-                raise UnavailableError("actual cloud authorization was unavailable")
-            decision = validate_info(answer[2]["idTagInfo"])
-            if decision["status"] == "Accepted":
-                check()
-            # A real denial belongs to the tag even when its initiating Start no longer has permission.
-            info = self.auth_info.put(tag, decision, self.auth_info.observe())
-            if decision["status"] != "Accepted":
+            if info is None:
+                actual = decision(answer)
+                if actual["status"] == "Accepted":
+                    check()
+                    info = self.auth_info.put(tag, actual)
+                else:
+                    info = self.auth_info.deny(tag, actual)
+            if info["status"] != "Accepted":
                 check()
 
-        await self.vendor.call("Authorize", {"idTag": tag}, priority=5, check=check, on_reply=received)
+        await self.vendor.call(
+            "Authorize", {"idTag": tag}, priority=5, check=check, on_receive=capture, on_reply=received
+        )
         assert info is not None
         return info
 

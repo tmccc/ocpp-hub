@@ -47,6 +47,8 @@ FAULTS = {
     "owner_control_or_delivery_uncertain": "Control or command delivery has an uncertain outcome.",
     "operator_debt_reconciled_at_zero": "An operator reconciliation still requires its remaining verification.",
     "native_observation_unavailable": REASONS["native_observation_unavailable"],
+    "native_repair_publication_pending": "The proxy is saving the result of its charger check.",
+    "owner_release_pending": "The proxy is finishing the return to app and schedule control.",
     "status_unavailable": "The proxy could not read its latest status.",
     "current_update_pending": REASONS["current_update_pending"],
     "start_operation_pending": REASONS["start_operation_pending"],
@@ -298,6 +300,8 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
         return "Detailed diagnostic evidence is unavailable."
     if detail["recovery"] == "strict_refusal":
         return REASONS["strict_native_refusal"]
+    if detail["current_fault"] == "native_repair_publication_pending":
+        return FAULTS["native_repair_publication_pending"]
     if detail["recovery"] == "audit_outcome_unknown":
         return REASONS["native_audit_outcome_unknown"]
     health = data.get("health_blockers")

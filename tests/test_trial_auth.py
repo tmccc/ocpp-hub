@@ -335,6 +335,68 @@ async def test_registered_cloud_authorize_never_falls_back_after_dispatch(tmp_pa
         await rig.close()
 
 
+# Intent: a real cloud denial remains current after a refused cache save, cancellation and process replacement.
+# Why: the old approval must never be usable for a new Start once the cloud has refused that tag.
+@pytest.mark.parametrize("exit_kind", ["completed", "cancelled", "checkpoint-refused"])
+async def test_cloud_denial_survives_storage_refusal_and_sender_exit(tmp_path: Path, exit_kind: str) -> None:
+    path = tmp_path / "state.db"
+    rig = StrictRig(path)
+    draining = asyncio.Event()
+    release = asyncio.Event()
+    caller = None
+    refused = info(status="Blocked")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        tag = "LOCAL_TEST"
+        rig.gateway.auth_info.put(tag, info())
+        rig.actual_info = refused
+        rig.store.db.execute(
+            "CREATE TEMP TRIGGER refuse_auth_cache BEFORE INSERT ON auth_info "
+            "BEGIN SELECT RAISE(ABORT,'synthetic authorization cache refusal'); END"
+        )
+        if exit_kind == "checkpoint-refused":
+            rig.store.db.execute(
+                "CREATE TEMP TRIGGER refuse_denial_receipt BEFORE INSERT ON auth_denial_replies "
+                "BEGIN SELECT RAISE(ABORT,'synthetic authorization receipt refusal'); END"
+            )
+        if exit_kind == "cancelled":
+            # The cloud delivers its real reply while the sender is still completing transport work.
+            async def drain(raw: str) -> None:
+                await rig.vendor_send(raw)
+                frame = decode(raw)
+                if frame[0] == 2 and frame[2] == "Authorize":
+                    draining.set()
+                    await release.wait()
+
+            rig.gateway.attach_vendor(drain)
+            caller = asyncio.create_task(rig.gateway._cloud_authorize(tag))
+            await asyncio.wait_for(draining.wait(), 2)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        else:
+            assert await rig.gateway._cloud_authorize(tag) == rig.actual_info
+        assert rig.gateway.auth_info.stored(tag) == rig.actual_info
+        assert not rig.gateway._local_start_allowed(tag)
+        if exit_kind == "checkpoint-refused":
+            rig.store.db.execute("DROP TRIGGER refuse_denial_receipt")
+            rig.gateway.retry_reply_writes()
+    finally:
+        release.set()
+        if caller is not None and not caller.done():
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+        await rig.close()
+
+    replacement = StrictRig(path)
+    try:
+        assert replacement.gateway.auth_info.stored("LOCAL_TEST") == refused
+        assert not replacement.gateway._local_start_allowed("LOCAL_TEST")
+    finally:
+        await replacement.close()
+
+
 # Intent: an ordinary Authorize cannot return Accepted after a newer local Stop claimed the station.
 # Why: metadata fetched before the hold must not release permission after the awaited cloud reply.
 async def test_ordinary_authorize_rechecks_stop_after_cloud_wait(tmp_path: Path) -> None:

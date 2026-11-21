@@ -71,9 +71,12 @@ def check_spec_path(config: TrialConfig, path: Path) -> None:
 def event(path: Path, value: dict[str, Any], *, maximum: int = 2 * 1024 * 1024) -> None:
     if path.exists() and path.stat().st_size > maximum:
         path.replace(path.with_suffix(path.suffix + ".1"))
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "a") as stream:
-        stream.write(json.dumps(value, sort_keys=True) + "\n")
+        size = os.fstat(descriptor).st_size
+        # Mark an incomplete last line invalid before appending fresh evidence.
+        separator = "!\n" if size and os.pread(descriptor, 1, size - 1) != b"\n" else ""
+        stream.write(separator + json.dumps(value, sort_keys=True) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
 

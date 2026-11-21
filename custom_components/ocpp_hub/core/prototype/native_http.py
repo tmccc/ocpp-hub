@@ -31,8 +31,10 @@ async def framing_line(reader: asyncio.StreamReader) -> bytes:
 async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
     status = await framing_line(reader)
     fields = status.split()
-    if len(status) > 8192 or len(fields) < 2 or fields[0] not in (b"HTTP/1.0", b"HTTP/1.1"):
-        raise NativeTransportUnavailableError("native reader received an invalid HTTP status line")
+    if len(status) > 8192 or len(fields) < 2 or not fields[0].startswith(b"HTTP/"):
+        raise NativeTransportUnavailableError("native reader did not receive a complete HTTP status")
+    if fields[0] not in (b"HTTP/1.0", b"HTTP/1.1"):
+        raise NativeContentError("content", "native reader received an unsupported HTTP version")
     code = fields[1]
     if code in (b"408", b"429") or len(code) == 3 and code.startswith(b"5") and code.isdigit():
         raise ConnectionError("native HTTP temporarily unavailable")
@@ -57,8 +59,10 @@ async def framed_body(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
     transfer = headers.get(b"transfer-encoding")
     length = headers.get(b"content-length")
     if transfer is not None:
-        if transfer != b"chunked" or length is not None:
-            raise ValueError("ambiguous native body framing")
+        if length is not None:
+            raise NativeContentError("content", "native response declared conflicting body lengths")
+        if transfer != b"chunked":
+            raise ValueError("unsupported native body framing")
         body = bytearray()
         while True:
             line = await framing_line(reader)
@@ -157,6 +161,9 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
             return result
     except NativeTransportUnavailableError:
         raise  # This subclass is a ValueError too; application unavailability must survive the strict outer boundary.
+    except NativeContentError as error:
+        content_refusal = error
+        raise
     except OSError, asyncio.IncompleteReadError:
         raise NativeTransportUnavailableError("native HTTP observation was interrupted") from None
     except ValueError, KeyError, TypeError, RecursionError:

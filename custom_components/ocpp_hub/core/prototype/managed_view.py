@@ -82,6 +82,7 @@ def health_snapshot(
     age = current - checked if checked is not None else math.inf
     native_age = current - native if native is not None else math.inf
     remaining = finite_number(value.get("certificate_remaining_seconds"))
+    certificate_valid = remaining is not None and remaining - max(age, 0) > 1800
     paused = value.get("desired_control") == "paused"
     selected = finite_number(value.get("requested_current_a", 6))
     native_ceiling = 32 if value.get("current_capability") is True else 6
@@ -111,8 +112,7 @@ def health_snapshot(
         and selected is not None
         and 6 <= selected <= native_ceiling
         and value.get("native_limit_a") == native_ceiling
-        and remaining is not None
-        and remaining > 1800
+        and certificate_valid
     )
     blockers = [
         reason
@@ -124,7 +124,7 @@ def health_snapshot(
             (value.get("boot_verified") is not False, "boot_unverified"),
             (value.get("cloud_start_pending") is not True, "cloud_start_pending"),
             (bool(authority), "control_verification_pending"),
-            (remaining is not None and remaining > 1800, "certificate_validity_insufficient"),
+            (certificate_valid, "certificate_validity_insufficient"),
             (value.get("cloud_connected") is not False, "cloud_disconnected"),
         )
         if not passed
@@ -274,20 +274,7 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
         j = c.session.journal
         value.update(phase=j.phase.read().value, automatic_charge_restart=False)
         value.update(vendor_command_status(c))
-        try:
-            value.update(
-                pending_lifecycle_events=j.db.execute(
-                    "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
-                ).fetchone()[0],
-                pending_observations=j.db.execute(
-                    "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
-                ).fetchone()[0],
-            )
-        except sqlite3.Error:
-            value.update(
-                pending_lifecycle_events=None,
-                pending_observations=None,
-            )
+        value.update(delivery_counts(j))
     return value
 
 
@@ -510,6 +497,18 @@ def control_mode(status: dict[str, Any], pending_fault: str | None, *, fresh: bo
     return "attention" if status["state"] in ("attention", "degraded") else "waiting"
 
 
+# Read the lifecycle and observation backlogs from the same journal snapshot.
+def delivery_counts(journal: Journal) -> dict[str, int | None]:
+    try:
+        lifecycle, observations = journal.db.execute(
+            "SELECT count(*) FILTER (WHERE action IN ('StartTransaction','StopTransaction')), "
+            "count(*) FILTER (WHERE action NOT IN ('StartTransaction','StopTransaction')) FROM outbox"
+        ).fetchone()
+    except sqlite3.Error:
+        lifecycle = observations = None
+    return {"pending_lifecycle_events": lifecycle, "pending_observations": observations}
+
+
 # Apply newer intent and refresh live availability without promoting stale poll evidence to current authority.
 def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[str, Any]:
     result = dict(published)
@@ -656,7 +655,8 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result.update(can_start_test=False, can_start=False, can_set_current=False, can_return=False)
     result["start_authorization"] = _reported_start_authorization(c)
     result["control_mode"] = control_mode(result, pending_fault if supervising else None, fresh=fresh)
-    result["sessions"] = session_history(c.session.journal)
+    result.update(delivery_counts(j))
+    result["sessions"] = session_history(j)
     # Refresh active diagnostics from the same live view and keep the poll's recorded reporting history.
     reported = published.get("diagnostics")
     if isinstance(reported, dict):

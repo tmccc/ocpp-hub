@@ -5,6 +5,7 @@ import json
 from itertools import product
 
 import pytest
+from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.native_http import NativeTransportUnavailableError, read_native, response_body
 from ocpp_hub_core.prototype.security import SecurityError
 
@@ -92,8 +93,8 @@ async def test_invalid_native_wire_cannot_supply_evidence(name, raw):
         await fragmented(raw, len(raw) // 2)
 
 
-# Intent: the complete native reader rejects invalid framing even when it surrounds a valid authoritative JSON body.
-# Why: successful application decoding must not hide an invalid lower-level protocol response.
+# Intent: reject invalid framing and distinguish explicit unsupported versions from unavailable responses.
+# Why: recognizing a complete but incompatible response must not restore an old Pause permission.
 @pytest.mark.parametrize("name,raw", [pytest.param(name, raw, id=name) for name, raw in invalid_wires()])
 async def test_invalid_native_reply_is_classified_over_real_http(name, raw):
     # Only this independent loopback peer supplies response bytes; the actual native reader runs unmodified.
@@ -110,7 +111,8 @@ async def test_invalid_native_reply_is_classified_over_real_http(name, raw):
 
     server = await asyncio.start_server(peer, "127.0.0.1", 0)
     try:
-        with pytest.raises(NativeTransportUnavailableError):
+        error = NativeContentError if name.startswith("version-HTTP/") else NativeTransportUnavailableError
+        with pytest.raises(error):
             await read_native("127.0.0.1", server.sockets[0].getsockname()[1], "Basic synthetic", "getConfig", None)
     finally:
         server.close()
