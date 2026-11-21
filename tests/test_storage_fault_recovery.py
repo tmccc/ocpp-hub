@@ -99,7 +99,14 @@ async def stopped_storage_bench(tmp_path, tls, unused_tcp_port, monkeypatch, *, 
             if s.journal.get("managed_control_fault") is None:
                 c.fault("owner_control_or_delivery_uncertain")
             fault = copy.deepcopy(s.journal.get("managed_control_fault"))
-            assert set(fault) == {"classification", "at_epoch"}
+            fields = {"classification", "at_epoch"}
+            if wire_debt == "unknown-start" and "late_delivery_token" in fault:
+                # The cloud pump can keep the original reply receiver alive after the timeout.
+                head = s.journal.next_delivery()
+                assert head is not None and (head.action, head.state) == ("StartTransaction", "ambiguous")
+                assert fault["late_delivery_token"] == head.token
+                fields.add("late_delivery_token")
+            assert set(fault) == fields
             assert fault["classification"] == "owner_control_or_delivery_uncertain"
             # This is an explicit old-version input, not a claim that current runtime creates this legacy fault.
             s.journal.put(
