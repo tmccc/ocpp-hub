@@ -37,6 +37,7 @@ from .model import (
     ChargeStats,
     ConnectorState,
     LimitMemory,
+    StartIdentity,
 )
 from .readings import PRIMARY_CONNECTOR, schedule_limit_at
 
@@ -77,6 +78,8 @@ class SessionListener(Protocol):
     def on_snapshot(self, snapshot: ChargerSnapshot) -> None: ...
 
     def on_frame(self, cp_id: str, sender: str, frame: Frame) -> None: ...
+
+    def on_start_committed(self, cp_id: str, transaction_id: int, payload: dict[str, Any]) -> None: ...
 
     def on_disconnected(self, cp_id: str) -> None: ...
 
@@ -491,7 +494,7 @@ class ChargerSession:
             self._update(composite_limit_a=limit, **self._reconcile_restored(limit))
 
     # Send one frame to the charger and tell the listener about it.
-    # Every frame the hub sends passes here, so listeners such as the mirror see the hub's answers too.
+    # Report only frames that were sent so the wire log reflects the actual connection.
     async def _send(self, text: str) -> None:
         frame = parse_frame(text)
         await self._connection.send(text)
@@ -644,15 +647,35 @@ class ChargerSession:
         ]
         return running[0] if len(running) == 1 else None
 
-    # Hand out a transaction id and remember which connector it runs on.
-    # A start on a connector that still has a running charge means the charger lost that charge's stop (a power cut,
+    # Reuse a valid Start still running on this connector, including when the reply was lost before reconnect.
+    # A different start on a connector with a running charge means the charger lost that charge's stop (a power cut,
     # a firmware that starts again); the old charge is closed first, at the new start, so it is not lost.
     # Every tag is accepted: this is a private charger on a trusted network, and refusing one only strands the owner.
     async def _start_transaction(self, payload: dict[str, Any]) -> dict[str, Any]:
         connector_id = _int_field(payload, "connectorId")
-        started_at = parse_timestamp(payload.get("timestamp"), self._clock())
-        transaction_id = await self._next_transaction_id()
+        timestamp = payload.get("timestamp")
+        tag = payload.get("idTag")
+        meter = payload.get("meterStart")
+        reservation = payload.get("reservationId")
+        received_at = self._clock()
+        started_at = parse_timestamp(timestamp, received_at)
+        identity = None
+        # A receive-time fallback or incomplete payload cannot identify a replay.
+        if (
+            started_at is not received_at
+            and isinstance(timestamp, str)
+            and len(timestamp) <= MAX_TEXT
+            and isinstance(tag, str)
+            and len(tag) <= MAX_TEXT
+            and type(meter) is int
+            and ("reservationId" not in payload or type(reservation) is int)
+            and payload.keys() <= {"connectorId", "timestamp", "idTag", "meterStart", "reservationId"}
+        ):
+            identity = StartIdentity(timestamp, tag, meter, reservation)
         connector = self._connector(connector_id)
+        if identity is not None and connector.transaction_id is not None and connector.start_identity == identity:
+            return {"transactionId": connector.transaction_id, "idTagInfo": {"status": "Accepted"}}
+        transaction_id = await self._next_transaction_id()
         if connector.transaction_id is not None:
             interrupted = self._finished_session(
                 connector,
@@ -664,12 +687,14 @@ class ChargerSession:
             replace(
                 connector,
                 transaction_id=transaction_id,
-                id_tag=_text(payload.get("idTag")),
-                meter_start_wh=_finite(payload.get("meterStart")),
+                id_tag=_text(tag),
+                meter_start_wh=_finite(meter),
                 started_at=started_at,
                 stats=ChargeStats(),
+                start_identity=identity,
             )
         )
+        self._listener.on_start_committed(self.cp_id, transaction_id, payload)
         return {"transactionId": transaction_id, "idTagInfo": {"status": "Accepted"}}
 
     # Clear the transaction from the connector that ran it, and report the finished charge.
@@ -688,6 +713,7 @@ class ChargerSession:
                         meter_start_wh=None,
                         started_at=None,
                         stats=ChargeStats(),
+                        start_identity=None,
                     )
                 )
                 self._listener.on_session_finished(finished)

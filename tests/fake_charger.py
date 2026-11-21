@@ -159,6 +159,10 @@ class RecordingListener:
     def on_frame(self, cp_id: str, sender: str, frame: list[Any]) -> None:
         self.frames.append((cp_id, sender, frame))
 
+    # The raw frame and snapshot are recorded separately in these tests.
+    def on_start_committed(self, cp_id: str, transaction_id: int, payload: dict[str, Any]) -> None:
+        return None
+
     # Record a finished charge.
     def on_session_finished(self, session: Any) -> None:
         self.finished.append(session)

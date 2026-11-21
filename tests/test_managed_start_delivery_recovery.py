@@ -4,10 +4,12 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 
 import pytest
 from ocpp_hub_core.prototype import managed_start_delivery
-from ocpp_hub_core.prototype.managed_debt_recovery import KEY
+from ocpp_hub_core.prototype.delivery_reply import DeliveryReply
+from ocpp_hub_core.prototype.managed_debt_recovery import KEY, start_retry_candidate
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_session import save_private
@@ -106,8 +108,35 @@ async def approve_stop_after_start(rig, tmp_path, capsys):
     assert await operator.run("reconcile", *args, path, port, kind="stop-delivery") == 0
 
 
+# Intent: a late Start reply saved before quarantine remains owned by ordinary settlement after process replacement.
+# Why: stopped-service retry would erase the saved frame and could repeat an already accepted cloud delivery.
+@pytest.mark.parametrize("body", [{"transactionId": 91, "idTagInfo": {"status": "Accepted"}}, {}])
+def test_saved_late_start_reply_blocks_operator_retry(tmp_path, body):
+    path = tmp_path / "pending-late-start.db"
+    identity = "START_REPLY_TEST"
+    with closing(Journal(path, identity)) as journal:
+        local = journal.start("start", START)["transactionId"]
+        journal.stop("stop", {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"})
+        head = journal.next_delivery()
+        journal.mark_sent(head)
+        journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (head.token,))
+        head = journal.next_delivery()
+        answer = [3, head.token, body]
+        DeliveryReply.received(head, answer).save(journal, head)
+    with closing(Journal(path, identity)) as journal:
+        snapshot = {
+            "fault": {"classification": "owner_control_or_delivery_uncertain"},
+            "outbox": [dict(row) for row in journal.db.execute("SELECT * FROM outbox ORDER BY seq")],
+            "start_retries": None,
+        }
+        with pytest.raises(RecoveryRequiredError, match="ordinary settlement of its saved reply"):
+            start_retry_candidate(journal, snapshot)
+        saved = DeliveryReply.restore(journal, journal.next_delivery())
+        assert saved is not None and saved.answer == answer
+
+
 # Intent: an exhausted retry has exact recovery, including another error, lost reply, malformed reply or restart.
-# Why: a repair that succeeds only on its first attempt can create a second unsupported permanent zero hold.
+# Why: repeated recovery must retain the latest reply evidence and let later genuine sessions complete.
 @pytest.mark.parametrize(
     "recovery_fault",
     [
@@ -115,7 +144,7 @@ async def approve_stop_after_start(rig, tmp_path, capsys):
         "error-once",
         "silent",
         "missing-id",
-        "bad-info",
+        pytest.param("bad-info", marks=pytest.mark.recovery_replay),
         "exhaust-again",
         "restart-inflight",
         "stop-error",
@@ -200,6 +229,12 @@ async def test_start_retry_can_itself_fail_and_recover(
             if recovery_fault == "exhaust-again":
                 await approve_retry(rig, tmp_path, capsys)
             else:
+                args = (tmp_path / "trial.json", strategy_file(rig, tmp_path))
+                port = rig.prepared.observer.port
+                assert await operator.run("inspect", *args, None, port, kind="start-delivery") == 0
+                inspected = json.loads(capsys.readouterr().out.splitlines()[-1])["candidate"]
+                answer = None if recovery_fault == "silent" else rig.bench.actual_start_replies[-1]
+                assert inspected["reply_digest"] == fingerprint(answer)
                 await map_unknown_retry(rig, tmp_path, capsys)
             rig.bench.start_replies = []
         if recovery_fault in ("stop-error", "stop-bad-info"):

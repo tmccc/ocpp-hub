@@ -115,7 +115,8 @@ async def test_boot_storage_failure_preserves_observation_generation(tmp_path, t
 
 # Intent: bind a buffered untimed report to the generation present before the following Boot arrives.
 # Why: the replacement reader can accept both messages before either asynchronous response sends.
-async def test_buffered_observation_before_replacement_boot_uses_original_generation(tmp_path, tls):
+@pytest.mark.parametrize("changed_body", [False, True])
+async def test_buffered_observation_before_replacement_boot_uses_original_generation(tmp_path, tls, changed_body):
     async with ObservationTLS(tmp_path / "state.db", tls) as peer:
         action, payload = observation_payload("status-untimed", None)
         assert (await peer.call("status", action, payload))[0] == 3
@@ -124,8 +125,11 @@ async def test_buffered_observation_before_replacement_boot_uses_original_genera
         await gateway.receive("charger", build_call("status", action, payload))
         await gateway.receive("charger", build_call("new-boot", "BootNotification", BOOT))
         await gateway.drain()
+        fresh = payload | {"status": "Charging"} if changed_body else payload
+        assert (await peer.call("status", action, fresh))[0] == 3
+        assert peer.j.get("last_status") == fresh
         await peer.flush()
-        assert len([frame for frame in peer.cloud_calls if frame[2] == action]) == 1
+        assert [frame[3] for frame in peer.cloud_calls if frame[2] == action] == [payload, fresh]
 
 
 # Intent: distinct IDs and genuine recurring statuses remain distinct while same-connection ID conflicts fail.

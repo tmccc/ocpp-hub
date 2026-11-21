@@ -7,6 +7,7 @@ import math
 import time
 from typing import TYPE_CHECKING, Any
 
+from ..frames import Frame
 from .managed_denial_faults import (
     current_operator_proof,
     denial_source_fault,
@@ -71,6 +72,24 @@ def supersede_unknown_start_retry(j: Journal, item: Delivery, *, restarting: boo
     if changed:
         j.put(PROOFS, records)
         j.fault.replace(retained_fault or fault)
+
+
+# Retain the exact reply digest in the same transaction that discards its unusable payload.
+def record_start_quarantine_reply(j: Journal, item: Delivery, answer: Frame) -> None:
+    records = j.get(RETRIES, {})
+    previous = records.get(item.token, {"errors": 0, "next_epoch": 0})
+    j.put(
+        RETRIES,
+        {
+            **records,
+            item.token: {
+                **previous,
+                "local": item.transaction,
+                "payload_digest": fingerprint(item.payload),
+                "quarantined_reply_digest": fingerprint(answer),
+            },
+        },
+    )
 
 
 # Only the exact bound ordinary owner request may settle metadata alongside its denied closed lifecycle.

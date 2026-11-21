@@ -294,13 +294,16 @@ def verify_listener_certificate(descriptor: int, name: str) -> float:
     try:
         try:
             ipaddress.ip_address(name)
-            option = "-checkip"
+            name_options = ["-checkip", name]
+            match_kind = "IP"
         except ValueError:
             if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", name) is None:
                 raise SecurityError("trial certificate DNS name is malformed")
-            option = "-checkhost"
+            # Clear only the in-memory subject for this read-only check, so OpenSSL cannot match the Common Name.
+            name_options = ["-subj", "/", "-checkhost", name]
+            match_kind = "Hostname"
         result = subprocess.run(
-            ["/usr/bin/openssl", "x509", "-in", f"/proc/self/fd/{descriptor}", "-noout", "-dates", option, name],
+            ["/usr/bin/openssl", "x509", "-in", f"/proc/self/fd/{descriptor}", "-noout", "-dates", *name_options],
             capture_output=True,
             text=True,
             timeout=5,
@@ -308,7 +311,6 @@ def verify_listener_certificate(descriptor: int, name: str) -> float:
             env={**os.environ, "LC_ALL": "C"},
         )
         lines = result.stdout.splitlines()
-        match_kind = "IP" if option == "-checkip" else "Hostname"
         if result.returncode or f"{match_kind} {name} does match certificate" not in lines:
             raise ValueError
         dates = dict(line.split("=", 1) for line in lines if line.startswith(("notBefore=", "notAfter=")))

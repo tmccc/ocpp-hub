@@ -196,6 +196,60 @@ async def test_ics_cold_orphan_and_overlapping_history_stay_blocked(tmp_path: Pa
     await rig.close()
 
 
+# Intent: an exact history query refuses if its original cloud ID becomes ambiguous while awaiting either peer.
+# Why: a read-only request must not relabel an older session's metadata as the newer session's result.
+@pytest.mark.parametrize("boundary", ["before-send", "before-reply"])
+async def test_ics_history_query_rechecks_reused_mapping(tmp_path: Path, boundary: str) -> None:
+    rig = Rig(tmp_path / "journal.db", ICS_POLICY)
+    gateway, journal = rig.gateway, rig.store
+    gateway.use_command_processor()
+    await rig.boot()
+    await rig.cloud()
+    local = journal.start("prior-start", STARTS[0])["transactionId"]
+    await gateway.flush()
+    vendor = journal.vendor_id(local)
+    stop = {"transactionId": local, "timestamp": "2030-01-01T00:01:00Z", "meterStop": 1_000_000_000}
+    journal.stop("prior-stop", stop)
+    rig.vendor_result = {}
+    await gateway.flush()
+    assert vendor is not None and journal.historical_local_id(vendor) == local
+    forwarded = []
+
+    # The independent cloud really reuses the drained ID while the original query is pending.
+    async def reuse_mapping() -> None:
+        newer = {**STARTS[0], "meterStart": stop["meterStop"], "timestamp": stop["timestamp"]}
+        assert journal.start("another-session", newer)["transactionId"] != local
+        rig.next_vendor = vendor - 1
+        await gateway.flush()
+        assert journal.historical_local_id(vendor) is None
+
+    # Separate the last send check from the time when the charger sends back its actual result.
+    async def validate(action: str, _payload: dict[str, Any]) -> None:
+        if action == "DataTransfer" and boundary == "before-send":
+            await reuse_mapping()
+
+    # Return the old session's exact metadata if the request really reaches the charger.
+    async def answer(raw: str) -> None:
+        frame = decode(raw)
+        if frame[0] != 2 or frame[2] != "DataTransfer":
+            await rig.charger_send(raw)
+            return
+        forwarded.append(frame)
+        if boundary == "before-reply":
+            await reuse_mapping()
+        data = json.dumps({"transactionId": local, "eco": "Fast"})
+        await gateway.receive("charger", build_call_result(frame[1], {"status": "Accepted", "data": data}))
+
+    gateway.charger.validate_send, gateway.charger.sender = validate, answer
+    query = {"vendorId": "IoCharger", "messageId": "getTransaction", "data": json.dumps({"transactionId": vendor})}
+    try:
+        refused = await rig.vendor("related-history", "DataTransfer", query)
+        assert refused[:3] == [4, "related-history", "SecurityError"]
+        assert len(forwarded) == int(boundary == "before-reply")
+    finally:
+        await rig.close()
+
+
 # Intent: enforce OCPP-J's 36-character messageId limit at both incoming and generated boundaries.
 # Why: the original prototype emitted 38/39-character ids that the real iCS server need not accept.
 @pytest.mark.parametrize("length", [0, 1, 19, 32, 36, 37, 64])

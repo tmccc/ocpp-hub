@@ -26,6 +26,7 @@ from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
 from tests.handover_helpers import crash
 from tests.managed_rig import OwnerBench, healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN
+from tests.native_peer_failures import InterruptedNativePeer
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
@@ -317,7 +318,7 @@ async def test_deadline_stop_has_reserved_capacity_after_last_request_slot_is_us
         assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
 
 
-# Intent: a real transient SQLite write failure rolls back the first Stop intent and the independent timer retries.
+# Intent: the independent timer retains zero and retries a refused timed Stop record.
 # Why: a storage error at the deadline cannot renew Start authority or leave an already flowing charge without Stop.
 async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
     tmp_path: Path,
@@ -331,7 +332,6 @@ async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
         await test.controller.charging.settle()
         local = await positive_flow(test)
         await healthy(test.controller)
-        before = copy.deepcopy(journal.get("control"))
         failure = asyncio.Event()
         attempts = []
 
@@ -350,9 +350,8 @@ async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
             "BEGIN SELECT test_timed_stop_failure(); END"
         )
         await asyncio.wait_for(failure.wait(), 3)
-        assert journal.get("control") == before
-        assert test.controller.requests.intent().mode == "app"
-        assert test.controller.charging.state()["state"] == "charging"
+        await until(lambda: test.controller.requests.intent().mode == "paused")
+        assert journal.get("control")["inhibit"] is True
         lease = test.controller.charging.lease
         assert lease is not None and lease.deadline <= time.monotonic()
         with pytest.raises(DeniedError):
@@ -362,6 +361,38 @@ async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
         assert (await actual_stop(test, local))["local_hold_verified"]
         assert len(attempts) >= 2 and len(starts(test.rig)) == 1
         assert test.rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: a timed charge goes to zero while the native read and the saved cutoff record both fail.
+# Why: the exact timed session already needs protection while its final outcome remains unconfirmed.
+async def test_timer_holds_zero_when_native_and_cutoff_storage_are_unavailable(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.5, native_peer=InterruptedNativePeer
+    ) as test:
+        controller, journal = test.controller, test.session.journal
+        controller.command(uuid.uuid4().hex, "start_test", 0)
+        await controller.charging.settle()
+        local = await positive_flow(test)
+        assert (await healthy(controller))["power_w"] > 0
+        journal.db.execute(
+            "CREATE TRIGGER refuse_timed_cutoff BEFORE INSERT ON meta "
+            "WHEN NEW.key='managed_test_charge' AND json_extract(NEW.value,'$.state')='stopping' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic timed cutoff record failure'); END"
+        )
+        test.rig.peer.unavailable = True
+        try:
+            await until(lambda: test.rig.bench.firmware.effective_limit() == 0, timeout=2)
+            assert controller.requests.intent().mode == "paused"
+            assert controller.charging.state()["state"] == "charging"
+            assert journal.active() == local and not test.rig.bench.remote_stop.is_set()
+        finally:
+            test.rig.peer.unavailable = False
+            journal.db.execute("DROP TRIGGER refuse_timed_cutoff")
+        assert (await actual_stop(test, local))["local_hold_verified"]
+        assert controller.charging.state()["stop_reason"] == "deadline"
+        assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
 
 
 # Intent: a native timetable cannot satisfy a cloud test, even after the charger rejected an actual cloud Start.

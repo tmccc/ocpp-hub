@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,27 @@ from tools import ha_restart
 from tools.qualification_snapshot import freeze
 
 deploy = load_tool("deploy_ha")
+
+
+# Intent: an unchecked archive with untracked component code carries a dirty build stamp.
+# Why: the printed commit alone cannot reproduce additions that are outside Git.
+def test_unchecked_archive_marks_untracked_component_code_dirty(tmp_path, monkeypatch) -> None:
+    integration = Path("custom_components/ics_proxy")
+    repo = project(tmp_path / "repo", {str(integration / "__init__.py"): "VALUE = 1\n", ".gitignore": "*.pyc\nBUILD\n"})
+    monkeypatch.setattr(deploy, "ROOT", repo)
+    (repo / integration / "ignored.pyc").touch()
+    (repo / "unrelated.py").touch()
+    _, bundle, expected = deploy.prepare_archive(integration, tmp_path, skip_checks=True, collection_executors=None)
+    assert set(expected) == {"__init__.py", "BUILD"}
+    with tarfile.open(fileobj=io.BytesIO(bundle)) as archive:
+        build = archive.extractfile("BUILD").read().decode().strip()
+    assert "+dirty" not in build
+
+    (repo / integration / "addition.py").write_text("VALUE = 2\n")
+    _, bundle, expected = deploy.prepare_archive(integration, tmp_path, skip_checks=True, collection_executors=None)
+    assert set(expected) == {"__init__.py", "addition.py", "BUILD"}
+    with tarfile.open(fileobj=io.BytesIO(bundle)) as archive:
+        assert archive.extractfile("BUILD").read().decode() == build + "+dirty\n"
 
 
 # Intent: .env parsing ignores comments and blank lines and strips quotes.

@@ -48,6 +48,15 @@ def test_proxy_change_detection_and_export(tmp_path, releases):
     assert (exported / "tools/managed_proxy.py").read_text() == "# installed\n"
 
 
+# Intent: changing only the standalone installation's dependency pin triggers the installation week.
+# Why: the service installs from a different requirements file than the offline test environment.
+def test_proxy_change_detection_includes_standalone_dependency_pins(releases):
+    repo, *_ = releases
+    old_pin = commit(repo, "requirements-trial.txt", "websockets==15.0.1\n")
+    new_pin = commit(repo, "requirements-trial.txt", "websockets==16.0\n")
+    assert checks.changed_proxy(repo, new_pin, old_pin) is True
+
+
 # Intent: exact scoped release checks precede publication of an approved source snapshot.
 # Why: a failed week must stop the actual packaging path, even when the normal four suites have already passed.
 @pytest.mark.parametrize(

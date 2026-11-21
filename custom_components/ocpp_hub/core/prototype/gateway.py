@@ -38,6 +38,7 @@ from .managed_start_delivery import (
     latch_start_delivery_fault,
     record_start_denial,
     record_start_error,
+    record_start_quarantine_reply,
     record_start_wire_ack,
     retry_deferred,
     supersede_unknown_start_retry,
@@ -1283,6 +1284,8 @@ class Gateway:
             def check() -> None:
                 require_origin()
                 self._check_vendor(action, original, own_mutation=mutation)
+                if query is not None:
+                    query.require_mapping(self.journal.historical_local_id)
                 if mutation is not None:
                     row = self.journal.db.execute(
                         "SELECT origin,action,digest,state FROM mutations WHERE token=?", (mutation,)
@@ -1330,7 +1333,16 @@ class Gateway:
             )
             if write and forwarded_reply is None and profile_reply is None and other_reply is None:
                 raise UnavailableError("charger write did not return a recognized outcome")
-            return reply_as(query.response(answer) if query is not None else answer, token)
+            if query is not None:
+                history = query
+
+                # Check and project the history reply in the same order as other received outcomes.
+                def project_history() -> Frame:
+                    history.require_mapping(self.journal.historical_local_id)
+                    return history.response(answer)
+
+                return reply_as(self.decide(project_history, priority=priority), token)
+            return reply_as(answer, token)
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
@@ -1799,17 +1811,29 @@ class Gateway:
             disposition = self._record_delivery_reply(item, reply)
         except DeniedError, ConflictError, RecoveryRequiredError:
             if item.action == "StartTransaction":
-                with self.journal.atomic():
-                    head = self.journal.next_delivery()
-                    if head is not None and head.token == item.token and head.state == "inflight":
-                        self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
-                        current_head = self.journal.next_delivery()
-                        assert current_head is not None
-                        supersede_unknown_start_retry(self.journal, current_head)
+                self._quarantine_start_reply(item)
             self.journal.outcomes.retain_delivery(None)
             raise RecoveryRequiredError("cloud reply requires exact delivery reconciliation") from None
         self.journal.outcomes.retain_delivery(None)
         return disposition
+
+    # Protect the same Start and keep only its durable reply digest, even if another reply conflicts with it.
+    def _quarantine_start_reply(self, item: Delivery) -> None:
+        with self.journal.atomic():
+            head = self.journal.next_delivery()
+            if head is None or head.token != item.token or head.state not in ("inflight", "ambiguous"):
+                return
+            try:
+                saved = DeliveryReply.restore(self.journal, head)
+            except RecoveryRequiredError:
+                saved = None  # An unusable cache identity provides no reliable reply provenance.
+            if saved is not None:
+                record_start_quarantine_reply(self.journal, head, saved.answer)
+            if saved is not None or head.state == "inflight":
+                self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
+                current_head = self.journal.next_delivery()
+                assert current_head is not None
+                supersede_unknown_start_retry(self.journal, current_head)
 
     # Keep a failed Start delivery under a durable hold before verifying the physical ceiling.
     def _hold_failed_start_delivery(self) -> None:
@@ -1861,14 +1885,5 @@ class Gateway:
             record_stop_ack(self.journal, item, answer[2])
             record_start_wire_ack(self.journal, item, answer[2])
 
-        try:
-            self.journal.acknowledge(item, answer[2], acknowledged, allow_denied=denied)
-        except ConflictError, RecoveryRequiredError:
-            if item.action == "StartTransaction":
-                with self.journal.atomic():
-                    self.journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE token=?", (item.token,))
-                    current_head = self.journal.next_delivery()
-                    assert current_head is not None
-                    supersede_unknown_start_retry(self.journal, current_head)
-            raise
+        self.journal.acknowledge(item, answer[2], acknowledged, allow_denied=denied)
         return "denied" if denied else "acknowledged"

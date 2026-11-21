@@ -98,7 +98,6 @@ def target_from_env(
 
 
 # List the files to deploy relative to the integration folder: tracked and untracked-but-not-ignored, no caches.
-# What git knows is what ships; a stray local file or a __pycache__ must never reach the server.
 def relative_files(root: Path = ROOT, integration: Path = INTEGRATION) -> list[str]:
     out = subprocess.run(
         ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--", str(integration)],
@@ -110,14 +109,13 @@ def relative_files(root: Path = ROOT, integration: Path = INTEGRATION) -> list[s
     return sorted(p[len(prefix) :] for p in out.split("\0") if p.startswith(prefix) and "__pycache__" not in p)
 
 
-# Write the commit the deployed code comes from into the integration's BUILD file and return it.
-# A log line must say which code wrote it; without a stamp an old build and the current one look identical.
+# Stamp the commit and mark local tracked or untracked component code shipped by an unchecked deploy.
 def write_build_stamp(root: Path = ROOT, integration: Path = INTEGRATION) -> str:
     head = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True, check=True
     ).stdout.strip()
     dirty = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no", "--", str(integration)],
+        ["git", "status", "--porcelain", "--untracked-files=normal", "--", str(integration)],
         cwd=root,
         capture_output=True,
         text=True,

@@ -325,8 +325,9 @@ are pinned in `requirements-trial.txt`; test/development dependencies remain in 
 - A Basic leg requires a known charger password. Never overwrite an unknown existing cloud password for a
   trial: the native backup cannot recover a write-only secret. Omit those key fields from connection updates and rollback;
   do not submit their blank readbacks. A separate bounded private handshake observation can establish the existing header.
-- Both legs retain TLS. Upstream CA and hostname checks are mandatory; listener key pairing, SAN/IP name and certificate
-  dates are checked offline. Production certificate trust remains separate from the temporary trial allowance.
+- Both legs retain TLS. Upstream CA and hostname checks are mandatory. Offline preflight checks listener key pairing,
+  certificate dates and the matching DNS or IP Subject Alternative Name. DNS checks use `/usr/bin/openssl` 3.0 or
+  later. Production certificate trust remains separate from the temporary trial allowance.
 - Files must be owned regular files, not symlinks. Secrets/configuration and state are private to the runtime user;
   public certificates/CA files may be readable but cannot be writable by other users. Keys are loaded from verified
   bytes through anonymous descriptors, avoiding a second pathname-open race. State directory permissions are checked
@@ -378,6 +379,7 @@ Stop and Release operations and their original priority, physical and ownership 
 that unscoped Start and exposes its separate guarded management controls. Status distinguishes actual Boot,
 transport/cloud registration, effective composite confirmation, local hold and delivery debt.
 Shutdown attempts zero and the exact known-session Stop, preserves uncertainty and leaves the journal intact.
+Closing the commissioning terminal or SSH session takes the same shutdown path as an explicit exit.
 It never automatically restores the manufacturer's connection.
 
 The plain commissioning mode, its `resume`/`rollback` commands and `capture-baseline` action are retired.
@@ -529,6 +531,8 @@ proof until a fresh charger reading arrives. The report separates the retained o
 blockers, pending/uncertain receipts and worker activity. A strict native refusal or an interrupted audit remains
 blocked; these explanations grant no new recovery permission. Missing receipt timestamps remain unknown.
 Protocol diagnostics also show the number of recent message-handler failures in the current proxy process.
+If a status refresh fails, Home Assistant keeps Pause available when the last valid status allowed it.
+The proxy decides the result of the Pause, and Home Assistant still waits for its command receipt.
 
 The download includes at most five pending receipts and twenty recent transitions from the current proxy process.
 The existing rotated event file preserves transitions across replacements; the download explicitly labels its
@@ -841,11 +845,12 @@ positive sends. Actual known Start and positive native power are required before
 
 The proxy owns Stop independently of HA and polling: startup is limited to60seconds, followed by120seconds from the
 first verified power flow, with an immutable180second acceptance ceiling. Stop atomically records the paused intent
-and zero claim without needing a free request-receipt slot, and retries transient storage failures. A replaced
-unfinished test becomes an interrupted pause and never resumes itself. Tests finish paused; Return to app/schedule
-remains a separate explicit action. A cloud-test arming request issues no Start; the actual app Start must be proved
-by its consumed vendor grant, exact confirmed mutation and known native transaction. The cloud safety deadline has
-15seconds grace for the app's planned two-minute Stop, within the same immutable acceptance ceiling. Current,
+and zero claim without needing a free request-receipt slot. If recording the timed Stop fails at the deadline,
+the proxy can claim and send zero for the same known test session while retrying the Stop record, even when
+the native read is unavailable. A replaced unfinished test becomes an interrupted pause and never resumes itself.
+Tests finish paused. Return to app or schedule control requires a separate command. A cloud-test arming request
+waits for the app Start and verifies its consumed vendor grant, exact confirmed mutation and known native transaction.
+The cloud safety deadline adds 15 seconds for the app's planned two-minute Stop, within the same acceptance ceiling. Current,
 duration, tag and arbitrary RPC are never supplied by management callers. Generic Start remains unavailable.
 
 Both authorized physical tests passed on2026-11-10 at nominal6A. The HA/local OCPP test delivered53Wh; its first
@@ -1541,9 +1546,11 @@ A charge runs from the charger's `StartTransaction` to its `StopTransaction`. `_
 the running charge with its start, duration, tag, peak and average power and limits as attributes. `_last_session`
 shows the latest finished charge and the 20 newest in `recent_sessions`.
 
-Every finished charge is kept in Home Assistant's storage without limit (about 300 bytes each). The action
-`ocpp_hub.get_sessions` returns the history, newest first, optionally for one `charger_id` and up to `limit`. A charge
-that was running while Home Assistant restarted is not recorded.
+Finished charges recorded by the hub are kept in Home Assistant's storage without limit (about 300 bytes each).
+The action `ocpp_hub.get_sessions` returns the history, newest first, optionally for one `charger_id` and up to
+`limit`. A charger reconnect keeps its running charge while the hub stays loaded. A Home Assistant restart or
+integration reload clears the older hub's running charges and the mirror's transaction mapping. A later Stop for
+one of those charges is acknowledged to the charger, leaving the vendor session open if the vendor still has it.
 
 ### Schedules and the charging plan
 
@@ -1612,8 +1619,9 @@ For Raedian chargers use `wss://cloud-protocol.raedian.com:9043/ocpp/` with no u
 
 What the mirror does:
 
-- It forwards every message of the charger except heartbeats, in order, and keeps up to 5000 frames while the vendor is
-  unreachable. Transaction ids are translated between the hub and the vendor.
+- It forwards charger reports in order and keeps up to 5000 frames while the vendor is unreachable. It sends its own
+  heartbeats and translates transaction IDs. A repeat of the exact Start for a still-open charge gets the original
+  hub transaction ID and uses the existing vendor report, including when the charger reconnects.
 - By default every command from the vendor is refused with an answer the protocol allows, and nothing reaches the
   charger.
 - With *Commands from the backend* set to *Pass them on to the charger*, the vendor's remote start and stop, charging

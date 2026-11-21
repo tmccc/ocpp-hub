@@ -39,8 +39,10 @@ class ObservationReceipts:
         if not self.j.db.in_transaction:
             raise ConflictError("observation receipt must share its acceptance transaction")
         digest = fingerprint([action, payload])
+        # Boot may reuse the peer's counter on this socket while buffered reports retain their arrival generation.
+        call_key = f"{generation}:{token}"
         previous = self.j.db.execute(
-            "SELECT digest,publication FROM observation_calls WHERE epoch=? AND token=?", (epoch, token)
+            "SELECT digest,publication FROM observation_calls WHERE epoch=? AND token=?", (epoch, call_key)
         ).fetchone()
         if previous is not None and previous["digest"] != digest:
             raise ConflictError("observation CALL id names a different request on this connection")
@@ -63,7 +65,7 @@ class ObservationReceipts:
             row["publication"] if row is not None else self.j.enqueue(action, payload, payload.get("transactionId"))
         )
         self.j.db.execute(
-            "INSERT OR IGNORE INTO observation_calls VALUES(?,?,?,?)", (epoch, token, digest, publication)
+            "INSERT OR IGNORE INTO observation_calls VALUES(?,?,?,?)", (epoch, call_key, digest, publication)
         )
         if not duplicate:
             self.j.db.execute(

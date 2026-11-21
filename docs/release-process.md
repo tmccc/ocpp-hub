@@ -48,8 +48,10 @@ python tools/validate.py --qualification-report "$QUALIFICATION_BUNDLE" \
 
 The corresponding environment settings are `OCPP_QUALIFICATION_REPORT`, `OCPP_INSTALLED_PROXY_COMMIT` and
 `OCPP_ICS_HA_PYTHON`. The gate runs the recovery search for each iCS release and the installation week when
-the standalone proxy source or its dependency pins differ from the installed build. The week commissions a
-synthetic journal with the installed build, uses the candidate, then reopens the same journal on the installed build.
+the standalone proxy source or its dependency pins differ from the installed build. This includes the service
+pins in `requirements-trial.txt`. The week commissions a synthetic journal with the installed build, uses the
+candidate, then reopens the same journal on the installed build. Both builds use the supplied rehearsal interpreter,
+so the rehearsal checks state compatibility across the source versions in one environment.
 Passing results beside the qualification bundle are reused for matching source, builds and test environments.
 A failed check stops validation before it produces a deployment snapshot.
 
@@ -97,6 +99,7 @@ For the legacy SSH restart, the API hostname must match the SSH target. Use `ssh
 configuration for an explicit SSH alias. Verification uses the configured Uptime timestamp entity, which
 defaults to `sensor.uptime` and can be set via `uptime_entity`.
 `--skip-checks` is an exceptional explicit override after a reviewed replacement gate, not the normal workflow.
+An unchecked archive stamps the build `+dirty` when local changes or untracked integration files are included.
 
 Verify installed software identity, fresh local/native and HA state, preserved records and the requested mode.
 Record cloud connectivity separately from local readiness. Respect commissioning's documented physical limits;

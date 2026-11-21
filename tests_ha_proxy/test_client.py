@@ -228,6 +228,39 @@ async def test_actual_setup_reload_and_unload_are_passive(actual_hass, peer):
     assert set(peer["commands"]) == {"status"}
 
 
+# Intent: a loaded HA entry can still Pause when only the proxy's status reply fails.
+# Why: a reporting failure must not hide the restrictive control while the command socket can still receive it.
+async def test_pause_still_works_during_status_only_failure(actual_hass, peer):
+    hass = actual_hass
+    entry = await setup(hass, peer)
+    coordinator = entry.runtime_data
+    pause = "button.ics_proxy_pause"
+    assert hass.states.get(pause).state != "unavailable"
+    cached_revision = coordinator.data["control_revision"]
+    peer["state"]["control_revision"] = cached_revision + 1
+    peer["status_failure"] = True
+    await coordinator.async_refresh()
+
+    assert not coordinator.last_update_success
+    assert hass.states.get("button.ics_proxy_start").state == "unavailable"
+    assert hass.states.get("button.ics_proxy_start_test").state == "unavailable"
+    assert hass.states.get(pause).state != "unavailable"
+    await hass.services.async_call("button", "press", {"entity_id": pause}, blocking=True)
+
+    requests = [request for request in peer["requests"] if request["command"] != "status"]
+    assert len(requests) == 1 and requests[0]["command"] == "pause"
+    assert requests[0]["revision"] == cached_revision
+    assert peer["state"]["local_hold_verified"] is True
+    assert not coordinator.last_update_success
+
+    peer["status_failure"] = False
+    peer["state"]["can_pause"] = False
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success
+    assert hass.states.get("binary_sensor.ics_proxy_local_hold_verified").state == "on"
+    assert hass.states.get(pause).state == "unavailable"
+
+
 # Intent: deliberate button presses use only Pause/Return commands, update actual mode, and never send Start.
 # Why: returning app/schedule authority is different from initiating a new charge.
 async def test_buttons_pause_and_return_with_real_ha_services(actual_hass, peer):

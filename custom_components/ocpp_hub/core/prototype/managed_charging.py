@@ -1136,6 +1136,12 @@ class ManagedCharging:
         self.changed.set()
         return True
 
+    # Record the protective Pause independently of any subsequent timed-test result.
+    def _claim_test_pause(self, intent: ControlIntent, identifier: str) -> None:
+        write_intent(self.journal, intent, "paused")
+        claim_internal_pause(self.controller, "test", identifier)
+        self.controller.requests.charge_stopped()
+
     # Retire only the timed test's target, or the matching normal Start's own pending evidence.
     def stop(self, lease: ChargeLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
         state = self.state()
@@ -1156,9 +1162,7 @@ class ManagedCharging:
                 and self.state().get("independent_seen") is True
             )
             if intent.mode != "paused" and not preserve:
-                write_intent(j, intent, "paused")
-                claim_internal_pause(c, "test", lease.identifier)
-                c.requests.charge_stopped()
+                self._claim_test_pause(intent, lease.identifier)
             elif self.failed_start_zero_needed(lease, reason, failure):
                 c.session.gateway.controls._claim(True)
             j.starts.expire(lease, reason, preserve, failure, target=target)
@@ -1185,9 +1189,40 @@ class ManagedCharging:
                 await asyncio.wait_for(self.changed.wait(), remaining)
             except TimeoutError:
                 continue
-            except sqlite3.Error, RecoveryRequiredError, DeniedError:
+            except sqlite3.Error:
+                await self._hold_timed_cutoff(lease)
+                await asyncio.sleep(0.1)
+            except RecoveryRequiredError, DeniedError:
                 # Failed no-dispatch settlement and restrictive claims retry without inventing another outcome.
                 await asyncio.sleep(0.1)
+
+    # Try the guarded zero at the deadline while the exact timed Stop record is still waiting to be saved.
+    async def _hold_timed_cutoff(self, lease: ChargeLease) -> None:
+        c, j = self.controller, self.journal
+
+        # Only the same expired lease and its accepted local lifecycle can request this fallback hold.
+        def claim() -> bool:
+            if self.lease is not lease or lease.normal or c.stopping or time.monotonic() < lease.deadline:
+                return False
+            state, intent, local = self.state(), c.requests.intent(), j.active()
+            if (
+                state.get("id") != lease.identifier
+                or state.get("state") != "charging"
+                or local is None
+                or local != self.timed_stop_target(state)
+            ):
+                return False
+            if intent == ControlIntent("app", lease.revision):
+                with j.atomic():
+                    self._claim_test_pause(intent, lease.identifier)
+                return True
+            return intent.mode == "paused"
+
+        try:
+            if await c.commands.run(claim, priority=CommandPriority.RESTRICT):
+                await c.ensure_pause_zero()
+        except sqlite3.Error, RecoveryRequiredError, DeniedError:
+            pass  # The deadline retries the exact hold and bookkeeping on its next turn.
 
     # Decide expiry in one restrictive turn and keep the existing work bound to the same lease.
     def _expire(self, lease: ChargeLease) -> bool:

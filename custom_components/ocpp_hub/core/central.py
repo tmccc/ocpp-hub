@@ -225,6 +225,10 @@ class _Fanout:
     def on_frame(self, cp_id: str, sender: str, frame: Frame) -> None:
         self._each("on_frame", cp_id, sender, frame)
 
+    # Forward the first acceptance before any attempt to reply to the charger.
+    def on_start_committed(self, cp_id: str, transaction_id: int, payload: dict[str, Any]) -> None:
+        self._each("on_start_committed", cp_id, transaction_id, payload)
+
     # Forward a disconnect.
     def on_disconnected(self, cp_id: str) -> None:
         self._each("on_disconnected", cp_id)

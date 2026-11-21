@@ -76,6 +76,11 @@ class TransactionQuery:
     def request(self, original: dict[str, Any]) -> dict[str, Any]:
         return {**original, "data": encoded({"transactionId": self.local})}
 
+    # A cloud ID can be reused after dispatch, so both send and translation check the same unique mapping.
+    def require_mapping(self, lookup: Callable[[int], int | None]) -> None:
+        if lookup(self.vendor) != self.local:
+            raise DeniedError("the iCS transaction query no longer has its original mapping")
+
     # Translate an actual Accepted metadata reply; refusals and protocol errors retain their real meaning.
     def response(self, frame: Frame) -> Frame:
         if frame[0] == 4:

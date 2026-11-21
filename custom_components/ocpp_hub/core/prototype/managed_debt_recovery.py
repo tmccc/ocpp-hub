@@ -500,6 +500,8 @@ def start_retry_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
         or fault.get("classification") != "owner_control_or_delivery_uncertain"
     ):
         raise RecoveryRequiredError("Start retry needs its exact quarantined delivery head and fault")
+    if j.db.execute("SELECT 1 FROM delivery_replies WHERE token=?", (head.token,)).fetchone():
+        raise RecoveryRequiredError("Start retry requires ordinary settlement of its saved reply first")
     row = j.db.execute("SELECT start,stop,vendor FROM transactions WHERE local=?", (head.transaction,)).fetchone()
     rows = snapshot["outbox"]
     if row is None or row["stop"] is None or row["vendor"] is not None or json.loads(row["start"]) != head.payload:
@@ -528,13 +530,17 @@ def start_retry_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
         ):
             raise RecoveryRequiredError("queued report has no original transaction")
     retry = (snapshot["start_retries"] or {}).get(head.token, {})
+    payload_digest = fingerprint(head.payload)
+    reply_key = "quarantined_reply_digest" if head.state == "ambiguous" else "reply_digest"
+    if retry and (retry.get("local"), retry.get("payload_digest")) != (head.transaction, payload_digest):
+        raise RecoveryRequiredError("Start retry reply does not identify its original delivery")
     return {
         "delivery_token": head.token,
         "local_transaction_id": head.transaction,
-        "payload_digest": fingerprint(head.payload),
+        "payload_digest": payload_digest,
         "start_digest": fingerprint(json.loads(row["start"])),
         "stop_digest": fingerprint(json.loads(row["stop"])),
-        "reply_digest": retry.get("reply_digest", NO_REPLY),
+        "reply_digest": retry.get(reply_key, NO_REPLY),
         "fault_digest": fingerprint(fault),
     }
 

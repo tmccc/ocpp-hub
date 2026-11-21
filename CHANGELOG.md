@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep a fresh charger report after Boot distinct from a buffered report that reused its message ID.
+- Recheck historical iCS transaction mappings immediately before sending the query and when translating its reply.
+- Keep the timed charge's zero hold available if recording its Stop and reading the native charger both fail.
+- Keep Home Assistant Pause available through a failed status read when the last valid status permitted Pause.
+- Retain the digest of a malformed cloud Start reply for exact offline reconciliation.
+- Check standalone runtime pin changes at the release gate and mark unchecked Home Assistant archives with local files.
+- Run normal shutdown when a commissioning terminal closes. Require the listener's hostname to match a certificate SAN.
+- Keep the original hub transaction and one vendor report when the older charger integration receives a repeated Start.
 - Recheck a scheduled Start's charger profile when a newer poll supersedes the reading under the same authority.
 - Use the original current-change sample to distinguish earlier idle attempts from new sessions.
 - Keep Pause and current recovery at zero while the charger finishes reporting a mapped, unplugged session.

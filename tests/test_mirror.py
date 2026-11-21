@@ -345,6 +345,98 @@ async def test_stop_after_the_charger_reconnected_still_uses_the_vendors_id(star
     assert rig.vendor.calls_of("StopTransaction")[0][3]["transactionId"] == 7001
 
 
+# Intent: replaying a real Start after reconnect keeps one charge and its original vendor mapping.
+# Why: a lost first answer must not strand the vendor session or reset the meter history the hub already holds.
+@pytest.mark.parametrize("lose_first_reply", [False, True], ids=["reply-delivered", "reply-lost"])
+async def test_replayed_start_keeps_its_charge_and_vendor_mapping(
+    start_rig: Any, monkeypatch: pytest.MonkeyPatch, lose_first_reply: bool
+) -> None:
+    rig = await start_rig()
+    start = {
+        "connectorId": 1,
+        "idTag": "owner",
+        "meterStart": 100,
+        "timestamp": "2026-10-20T17:59:30Z",
+        "reservationId": 12,
+    }
+    sample = {"connectorId": 1, "meterValue": METER_VALUE}
+    first = await rig.hub.charger()
+    await first.boot()
+    if lose_first_reply:
+        session = rig.hub.central.session(CHARGER)
+        connection = session._connection
+        send = connection.send
+
+        # Drop the actual charger socket after the hub has accepted Start and before its reply can be sent.
+        async def lose_start_reply(text: str) -> None:
+            frame = json.loads(text)
+            if frame[0] == 3 and frame[1] == "lost-start":
+                session.abort()
+                await connection.wait_closed()
+            await send(text)
+
+        monkeypatch.setattr(connection, "send", lose_start_reply)
+        await first.send_raw(json.dumps([2, "lost-start", "StartTransaction", start]))
+        await first.wait_closed()
+        assert not any(frame[1] == "lost-start" for _, sender, frame in rig.hub.listener.frames if sender == "CSMS")
+    else:
+        reply = await first.call("StartTransaction", start)
+        assert reply[0] == 3
+        await first.call("MeterValues", {**sample, "transactionId": reply[2]["transactionId"]})
+        await first.close()
+    await eventually(lambda: rig.hub.central.session(CHARGER) is None, message="charger did not disconnect")
+    original = rig.hub.listener.latest.connectors[1]
+    assert original.transaction_id is not None
+
+    second = await rig.hub.charger()
+    await second.boot()
+    if lose_first_reply:
+        await second.call("MeterValues", sample)
+    assert rig.hub.listener.latest.connectors[1].stats.samples == 1
+    repeated = await second.call("StartTransaction", start)
+    assert repeated[0] == 3 and repeated[2]["transactionId"] == original.transaction_id
+    assert rig.hub.listener.latest.connectors[1].stats.samples == 1
+    assert not rig.hub.listener.finished
+
+    await second.call(
+        "StopTransaction",
+        {"transactionId": original.transaction_id, "meterStop": 600, "timestamp": "2026-10-20T18:01:00Z"},
+    )
+    await eventually(lambda: rig.vendor.calls_of("StopTransaction"), message="original session's Stop did not arrive")
+    assert [call[3] for call in rig.vendor.calls_of("StartTransaction")] == [start]
+    assert [call[3]["transactionId"] for call in rig.vendor.calls_of("StopTransaction")] == [7001]
+    (finished,) = rig.hub.listener.finished
+    assert finished.transaction_id == original.transaction_id
+    assert finished.energy_wh == 500 and finished.average_power_w == 7
+
+
+# Intent: every field of an otherwise valid reported Start can distinguish the next charge on the same connector.
+# Why: deduplicating must not suppress a real new charge or reuse the vendor's earlier transaction id.
+@pytest.mark.parametrize(
+    "changes",
+    [{"timestamp": "2026-10-20T18:00:00Z"}, {"idTag": "Owner"}, {"meterStart": 101}, {"reservationId": 13}],
+    ids=["timestamp", "tag-case", "meter", "reservation"],
+)
+async def test_distinct_starts_still_open_new_transactions(start_rig: Any, changes: dict[str, Any]) -> None:
+    rig = await start_rig()
+    charger = await rig.hub.charger()
+    await charger.boot()
+    start = {
+        "connectorId": 1,
+        "idTag": "owner",
+        "meterStart": 100,
+        "timestamp": "2026-10-20T17:59:30Z",
+        "reservationId": 12,
+    }
+    first = await charger.call("StartTransaction", start)
+    second = await charger.call("StartTransaction", start | changes)
+    assert first[0] == second[0] == 3
+    assert first[2]["transactionId"] != second[2]["transactionId"]
+    assert [charge.transaction_id for charge in rig.hub.listener.finished] == [first[2]["transactionId"]]
+    await eventually(lambda: len(rig.vendor.calls_of("StartTransaction")) == 2, message="starts did not arrive")
+    assert [call[3] for call in rig.vendor.calls_of("StartTransaction")] == [start, start | changes]
+
+
 # Intent: a wss vendor is reached with the SSL context given to the mirror.
 # Why: the real vendor backend is probably TLS-only, and the context is built outside the event loop on purpose.
 async def test_wss_vendor_is_reached_with_the_given_ssl_context(

@@ -39,18 +39,19 @@ class ProxyButton(ProxyEntity, ButtonEntity):
             "start_test": "mdi:play-circle-outline",
         }[action]
 
-    # Returning requires the latest confirmed hold/revision; Stop remains available for an ordinary cloud outage.
+    # Pause can use the last valid status because the proxy accepts a stale revision for this restrictive command.
     @property
     def available(self) -> bool:
-        key = {"start": "can_start", "pause": "can_pause", "app_control": "can_return", "start_test": "can_start_test"}[
-            self.action
-        ]
+        data = self.coordinator.data or {}
+        if self.action == "pause":
+            return data.get("can_pause") is True
+        key = {"start": "can_start", "app_control": "can_return", "start_test": "can_start_test"}[self.action]
         fresh = self.coordinator.fresh_local_healthy if self.action == "start" else self.coordinator.fresh_healthy
-        requested = self.coordinator.data.get("requested_current_a", 6)
+        requested = data.get("requested_current_a", 6)
         return (
             super().available
-            and self.coordinator.data.get(key) is True
-            and (self.action == "pause" or fresh)
+            and data.get(key) is True
+            and fresh
             and (self.action != "start_test" or type(requested) is int and requested == 6)
         )
 

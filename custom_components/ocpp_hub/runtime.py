@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
@@ -165,6 +166,10 @@ class HubListener:
     def on_frame(self, cp_id: str, sender: str, frame: Frame) -> None:
         if _FRAME_LOGGER.isEnabledFor(logging.DEBUG):
             _FRAME_LOGGER.debug("%s %s %s", cp_id, sender, frame)
+
+    # The snapshot already publishes the active charge for Home Assistant.
+    def on_start_committed(self, cp_id: str, transaction_id: int, payload: dict[str, Any]) -> None:
+        return None
 
     # Keep a finished charge in the history and tell the entities that show it.
     def on_session_finished(self, session: ChargeSession) -> None:

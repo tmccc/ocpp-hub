@@ -153,7 +153,8 @@ async def run(
     session = TrialSession(prepared, native_bounded=bounded)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for signum in (signal.SIGTERM, signal.SIGINT):
+    stop_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    for signum in stop_signals:
         loop.add_signal_handler(signum, stopped.set)
     tasks: list[asyncio.Task[None]] = []
     cleanup_completed = False
@@ -191,7 +192,7 @@ async def run(
                     save_private(prepared.config.journal.with_suffix(".status.json"), session.final_status)
                     emit({"trial_stopped": True, "shutdown_uncertain": session.final_status["shutdown_uncertain"]})
             finally:
-                for signum in (signal.SIGTERM, signal.SIGINT):
+                for signum in stop_signals:
                     loop.remove_signal_handler(signum)
     if session.final_status is None or session.final_status["shutdown_uncertain"]:
         return 2

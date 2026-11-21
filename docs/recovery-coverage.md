@@ -56,6 +56,8 @@ native closure, the charger’s Stop report and the cloud reply, then verify ori
 The [Home Assistant timed replays](../tests_ha_proxy/test_timed_system.py) use actual commissioning, a lost
 Start reply, HA reload on either side of the Stop, and both explicit Pause and automatic cutoff. They then
 exercise Return, change the selected current through HA, and finish a subsequent scheduled charge.
+The [timed cutoff tests](../tests/test_managed_test_charge.py) also hold a native read failure and a failed timed
+Stop write together. The exact timed session still receives a zero hold, and Stop waits for recovery of its own proof.
 
 The focused interaction checks run in the ordinary engine suite. The finite families below have their
 own per-case manifest and recovery evidence.
@@ -151,8 +153,8 @@ These controls model task/runtime/process death, not literal hardware power fail
 
 | Boundary | Safety | Recovery | Bound |
 |---|---|---|---|
-| Observation retry | Durable CALL identity is distinct from equal message bodies; pending receipts cannot be evicted | BEGIN/statement/COMMIT refusal rolls back receipt, queue and local status; repaired retry and later sessions succeed | A bounded recent retry window; new untimed reports after a fresh replacement Boot remain distinct. |
-| Cloud Start reply | Explicit error retry, denied authorization and unknown delivery have different receipts | Retry budget survives restart; exact new proof after recovery itself fails; denied Start keeps mapping for real Stop | Mapping commits before the separate physical zero confirmation; held incoming zero commands prove both boundaries. Three transmissions with60/120-second waits; no automatic retry of an unknown outcome. |
+| Observation retry | Durable CALL identity includes the observed Boot generation. Pending receipts cannot be evicted. | A failed SQLite transaction rolls back the receipt, queue and local status. Retries and later sessions succeed after recovery. | A buffered report before Boot and a fresh report after it can reuse a CALL ID. The recent retry window is bounded. |
+| Cloud Start reply | Explicit error retry, denied authorization and unknown delivery have different receipts | Retry budget survives restart. A quarantined malformed reply keeps its digest. Denied Start keeps its mapping for real Stop. | Mapping commits before the separate physical zero confirmation. There are three transmissions with 60/120-second waits for explicit errors, and an unknown outcome needs independent proof before retry. |
 | Forwarded charger Start and Stop replies | Match the actual charger reply to the issued request. An accepted Stop still needs its own closure report. | Retry temporary journal writes without sending the command again. Settle a saved reply after restart and respect the latest owner request. | The simulator cuts the process on both sides of the reply commit. A reply lost before commit retains the zero hold and shows the unknown outcome. |
 | Start dispatch | Prepared/unsent/rejected differs from issued/accepted unknown; exact request/tag binding | Exact closed local lifecycle and atomic receipt/metadata settlement at verified zero; unmapped cloud debt remains separately blocked | Unknown/unbound debt still needs supported exact evidence. |
 | Current/native proof | Real503/EOF/bad JSON, profile/composite rejection, applied CALLERROR, excessive composite | Prior selection unless target fully confirmed before revocation; new Pause/Return | All integer pairs for successful selection/idempotency; failure-order grammar uses representative currents. |

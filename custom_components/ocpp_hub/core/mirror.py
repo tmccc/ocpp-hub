@@ -12,6 +12,7 @@ import logging
 import ssl
 from collections.abc import Callable
 from datetime import datetime
+from typing import Any
 
 from .control import ControlPolicy
 from .frames import Frame
@@ -19,7 +20,7 @@ from .mirror_link import MirrorLink
 from .mirror_model import MirrorSettings, MirrorStatus
 from .model import ChargerSnapshot, ChargeSession
 from .plan_bridge import PlanHandler
-from .session import SENDER_CHARGER, SENDER_HUB, ChargerSession
+from .session import SENDER_CHARGER, ChargerSession
 from .txid_map import TransactionIdMap
 
 _LOGGER = logging.getLogger(__name__)
@@ -100,18 +101,19 @@ class VendorMirror:
     def on_snapshot(self, snapshot: ChargerSnapshot) -> None:
         return None
 
-    # Pass a frame to the link of its charger: the charger's requests go to the vendor, the hub's answers help to pair
-    # transaction ids.
+    # Forward charger traffic. Accepted Starts are sent through their separate committed event.
     def on_frame(self, cp_id: str, sender: str, frame: Frame) -> None:
         link = self._links.get(cp_id)
-        if link is None:
-            return
-        if sender == SENDER_CHARGER:
+        if link is not None and sender == SENDER_CHARGER:
             link.charger_frame(frame)
-        elif sender == SENDER_HUB:
-            link.hub_frame(frame)
 
-    # Finished charges are the entities' business; the mirror forwards frames, which already carry them.
+    # Mirror the original Start once even if the charger never receives its local transaction id.
+    def on_start_committed(self, cp_id: str, transaction_id: int, payload: dict[str, Any]) -> None:
+        link = self._links.get(cp_id)
+        if link is not None:
+            link.start_committed(transaction_id, payload)
+
+    # Finished charges are the entities' business; the mirror forwards the charger's own Stop report.
     def on_session_finished(self, session: ChargeSession) -> None:
         return None
 

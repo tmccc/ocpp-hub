@@ -20,7 +20,7 @@ from ocpp_hub_core.frames import build_call_result
 from ocpp_hub_core.prototype.delivery_reply import DeliveryReply
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
-from ocpp_hub_core.prototype.managed_start_delivery import DENIALS
+from ocpp_hub_core.prototype.managed_start_delivery import DENIALS, RETRIES
 from ocpp_hub_core.prototype.managed_stop_delivery import REJECTION
 from ocpp_hub_core.prototype.runtime import ConnectionRuntime
 from ocpp_hub_core.prototype.store import Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
@@ -683,12 +683,12 @@ async def test_saved_reply_identity_and_cleanup_contract(tmp_path, tamper):
         j.close()
 
 
-# Intent: malformed but genuinely received Start metadata is quarantined, not restored in a reconnect loop.
-# Why: a durable response cannot bypass unknown-mapping zero or keep restarting the vendor session forever.
+# Intent: an actual malformed Start response leaves a digest after quarantine, including after the wire deadline.
+# Why: late, repeated and conflicting replies must preserve exact provenance without replaying or mapping the Start.
 @pytest.mark.parametrize("selected", [6, 16, 32])
-@pytest.mark.parametrize("replaced", [False, True], ids=["same-process", "replacement"])
+@pytest.mark.parametrize("boundary", ["same-process", "replacement", "late", "saved-conflict"])
 async def test_malformed_start_reply_cache_quarantines_without_replay(
-    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, selected, replaced
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, selected, boundary
 ):
     async with AsyncExitStack() as stack:
         b = await stack.enter_async_context(
@@ -704,13 +704,37 @@ async def test_malformed_start_reply_cache_quarantines_without_replay(
             )
         )
         strategy_file(b.rig, tmp_path)
+        gateway, journal = b.session.gateway, b.session.journal
+        if boundary == "late":
+            gateway.vendor.timeout = 0.25
         b.rig.bench.start_replies = ["bad-info"]
         held, local = await enqueue(b, "StartTransaction", 0)
+        retained_answer = held.answer
+        if boundary == "saved-conflict":
+            # Simulate a conflicting durable checkpoint without replacing receipt or gateway logic.
+            retained_answer = b.rig.bench.underlying_start_replies[-1]
+            saved_json = journal.db.execute("SELECT quote(?)", (encoded(retained_answer),)).fetchone()[0]
+            journal.db.execute(
+                "CREATE TEMP TRIGGER reply_conflict AFTER INSERT ON delivery_replies "
+                f"WHEN NEW.action='StartTransaction' BEGIN UPDATE delivery_replies SET answer={saved_json} "
+                "WHERE token=NEW.token; END"
+            )
+        if boundary == "late":
+            await until(lambda: journal.next_delivery().state == "ambiguous")
+            assert held.token in gateway.vendor._late_receivers
         held.release.set()
         await until(lambda: b.session.runtime.status.delivery_blocked)
         assert b.session.runtime.status.delivery_blocked_cause == "reconciliation"
-        assert b.session.journal.next_delivery().state == "ambiguous"
-        if replaced:
+        assert journal.next_delivery().state == "ambiguous"
+        reply_digest = fingerprint(retained_answer)
+        await until(
+            lambda: journal.get(RETRIES, {}).get(held.token, {}).get("quarantined_reply_digest") == reply_digest
+        )
+        if boundary == "late":
+            unmatched = gateway.vendor.diagnostics.unmatched_replies
+            await b.rig.bench.cloud.send(build_call_result(held.token, held.answer[2]))
+            await until(lambda: gateway.vendor.diagnostics.unmatched_replies == unmatched + 1)
+        if boundary != "same-process":
             await b.controller.charging.close()
             await crash(b.session)
             b = await stack.enter_async_context(replacement(b, "malformed-reply-replacement"))
@@ -723,6 +747,7 @@ async def test_malformed_start_reply_cache_quarantines_without_replay(
         assert j.next_delivery().state == "ambiguous" and wire_count(b.rig, held.token) == 1
         assert b.session.journal.outcomes.delivery_reply is None
         assert j.db.execute("SELECT COUNT(*) FROM delivery_replies").fetchone()[0] == 0
+        assert j.get(RETRIES)[held.token]["quarantined_reply_digest"] == reply_digest
         assert str(local) not in j.get(DENIALS, {})
         heartbeats = sum(frame[0] == 2 and frame[2] == "Heartbeat" for frame in b.rig.bench.calls)
         await until(
@@ -738,6 +763,7 @@ async def test_malformed_start_reply_cache_quarantines_without_replay(
         b = await replace_and_recover(
             stack, b, SqlFault("begin", held.token), held, "StartTransaction", tmp_path, capsys, 99
         )
+        assert held.token not in b.session.journal.get(RETRIES, {})
         assert (await mp.healthy(b.controller))["station_ceiling_a"] == selected
         await two_later_sessions(b, selected=selected, original_starts=0, first_minute=20)
         assert wire_count(b.rig, held.token) == 1 and not b.rig.bench.backend_errors

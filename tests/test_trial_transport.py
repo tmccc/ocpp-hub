@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import socket
 import ssl
+import subprocess
 import sys
 import time
 from dataclasses import replace
@@ -84,6 +86,47 @@ def test_listener_certificate_requires_positive_name_result(monkeypatch):
         verify_listener_certificate(0, "127.0.0.1")
 
 
+# Intent: DNS preflight requires a matching DNS SAN on a real OpenSSL certificate.
+# Why: a matching Common Name alone can pass OpenSSL's hostname check and then be refused by the charger.
+@pytest.mark.parametrize(
+    "san,accepted",
+    [
+        ("DNS:offline.local.example", True),
+        ("IP:127.0.0.1,DNS:*.local.example", True),
+        ("DNS:wrong.local.example", False),
+        ("IP:127.0.0.1", False),
+        (None, False),
+    ],
+)
+def test_listener_dns_certificate_requires_subject_alternative_name(tmp_path, san, accepted):
+    certificate = tmp_path / "listener.pem"
+    args = [
+        "/usr/bin/openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=offline.local.example",
+        "-keyout",
+        str(tmp_path / "listener.key"),
+        "-out",
+        str(certificate),
+    ]
+    if san is not None:
+        args += ["-addext", f"subjectAltName={san}"]
+    subprocess.run(args, check=True, capture_output=True, timeout=20)
+    with certificate.open("rb") as stream:
+        if accepted:
+            assert verify_listener_certificate(stream.fileno(), "offline.local.example") > time.time() + 1800
+        else:
+            with pytest.raises(SecurityError, match="certificate name or validity"):
+                verify_listener_certificate(stream.fileno(), "offline.local.example")
+
+
 # Intent: default CLI validation parses files/certificates but creates no journal, socket or DNS request.
 # Why: preparing the package must never become an accidental live switch.
 def test_default_cli_preflight_is_dormant(
@@ -136,10 +179,11 @@ def test_preflight_preserves_long_ocpp_identity(
         replace(prepared.config, identity="C" * 65)
 
 
-# Intent: final failure status replaces the running status even when cleanup itself raises after retiring connections.
-# Why: a storage failure during shutdown must not leave a stale healthy report or installed signal handlers.
+# Intent: both the startup deadline and a terminal hangup reach reporting and signal cleanup despite close errors.
+# Why: a shutdown error must not leave a stale healthy report or installed signal handlers.
+@pytest.mark.parametrize("hangup", [False, True], ids=["startup-timeout", "terminal-hangup"])
 async def test_cli_persists_final_status_when_close_raises(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], monkeypatch: Any, capsys: Any
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], monkeypatch: Any, capsys: Any, hangup: bool
 ) -> None:
     from tools import trial_proxy
 
@@ -147,22 +191,50 @@ async def test_cli_persists_final_status_when_close_raises(
     final = {"running": False, "phase": "unavailable", "shutdown_uncertain": True}
     removed = []
     loop = asyncio.get_running_loop()
+    original_add = loop.add_signal_handler
     original_remove = loop.remove_signal_handler
+    registered = set()
+    delivered = set()
+    polls = []
 
     # Model the explicit outer CLI boundary after a real session has already produced its failure report.
     class FailedSession:
         # Accept the validated package without opening a socket in this boundary-only regression.
         def __init__(self, prepared: Any, **kwargs: Any) -> None:
             self.final_status: dict[str, Any] | None = None
+            self.started = False
 
-        # Enter cleanup immediately, as if the bounded startup deadline had expired.
+        # Deliver a real signal only if the CLI installed its handler, so a regression cannot kill the test runner.
         async def start(self) -> None:
-            raise TimeoutError
+            if not hangup:
+                raise TimeoutError
+            assert signal.SIGHUP in registered
+            self.started = True
+            os.kill(os.getpid(), signal.SIGHUP)
+            async with asyncio.timeout(2):
+                while signal.SIGHUP not in delivered:
+                    await asyncio.sleep(0.005)
+
+        # Any poll after the stop signal would mean the main loop still ran.
+        async def command(self, command: dict[str, Any]) -> None:
+            polls.append(command)
+            raise AssertionError("commissioning did not enter cleanup after the signal")
 
         # Preserve the real shutdown contract: final status exists even if a later storage close raises.
         async def close(self) -> None:
             self.final_status = final
             raise RuntimeError("synthetic private failure")
+
+    # Observe the real event loop delivering the signal to the CLI's original callback.
+    def register(signum, callback) -> None:
+        registered.add(signum)
+
+        # Run the CLI callback before allowing startup to resume.
+        def receive() -> None:
+            callback()
+            delivered.add(signum)
+
+        original_add(signum, receive)
 
     # Observe cleanup while preserving the event loop's actual signal-handler removal.
     def remove(signum: Any) -> bool:
@@ -171,12 +243,14 @@ async def test_cli_persists_final_status_when_close_raises(
 
     monkeypatch.setattr(trial_proxy, "TrialSession", FailedSession)
     monkeypatch.setattr(trial_proxy, "native_spec", lambda *_: object())
+    monkeypatch.setattr(loop, "add_signal_handler", register)
     monkeypatch.setattr(loop, "remove_signal_handler", remove)
     save_private(config.journal.with_suffix(".status.json"), {"running": True, "shutdown_uncertain": False})
-    with pytest.raises(RuntimeError):
-        await trial_proxy.run(path, 60, False, tmp_path / "explicit-test-spec.json")
+    with pytest.raises(RuntimeError, match="synthetic private failure"):
+        await trial_proxy.run(path, 60, hangup, tmp_path / "explicit-test-spec.json")
+    assert not polls
     assert json.loads(config.journal.with_suffix(".status.json").read_text()) == final
-    assert len(removed) == 2
+    assert set(removed) == {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
     output = capsys.readouterr().out
     assert json.loads(output.splitlines()[-1]) == {"trial_stopped": True, "shutdown_uncertain": True}
     assert "private" not in output

@@ -136,8 +136,6 @@ class MirrorLink:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._queue = OutgoingQueue(settings.max_queue)
         self._pairing = StartPairing(transactions)
-        # Charger unique id of a StartTransaction the hub has not answered yet -> the mirror's id for it.
-        self._start_tokens: dict[str, str] = {}
         self._replies: dict[str, asyncio.Future[Frame]] = {}
         self._wakeup = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -202,44 +200,24 @@ class MirrorLink:
             self._connected, waiting, self._last_success, self._last_error, self._dropped, self._unmapped
         )
 
-    # Take in a frame the charger sent to the hub. Requests are queued for the vendor; heartbeats are not,
-    # because the vendor chose its own heartbeat interval and gets heartbeats from the link itself.
+    # Queue charger requests apart from Starts and heartbeats, which have their own sources.
     def charger_frame(self, frame: Frame) -> None:
         action = call_action(frame)
-        if action is None or action == ACTION_HEARTBEAT or not isinstance(frame[3], dict):
+        if action is None or action in (ACTION_HEARTBEAT, ACTION_START) or not isinstance(frame[3], dict):
             return
         item = Outgoing(str(frame[1]), action, frame[3])
         if action == ACTION_BOOT:
             self._boot = item
         elif action == ACTION_STATUS and (connector := connector_of(item)) is not None:
             self._statuses[connector] = item
-        elif action == ACTION_START:
-            item = self._track_start(item)
         self._enqueue(item)
 
-    # Give a StartTransaction a unique id of the mirror's own and remember which charger id it belongs to.
-    # A charger can reuse an id after a restart while an earlier start still waits for an offline vendor, so pairing
-    # on the charger's id would mix up the two transactions.
-    def _track_start(self, item: Outgoing) -> Outgoing:
-        tracked = replace(item, unique_id=_new_id())
-        self._start_tokens[item.unique_id] = tracked.unique_id
-        self._pairing.expect(tracked.unique_id)
-        return tracked
-
-    # Take in a frame the hub sent to the charger. Only the answers to StartTransaction matter: they carry the
-    # transaction id the hub handed out, which the vendor's own id has to be paired with. The hub answers every
-    # request once, so the id is forgotten here and the table cannot grow.
-    def hub_frame(self, frame: Frame) -> None:
-        if frame[0] not in (MSG_CALL_RESULT, MSG_CALL_ERROR):
-            return
-        token = self._start_tokens.pop(str(frame[1]), None)
-        if token is None:
-            return
-        hub_id = frame[2].get("transactionId") if frame[0] == MSG_CALL_RESULT and isinstance(frame[2], dict) else None
-        if is_integer(hub_id):
-            self._pairing.hub_answered(token, hub_id)
-        else:
-            self._pairing.abandon(token)
+    # Pair the local id with the future vendor answer before sending, using a message id of the mirror's own.
+    def start_committed(self, transaction_id: int, payload: dict[str, Any]) -> None:
+        item = Outgoing(_new_id(), ACTION_START, payload)
+        self._pairing.expect(item.unique_id)
+        self._pairing.hub_answered(item.unique_id, transaction_id)
+        self._enqueue(item)
 
     # Queue a frame, count what the size limit made us drop, and wake the sender.
     def _enqueue(self, item: Outgoing) -> None:

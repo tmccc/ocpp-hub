@@ -72,6 +72,16 @@ class ChargeStats:
 
 
 @dataclass(frozen=True, slots=True)
+class StartIdentity:
+    """The original fields of a valid Start report on its connector."""
+
+    timestamp: str
+    id_tag: str
+    meter_start: int
+    reservation_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorState:
     """Status of one connector, plus the transaction running on it."""
 
@@ -84,6 +94,7 @@ class ConnectorState:
     meter_start_wh: float | None = None
     started_at: datetime | None = None
     stats: ChargeStats = field(default_factory=ChargeStats)
+    start_identity: StartIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
