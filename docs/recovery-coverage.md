@@ -29,7 +29,7 @@ that every state has a recovery path when failures cease and the required exact 
 arrives. The model represents ownership by whether a report belongs to the tracked request or session.
 It groups current values into retained and changed selections. The separate current families test literal amps.
 
-The [held-Start replays](../tests_discovery/test_complete_overlap.py) run all 40 orders in their grammar
+The [held-Start replays](../tests_model/test_complete_overlap.py) run all 40 orders in their grammar
 against the standalone service. They cover a failed Pause write, a newer Pause, Return and its UUID replay,
 lost or delivered Start replies, and process replacement. Each finishes with real simulated lifecycle reports
 and a subsequent charge. The [daily replays](../tests_model/test_interaction_replay.py) run all six orders
@@ -41,7 +41,7 @@ A valid read and the resulting Start record share one turn in the decision queue
 ```sh
 TMPDIR=/absolute/task .venv/bin/python -B tools/offline_validate.py \
     tests_model/test_interaction_model.py tests_model/test_interaction_replay.py \
-    tests_discovery/test_complete_overlap.py
+    tests_model/test_complete_overlap.py
 ```
 
 The [system model](../tests_model/test_system_interactions.py) also explores the timed controls, installation
