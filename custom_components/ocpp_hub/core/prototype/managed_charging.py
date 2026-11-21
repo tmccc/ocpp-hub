@@ -423,11 +423,18 @@ class ManagedCharging:
             if initial.physical.connection != "Plug":
                 raise DeniedError("test requires a freshly connected idle vehicle")
             self.guard(lease)
+            if j.active() is not None:
+                raise DeniedError("another session began before the Start's idle hold")
             effects = True
 
             # Capture this exact restrictive claim even if the outer worker is cancelled while its child finishes.
             def initial_zero_guard() -> None:
+                nonlocal effects
                 self.guard(lease, stopping=True)
+                if j.active() is not None:
+                    if lease.initial_zero_ticket is None:
+                        effects = False
+                    raise DeniedError("another session began during the Start's idle hold")
                 control, g = j.get("control", {}), c.session.gateway
                 if lease.initial_zero_ticket is None and control.get("stop_epoch", 0) == lease.stop_epoch:
                     return  # LocalControl checks once before synchronously making its own claim.
@@ -596,8 +603,16 @@ class ManagedCharging:
     def record_source(self, native: HandoverEvidence) -> None:
         g = self.controller.session.gateway
         self.source = (native, g.boot_observation, g.controls._revision)
-        local, state = self.journal.active(), self.state()
-        if local is not None and self.independent_daily(native, local) and not state.get("independent_seen"):
+        state, lease = self.state(), self.lease
+        if state.get("state") == "completed" or state.get("independent_seen"):
+            return
+        if (
+            not (lease is not None and lease.normal and lease.identifier == state.get("id"))
+            and not self.scoped_normal_stop()
+        ):
+            return
+        local = self.journal.active()
+        if local is not None and self.independent_daily(native, local):
             self.journal.starts.independent_seen(state)
 
     # The verified original plan and matching ledger identify the daily even when the owner uses its tag.
@@ -817,7 +832,11 @@ class ManagedCharging:
             active = j.active()
             if expected.mode == "paused" or active is not None and not self.current_daily(active):
                 await self.hold_expired()
-            native = await c.native.read()
+            owner = local_start_receipt(j)
+            closing = (
+                active if owner.get("local") == active and owner.get("digest") == state.get("tag_digest") else None
+            )
+            native = await c.native.read(closing_local=closing, stop_only=closing is not None)
 
             # Apply the native closure to the original outstanding owner Start.
             def settle_at_zero() -> bool:
@@ -888,7 +907,8 @@ class ManagedCharging:
                     ):
                         raise RecoveryRequiredError("expired owner Stop was superseded")
 
-                await g.controls.stop(expected_local=local, guard=guard)
+                if not g.controls.stop_acknowledged(local):
+                    await g.controls.stop(expected_local=local, guard=guard)
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
             try:
                 await self.hold_expired()

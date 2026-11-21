@@ -81,7 +81,8 @@ async def cut_and_restart(tmp, model_tls, ports, monkeypatch, boundary, selected
                 gate = await child.gate(boundary, identifier)
                 assert gate["transaction_open"] is (boundary == "before-accepted-commit")
                 if boundary == "before-accepted-commit":
-                    await until(lambda: report(child)["wire"]["observed_reply"] == "accepted", timeout=2)
+                    before_publication = report(child)["journal"]["start"]
+                    assert before_publication["stage"] == "issued" and before_publication["saved_reply"] == "accepted"
             frames = starts(child.rig)
             before = child.durable()["metadata"]["local_start_receipt"]
             assert before["request_id"] == identifier and before["local"] is None
@@ -107,7 +108,9 @@ async def cut_and_restart(tmp, model_tls, ports, monkeypatch, boundary, selected
             )
         before_report = child.durable()
         learned = report(child)
-        assert child.durable()["metadata"]["local_start_receipt"] == before
+        expected = {**before, "stage": "accepted"} if boundary == "before-accepted-commit" else before
+        assert before_report["metadata"]["local_start_receipt"] == expected
+        assert child.durable()["metadata"]["local_start_receipt"] == before_report["metadata"]["local_start_receipt"]
         assert child.durable()["requests"] == before_report["requests"]
         assert starts(child.rig) == frames
         assert len(child.kills) == 1
@@ -152,18 +155,18 @@ async def test_incident_issued_leaves_transmission_unknown(tmp_path, model_tls, 
     assert learned["wire"]["send"] == learned["wire"]["observed_reply"] == "unknown"
 
 
-# Intent: a real matched Accepted can be observed while process death rolls back its journal write.
-# Why: the optional report cannot upgrade an observed reply into committed recovery authority.
-async def test_incident_observed_reply_survives_failed_commit(
+# Intent: the journal exposes a real Accepted while the separate Start authority write is still uncommitted.
+# Why: the reply survives restart independently, and the real Start lifecycle must still arrive.
+async def test_incident_durable_reply_visible_before_control_commit(
     tmp_path, model_tls, unused_tcp_port_factory, monkeypatch
 ):
     learned = await cut_and_restart(
         tmp_path / "before-commit", model_tls, unused_tcp_port_factory, monkeypatch, "before-accepted-commit", 6
     )
-    assert learned["wire"]["observed_reply"] == "accepted"
-    assert learned["journal"]["start"]["stage"] == "issued"
-    assert learned["journal"]["start"]["saved_reply"] == "unknown"
-    assert learned["waiting_for_evidence"] == ["start_outcome_or_lifecycle"]
+    assert learned["journal"]["start"]["stage"] == "accepted"
+    assert learned["journal"]["start"]["saved_reply"] == "accepted"
+    assert learned["journal"]["start"]["authority_published"] is False
+    assert learned["waiting_for_evidence"] == ["start_lifecycle"]
 
 
 # Intent: a genuine late Accepted is correlated with the exact newer Pause through a process replacement.
@@ -290,6 +293,35 @@ def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
         assert learned["wire"]["ticket"] is None and learned["wire"]["observed_reply"] == "unknown"
     finally:
         journal.close()
+
+
+# Intent: a committed charger error is visible when the optional incident log is absent.
+# Why: a real reply and actual session completion are separate evidence for the original request.
+def test_incident_reads_the_exact_saved_start_error(tmp_path):
+    path = tmp_path / "journal.db"
+    events = tmp_path / "journal.start-events.jsonl"
+    journal = Journal(path, "OFFLINE001")
+    request, ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    try:
+        ManagedRequests(journal)
+        journal.db.execute("INSERT INTO managed_requests VALUES(?,'start',0,'uncertain','{}')", (request,))
+        journal.put("local_start_receipt", {"request_id": request, "ticket": ticket, "stage": "issued", "local": None})
+        journal.db.execute(
+            "INSERT INTO owner_command_wires VALUES(?,?,?,NULL,'RemoteStartTransaction',NULL,NULL,'Accepted')",
+            (uuid.uuid4().hex, request, uuid.uuid4().hex),
+        )
+        assert incident_report(path, events)["journal"]["start"]["saved_reply"] == "unknown"
+        journal.db.execute(
+            "INSERT INTO owner_command_wires VALUES(?,?,?,NULL,'RemoteStartTransaction',NULL,NULL,'error')",
+            (uuid.uuid4().hex, request, ticket),
+        )
+    finally:
+        journal.close()
+
+    result = incident_report(path, events)
+    assert result["journal"]["start"]["saved_reply"] == "call_error"
+    assert result["journal"]["start"]["lifecycle"] == "unbound"
+    assert result["wire"]["send"] == "matching_reply" and result["wire"]["observed_reply"] == "unknown"
 
 
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.

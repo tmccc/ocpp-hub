@@ -139,8 +139,23 @@ async def test_rollback_restart_after_actual_absence_never_listens_or_reclears(
         await second.start()
         assert second.runtime._server is None and not second.started
         assert second.gateway.charger.sender is None
-        assert (await second.command({"command": "native-bounded-handover"}))["profiles_restored"]
-        assert second.journal.get("trial_phase") == "backend_restore_pending"
+        from tools import trial_proxy
+
+        observed = []
+
+        # Exercise the actual commissioning runner's listenerless handover route with real retained evidence.
+        async def terminal(candidate, stopped):
+            assert candidate is second and not candidate.started and candidate.runtime._server is None
+            assert (await candidate.command({"command": "native-bounded-handover"}))["profiles_restored"]
+            observed.append(candidate.journal.get("trial_phase"))
+            stopped.set()
+
+        monkeypatch.setattr(trial_proxy, "preflight", lambda _: rig.prepared)
+        monkeypatch.setattr(trial_proxy, "native_spec", lambda *_: rig.spec)
+        monkeypatch.setattr(trial_proxy, "TrialSession", lambda *_, **__: second)
+        monkeypatch.setattr(trial_proxy, "interactive", terminal)
+        assert await trial_proxy.run(tmp_path / "config.json", 10, True, tmp_path / "spec.json") == 0
+        assert observed == ["backend_restore_pending"]
         assert rig.bench.device_calls == before
         assert [frame[3] for frame in before if frame[2] == "ClearChargingProfile"] == [{"id": 7001}]
         assert rig.peer.configuration["AmpLmt"] == "6" and rig.peer.runtime_user == 60

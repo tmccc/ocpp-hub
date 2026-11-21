@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import ssl
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -86,13 +87,18 @@ async def test_current_selection_confirms_real_profile_and_persists_revision(
 
 
 # Intent: a completed historical attempt cannot be mistaken for an overlap when the charger retains its plan marker.
-# Why: a new idle selection still needs to apply when the car has no real transaction or recent attempt.
+# Why: an attempt already visible in the idle sample is not a new session, even if it happened seconds ago.
+@pytest.mark.parametrize("recent", [False, True])
 async def test_current_selection_ignores_already_observed_unassigned_attempt(
-    tmp_path, tls, unused_tcp_port, monkeypatch
+    tmp_path, tls, unused_tcp_port, monkeypatch, recent
 ):
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
         rig = test.rig
-        rig.bench.history.append(unassigned())
+        attempt = unassigned()
+        if recent:
+            attempt["startTime"] = int(time.time()) - 5
+            attempt["MeterValues"][0]["timestamp"] = attempt["startTime"] + 1
+        rig.bench.history.append(attempt)
         native = rig.peer.native
 
         # Reproduce firmware retaining the actual original plan marker after the car returned to idle.

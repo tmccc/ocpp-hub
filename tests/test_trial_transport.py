@@ -208,7 +208,9 @@ def test_private_file_boundary(tmp_path: Path, change: str) -> None:
 
 # Intent: a path typo cannot make baseline capture or status writing overwrite a credential/configuration input.
 # Why: all derived output locations must remain independent before any live read or disk write begins.
-@pytest.mark.parametrize("alias", ["baseline-secret", "journal-secret", "status-secret", "config-output"])
+@pytest.mark.parametrize(
+    "alias", ["baseline-secret", "journal-secret", "status-secret", "config-output", "linked-output"]
+)
 def test_trial_file_aliases_are_rejected(
     tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], alias: str
 ) -> None:
@@ -222,6 +224,11 @@ def test_trial_file_aliases_are_rejected(
             replace(config, journal=config.native_secret)
         elif alias == "status-secret":
             replace(config, upstream_secret=config.journal.with_suffix(".status.json"))
+        elif alias == "linked-output":
+            first, second = tmp_path / "first.json", tmp_path / "second.json"
+            first.touch()
+            second.hardlink_to(first)
+            replace(config, baseline=first, evidence=second)
         else:
             value = json.loads(path.read_text())
             value["baseline"] = str(path)

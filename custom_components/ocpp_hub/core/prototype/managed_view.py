@@ -109,6 +109,7 @@ def health_snapshot(
         and value.get("preservation_failed") is False
         and not delivery_blocked
         and value.get("cloud_start_pending") is not True
+        and value.get("operator_reconciliation_required") is not True
         and selected is not None
         and 6 <= selected <= native_ceiling
         and value.get("native_limit_a") == native_ceiling
@@ -123,6 +124,7 @@ def health_snapshot(
             (value.get("charger_connected") is not False, "charger_disconnected"),
             (value.get("boot_verified") is not False, "boot_unverified"),
             (value.get("cloud_start_pending") is not True, "cloud_start_pending"),
+            (value.get("operator_reconciliation_required") is not True, "command_outcome_unknown"),
             (bool(authority), "control_verification_pending"),
             (certificate_valid, "certificate_validity_insufficient"),
             (value.get("cloud_connected") is not False, "cloud_disconnected"),
@@ -576,7 +578,8 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
             test_charge=None,
         )
     result.setdefault("last_session_energy_kwh", None)
-    supervising = not c.stopping and not j.fault.latched() and not station_lost
+    uncertain = result.get("operator_reconciliation_required") is True
+    supervising = not c.stopping and not j.fault.latched() and not station_lost and not uncertain
     scope_current = same_session and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):

@@ -10,6 +10,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype import trial_evidence
 from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.security import SecurityError, StaleEvidenceError
@@ -158,6 +159,23 @@ async def test_strict_native_refusal_revokes_status_before_next_poll(tmp_path, t
             assert not status["healthy"] and not status["owner_control_enabled"]
             assert status["power_w"] is None and not status["can_start"]
         assert (await healthy(c))["owner_control_enabled"]
+
+
+# Intent: a refused Start report immediately withdraws stale health from before the station profile changed.
+# Why: the profile-only observation can prove the old sample invalid without a second supervision poll.
+async def test_reported_start_ceiling_refusal_revokes_status(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, journal = b.controller, b.session.journal
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        assert refresh_for_read(c, published)["healthy"]
+        b.rig.bench.firmware.profiles.pop(HUB_PROFILE_ID)
+        result = await b.rig.bench.call(
+            b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+        )
+        assert result[0] == 4 and journal.active() is None
+        latest = refresh_for_read(c, published)
+        assert c.native.last_verified_at == 0
+        assert not latest["healthy"] and not latest["owner_control_enabled"] and not latest["can_start"]
 
 
 # Intent: the same actual native sample can expire at observed's final Pause check without ending supervision.

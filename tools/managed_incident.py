@@ -212,6 +212,29 @@ def lifecycle_fields(db: sqlite3.Connection, local: object) -> tuple[str, str, l
     return "closed" if row[0] else "open", "recorded" if row[1] else "unmapped", delivery
 
 
+# Read the exact saved wire receipt, with the completed Start stage available on older journals.
+def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: str) -> str:
+    if stage in ("accepted", "rejected"):
+        return stage
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_command_wires'").fetchone():
+        return UNKNOWN
+    rows = db.execute(
+        "SELECT reply FROM owner_command_wires "
+        "WHERE request=? AND ticket=? AND action='RemoteStartTransaction' AND reply IS NOT NULL LIMIT 2",
+        (request, ticket),
+    ).fetchall()
+    if len(rows) != 1:
+        return UNKNOWN
+    return {
+        "Accepted": "accepted",
+        "Rejected": "rejected",
+        "error": "call_error",
+        "other": "other",
+        "NotSupported": "other",
+        "Unknown": "other",
+    }.get(rows[0][0], UNKNOWN)
+
+
 # Use a single read-only WAL snapshot with no service lock, normalization, socket or recovery call.
 def journal_facts(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {"available": False, "intent": None, "request": None, "start": None}
@@ -248,7 +271,7 @@ def journal_facts(path: Path) -> dict[str, Any]:
                 start = {
                     "ticket": ticket,
                     "stage": stage,
-                    "saved_reply": stage if stage in ("accepted", "rejected") else UNKNOWN,
+                    "saved_reply": saved_start_reply(db, original, wire["ticket"], stage),
                     "authority_published": published if type(published) is bool else None,
                     "lifecycle": lifecycle,
                     "cloud_mapping": cloud_mapping,
@@ -343,9 +366,9 @@ def incident_report(journal: Path, event_path: Path) -> dict[str, Any]:
         transport = "matching_reply"
     waiting = []
     if start.get("lifecycle") == "unbound":
-        if start.get("stage") == "issued":
+        if start.get("stage") == "issued" and start.get("saved_reply") != "accepted":
             waiting.append("start_outcome_or_lifecycle")
-        elif start.get("stage") == "accepted":
+        elif start.get("stage") == "accepted" or start.get("saved_reply") == "accepted":
             waiting.append("start_lifecycle")
     if start.get("lifecycle") == "open" and (saved["intent"] or {}).get("mode") == "paused":
         waiting.append("session_closure")

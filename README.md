@@ -370,6 +370,9 @@ The optional terminal interface accepts one JSON object per line:
 {"command":"exit"}
 ```
 
+If a restart verifies that the last owned profile was already removed, the interactive run can finish
+`native-bounded-handover` without reopening the charger listener.
+
 Local Start requires exactly one explicitly approved owner tag. Native-bounded commissioning retains its Start,
 Stop and Release operations and their original priority, physical and ownership checks. The managed service disables
 that unscoped Start and exposes its separate guarded management controls. Status distinguishes actual Boot,

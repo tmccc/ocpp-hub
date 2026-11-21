@@ -158,8 +158,9 @@ class ReportWriter:
     def submit(self, status: dict[str, Any]) -> None:
         snapshot = deepcopy(status)
         with self.changed:
-            self.pending.append(snapshot)
-            self.changed.notify()
+            if not self.closed:
+                self.pending.append(snapshot)
+                self.changed.notify()
 
     # Disk delay may discard the oldest queued reports, but it never holds the producer's lock.
     def _run(self) -> None:
@@ -175,8 +176,7 @@ class ReportWriter:
     # A responsive sink records the final status in order. Shutdown can finish even if the sink is stalled.
     async def close(self, status: dict[str, Any]) -> None:
         with self.changed:
-            self.pending.clear()
-            self.pending.append(status)
+            self.pending.append(deepcopy(status))
             self.closed = True
             self.changed.notify()
         with suppress(TimeoutError):

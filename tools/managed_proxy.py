@@ -27,7 +27,7 @@ from ocpp_hub_core.prototype.managed_view import health_snapshot, publish_poll  
 from ocpp_hub_core.prototype.policy import DeniedError  # noqa: E402
 from ocpp_hub_core.prototype.security import SecurityError  # noqa: E402
 from ocpp_hub_core.prototype.store import RecoveryRequiredError  # noqa: E402
-from ocpp_hub_core.prototype.trial_config import TrialConfig, private_json  # noqa: E402
+from ocpp_hub_core.prototype.trial_config import TrialConfig, file_identity, private_json  # noqa: E402
 from ocpp_hub_core.prototype.trial_session import TrialSession, preflight, save_private  # noqa: E402
 
 from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, incident_report  # noqa: E402
@@ -63,7 +63,7 @@ async def watchdog(stopped: asyncio.Event) -> None:
 
 # The extra mode input cannot alias any file the service writes or rotates.
 def check_spec_path(config: TrialConfig, path: Path) -> None:
-    if path.resolve(strict=False) in {output.resolve(strict=False) for output in config.output_paths()}:
+    if file_identity(path) in {file_identity(output) for output in config.output_paths()}:
         raise SecurityError("managed specification must not alias service outputs")
 
 

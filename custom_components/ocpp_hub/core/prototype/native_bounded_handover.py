@@ -877,11 +877,29 @@ class NativeBoundedHandover:
 
     # Read the station profile independently of an incoming report's still-unassigned transaction number.
     async def require_reported_start_ceiling(self) -> None:
+        # Share the observation order with full native reads so a superseded result cannot revoke a newer proof.
+        def begin() -> tuple[int, str]:
+            self.read_sequence += 1
+            return self.read_sequence, self.authority()
+
+        sequence, authority = self.gateway.decide(begin)
         try:
             profiles = await self.observe_profiles()
         except TimeoutError as error:
             raise UnavailableError("the native station profile read timed out") from error
-        self.book.require_confirmed_station(profiles, self.gateway.controls.desired())
+
+        # This profile alone cannot make a full native sample fresh. A current contradiction withdraws that proof.
+        def check() -> None:
+            if sequence < self.last_resolved_read or authority != self.authority():
+                raise AuditSupersededError("reported Start profile read was superseded")
+            try:
+                self.book.require_confirmed_station(profiles, self.gateway.controls.desired())
+            except DeniedError:
+                self.last_resolved_read = sequence
+                self.last_verified_at = 0
+                raise
+
+        self.gateway.decide(check)
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
     async def validate_send(self, action: str, payload: dict[str, Any]) -> Guard | Pending | None:
@@ -1086,8 +1104,10 @@ class NativeBoundedHandover:
 
     # Persist cleanup only after every intended resource is independently absent.
     def _complete_cleanup(self) -> None:
-        self.save("awaiting_backend", clear_intent={})
-        self.gateway.journal.phase.await_backend()
+        journal = self.gateway.journal
+        with journal.atomic():
+            self.save("awaiting_backend", clear_intent={})
+            journal.phase.await_backend()
 
     # A route intent is durable and narrowly scoped; a native adapter performs only this exact four-field patch.
     async def restore_route(self, patch: NativePatch, retire: Callable[[], Awaitable[None]]) -> None:

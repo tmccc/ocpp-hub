@@ -69,6 +69,34 @@ async def test_delayed_final_report_owns_shared_output_until_finished(tmp_path):
         pass
 
 
+# Intent: a normal shutdown writes the last queued transition before the final stopped status.
+# Why: the final status alone cannot tell the next process about the last fault or Pause transition.
+async def test_reporting_shutdown_preserves_queued_transition():
+    entered, release = threading.Event(), threading.Event()
+    reports = []
+
+    # Allow one write to start so the transition queues before the final status.
+    def write(status):
+        if not reports:
+            entered.set()
+            release.wait(5)
+        reports.append(status)
+
+    writer = ReportWriter(write)
+    first, transition, final = {"state": "healthy"}, {"state": "attention"}, {"state": "stopped"}
+    writer.submit(first)
+    try:
+        await until(entered.is_set)
+        writer.submit(transition)
+        closing = asyncio.create_task(writer.close(final))
+        await until(lambda: writer.closed)
+        writer.submit({"state": "late"})
+    finally:
+        release.set()
+    await closing
+    assert reports == [first, transition, final]
+
+
 # A complete measured healthy status includes physical freshness and the service's local-Start restriction.
 def healthy_status(now: float) -> dict[str, Any]:
     return {
@@ -192,6 +220,12 @@ def test_managed_spec_rejects_output_aliases(
     alias.symlink_to(paths[output])
     with pytest.raises(SecurityError):
         managed_proxy.check_spec_path(config, alias)
+    target = paths[output]
+    target.touch(exist_ok=True)
+    linked = tmp_path / "linked.json"
+    linked.hardlink_to(target)
+    with pytest.raises(SecurityError):
+        managed_proxy.check_spec_path(config, linked)
 
 
 # Intent: derived managed event files cannot alias existing input credentials or configuration.

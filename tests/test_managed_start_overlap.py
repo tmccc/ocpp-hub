@@ -77,6 +77,32 @@ async def close_in_order(b: TimerBench, owner: int, first: str, returning: str |
         b.device.active = None
 
 
+# Intent: a scheduled session entering before the initial local Start hold keeps its own charging authority.
+# Why: Start was accepted for an idle charger and must never select another session as its Stop target.
+async def test_new_daily_preempts_an_unissued_owner_start(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        owner_tag(b)
+        controls = b.session.gateway.controls
+        stop = controls.stop
+        daily = None
+
+        # Deliver a real independent schedule report immediately before the initial hold takes its claim.
+        async def start_daily_before_claim(*args, **kwargs):
+            nonlocal daily
+            if daily is None:
+                daily = await b.start_plan(9, demand=True)
+            return await stop(*args, **kwargs)
+
+        monkeypatch.setattr(controls, "stop", start_daily_before_claim)
+        identifier = uuid.uuid4().hex
+        b.c.command(identifier, "start", b.c.requests.intent().revision)
+        await b.c.charging.settle()
+        assert daily is not None and b.session.journal.active() == daily
+        assert b.c.requests.receipt(identifier)["state"] == "failed"
+        assert (await healthy(b.c))["current_a"] == 6
+        assert not b.stops() and not starts(b.rig)
+
+
 # Intent: daily charging survives expired Start before/after its ACK and a delayed cloud Stop reply at closure.
 # Why: the expired Start may stop only its own session, and app control must recover once that Stop settles.
 @pytest.mark.parametrize("before_ack", [False, True])

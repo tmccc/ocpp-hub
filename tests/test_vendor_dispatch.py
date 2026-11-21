@@ -8,7 +8,7 @@ from ocpp_hub_core.frames import build_call, build_call_error, build_call_result
 from ocpp_hub_core.prototype.connection_scope import current_control_scope
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed_diagnostics import snapshot
-from ocpp_hub_core.prototype.managed_view import poll_base
+from ocpp_hub_core.prototype.managed_view import poll_base, refresh_for_read
 from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
@@ -207,10 +207,13 @@ async def test_late_cloud_command_reply_settles_exactly_once(
         local = None
         status = "Rejected"
         payload = {"idTag": "CLOUD_OWNER"}
+        published = None
         if action == "RemoteStopTransaction":
             local = await positive_flow(b, "daily")
             payload = {"transactionId": j.vendor_id(local)}
             status = "Accepted"
+            published = dict(await healthy(b.controller), running=True, certificate_remaining_seconds=86400)
+            assert refresh_for_read(b.controller, published)["healthy"]
 
         # Delay one answer while leaving the actual charger reader free to apply protective zero.
         async def delay_reply(raw):
@@ -250,6 +253,10 @@ async def test_late_cloud_command_reply_settles_exactly_once(
             expired = await task
             assert expired[:3] == [4, "delayed-result", "InternalError"]
             assert poll_base(b.controller)["vendor_write_uncertain"] == 1
+            if published is not None:
+                refreshed = refresh_for_read(b.controller, published)
+                assert refreshed["operator_reconciliation_required"] and not refreshed["healthy"]
+                assert not refreshed["owner_control_enabled"] and refreshed["control_mode"] != "app"
             if poll_first:
                 assert j.db.execute("SELECT state FROM mutations").fetchone()[0] == "pending"
                 await b.controller.tick()

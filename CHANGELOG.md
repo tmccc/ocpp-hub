@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Use the original current-change sample to distinguish earlier idle attempts from new sessions.
+- Wait for real closure after a Stop reply, including an exact expired Start that has been unplugged.
+- Refresh Start availability and health after confirmed charger contradictions or an unresolved app command.
+- Read committed Start replies in incident reports and reject existing aliases of input and output files.
+- Protect an independent scheduled charge that begins just before a local Start takes its hold.
+- Keep queued shutdown reports and finish verified cleanup without reopening the charger listener.
 - Retain a newer cloud refusal when the old approval cannot be updated. Keep confirmed plan replies across restart.
 - Handle late Start and Stop errors on their original connections. Retain the first complete incident entry after a partial write.
 - Refresh delivery counts, age certificate status, and report when a saved charger check is still being written.

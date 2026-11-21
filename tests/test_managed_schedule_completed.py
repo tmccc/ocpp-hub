@@ -23,7 +23,8 @@ NEXT = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
 # Intent: replacement before Start expiry preserves the independent daily and the separate late owner debt.
 # Why: startup's zero hold cannot turn the missing owner lifecycle into authority to Stop a different charge.
 @pytest.mark.parametrize("demand", [False, True])
-async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port, monkeypatch, demand):
+@pytest.mark.parametrize("unplugged", [False, True])
+async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port, monkeypatch, demand, unplugged):
     async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         owner_tag(b)
         b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
@@ -57,14 +58,30 @@ async def test_restart_before_owner_start_expiry(tmp_path, tls, unused_tcp_port,
             await b.close_transaction(daily)
             await healthy(b.c)
             owner = await delayed_owner(b)
+            bench = b.rig.bench
+            connection = bench.cp, bench.connection
+            if unplugged:
+                bench.cp, bench.connection = "A", "Unplug"
             for _ in range(3):
                 await b.c.tick()
-            assert set(b.stops()) == {owner} and b.device.effective_limit() == 0
+            assert b.stops() == [owner] and b.device.effective_limit() == 0
+            bench.cp, bench.connection = connection
             await close_in_order(b, owner, "native" if demand else "ledger")
             assert (await healthy(b.c))["station_ceiling_a"] == 6
+            journal = b.session.journal
+            completed = b.c.charging.state()
+            assert completed["state"] == "completed"
+            # An older completed Start may have no independent daily marker in its saved metadata.
+            journal.put("managed_test_charge", {**completed, "independent_seen": False})
+            journal.db.execute(
+                "CREATE TEMP TRIGGER refuse_old_start_marker BEFORE INSERT ON meta WHEN NEW.key='managed_test_charge' "
+                "AND json_extract(NEW.value,'$.state')='completed' AND json_extract(NEW.value,'$.independent_seen')=1 "
+                "BEGIN SELECT RAISE(ABORT,'completed Start marker refused'); END"
+            )
             following = await b.advance_idle_to(NEXT)
             assert following not in (None, daily, owner) and (await healthy(b.c))["current_a"] == 6
-            assert set(b.stops()) == {owner} and len(starts(b.rig)) == 1
+            assert b.c.charging.independent_daily(await b.c.native.read(), following)
+            assert b.stops() == [owner] and len(starts(b.rig)) == 1
 
 
 # Intent: reconnect preserves an independently identified daily transaction.

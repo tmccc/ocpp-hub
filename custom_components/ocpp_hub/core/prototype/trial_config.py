@@ -103,6 +103,15 @@ def exact_wss(value: Any) -> str:
         raise SecurityError("trial WSS endpoint is malformed or ambiguous") from None
 
 
+# Identify existing aliases by file identity and planned files by their resolved name.
+def file_identity(path: Path) -> tuple[int, int] | Path:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return path.resolve(strict=False)
+    return info.st_dev, info.st_ino
+
+
 @dataclass(frozen=True, repr=False)
 class TrialConfig:
     """Private endpoints and identities are excluded from representations and public status."""
@@ -162,13 +171,13 @@ class TrialConfig:
             for path in (self.incoming_secret, self.upstream_secret, self.ca_file, configuration)
             if path is not None
         ]
-        resolved = [path.resolve(strict=False) for path in self.output_paths()]
-        input_paths = {path.resolve(strict=False) for path in inputs}
+        resolved = [file_identity(path) for path in self.output_paths()]
+        input_paths = {file_identity(path) for path in inputs}
         if len(resolved) != len(set(resolved)) or input_paths.intersection(resolved):
             raise SecurityError("trial output paths must not alias inputs or other state files")
         credentials = [self.native_secret]
         credentials += [path for path in (self.incoming_secret, self.upstream_secret) if path is not None]
-        if len({path.resolve(strict=False) for path in credentials}) != len(credentials):
+        if len({file_identity(path) for path in credentials}) != len(credentials):
             raise SecurityError("trial credential files must remain independent")
 
     # Enforce a single station, single source address, 6 A commissioning ceiling and explicit file locations.

@@ -368,11 +368,8 @@ class ManagedCurrentLimits:
         if connection is None or intent.revision != revision or native is None or not self.available(native):
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
         previous_value = self.selected()
-        prior_attempts = [
-            attempt_key(record)
-            for record in native.history
-            if record["transactionId"] == -1 and record["startTime"] < native.physical.observed_at - 60
-        ]
+        # This verified idle sample already saw these attempts, regardless of when their records were created.
+        prior_attempts = [attempt_key(record) for record in native.history if record["transactionId"] == -1]
         with j.atomic():
             expected = write_intent(j, intent, intent.mode)
             j.current_change.accept(

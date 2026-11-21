@@ -156,12 +156,16 @@ async def run(
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, stopped.set)
     tasks: list[asyncio.Task[None]] = []
+    cleanup_completed = False
     try:
         async with asyncio.timeout(duration):
             await session.start()
-            if not session.started:
+            if session.started:
+                emit({"trial_started": True, "maximum_duration_seconds": duration, "ceiling_a": 6})
+            elif terminal and session.journal.phase.read().value == "rollback":
+                emit({"trial_started": False, "cleanup_available": True})
+            else:
                 raise RecoveryRequiredError("commissioning requires an open charger listener")
-            emit({"trial_started": True, "maximum_duration_seconds": duration, "ceiling_a": 6})
             if terminal:
                 tasks.append(asyncio.create_task(interactive(session, stopped)))
             while not stopped.is_set():
@@ -171,6 +175,8 @@ async def run(
                     await asyncio.wait_for(stopped.wait(), 1)
                 except TimeoutError:
                     pass
+            if not session.started:
+                cleanup_completed = session.journal.phase.read().value == "backend_restore_pending"
     except TimeoutError:
         emit({"trial_duration_expired": True, "automatic_backend_restore": False})
     finally:
@@ -187,7 +193,9 @@ async def run(
             finally:
                 for signum in (signal.SIGTERM, signal.SIGINT):
                     loop.remove_signal_handler(signum)
-    return 2 if not session.started or session.final_status is None or session.final_status["shutdown_uncertain"] else 0
+    if session.final_status is None or session.final_status["shutdown_uncertain"]:
+        return 2
+    return 0 if session.started or cleanup_completed else 2
 
 
 # A separate explicit action captures a fresh read-only baseline and original configuration backup.
