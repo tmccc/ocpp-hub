@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import ssl
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +31,37 @@ from websockets.http11 import Request
 
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
+
+
+# Intent: a pasted oversized line is refused while the next intact terminal command still works.
+# Why: a suffix of the refused line must not become an operation, and Stop must remain available.
+async def test_interactive_trial_recovers_after_an_oversized_line(monkeypatch, capsys):
+    from tools.trial_proxy import interactive
+
+    read_fd, write_fd = os.pipe()
+    stopped = asyncio.Event()
+    calls = []
+
+    # Record only what the ordinary interactive parser would pass to its session.
+    async def command(value):
+        calls.append(value)
+        return {"received": True}
+
+    with os.fdopen(read_fd) as source, os.fdopen(write_fd, "wb", buffering=0) as writer:
+        monkeypatch.setattr(sys, "stdin", source)
+        terminal = asyncio.create_task(interactive(SimpleNamespace(command=command), stopped))
+        try:
+            writer.write(b" " * 4097)
+            async with asyncio.timeout(2):
+                while "CommandTooLong" not in capsys.readouterr().out:
+                    await asyncio.sleep(0.005)
+            writer.write(b'{"command":"ignored"}\n{"command":"status"}\n{"command":"exit"}\n')
+            await asyncio.wait_for(terminal, 2)
+            assert stopped.is_set() and calls == [{"command": "status"}]
+        finally:
+            if not terminal.done():
+                terminal.cancel()
+                await asyncio.gather(terminal, return_exceptions=True)
 
 
 # Intent: refuse a certificate name mismatch even if an older checker exits successfully.

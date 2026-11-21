@@ -109,10 +109,23 @@ async def interactive(session: Any, stopped: asyncio.Event) -> None:
     protocol = asyncio.StreamReaderProtocol(reader)
     transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin)
     try:
+        discarding = False
         while not stopped.is_set():
-            raw = await reader.readline()
+            try:
+                raw = await reader.readuntil(b"\n")
+            except asyncio.LimitOverrunError as error:
+                await reader.readexactly(error.consumed)
+                if not discarding:
+                    emit({"command_failed": "CommandTooLong"})
+                discarding = True
+                continue
+            except asyncio.IncompleteReadError as error:
+                raw = error.partial
             if not raw:
                 return
+            if discarding:
+                discarding = False
+                continue
             try:
                 value = json.loads(raw)
                 if value == {"command": "exit"}:
