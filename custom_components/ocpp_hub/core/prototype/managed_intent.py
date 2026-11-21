@@ -118,7 +118,7 @@ def retire_pause_ack(journal: Journal, fault: dict[str, Any]) -> None:
     ack = saved_pause_ack(journal)
     if ack is not None and ack.get("fault") == fault and journal.get("managed_control_intent") is not None:
         journal.db.execute(
-            "UPDATE managed_requests SET result=json_set(result,?,NULL) WHERE id=? AND json_type(result,?)='object'",
+            "UPDATE managed_requests SET result=json_remove(result,?) WHERE id=? AND json_type(result,?)='object'",
             (f"$.{PAUSE_RELEASE_PROOF}", ack["pause_request"], f"$.{PAUSE_RELEASE_PROOF}"),
         )
     legacy = journal.get(RELEASE_PAUSE_ACK)
@@ -393,7 +393,9 @@ class ManagedRequests:
                     (json.dumps({"classification": "superseded_by_pause"}), current.revision),
                 )
                 if "_pause" in result and capture_release_proof is not None:
-                    result[PAUSE_RELEASE_PROOF] = capture_release_proof()
+                    proof = capture_release_proof()
+                    if proof is not None:
+                        result[PAUSE_RELEASE_PROOF] = proof
             insert_request(self.journal, identifier, action, revision, result)
         # Acceptance is already durable. An unrelated read must not prevent the command worker from launching.
         return {"id": identifier, "action": action, "state": "accepted", "result": {"accepted_at": accepted_at}}
