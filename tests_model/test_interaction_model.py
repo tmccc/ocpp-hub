@@ -1,59 +1,8 @@
 """Explore every reachable state and enabled edge in each finite reference model."""
 
-from collections import defaultdict, deque
-from collections.abc import Callable, Iterable
-from typing import NamedTuple
-
+from .exploration import explore, require_recovery
 from .interaction_delivery import Delivery, delivery_decisions, delivery_violation
 from .interaction_model import Control, Mode, Start, control_violation, decisions
-
-
-class Exploration[State](NamedTuple):
-    paths: dict[State, tuple[str, ...]]
-    incoming: dict[State, set[State]]
-    transitions: int
-
-
-# Breadth first makes the first invariant failure a shortest reproducible event sequence.
-def explore[State, Edge](
-    initial: State,
-    choices: Callable[[State], Iterable[Edge]],
-    check: Callable[[State, Edge], str | None],
-    successor: Callable[[Edge], State],
-    event: Callable[[Edge], str],
-    recovery_event: Callable[[str], bool],
-) -> Exploration[State]:
-    paths = {initial: ()}
-    incoming = defaultdict(set)
-    pending = deque([initial])
-    transitions = 0
-    while pending:
-        before = pending.popleft()
-        for edge in choices(before):
-            after, name = successor(edge), event(edge)
-            transitions += 1
-            violation = check(before, edge)
-            path = (*paths[before], name)
-            assert violation is None, f"{violation}\n{' -> '.join(path)}"
-            if recovery_event(name):
-                incoming[after].add(before)
-            if after not in paths:
-                paths[after] = path
-                pending.append(after)
-    return Exploration(paths, incoming, transitions)
-
-
-# After failures stop, required evidence must admit a path back to the ordinary operating state.
-def require_recovery[State](graph: Exploration[State], recovered: Callable[[State], bool]) -> None:
-    reachable = {state for state in graph.paths if recovered(state)}
-    pending = deque(reachable)
-    while pending:
-        for before in graph.incoming.get(pending.popleft(), ()):
-            if before not in reachable:
-                reachable.add(before)
-                pending.append(before)
-    for state, path in graph.paths.items():
-        assert state in reachable, f"Cannot recover from {state}\n{' -> '.join(path)}"
 
 
 # Given cooperating peers and no further invalidation, an intentional Pause may still be needed to recover.

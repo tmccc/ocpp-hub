@@ -23,7 +23,7 @@ Cloud delivery can become blocking while any of those steps is pending. The
 [delivery model](../tests_model/interaction_delivery.py) follows the head of up to three waiting Start/Stop
 pairs through transmission, retry, a late reply on the original connection, mapping and retirement.
 
-The [explorer](../tests_model/test_interaction_model.py) follows every enabled edge until no new states remain
+The [explorer](../tests_model/exploration.py) follows every enabled edge until no new states remain
 and checks safety after each event. Repeated events returning to the same state need one visit. It also checks
 that every state has a recovery path when failures cease and the required exact charger and cloud evidence
 arrives. The model represents ownership by whether a report belongs to the tracked request or session.
@@ -44,9 +44,24 @@ TMPDIR=/absolute/task .venv/bin/python -B tools/offline_validate.py \
     tests_discovery/test_complete_overlap.py
 ```
 
-This scope leaves the exact cross-product of live transports, storage and timers open. Multiple historical
-identities, all device and vendor commands, commissioning and the Home Assistant lifecycle still rely on the
-other test families. Hardware behavior and arbitrary amounts of pending history remain outside the model.
+The [system model](../tests_model/test_system_interactions.py) also explores the timed controls, installation
+and Home Assistant. A timed test keeps its own first-power proof, deadline and Stop target. Cleanup waits for
+native closure, the charger’s Stop report and the cloud’s reply before clearing profiles and restoring the
+original backend. The client sends a command once and uses its exact saved receipt to confirm it. The shared
+model explores those boundaries together so a reload, late reply or withdrawn installation proof can fall
+between admission, physical power, stopping and confirmation.
+
+The [cleanup replays](../tests_model/test_installation_interaction_replay.py) test all three legal orders of
+native closure, the charger’s Stop report and the cloud reply, then verify original-backend restoration.
+The [Home Assistant timed replays](../tests_ha_proxy/test_timed_system.py) use actual commissioning, a lost
+Start reply, HA reload on either side of the Stop, and both explicit Pause and automatic cutoff. They then
+exercise Return, change the selected current through HA, and finish a subsequent scheduled charge.
+
+The models group opaque identifiers by their relation to the current request, connection and session. Their
+state counts apply to those rules and bounds. The combined model ties one timed request to one HA exchange.
+Other command detail, longer queues and historical identities have separate test families. Offline peers
+exercise the software paths. Firmware behavior, physical faults and arbitrary amounts of history remain outside
+these guarantees.
 
 ## Finite families
 

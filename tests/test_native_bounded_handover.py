@@ -22,6 +22,7 @@ from tests.connected_rig import ConnectedBench, connected_bench
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
 
 
 # Introduce the real connected device through both TLS legs, with the native HTTP peer retaining the USER6 guard.
@@ -34,8 +35,16 @@ async def native_ready(
     station: StationChoice | None = None,
     incoming_mode: str = "basic",
     composite_reply_delay: float = 0,
+    bench_type: type[Bench] = Bench,
 ) -> AsyncIterator[tuple[ConnectedBench, Any, Any]]:
-    async with connected_bench(directory, contexts, port, station=station, incoming_mode=incoming_mode) as rig:
+    async with connected_bench(
+        directory,
+        contexts,
+        port,
+        station=station,
+        incoming_mode=incoming_mode,
+        bench_type=bench_type,
+    ) as rig:
         rig.bench.composite_reply_delay = composite_reply_delay
         session = rig.session()
         await session.start()
