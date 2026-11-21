@@ -1035,6 +1035,27 @@ class ManagedCharging:
             and not c.stopping
         )
 
+    # An internal timed-test Pause can hold zero without stopping a different charging session.
+    def timed_pause_leaves_session(self, local: int | None) -> bool:
+        requests = self.controller.requests
+        if local is None or requests.pause_request() is not None:
+            return False
+        intent = requests.intent()
+        test = self.state()
+        internal = self.journal.get("managed_internal_pause", {})
+        return (
+            intent.mode == "paused"
+            and internal.get("source") == "test"
+            and internal.get("revision") == intent.revision
+            and internal.get("id") == test.get("id")
+            and test.get("kind") != "normal"
+            and self.timed_stop_target(test) != local
+        )
+
+    # A replacement introduction retains the same limits on which session the previous request can Stop.
+    def recovery_zero_only(self) -> bool:
+        return self.scoped_normal_stop() or self.timed_pause_leaves_session(self.journal.active())
+
     # Resolve the exact timed test transaction, including a genuine report received before first power.
     def timed_stop_target(self, state: dict[str, Any]) -> int | None:
         for key in ("stop_local", "local_transaction"):

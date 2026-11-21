@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent owner app/schedule proxy service; no local Start endpoint or automatic resource cleanup."""
+"""Persistent owner app and schedule proxy service with guarded Start, Pause, Return and current controls."""
 
 from __future__ import annotations
 

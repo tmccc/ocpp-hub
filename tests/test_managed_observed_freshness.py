@@ -47,6 +47,7 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
             assert observed["charging_session_open"] is False and j.active() == local
         stale = refresh_for_read(c, dict(observed, running=True, certificate_remaining_seconds=86400))
         assert stale["charging_session_open"] is None and stale["power_w"] is None
+        assert not stale["healthy"] and not stale["owner_control_enabled"]
         assert not stale["can_start"] and not stale["can_set_current"]
         fresh = await healthy(c)
         assert fresh["charging_session_open"] is (event == "start")

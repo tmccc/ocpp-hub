@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep a scheduled session separate from an interrupted timed test during charger introduction. Hold zero while
+  recovering the test without sending Stop to the schedule's transaction.
+- Withdraw live health and control proof after a Start or Stop changes the session. Show a pending command ahead
+  of optional Start approval information.
+- Retry a briefly unavailable native read while shutdown verifies zero. Reuse archived history when the same
+  records are observed again.
 - Keep the OCPP reader available when a refusal or routine reply takes too long to send. Skip unchanged inventory and
   already-settled Start writes during supervision.
 - Keep verified Pause when a Return claim cannot be saved. Explain the release separately from a zero-current check.

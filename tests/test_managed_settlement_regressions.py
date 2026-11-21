@@ -462,3 +462,57 @@ async def test_terminal_current_snapshot_is_revoked_during_native_read(
         assert (await healthy(c))["local_hold_verified"]
         assert j.get("managed_current_change")["state"] == "cancelled"
         assert c.requests.receipt(identifier) == {**historical, "state": "failed"}
+
+
+# Intent: an interrupted unclaimed cloud test cannot Stop a separate scheduled session after replacement.
+# Why: a protective zero belongs to the interrupted test, while Stop still needs authority over that transaction.
+async def test_replaced_unused_cloud_arm_leaves_two_independent_sessions_separate(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=60, startup=60) as b:
+        c, rig = b.controller, b.rig
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "arm_cloud_test", c.requests.intent().revision)
+        local = await positive_flow(b, "daily")
+        assert (await healthy(c))["power_w"] == 1440
+        historical = c.requests.receipt(identifier)
+        assert c.charging.state()["state"] == "armed"
+        assert c.charging.timed_stop_target(c.charging.state()) is None
+        assert not starts(rig)
+        await c.charging.close()
+        await crash(b.session)
+        replacement = managed_session(rig)
+        await replacement.start()
+        recovered = ManagedController(replacement)
+        try:
+            assert recovered.requests.intent().mode == "paused"
+            async with rig.charger(replacement) as charger:
+                mark = len(rig.bench.device_calls)
+                await introduced(rig, replacement, charger, "unrelated-schedule-after-replacement")
+                g = replacement.gateway
+                await until(
+                    lambda: (
+                        recovered.native.introduced_epoch == g._charger_epoch
+                        and g.controls.ready
+                        and not replacement.runtime.introduction_pending
+                    )
+                )
+                assert replacement.journal.active() == local
+                assert rig.bench.firmware.effective_limit() == 0
+                assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls[mark:])
+                assert recovered.requests.receipt(identifier) == historical
+
+                # A subsequent explicit Pause still owns Stop for the known scheduled transaction.
+                pause_at = len(rig.bench.device_calls)
+                recovered.command(uuid.uuid4().hex, "pause", recovered.requests.intent().revision)
+                await until(
+                    lambda: any(
+                        frame[2] == "RemoteStopTransaction" and frame[3] == {"transactionId": local}
+                        for frame in rig.bench.device_calls[pause_at:]
+                    )
+                )
+                await close_session(rig, replacement, charger, local)
+                await settled_without_another_command(recovered)
+        finally:
+            await recovered.charging.close()
+            await replacement.close()

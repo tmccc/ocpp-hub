@@ -86,7 +86,7 @@ function that returns successfully may only advance one boundary, leaving an act
 `TrialSession` creates one `CommandProcessor` and `ManagedController` uses that same instance. The queue runs short
 synchronous decisions for command claims, send checks, incoming charger reports, matched replies, and native
 observations. Pause and other protective decisions have priority. Ordinary decisions at the same priority keep
-queue order. Socket reads, sends and native HTTP waits run independently. The peer matches a reply to its request
+queue order. Socket reads, sends and native HTTP waits run outside the queue. The peer matches a reply to its request
 as it arrives. The queue then lets the request owner record the result and check the original Boot, ticket and
 session before publishing any change in authority. Start and Stop replies record what the peer confirmed.
 Lifecycle reports and independent observations establish what the charger actually did.

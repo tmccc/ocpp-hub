@@ -115,7 +115,7 @@ class ManagedController:
         self.native.ordinary_source_observer = self.ordinary.observe
         self.native.positive_guard = self.positive_decision
         self.native.continuation_guard = self.continuation_decision
-        self.native.recovery_zero_only = self.charging.scoped_normal_stop
+        self.native.recovery_zero_only = self.charging.recovery_zero_only
         binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest, self.charging)
         session.gateway.start_reports = ManagedStartReports(self.charging, binding)
         self.native.command_source_observer = binding.observe
@@ -310,17 +310,7 @@ class ManagedController:
             intent, connection = self.requests.intent(), current_control_scope(g)
             request = self.requests.pause_request()
             local = j.active()
-            test = self.charging.state()
-            internal = j.get("managed_internal_pause", {})
-            if (
-                request is None
-                and local is not None
-                and internal.get("source") == "test"
-                and internal.get("revision") == intent.revision
-                and internal.get("id") == test.get("id")
-                and test.get("kind") != "normal"
-                and self.charging.timed_stop_target(test) != local
-            ):
+            if self.charging.timed_pause_leaves_session(local):
                 return  # The zero hold is restrictive; a timed test cannot Stop another session.
             prior_control = j.get("control", {})
             stop_epoch, prior_ticket = prior_control.get("stop_epoch", 0), prior_control.get("ticket")

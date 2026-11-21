@@ -48,8 +48,8 @@ freshness limits still apply. A newer restrictive control can cancel an unsent a
 retains its actual reply or unknown outcome.
 
 The proxy uses one queue to decide what to send and how incoming reports and replies change charging state.
-The charger and cloud connections keep reading while requests wait. A newer Pause can take effect while an
-earlier reply is outstanding. The proxy applies that reply to its original request and charging session.
+The charger and cloud connections keep reading while the proxy waits for command replies. A newer Pause can
+take effect while an earlier reply is outstanding. The proxy applies that reply to its original request and charging session.
 
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
@@ -502,7 +502,8 @@ renewal requires a controlled service restart; file replacement alone cannot fal
 The active `ics_proxy` Home Assistant integration provides a **Download diagnostics** report from its integration
 entry. It uses cached status only, plus public installed software metadata; downloading never requests a charger
 reading, retries a control, or runs recovery. The control-mode entity's attributes and the existing delayed fault
-notification include a plain-English explanation. The report separates the retained original fault, current
+notification include a plain-English explanation. A new Start or Stop withdraws the previous session's live health
+proof until a fresh charger reading arrives. The report separates the retained original fault, current
 blockers, pending/uncertain receipts and worker activity. A strict native refusal or an interrupted audit remains
 blocked; these explanations grant no new recovery permission. Missing receipt timestamps remain unknown.
 
@@ -540,7 +541,9 @@ report. Eligible acknowledged faults use the same closed-zero proof to settle th
 owned temporary timer remains, recovery removes only that receipted plan and verifies the original timetable before
 clearing the fault. Separate cutoff duties remain under Pause until real closure or successful explicit Return.
 Timed tests must finish their final Pause observation before Return is accepted; normal Start retains its existing
-deferred Return behavior.
+deferred Return behavior. On replacement, an interrupted timed test can hold zero while a separate scheduled
+session stays open. Its Stop applies to the session bound to that test. An explicit owner Pause can still stop
+the known scheduled session.
 
 A normal Start from a recovered Pause records its current connection authority after the guarded physical command
 succeeds. Its startup deadline retires only after actual session evidence; an unobserved Start still expires and

@@ -1,4 +1,4 @@
-"""Authenticated loopback-only management websocket; no Start, configuration or arbitrary charger RPC endpoint."""
+"""Authenticated loopback management for guarded Start, Pause, Return and current selection."""
 
 from __future__ import annotations
 

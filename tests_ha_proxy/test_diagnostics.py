@@ -69,7 +69,11 @@ def detail():
 async def test_start_authorization_explanation_is_allowlisted(actual_hass, authorization, expected):
     from custom_components.ics_proxy.diagnostic_view import explanation
 
-    data = {"healthy": True, "diagnostics": detail(), "start_authorization": authorization}
+    data = {
+        "healthy": True,
+        "diagnostics": detail() | {"pending_commands": [], "pending_command_count": 0},
+        "start_authorization": authorization,
+    }
     assert expected in explanation(data, fresh=True, native_fresh=True)
     data["start_authorization"] = PRIVATE
     assert PRIVATE not in explanation(data, fresh=True, native_fresh=True)
@@ -84,7 +88,7 @@ async def test_start_authorization_explanation_is_allowlisted(actual_hass, autho
 # Intent: the real HA control-mode entity explains an expired approval without making the service unhealthy.
 # Why: a core-only status field would still leave the owner-facing diagnostic surface silent.
 async def test_actual_control_mode_sensor_explains_start_renewal(actual_hass, peer):
-    peer["state"]["diagnostics"] = detail()
+    peer["state"]["diagnostics"] = detail() | {"pending_commands": [], "pending_command_count": 0}
     peer["state"]["start_authorization"] = "renewal_required"
     entry = await setup(actual_hass, peer)
     entity = actual_hass.states.get("sensor.ics_proxy_control_mode")
@@ -99,7 +103,13 @@ async def test_actual_control_mode_explains_unconfirmed_return(actual_hass, peer
     value = detail()
     value["pending_commands"][0]["action"] = "app_control"
     state = peer["state"]
-    state.update(diagnostics=value, desired_control="paused", local_hold_verified=True, can_return=True)
+    state.update(
+        diagnostics=value,
+        desired_control="paused",
+        local_hold_verified=True,
+        can_return=True,
+        start_authorization="renewal_required",
+    )
     entry = await setup(actual_hass, peer)
     entity_id = "sensor.ics_proxy_control_mode"
     assert "Press Return again" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]

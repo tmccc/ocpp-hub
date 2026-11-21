@@ -127,11 +127,22 @@ class NativeHistoryArchive:
             "CREATE TABLE IF NOT EXISTS native_start_attempts(digest TEXT PRIMARY KEY,body TEXT NOT NULL)"
         )
 
-    # Called inside the caller's savepoint so a failed row cannot leave part of an observation behind.
+    # Keep previously persisted attempt bodies on repeat observations without touching their rows.
+    def _new_attempts(self, attempts: dict[str, dict[str, Any]]) -> list[tuple[str, str]]:
+        result = []
+        for body in attempts.values():
+            digest = fingerprint(body)
+            archived = self.journal.db.execute(
+                "SELECT 1 FROM native_start_attempts WHERE digest=?", (digest,)
+            ).fetchone()
+            if archived is None:
+                result.append((digest, encoded(body)))
+        return result
+
+    # Save only fresh attempts inside the caller's history transaction.
     def retain_attempts(self, attempts: dict[str, dict[str, Any]]) -> None:
         self.journal.db.executemany(
-            "INSERT OR IGNORE INTO native_start_attempts VALUES(?,?)",
-            ((fingerprint(body), encoded(body)) for body in attempts.values()),
+            "INSERT OR IGNORE INTO native_start_attempts VALUES(?,?)", self._new_attempts(attempts)
         )
 
     # A savepoint supports both standalone observations and an atomic operator recovery without partial acceptance.
@@ -141,24 +152,38 @@ class NativeHistoryArchive:
         originals, present, admitted_attempts, attempts, binding = _archive_view(
             self.journal, original, current, allow_missing
         )
+        new_attempts = self._new_attempts(admitted_attempts | attempts)
+        records = {**originals, **{key: row for key, row in present.items() if row["stopTime"] > 0}}
+        new_records = []
+        for identifier, record in records.items():
+            digest = fingerprint(record)
+            exists = self.journal.db.execute(
+                "SELECT 1 FROM native_history_records WHERE transaction_id=? AND digest=?", (identifier, digest)
+            ).fetchone()
+            if exists is None:
+                new_records.append((identifier, digest, encoded(record), int(identifier in originals)))
+        identifiers = {
+            row[0] for row in self.journal.db.execute("SELECT DISTINCT transaction_id FROM native_history_records")
+        }
+        identifiers.update(records)
+        summary = {"archived_records": len(identifiers), "missing_records": len(identifiers - present.keys())}
+        if missing_attempts := admitted_attempts.keys() - attempts.keys():
+            summary["missing_attempts"] = len(missing_attempts)
+        bound = self.journal.get("native_history_archive_binding") == binding
+        summary_changed = self.journal.get("native_history_summary") != summary
+        if bound and not summary_changed and not new_attempts and not new_records:
+            return summary
         with history_savepoint(self.journal):
-            self.journal.put("native_history_archive_binding", binding)
-            self.retain_attempts(admitted_attempts | attempts)
+            if not bound:
+                self.journal.put("native_history_archive_binding", binding)
+            self.journal.db.executemany("INSERT OR IGNORE INTO native_start_attempts VALUES(?,?)", new_attempts)
             now = time.time()
-            records = {**originals, **{key: row for key, row in present.items() if row["stopTime"] > 0}}
-            for identifier, record in records.items():
-                self.journal.db.execute(
-                    "INSERT INTO native_history_records VALUES(?,?,?,?,?,?) "
-                    "ON CONFLICT(transaction_id,digest) DO UPDATE SET last_archived=excluded.last_archived",
-                    (identifier, fingerprint(record), encoded(record), now, now, int(identifier in originals)),
-                )
-            identifiers = {
-                row[0] for row in self.journal.db.execute("SELECT DISTINCT transaction_id FROM native_history_records")
-            }
-            summary = {"archived_records": len(identifiers), "missing_records": len(identifiers - present.keys())}
-            if missing_attempts := admitted_attempts.keys() - attempts.keys():
-                summary["missing_attempts"] = len(missing_attempts)
-            self.journal.put("native_history_summary", summary)
+            self.journal.db.executemany(
+                "INSERT INTO native_history_records VALUES(?,?,?,?,?,?)",
+                ((identifier, digest, body, now, now, original) for identifier, digest, body, original in new_records),
+            )
+            if summary_changed:
+                self.journal.put("native_history_summary", summary)
         return summary
 
 

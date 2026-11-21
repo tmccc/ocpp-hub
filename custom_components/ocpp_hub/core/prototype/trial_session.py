@@ -686,7 +686,7 @@ class TrialSession:
         while True:
             try:
                 native = await self.native_bounded.read(closed=True, owned=True)
-            except NativeReadinessError, _NativeMeasurementError:
+            except NativeReadinessError, NativeTransportUnavailableError, StaleEvidenceError, _NativeMeasurementError:
                 await asyncio.sleep(0.05)
                 continue
             self.native_bounded.require_known_session(native)

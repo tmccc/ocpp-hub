@@ -426,3 +426,23 @@ def test_strict_audit_retains_attempts(history_journal: Journal) -> None:
     assert contents(history_journal) == before
     assert [json.loads(r[0]) for r in history_journal.db.execute("SELECT body FROM native_start_attempts")] == [attempt]
     assert history_journal.get("native_history_policy") is None
+
+
+# Intent: a repeated complete archive observation uses the retained records without making a new write.
+# Why: an idle poll must not depend on writing already-stored history every time it sees the same charger records.
+def test_unchanged_archive_observation_uses_saved_history(history_journal: Journal) -> None:
+    original, later, attempt = row(1001), row(1002), unassigned()
+    archive = NativeHistoryArchive(history_journal)
+    current = [later, attempt]
+    expected = archive.observe([original], current, allow_missing=True)
+    before = contents(history_journal)
+    history_journal.db.execute(
+        "CREATE TEMP TRIGGER no_repeat_archive BEFORE INSERT ON native_history_records "
+        "BEGIN SELECT RAISE(ABORT,'unchanged record already archived'); END"
+    )
+    history_journal.db.execute(
+        "CREATE TEMP TRIGGER no_repeat_attempt BEFORE INSERT ON native_start_attempts "
+        "BEGIN SELECT RAISE(ABORT,'unchanged attempt already archived'); END"
+    )
+    assert archive.observe([original], current, allow_missing=True) == expected
+    assert contents(history_journal) == before

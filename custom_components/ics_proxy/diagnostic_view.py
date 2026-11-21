@@ -315,8 +315,6 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
         return REASONS[blockers[0]]
     if not native_fresh:
         return REASONS["native_stale"]
-    if authorization is not None:
-        return START_AUTHORIZATION[authorization]
     if detail["pending_command_count"]:
         rows = detail["pending_commands"]
         if any(row["confirmation"] == "pending" for row in rows):
@@ -331,6 +329,8 @@ def explanation(data: dict[str, Any], *, fresh: bool, native_fresh: bool) -> str
                 return "The previous Return ended without confirmation. Press Return again to try again."
             return "The previous Return ended without confirmation."
         return REASONS["command_outcome_unknown"]
+    if authorization is not None:
+        return START_AUTHORIZATION[authorization]
     return (
         "No problem reported in the latest verified status."
         if data.get("healthy") is True

@@ -549,9 +549,10 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and pending_fault is None
         and not station_lost
     )
+    same_session = sample_available and native is not None and native.physical.native_transaction_id == j.active()
     if not sample_available:
         clear_native_sample(result)
-    elif native is not None and native.physical.native_transaction_id != j.active():
+    elif not same_session:
         result.update(
             current_a=None,
             power_w=None,
@@ -563,7 +564,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         )
     result.setdefault("last_session_energy_kwh", None)
     supervising = not c.stopping and not j.fault.latched() and not station_lost
-    scope_current = sample_available and current == observed and supervising
+    scope_current = same_session and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):
         result.update(station_ceiling_a=None, local_charge=None, test_charge=None)

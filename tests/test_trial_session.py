@@ -19,6 +19,7 @@ from tests.charge_rig import owner_rig, positive_flow, ready
 from tests.managed_rig import healthy, managed_bench, starts
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
+from tests.test_rpc_validation_deadlines import NativeAuditPeer
 from tests.tls_support import tls as tls
 
 
@@ -382,3 +383,22 @@ async def test_different_commissioning_spec_does_not_recover_the_existing_journa
             TrialSession(rig.prepared, native_bounded=changed)
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as stored:
             assert stored.execute("SELECT state FROM outbox WHERE token=?", (token,)).fetchone()[0] == "inflight"
+
+
+# Intent: shutdown can verify a genuine closed zero after one unavailable native response.
+# Why: retrying the read inside the existing deadline can complete the result without another charger command.
+async def test_shutdown_retries_one_unavailable_native_confirmation(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as b:
+        c, peer = b.controller, b.rig.peer
+        assert (await healthy(c))["charging_session_open"] is False
+        assert not b.session.journal.active()
+        first = len(b.rig.bench.device_calls)
+        peer.arm = "503"
+        await b.session.close()
+        assert peer.selected_count == 1 and peer.selected_request["action"] == "getConfig"
+        assert b.session.final_status["shutdown_attempt_uncertain"] is False
+        assert b.rig.bench.firmware.effective_limit() == 0
+        wire = b.rig.bench.device_calls[first:]
+        assert [frame[2] for frame in wire if frame[2] in ("SetChargingProfile", "RemoteStopTransaction")] == [
+            "SetChargingProfile"
+        ]
