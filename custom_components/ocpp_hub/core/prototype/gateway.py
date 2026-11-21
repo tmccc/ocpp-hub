@@ -177,6 +177,7 @@ class Gateway:
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
+        self._boot_response: asyncio.Task[None] | None = None
         self._reserved_stops: dict[str, asyncio.Task[None]] = {}
         self._refusals: dict[str, asyncio.Task[None]] = {}
         self._flush_lock = asyncio.Lock()
@@ -238,6 +239,9 @@ class Gateway:
         epoch = self.journal.connection_epoch()
         self.charger.detach()
         self._charger_epoch = epoch
+        if self._boot_response is not None:
+            self._boot_response.cancel()
+            self._boot_response = None
         self._retire_boot_proof()
         self._boot_retry.clear()
         self._inbound.retire("charger", epoch)
@@ -266,6 +270,9 @@ class Gateway:
     def _detach_charger(self, epoch: int) -> None:
         if epoch == self._charger_epoch:
             self.charger.detach()
+            if self._boot_response is not None:
+                self._boot_response.cancel()
+                self._boot_response = None
             self._retire_boot_proof()
             self._boot_charger_epoch = -1
             self.controls.invalidate()
@@ -336,7 +343,9 @@ class Gateway:
             await asyncio.sleep(0)
 
     # Resolve replies immediately; process bounded incoming requests in separate tasks.
-    async def receive(self, side: str, raw: str | bytes, epoch: int | None = None) -> None:
+    async def receive(
+        self, side: str, raw: str | bytes, epoch: int | None = None, *, replies_only: bool = False
+    ) -> None:
         if side not in ("charger", "vendor"):
             raise DeniedError("unknown peer")
         current_epoch = self._charger_epoch if side == "charger" else self._vendor_epoch
@@ -348,14 +357,17 @@ class Gateway:
         except UnreadableFrameError, MalformedReplyError:
             return  # Keep the socket and wait for a valid message or the existing reply deadline.
         except MalformedCallError as error:
-            self._refuse_call(side, current_epoch, str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape")
+            if not replies_only:
+                self._refuse_call(side, current_epoch, str(error), ERROR_FORMATION_VIOLATION, "invalid CALL shape")
             return
         if frame[0] != 2:
             peer.receive(frame)
             return
+        if replies_only:
+            return
         boot = side == "charger" and frame[2] == "BootNotification"
         if boot:
-            await self._answer_boot(current_epoch, str(frame[1]), frame[3])
+            self._start_boot_response(current_epoch, str(frame[1]), frame[3])
             return
         reserved = len(self._tasks) >= 32
         stop = frame[2] == ("StopTransaction" if side == "charger" else "RemoteStopTransaction")
@@ -417,34 +429,43 @@ class Gateway:
             async with asyncio.timeout(peer.timeout):
                 await sender(text)
 
-    # A blocked Boot response cannot hold the serial charger reader indefinitely.
-    async def _send_boot_response(self, sender: Sender, text: str) -> None:
-        try:
-            async with asyncio.timeout(self.charger.timeout):
-                await sender(text)
-        except TimeoutError:
-            raise UnavailableError("charger Boot reply could not be sent") from None
-
-    # Make a durable Boot usable only after sending its reply, on the exact connection that received it.
-    async def _answer_boot(self, epoch: int, token: str, payload: dict[str, Any]) -> None:
+    # Retire old proof on arrival and give the bounded send its own task so the reader can receive other replies.
+    def _start_boot_response(self, epoch: int, token: str, payload: dict[str, Any]) -> None:
         # Withdrawal, admission and persistence are one turn, even if no handler slot is available.
-        def prepare() -> tuple[Sender | None, str, str | None]:
+        def prepare() -> tuple[Sender | None, str, str | None] | None:
             self._require_epoch("charger", epoch)
             self._retire_boot_proof()
-            if len(self._tasks) >= 32:
+            if len(self._tasks) >= 32 or (self._boot_response is not None and not self._boot_response.done()):
                 self._boot_retry.set()
-                return (
-                    self.charger.sender,
-                    build_call_error(token, "OccurrenceConstraintViolation", "request queue is full"),
-                    None,
-                )
+                return None
             text = self._boot_reply(token, payload)
             return self.charger.sender, text, self._pending_boot
 
-        sender, text, observation = self.decide(prepare, priority=CommandPriority.RESTRICT)
+        prepared = self.decide(prepare, priority=CommandPriority.RESTRICT)
+        if prepared is None:
+            self._refuse_call("charger", epoch, token, "OccurrenceConstraintViolation", "request queue is full")
+            return
+        sender, text, observation = prepared
         if sender is None:
             return
-        await self._send_boot_response(sender, text)
+        task = asyncio.create_task(self._send_boot_response(epoch, sender, text, observation))
+        self._boot_response = task
+        self._tasks.add(task)
+        task.add_done_callback(self._finished)
+
+    # Make a durable Boot usable only after its reply succeeds on the exact connection that received it.
+    async def _send_boot_response(self, epoch: int, sender: Sender, text: str, observation: str | None) -> None:
+        try:
+            async with asyncio.timeout(self.charger.timeout):
+                await sender(text)
+        except TimeoutError, UnavailableError:
+            # Only the current socket can request a fresh Boot after its send fails.
+            def retry() -> None:
+                if epoch == self._charger_epoch and self.charger.sender is sender:
+                    self._boot_retry.set()
+
+            self.decide(retry, priority=CommandPriority.RESTRICT)
+            raise
 
         # A successful send proves only the exact pending observation for its original connection.
         def publish() -> None:
@@ -470,6 +491,8 @@ class Gateway:
     # Retrieve task exceptions without logging frame bodies, identities or credentials.
     def _finished(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
+        if self._boot_response is task:
+            self._boot_response = None
         for group in (self._reserved_stops, self._refusals):
             for side, answer in group.items():
                 if answer is task:
@@ -728,7 +751,14 @@ class Gateway:
             number(payload.get("meterStop"), 1e12)
             timestamp(payload.get("timestamp"))
             tag = payload.get("idTag")
-            info = self.auth_info.get(tag) if self.policy.strict_cloud_authorization and isinstance(tag, str) else None
+            info = None
+            if self.policy.strict_cloud_authorization and isinstance(tag, str):
+                try:
+                    info = self.auth_info.get(tag)
+                except sqlite3.Error:
+                    if self.journal.db.in_transaction:
+                        raise
+                    # Tag information is optional. The known transaction still needs its exact Stop recorded.
             if info is not None and info["status"] == "Accepted" and isinstance(tag, str) and not self._local_tag(tag):
                 try:
                     self.auth_info.require_dynamic(info)
@@ -924,10 +954,16 @@ class Gateway:
         # Interpret and persist the cloud decision while its reply still owns the vendor gate.
         def received(_action: str, answer: Frame) -> None:
             nonlocal info
-            check()
+            self._require_epoch("vendor", epoch)
             if answer[0] != 3 or set(answer[2]) != {"idTagInfo"}:
                 raise UnavailableError("actual cloud authorization was unavailable")
-            info = self.auth_info.put(tag, answer[2]["idTagInfo"], self.auth_info.observe())
+            decision = validate_info(answer[2]["idTagInfo"])
+            if decision["status"] == "Accepted":
+                check()
+            # A real denial belongs to the tag even when its initiating Start no longer has permission.
+            info = self.auth_info.put(tag, decision, self.auth_info.observe())
+            if decision["status"] != "Accepted":
+                check()
 
         await self.vendor.call("Authorize", {"idTag": tag}, priority=5, check=check, on_reply=received)
         assert info is not None
@@ -1153,9 +1189,9 @@ class Gateway:
                     raise UnavailableError("unobserved remote transaction command response")
                 if query is not None:
                     answer = query.response(answer)
-                if grant is not None and answer[0] == 3 and answer[2] == {"status": "Rejected"}:
-                    self.authorisation.revoke(grant)
                 with self.journal.atomic():
+                    if grant is not None and answer[0] == 3 and answer[2] == {"status": "Rejected"}:
+                        self.authorisation.revoke(grant)
                     if profile_write is not None and answer[0] == 3 and answer[2] == {"status": "Accepted"}:
                         self._accepted_vendor_profile(profile_write)
                     if ics_write is not None and ics_write.accepted(answer):
@@ -1179,7 +1215,13 @@ class Gateway:
                             )
                 return reply_as(answer, token)
 
-            text = self.decide(lambda: settle(answer), priority=priority)
+            try:
+                text = self.decide(lambda: settle(answer), priority=priority)
+            except sqlite3.Error:
+                if self.journal.db.in_transaction:
+                    raise
+                # Replay only the rolled-back publication of this reply, never the charger command.
+                text = self.decide(lambda: settle(answer), priority=priority)
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
@@ -1494,13 +1536,17 @@ class Gateway:
             raise UnavailableError("vendor heartbeat time is invalid") from None
 
     # Deliver durable events in order; a cloud-accepted Start with a lost reply requires explicit reconciliation.
-    async def flush(self) -> None:
+    async def flush(self, *, can_send: Callable[[], bool] | None = None) -> None:
         epoch = self._vendor_epoch
         async with self._flush_lock:
             self.decide(self._refresh_delivery_uncertainty)
             self._require_epoch("vendor", epoch)
             await self._ensure_vendor_boot()
-            while (head := self.decide(self._prepare_delivery)) is not None:
+            while can_send is None or can_send():
+                head = self.decide(self._prepare_delivery)
+                if head is None:
+                    self.decide(self._clear_delivery_reply)
+                    return
                 item = head
                 if self._delivery_reply is None and retry_deferred(self.journal, item, self._start_retry_waits):
                     return
@@ -1520,6 +1566,8 @@ class Gateway:
                         def before_send() -> None:
                             nonlocal sent
                             self._require_epoch("vendor", epoch)
+                            if can_send is not None and not can_send():
+                                raise UnavailableError("charger changed before cloud delivery was sent")
                             self.journal.mark_sent(current)
                             sent = True
                             self.delivery_outcome_uncertain = item.action in ("StartTransaction", "StopTransaction")
@@ -1572,7 +1620,22 @@ class Gateway:
                 if disposition == "denied":
                     await self.controls.ensure_ceiling()
                     raise RecoveryRequiredError("cloud denied the mapped local session; zero hold retained")
-            self.decide(self._clear_delivery_reply)
+
+    # A retiring socket may finish the exact Start already sent, within the original reply timeout.
+    async def finish_sent_start(self) -> None:
+        item = self.journal.next_delivery()
+        if (
+            item is None
+            or item.action != "StartTransaction"
+            or item.state != "inflight"
+            or not self._flush_lock.locked()
+        ):
+            return
+        try:
+            async with asyncio.timeout(self.vendor.timeout), self._flush_lock:
+                pass
+        except TimeoutError:
+            pass  # Cancellation will leave an unanswered Start in the existing ambiguous state.
 
     # Refresh the transport's delivery diagnosis from the retained receipt.
     def _refresh_delivery_uncertainty(self) -> None:

@@ -577,6 +577,10 @@ class Journal:
         ).fetchone()
         return int(row[0]) if row else None
 
+    # A complete Start and Stop advances the allocation even when the connector is idle again.
+    def lifecycle_position(self) -> tuple[int, int | None]:
+        return self.get("next_transaction", 1000), self.active()
+
     # Translate a known local transaction without guessing from connector number.
     def vendor_id(self, local: int) -> int | None:
         row = self.db.execute("SELECT vendor FROM transactions WHERE local=?", (local,)).fetchone()

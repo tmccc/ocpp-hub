@@ -163,17 +163,18 @@ async def test_unrenewable_approval_refuses_admission(tmp_path, tls, unused_tcp_
         assert not peer.authorizations and not starts(test.rig)
 
 
-# Intent: a late Accepted cannot replace a newer Pause, genuine Boot or persisted denial during renewal.
-# Why: fresh cloud metadata must be bound to the same authority that requested it before any Start is allowed.
-@pytest.mark.parametrize("superseding", ["pause", "boot", "metadata", "vendor"])
+# Intent: a newer Pause, Boot or tag decision blocks a late approval, while a real denial still belongs to its tag.
+# Why: the settled tag and permission to use it for this Start are separate facts.
+@pytest.mark.parametrize("superseding", ["pause", "pause-denial", "boot", "metadata", "vendor"])
 async def test_renewal_reply_cannot_overtake_newer_authority(tmp_path, tls, unused_tcp_port, monkeypatch, superseding):
-    async with renewal_rig(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as (test, peer, expired):
+    outcome = "Blocked" if superseding == "pause-denial" else "Accepted"
+    async with renewal_rig(tmp_path, tls, unused_tcp_port, monkeypatch, 32, outcome) as (test, peer, expired):
         c, g = test.controller, test.session.gateway
         identifier = uuid.uuid4().hex
         c.command(identifier, "start", c.requests.intent().revision)
         await asyncio.wait_for(peer.entered.wait(), 2)
         tag = sorted(g.policy.allowed_tags)[0]
-        if superseding == "pause":
+        if superseding in ("pause", "pause-denial"):
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
         elif superseding == "boot":
             before = c.authority()
@@ -188,8 +189,11 @@ async def test_renewal_reply_cannot_overtake_newer_authority(tmp_path, tls, unus
         peer.release.set()
         await c.charging.settle()
         assert c.requests.receipt(identifier)["state"] == "failed" and not starts(test.rig)
-        assert g.auth_info.stored(tag) == ({"status": "Blocked"} if superseding == "metadata" else expired)
-        if superseding == "pause":
+        if superseding == "pause-denial":
+            assert g.auth_info.stored(tag)["status"] == "Blocked"
+        else:
+            assert g.auth_info.stored(tag) == ({"status": "Blocked"} if superseding == "metadata" else expired)
+        if superseding in ("pause", "pause-denial"):
             assert (await healthy(c))["local_hold_verified"]
 
 

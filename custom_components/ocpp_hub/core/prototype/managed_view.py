@@ -537,7 +537,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     pause_pending = c.requests.pending_pause()
     station_lost = c.session.book.station_ceiling_lost()
     # A pending Pause may show the last sample for the same session, but a new lifecycle needs a new reading.
-    native = c.latest_native
+    native = c.current_native_sample()
     sample_available = (
         result.get("charger_connected") is True
         and current is not None
@@ -633,9 +633,9 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     result["can_pause"] = not c.stopping
     try:
         result.update(
-            can_start_test=result["healthy"] and c.charging.available(c.latest_native),
-            can_start=result["local_healthy"] and c.charging.available(c.latest_native, normal=True),
-            can_set_current=result["local_healthy"] and c.current.available(c.latest_native),
+            can_start_test=result["healthy"] and c.charging.available(native),
+            can_start=result["local_healthy"] and c.charging.available(native, normal=True),
+            can_set_current=result["local_healthy"] and c.current.available(native),
             can_return=_return_refusal(c, intent.mode, result) is None,
         )
     except sqlite3.Error:

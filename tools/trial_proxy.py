@@ -47,6 +47,7 @@ from ocpp_hub_core.prototype.trial_evidence import NativeObserver  # noqa: E402
 from ocpp_hub_core.prototype.trial_session import (  # noqa: E402
     PreparedNative,
     TrialSession,
+    open_native_journal,
     preflight,
     save_private,
 )
@@ -71,9 +72,9 @@ def native_spec(path: Path, prepared: PreparedNative) -> NativeBoundedSpec:
 
 # A stopped inspection runs normal recovery checks on a private copy, with the original owner lock held.
 @contextmanager
-def operator_journal(config: TrialConfig, *, inspect: bool) -> Iterator[Journal]:
+def operator_journal(config: TrialConfig, spec: NativeBoundedSpec, *, inspect: bool) -> Iterator[Journal]:
     if not inspect:
-        with closing(Journal(config.journal, config.identity)) as journal:
+        with closing(open_native_journal(config.journal, config.identity, spec)) as journal:
             yield journal
         return
 
@@ -92,7 +93,7 @@ def operator_journal(config: TrialConfig, *, inspect: bool) -> Iterator[Journal]
             wal = Path(str(original) + "-wal")
             if wal.exists():
                 shutil.copyfile(wal, Path(str(copy) + "-wal"))
-            with closing(Journal(copy, config.identity)) as journal:
+            with closing(open_native_journal(copy, config.identity, spec)) as journal:
                 yield journal
 
 

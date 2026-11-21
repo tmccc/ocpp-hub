@@ -19,9 +19,8 @@ from ocpp_hub_core.prototype.native_history_recovery import (  # noqa: E402
     acknowledge_history_policy,
     acknowledge_start_attempts,
 )
-from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
-from ocpp_hub_core.prototype.trial_session import preflight_native  # noqa: E402
+from ocpp_hub_core.prototype.trial_session import open_native_journal, preflight_native  # noqa: E402
 
 
 # No listener, charger writer or service lifecycle is available through this deliberately small operator tool.
@@ -31,7 +30,7 @@ async def run(action: str, config_path: Path, spec_path: Path) -> int:
     if action == "check":
         emit({"inputs_valid": True, "offline_only": True, "charger_changed": False})
         return 0
-    journal = Journal(prepared.config.journal, prepared.config.identity)
+    journal = open_native_journal(prepared.config.journal, prepared.config.identity, spec)
     try:
         book = ResourceBook(journal, prepared.baseline)
         native = await prepared.observer.observe_handover()

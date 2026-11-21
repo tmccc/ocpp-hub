@@ -101,6 +101,7 @@ class ManagedController:
         self.pause_task: asyncio.Task[Any] | None = None
         self._pause_generation = 0
         self.latest_native: HandoverEvidence | None = None
+        self.latest_native_lifecycle: tuple[int, int | None] | None = None
         self.status_authority: AuthorityStamp | None = None
         self.status_latest_closed: int | None = None
         self.status_vendor_epoch: int | None = None
@@ -122,6 +123,12 @@ class ManagedController:
         self.native.repair_audits = NativeRepairAudits(
             session.journal, lambda fault: release_evidence(self, fault) is not None
         )
+
+    # A sample before a recorded Start or Stop cannot prove the current session, even after it closes.
+    def current_native_sample(self) -> HandoverEvidence | None:
+        if self.latest_native is not None and self.latest_native_lifecycle == self.session.journal.lifecycle_position():
+            return self.latest_native
+        return None
 
     # Rebuild full ownership for result/publication checks without caching permission across an await.
     def authority(self) -> AuthorityStamp | None:
@@ -1132,6 +1139,7 @@ class ManagedController:
         self.strict_failure_seen = False
         self.history_omission_only = True
         self.native_unavailable = 0
+        self.latest_native_lifecycle = self.session.journal.lifecycle_position()
         self.latest_native = native
         if intent_changed:
             return PollStatus("pausing", intent=observed_intent)

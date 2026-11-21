@@ -174,7 +174,7 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert status["healthy"] and status["local_hold_verified"] and status["can_return"]
 
                     # Fail the real delivery pump after the last complete poll.
-                    async def refuse_flush():
+                    async def refuse_flush(*, can_send=None):
                         raise sqlite3.OperationalError("delivery storage unavailable")
 
                     runtime = session.runtime.status

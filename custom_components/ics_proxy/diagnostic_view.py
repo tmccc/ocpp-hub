@@ -153,6 +153,7 @@ def protocol(value: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
         "reconnects": number(value.get("reconnects")),
         "connection_attempts": number(value.get("connection_attempts")),
+        "recent_handler_failures": number(value.get("recent_handler_failures")),
         "delivery_blocked": value.get("delivery_blocked") if type(value.get("delivery_blocked")) is bool else None,
         "delivery_cause": label(value.get("delivery_cause"), {"storage", "reconciliation"}),
     }

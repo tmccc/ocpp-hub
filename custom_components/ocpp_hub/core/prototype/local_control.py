@@ -875,11 +875,8 @@ class LocalControl:
                 def settle(answer: Frame) -> None:
                     if attempt is not None:
                         attempt.answer = answer
-                    if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
-                        if answer[0] == 3 and answer[2] == {"status": "Rejected"}:
-                            record_stage("rejected")
+                    if not self.journal.starts.record_reply(ticket, answer):
                         raise UnavailableError("transaction start was not confirmed")
-                    record_stage("accepted")
                     check()
                     publication = None
                     with self.journal.atomic():

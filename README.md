@@ -50,6 +50,8 @@ retains its actual reply or unknown outcome.
 The proxy uses one queue to decide what to send and how incoming reports and replies change charging state.
 The charger and cloud connections keep reading while the proxy waits for command replies. A newer Pause can
 take effect while an earlier reply is outstanding. The proxy applies that reply to its original request and charging session.
+A Start or Stop expires the previous charger observation even if the whole charge finishes before the next poll.
+The proxy rechecks the evidence for a charging command immediately before sending it.
 
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
@@ -506,6 +508,7 @@ notification include a plain-English explanation. A new Start or Stop withdraws 
 proof until a fresh charger reading arrives. The report separates the retained original fault, current
 blockers, pending/uncertain receipts and worker activity. A strict native refusal or an interrupted audit remains
 blocked; these explanations grant no new recovery permission. Missing receipt timestamps remain unknown.
+Protocol diagnostics also show the number of recent message-handler failures in the current proxy process.
 
 The download includes at most five pending receipts and twenty recent transitions from the current proxy process.
 The existing rotated event file preserves transitions across replacements; the download explicitly labels its

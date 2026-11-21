@@ -249,7 +249,7 @@ class Peer:
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
         self.before_send: Callable[[str, dict[str, Any]], GateDecision | None] | None = None
-        self.validate_send: Callable[[str, dict[str, Any]], Awaitable[GateDecision | None]] | None = None
+        self.validate_send: Callable[[str, dict[str, Any]], Awaitable[Guard | GateDecision | None]] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
         self.diagnostics = RpcDiagnostics()
 
@@ -363,7 +363,7 @@ class Peer:
     # Bound native preparation independently, retiring its sockets promptly on Stop, disconnect or cancellation.
     async def _validate(
         self, action: str, payload: dict[str, Any], future: asyncio.Future[Frame], preemptible: bool
-    ) -> GateDecision | None:
+    ) -> Guard | GateDecision | None:
         if self.validate_send is None:
             return None
         validation = asyncio.ensure_future(self.validate_send(action, payload))
@@ -447,9 +447,9 @@ class Peer:
         noted_reply = False
         try:
             actual = self.decide(payload, priority=priority) if callable(payload) else payload
-            decision = await self._validate(action, actual, future, preemptible)
-            if isinstance(decision, Pending):
-                return NotSent(decision)
+            validation = await self._validate(action, actual, future, preemptible)
+            if isinstance(validation, Pending):
+                return NotSent(validation)
 
             # Guard and record the exact request immediately before its sender can transmit.
             def ready_to_send() -> str | Pending:
@@ -464,6 +464,10 @@ class Peer:
                 if future.done():
                     future.result()
                     raise UnavailableError("request was not sent; peer replied before dispatch")
+                if callable(validation):
+                    permitted = validation()
+                    if isinstance(permitted, Pending):
+                        return permitted
                 if before_send is not None:
                     permitted = before_send()
                     if isinstance(permitted, Pending):

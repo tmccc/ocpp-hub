@@ -154,6 +154,11 @@ def require_supported_installation(db: sqlite3.Connection, spec: NativeBoundedSp
         raise SecurityError("native bounded specification changed across process replacement")
 
 
+# Check the exact installation under the journal lock before any normalisation, including in offline tools.
+def open_native_journal(path: Path, identity: str, spec: NativeBoundedSpec) -> Journal:
+    return Journal(path, identity, check_existing=lambda db: require_supported_installation(db, spec))
+
+
 class TrialSession:
     """Only explicit start opens sockets; expiry/shutdown leaves a hold rather than silently rolling back a live car."""
 
@@ -174,11 +179,7 @@ class TrialSession:
             raise SecurityError("unplugged native monitoring requires bounded mode and disabled local Start")
         self.prepared = prepared
         config = prepared.config
-        self.journal = Journal(
-            config.journal,
-            config.identity,
-            check_existing=lambda db: require_supported_installation(db, native_bounded),
-        )
+        self.journal = open_native_journal(config.journal, config.identity, native_bounded)
         try:
             managed = self.journal.get("managed_mode")
             if managed is not None and (

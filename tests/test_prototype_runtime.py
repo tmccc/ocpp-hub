@@ -313,10 +313,10 @@ def test_runtime_constructor_is_dormant_and_rejects_live_urls(
     store.close()
 
 
-# Intent: the socket keeps receiving genuine replies while a refusal send is waiting for the peer.
-# Why: a stalled reply to a malformed or excess report cannot hide the charger response to another command.
-@pytest.mark.parametrize("full", [False, True])
-async def test_runtime_reads_a_reply_while_a_refusal_send_waits(tmp_path, tls, admission, full):
+# Intent: the socket keeps receiving genuine replies while a Boot response or a refusal is waiting for the peer.
+# Why: a stalled response cannot hide the charger reply to another command.
+@pytest.mark.parametrize("blocked", ["malformed", "full_queue", "boot"])
+async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, tls, admission, blocked):
     bench = Bench(tmp_path / "reply-congestion.db", tls, admission)
     release, refusing, full_queue = asyncio.Event(), asyncio.Event(), asyncio.Event()
     queued = set()
@@ -341,7 +341,7 @@ async def test_runtime_reads_a_reply_while_a_refusal_send_waits(tmp_path, tls, a
                         if len(queued) == 32:
                             full_queue.set()
                         await release.wait()
-                    if frame[0] == 4 and frame[1] == "refused":
+                    if frame[0] in (3, 4) and frame[1] == "held":
                         refusing.set()
                         await release.wait()
                     await sender(raw)
@@ -349,16 +349,21 @@ async def test_runtime_reads_a_reply_while_a_refusal_send_waits(tmp_path, tls, a
                 peer.sender = congested
                 command = None
                 try:
-                    if full:
+                    if blocked == "full_queue":
                         for index in range(32):
                             await charger.send(build_call(f"queued-{index}", "Heartbeat", {}))
                         await asyncio.wait_for(full_queue.wait(), 1)
-                        await charger.send(build_call("refused", "Heartbeat", {}))
+                        await charger.send(build_call("held", "Heartbeat", {}))
+                    elif blocked == "boot":
+                        command = asyncio.create_task(peer.call("GetConfiguration", {"key": ["HeartbeatInterval"]}))
+                        request = decode(await asyncio.wait_for(charger.recv(), 1))
+                        await charger.send(build_call("held", "BootNotification", BOOT))
                     else:
-                        await charger.send('[2,"refused","Heartbeat",[]]')
+                        await charger.send('[2,"held","Heartbeat",[]]')
                     await asyncio.wait_for(refusing.wait(), 1)
-                    command = asyncio.create_task(peer.call("GetConfiguration", {"key": ["HeartbeatInterval"]}))
-                    request = decode(await asyncio.wait_for(charger.recv(), 1))
+                    if command is None:
+                        command = asyncio.create_task(peer.call("GetConfiguration", {"key": ["HeartbeatInterval"]}))
+                        request = decode(await asyncio.wait_for(charger.recv(), 1))
                     assert request[0] == 2 and request[2] == "GetConfiguration"
                     actual = {"configurationKey": []}
                     await charger.send(build_call_result(request[1], actual))

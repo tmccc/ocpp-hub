@@ -8,9 +8,10 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 from ocpp_hub_core.prototype.native_bounded import NativeBoundedSpec, capture_native_bounded_baseline
+from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import fingerprint
-from ocpp_hub_core.prototype.trial_evidence import Resource
+from ocpp_hub_core.prototype.trial_evidence import Resource, native_profiles
 from ocpp_hub_core.prototype.trial_handover_evidence import HandoverEvidence, handover_evidence
 from ocpp_hub_core.prototype.trial_resources import Baseline
 
@@ -32,6 +33,15 @@ ORIGINAL = {
 ROUTE = {"sDomain": "127.0.0.1", "sPort": "19001", "sURL": "/trial/", "allowSelfSign": "1"}
 SCHEDULE = {"planList": [{"planId": 11, "startTime": 0, "limitCurrent": 320}], "defaultEco": {"ecoMode": "Fast"}}
 BOOT = {"chargePointVendor": "Synthetic", "firmwareVersion": "verified-1"}
+
+
+# Intent: refuse inventory containers that list the expected names but lack their profile data.
+# Why: a charger format error must follow the ordinary refusal path and leave supervision running.
+def test_native_profile_inventory_requires_mappings():
+    purposes = ["ChargePointMaxProfile", "TxDefaultProfile", "TxProfile"]
+    for body in (["conn0", "conn1"], {"conn0": purposes, "conn1": dict.fromkeys(purposes, [])}):
+        with pytest.raises(NativeContentError, match="inventory could not be validated"):
+            native_profiles(body)
 
 
 # Build a separate native firmware snapshot rather than deriving physical values from the policy under test.

@@ -7,7 +7,7 @@ from contextlib import AsyncExitStack
 import pytest
 
 from tests import managed_rig as mp
-from tests.charge_rig import ChargeRig
+from tests.charge_rig import ChargeRig, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import START
@@ -15,6 +15,33 @@ from tests.runtime_rig import until
 from tests.test_managed_start_delivery_recovery import map_unknown_retry
 from tests.test_managed_stop_reply_recovery import pause, running
 from tests.tls_support import tls as tls
+
+
+# Intent: receive the outcome of a Start already sent to the cloud when the charger's socket closes.
+# Why: retiring the cloud socket immediately can leave a genuine scheduled charge unresolved.
+async def test_closed_charger_socket_allows_sent_start_reply_to_finish(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, bench_type=StartReplyBench) as b:
+        bench, gateway, journal = b.rig.bench, b.session.gateway, b.session.journal
+        release = asyncio.Event()
+        bench.start_reply_gate = release
+        try:
+            opened = await bench.call(
+                b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            assert opened[0] == 3
+            local = opened[2]["transactionId"]
+            await until(lambda: bool(bench.backend_starts))
+            assert journal.next_delivery().state == "inflight"
+            await b.charger.close()
+            await until(lambda: gateway.charger.sender is None)
+            await asyncio.sleep(b.session.runtime.settings.pump_interval * 3)
+            assert bench.cloud is not None and journal.next_delivery().state == "inflight"
+            release.set()
+            await until(lambda: journal.vendor_id(local) == bench.backend_starts[0]["answer"]["transactionId"])
+            await until(lambda: not b.session.runtime.status.vendor_connected)
+            assert len(bench.backend_starts) == 1 and not journal.get("managed_control_fault")
+        finally:
+            release.set()
 
 
 # Intent: lifecycle closure and owner revocation before the Start reply never lose real mapping or later recovery.

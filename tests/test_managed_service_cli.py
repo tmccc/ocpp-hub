@@ -304,7 +304,7 @@ async def test_operator_inspection_reads_a_stopped_wal_without_writing_it(tmp_pa
         config = rig.prepared.config
         with closing(Journal(config.journal, config.identity)):
             with pytest.raises(RecoveryRequiredError, match="active owner"):
-                with trial_proxy.operator_journal(config, inspect=True):
+                with trial_proxy.operator_journal(config, rig.spec, inspect=True):
                     pytest.fail("inspection bypassed the original lock")
         original = config.journal
         with closing(sqlite3.connect(original, isolation_level=None)) as writer:
@@ -312,7 +312,7 @@ async def test_operator_inspection_reads_a_stopped_wal_without_writing_it(tmp_pa
             writer.execute("INSERT INTO meta VALUES('test_stopped_wal','true')")
             files = tuple(Path(str(original) + suffix) for suffix in ("", ".lock", "-wal", "-shm"))
             before = [path.read_bytes() for path in files]
-            with trial_proxy.operator_journal(config, inspect=True) as snapshot:
+            with trial_proxy.operator_journal(config, rig.spec, inspect=True) as snapshot:
                 assert snapshot.get("test_stopped_wal") is True
                 snapshot.put("test_stopped_wal", False)
             assert [path.read_bytes() for path in files] == before

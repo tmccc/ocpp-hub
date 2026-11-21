@@ -16,9 +16,8 @@ from tools.trial_proxy import emit, load_core, native_spec  # noqa: E402
 load_core()
 from ocpp_hub_core.prototype.managed_current_prepare import prepare_current_capability  # noqa: E402
 from ocpp_hub_core.prototype.native_http import read_native  # noqa: E402
-from ocpp_hub_core.prototype.store import Journal  # noqa: E402
 from ocpp_hub_core.prototype.trial_resources import ResourceBook  # noqa: E402
-from ocpp_hub_core.prototype.trial_session import preflight_native  # noqa: E402
+from ocpp_hub_core.prototype.trial_session import open_native_journal, preflight_native  # noqa: E402
 
 
 # A named action is the only write path; the default parses private inputs without contacting the charger.
@@ -28,7 +27,7 @@ async def run(action: str, config_path: Path, spec_path: Path) -> int:
     if action == "check":
         emit({"offline_only": True, "native_ceiling_a": 32, "charger_changed": False})
         return 0
-    journal = Journal(prepared.config.journal, prepared.config.identity)
+    journal = open_native_journal(prepared.config.journal, prepared.config.identity, spec)
     try:
         book = ResourceBook(journal, prepared.baseline)
 

@@ -56,7 +56,7 @@ async def run(
     if action == "reconcile" and evidence is None:
         raise SecurityError("reconciliation requires explicit independently verified operator evidence")
     prepared.observer.port = native_port
-    with operator_journal(prepared.config, inspect=action == "inspect") as journal:
+    with operator_journal(prepared.config, spec, inspect=action == "inspect") as journal:
         book = ResourceBook(journal, prepared.baseline)
         native = await prepared.observer.observe_handover()
         if action == "inspect":

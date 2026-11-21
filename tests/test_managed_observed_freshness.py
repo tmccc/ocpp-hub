@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import sqlite3
 import sys
 import time
 import uuid
@@ -23,7 +24,7 @@ from tests.trial_peer import Bench
 
 # Intent: a new charger lifecycle report retires the earlier dashboard measurement before the next poll.
 # Why: the viewer cannot use power or session state taken before a genuine Start or Stop.
-@pytest.mark.parametrize("event", ["start", "stop"])
+@pytest.mark.parametrize("event", ["start", "stop", "start-stop"])
 async def test_charger_lifecycle_change_retires_older_live_measurement(
     tmp_path, tls, unused_tcp_port, monkeypatch, event
 ):
@@ -34,6 +35,9 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
         if event == "stop":
             observed = await healthy(c)
             assert observed["charging_session_open"] is True and observed["power_w"] == 1440
+        else:
+            assert observed["charging_session_open"] is False and j.active() == local
+        if event != "start":
             reply = await b.rig.bench.call(
                 b.charger,
                 "daily-natural-stop",
@@ -43,8 +47,7 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
             assert reply[0] == 3 and j.active() is None
             b.rig.peer.permission_enabled = False
             b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
-        else:
-            assert observed["charging_session_open"] is False and j.active() == local
+            await until(lambda: j.next_delivery() is None)
         stale = refresh_for_read(c, dict(observed, running=True, certificate_remaining_seconds=86400))
         assert stale["charging_session_open"] is None and stale["power_w"] is None
         assert not stale["healthy"] and not stale["owner_control_enabled"]
@@ -54,6 +57,68 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
         if event == "start":
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
             await actual_stop(b, local)
+
+
+# Intent: record a genuine Stop when the optional tag cache cannot be read.
+# Why: an optional authorization detail must never keep a closed session open in the journal.
+async def test_stop_records_closure_when_tag_cache_read_fails(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        journal = b.session.journal
+        local = await positive_flow(b, "daily")
+        refused = False
+
+        # Leave the real STOP transaction writable; fail only the optional tag lookup.
+        def authorize(action, table, column, database, trigger):
+            nonlocal refused
+            if action == sqlite3.SQLITE_READ and (table, column) == ("auth_info", "info"):
+                refused = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        journal.db.set_authorizer(authorize)
+        try:
+            reply = await b.rig.bench.call(
+                b.charger,
+                "daily-tagged-stop",
+                "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100, "idTag": "NATIVE_TIMER"},
+            )
+            assert refused and reply[0] == 3 and journal.active() is None
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        finally:
+            journal.db.set_authorizer(None)
+        await until(lambda: journal.next_delivery() is None)
+
+
+# Intent: a strict native observation after validation but before wiring a Start invalidates that dispatch.
+# Why: later evidence must win even while connection, control ticket and user intent are unchanged.
+async def test_send_rechecks_native_validation_after_new_strict_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, peer = b.controller, b.session.gateway.charger
+        await healthy(c)
+        validate = peer.validate_send
+        assert validate is not None
+        refused = False
+
+        # Deliver one real contradictory sample after the original native validation completes.
+        async def validation(action, body):
+            nonlocal refused
+            result = await validate(action, body)
+            if action == "RemoteStartTransaction":
+                with monkeypatch.context() as native:
+                    native.setitem(b.rig.peer.configuration, "maxOutCurrent0", "31")
+                    with pytest.raises(SecurityError):
+                        await c.native.read()
+                    assert c.native.last_verified_at == 0
+                refused = True
+            return result
+
+        monkeypatch.setattr(peer, "validate_send", validation)
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        assert refused and not starts(b.rig)
 
 
 # Intent: a later independent failed native audit withdraws the earlier healthy dashboard sample immediately.

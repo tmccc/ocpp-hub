@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
+from ..frames import Frame
 from .managed_intent import ControlIntent, insert_request
 from .start_handoff import StartHandoffContext, StartPublication
 from .start_settlement import (
@@ -37,6 +38,7 @@ class StartLifecycle:
     def __init__(self, journal: Journal) -> None:
         self.journal = journal
         self.lease: ChargeLease | None = None
+        self.pending_reply: tuple[str, str] | None = None
 
     # Preserve the established fallback for journals written before a separate wire receipt existed.
     def receipt(self) -> dict[str, Any]:
@@ -470,6 +472,33 @@ class StartLifecycle:
             j.put("local_start_receipt", {**receipt, "stage": stage, **({"settled_ticket": ticket} if settled else {})})
             if settled:
                 j.control.project(control, start_pending=False)
+
+    # Store only a definite reply, independently of permission to publish an accepted Start.
+    def record_reply(self, ticket: str, answer: Frame) -> bool:
+        if answer[0] != 3 or answer[2] not in ({"status": "Accepted"}, {"status": "Rejected"}):
+            return False
+        stage = "accepted" if answer[2] == {"status": "Accepted"} else "rejected"
+        try:
+            self.record(ticket, stage)
+        except sqlite3.Error:
+            self.pending_reply = ticket, stage
+            raise
+        return stage == "accepted"
+
+    # Retry the original write without holding up Pause or reopening the Start's authority.
+    def publish_pending_reply(self) -> None:
+        if self.pending_reply is None:
+            return
+        ticket, stage = self.pending_reply
+        try:
+            wire = self.receipt()
+            if wire.get("ticket") == ticket and wire.get("stage") == "issued":
+                self.record(ticket, stage)
+        except sqlite3.Error:
+            if self.journal.db.in_transaction:
+                raise
+            return
+        self.pending_reply = None
 
     # A newer Pause can settle an exact, unbound device rejection after verifying its own closed zero.
     def settle_rejected_pause(self, revision: int, require_hold: Callable[[dict[str, Any]], None]) -> None:

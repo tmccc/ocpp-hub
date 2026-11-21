@@ -58,6 +58,7 @@ def protocol_snapshot(c: ManagedController) -> dict[str, Any]:
         "cloud": {"rpc": gateway.vendor.diagnostics.snapshot(), "fault": runtime.vendor_fault.snapshot()},
         "reconnects": runtime.reconnects,
         "connection_attempts": runtime.vendor_attempts,
+        "recent_handler_failures": len(gateway.failures),
         "delivery_blocked": runtime.delivery_blocked,
         "delivery_cause": runtime.delivery_blocked_cause
         if runtime.delivery_blocked_cause in ("storage", "reconciliation")

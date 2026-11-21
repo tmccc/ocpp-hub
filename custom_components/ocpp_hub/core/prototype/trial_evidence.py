@@ -288,11 +288,15 @@ class NativeObserver:
 def native_profiles(smart: Any) -> tuple[Resource, ...]:
     try:
         resources = []
-        if set(smart) != {"conn0", "conn1"}:
+        if not isinstance(smart, dict) or set(smart) != {"conn0", "conn1"}:
             raise ValueError
         for connector in (0, 1):
             purposes = smart["conn" + str(connector)]
-            if set(purposes) != {"ChargePointMaxProfile", "TxDefaultProfile", "TxProfile"}:
+            if not isinstance(purposes, dict) or set(purposes) != {
+                "ChargePointMaxProfile",
+                "TxDefaultProfile",
+                "TxProfile",
+            }:
                 raise ValueError
             for purpose, profiles in purposes.items():
                 if not isinstance(profiles, list):

@@ -440,11 +440,20 @@ class ConnectionRuntime:
         boot_revision = self.gateway.boot_metadata_revision
         fault_count = self.status.vendor_fault.count
 
+        # This exact charger introduction is the only one this cloud socket represents.
+        def charger_current() -> bool:
+            return (
+                self.vendor_session_enabled()
+                and self.gateway.current_boot_seen(charger_epoch)
+                and self.gateway.journal.get("boot") == boot
+                and self.gateway.boot_metadata_revision == boot_revision
+            )
+
         # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
         async def receive() -> None:
             try:
                 async for raw in connection:
-                    await self.gateway.receive("vendor", raw, epoch)
+                    await self.gateway.receive("vendor", raw, epoch, replies_only=not charger_current())
             except ConnectionClosed as error:
                 self.status.vendor_fault.record(error, self._vendor_stage(), self.gateway.vendor.diagnostics.action)
                 raise
@@ -453,17 +462,13 @@ class ConnectionRuntime:
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
-            while (
-                self.vendor_session_enabled()
-                and self.gateway.current_boot_seen(charger_epoch)
-                and self.gateway.journal.get("boot") == boot
-                and self.gateway.boot_metadata_revision == boot_revision
-            ):
+            while charger_current():
                 await asyncio.sleep(self.settings.pump_interval)
+            await self.gateway.finish_sent_start()
 
         tasks = [
             asyncio.create_task(receive()),
-            asyncio.create_task(self._pump()),
+            asyncio.create_task(self._pump(charger_current)),
             asyncio.create_task(self._heartbeat()),
             asyncio.create_task(charger_presence()),
         ]
@@ -492,13 +497,13 @@ class ConnectionRuntime:
                 raise RuntimeError("offline runtime task retirement exceeded its deadline")
 
     # Registration retry and durable delivery are independent of heartbeat and local command handling.
-    async def _pump(self) -> None:
-        while True:
+    async def _pump(self, can_send: Callable[[], bool]) -> None:
+        while can_send():
             try:
                 if self.gateway.journal.get("boot") is None:
                     await asyncio.sleep(self.settings.pump_interval)
                     continue
-                await self.gateway.flush()
+                await self.gateway.flush(can_send=can_send)
                 self.gateway.decide(lambda: self._settle_delivery_status(None))
             except RegistrationDeferredError as error:
                 await asyncio.sleep(error.retry_after)

@@ -12,11 +12,49 @@ from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from websockets.asyncio.server import serve
 
+from tests.charge_rig import ready
 from tests.prototype_rig import START
 from tests.runtime_rig import Bench, until
 from tests.tls_support import admission as admission
 from tests.tls_support import tls as tls
 from tests.trial_peer import Bench as TrialBench
+
+
+# Intent: retry a refused journal publication using the real charger rejection already received.
+# Why: the issued grant and its result must settle together, without another physical command.
+async def test_cloud_start_rejection_survives_one_failed_outcome_write(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        journal, bench = b.session.journal, b.rig.bench
+        sender = b.charger.send
+        writes = 0
+
+        # Change only the synthetic charger's actual reply after its independent receiver records the request.
+        async def reject_start(raw):
+            frame = decode(raw)
+            if frame[0] == 3 and any(
+                call[1] == frame[1] and call[2] == "RemoteStartTransaction" for call in bench.device_calls
+            ):
+                raw = build_call_result(frame[1], {"status": "Rejected"})
+            await sender(raw)
+
+        # Refuse only the first write of this definite outcome in the real transaction.
+        def refuse_once():
+            nonlocal writes
+            writes += 1
+            return writes == 1
+
+        monkeypatch.setattr(b.charger, "send", reject_start)
+        journal.db.create_function("refuse_first_start_result", 0, refuse_once)
+        journal.db.execute(
+            "CREATE TEMP TRIGGER fail_start_result BEFORE UPDATE ON vendor_command_scope "
+            "WHEN NEW.wire_result='Rejected' AND refuse_first_start_result() "
+            "BEGIN SELECT RAISE(ABORT,'synthetic journal refusal'); END"
+        )
+        reply = await bench.cloud_call("record-rejected-start", "RemoteStartTransaction", {"idTag": "CLOUD_OWNER"})
+        assert reply == [3, "record-rejected-start", {"status": "Rejected"}] and writes == 2
+        assert not journal.get("vendor_start_grant") and not journal.get("uncertain_vendor_command")
+        assert journal.db.execute("SELECT wire_result FROM vendor_command_scope").fetchone()[0] == "Rejected"
+        assert sum(call[2] == "RemoteStartTransaction" for call in bench.device_calls) == 1
 
 
 # Intent: an accepted profile replacement without a transaction remains clearable after the old session ends.

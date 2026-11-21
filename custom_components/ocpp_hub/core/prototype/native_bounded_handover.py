@@ -26,7 +26,7 @@ from .native_faults import MeasuredValues, NativeContentError, _NativeMeasuremen
 from .native_history import MissingOriginalHistoryError, audit_history, inspect_history
 from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, GateDecision, Guard, Pending, Prerequisite, require_allowed
 from .rpc import IntroductionDeferredError, UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice
@@ -137,7 +137,7 @@ class NativeBoundedHandover:
                 "revision": gateway.controls._revision,
                 "phase": journal.phase.read().value,
                 "control": journal.get("control"),
-                "active": journal.active(),
+                "lifecycle": journal.lifecycle_position(),
                 "boot": journal.get("boot"),
                 "binding": journal.get("trial_binding"),
                 "grant": journal.get("vendor_start_grant"),
@@ -872,7 +872,7 @@ class NativeBoundedHandover:
         self.book.require_confirmed_station(profiles, self.gateway.controls.desired())
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
-    async def validate_send(self, action: str, payload: dict[str, Any]) -> GateDecision | None:
+    async def validate_send(self, action: str, payload: dict[str, Any]) -> Guard | Pending | None:
         if action == "DataTransfer" and is_safe_transaction_query(payload):
             return None
         if action in ("GetConfiguration", "GetCompositeSchedule", "TriggerMessage", "RemoteStopTransaction"):
@@ -894,7 +894,19 @@ class NativeBoundedHandover:
                 closed=action == "ClearChargingProfile" or selecting and action == "SetChargingProfile"
             )
         authority, sequence = self.authority(), self.last_resolved_read
-        return self.gateway.decide(lambda: self._accept_send_observation(action, payload, native, authority, sequence))
+        decision = self.gateway.decide(
+            lambda: self._accept_send_observation(action, payload, native, authority, sequence)
+        )
+        if isinstance(decision, Pending):
+            return decision
+
+        # The transport can yield after validation. Recheck this sample before it records the send.
+        def require_current() -> None:
+            if self.last_verified_at == 0 or sequence != self.last_resolved_read or authority != self.authority():
+                raise AuditSupersededError("outgoing validation was superseded before dispatch")
+            native.physical.require_fresh(self.gateway.journal.identity, 5)
+
+        return require_current
 
     # Apply the independent send evidence before the final wire guard and resource receipt.
     def _accept_send_observation(

@@ -363,7 +363,7 @@ class ManagedCurrentLimits:
             return previous
         intent = c.requests.intent()
         g = c.session.gateway
-        connection, native = current_control_scope(g), c.latest_native
+        connection, native = current_control_scope(g), c.current_native_sample()
         if connection is None or intent.revision != revision or native is None or not self.available(native):
             raise RecoveryRequiredError("current selection requires fresh idle authority and the current revision")
         previous_value = self.selected()

@@ -301,7 +301,7 @@ class ManagedCharging:
         previous = c.requests.existing(identifier, action, revision)
         if previous is not None:
             return previous
-        native = c.latest_native
+        native = c.current_native_sample()
         if (
             revision != c.requests.intent().revision
             or native is None
@@ -897,6 +897,7 @@ class ManagedCharging:
 
     # A poll leaves physical work owned; cancelled-task recovery still needs fresh source and exact outcome evidence.
     async def settle_for_poll(self) -> bool:
+        self.controller.commands.decide(self.journal.starts.publish_pending_reply)
         worker = self.worker
         if worker is None:
             return True

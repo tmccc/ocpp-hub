@@ -134,6 +134,11 @@ async def test_start_child_publishes_all_authority_or_retains_accepted_debt(
             j.db.execute("DROP TRIGGER start_publication_cut")
             j.db.create_function("start_publication_observed", 0, None)
 
+        if boundary == "accepted_commit":
+            await c.tick()
+            assert j.get("local_start_receipt")["stage"] == "accepted"
+            assert c.requests.intent() == intent and len(starts(b.rig)) == 1
+
         # A new explicit Pause owns zero; the original actual Start later supplies its own genuine lifecycle.
         pause = uuid.uuid4().hex
         c.command(pause, "pause", c.requests.intent().revision)

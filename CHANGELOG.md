@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Expire a charger reading after any new Start or Stop, including a complete charge between polls. Recheck the
+  exact native observation at dispatch.
+- Keep receiving command replies while a charger startup response is waiting to send. Give an already-sent
+  cloud Start report its remaining reply window when the charger reconnects.
+- Keep definite Start replies and tag denials tied to their original outcomes. Record a valid Stop when its
+  optional tag lookup fails, and include a recent handler failure count in diagnostics.
+- Classify an unexpected profile inventory shape as a native refusal. Require the commissioned specification
+  before recovery tools open a journal for writes.
 - Stop looking up a Home Assistant command receipt when the reply is invalid or oversized. Keep retrying temporary
   read failures within the deadline without repeating the command.
 - Keep a scheduled session separate from an interrupted timed test during charger introduction. Hold zero while
