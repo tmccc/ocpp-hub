@@ -363,36 +363,104 @@ async def test_timer_retries_atomic_stop_after_one_sqlite_failure_without_tick(
         assert test.rig.bench.firmware.effective_limit() == 0
 
 
-# Intent: a timed charge goes to zero while the native read and the saved cutoff record both fail.
-# Why: the exact timed session already needs protection while its final outcome remains unconfirmed.
+# Intent: a timed charge sends a new zero at expiry during both failures and retains it through either recovery order.
+# Why: the exact timed session can draw power before the proxy observes it, and recovery still needs the real Stop.
+@pytest.mark.parametrize(
+    ("source", "state", "first_repair"),
+    [
+        ("local", "charging", "together"),
+        ("local", "awaiting_power", "storage"),
+        ("cloud", "armed", "native"),
+    ],
+    ids=["flow-recorded", "local-storage-first", "cloud-native-first"],
+)
 async def test_timer_holds_zero_when_native_and_cutoff_storage_are_unavailable(
-    tmp_path, tls, unused_tcp_port, monkeypatch
+    tmp_path, tls, unused_tcp_port, monkeypatch, source, state, first_repair
 ):
+    clock = [time.monotonic()]
+    monkeypatch.setattr(charge_tests, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
     async with ready(
-        tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.5, native_peer=InterruptedNativePeer
+        tmp_path,
+        tls,
+        unused_tcp_port,
+        monkeypatch,
+        duration=60,
+        startup=60,
+        native_peer=InterruptedNativePeer,
+        owner_tag="APP_OWNER",
     ) as test:
-        controller, journal = test.controller, test.session.journal
-        controller.command(uuid.uuid4().hex, "start_test", 0)
-        await controller.charging.settle()
-        local = await positive_flow(test)
-        assert (await healthy(controller))["power_w"] > 0
+        c, journal, bench, peer = test.controller, test.session.journal, test.rig.bench, test.rig.peer
+        if source == "cloud":
+            c.command(uuid.uuid4().hex, "arm_cloud_test", 0)
+            await owner_start(test)
+        else:
+            c.command(uuid.uuid4().hex, "start_test", 0)
+            await c.charging.settle()
+        local = await positive_flow(test, source)
+        if state == "charging":
+            assert (await healthy(c))["power_w"] > 0
+        assert c.charging.state()["state"] == state and c.charging.timed_stop_target(c.charging.state()) == local
+        assert journal.active() == local and bench.firmware.current == 6
+        before = len(bench.received_limits)
+        wire_start = len(bench.device_calls)
+        refusals = 0
+
+        # Witness a rejected write without substituting a fake Stop result for the real SQLite transaction.
+        def refuse_cutoff() -> None:
+            nonlocal refusals
+            refusals += 1
+            raise sqlite3.OperationalError("synthetic timed cutoff record failure")
+
+        journal.db.create_function("test_cutoff_refusal", 0, refuse_cutoff)
         journal.db.execute(
-            "CREATE TRIGGER refuse_timed_cutoff BEFORE INSERT ON meta "
+            "CREATE TEMP TRIGGER refuse_timed_cutoff BEFORE INSERT ON meta "
             "WHEN NEW.key='managed_test_charge' AND json_extract(NEW.value,'$.state')='stopping' "
-            "BEGIN SELECT RAISE(ABORT,'synthetic timed cutoff record failure'); END"
+            "BEGIN SELECT test_cutoff_refusal(); END"
         )
-        test.rig.peer.unavailable = True
+        peer.unavailable = True
         try:
-            await until(lambda: test.rig.bench.firmware.effective_limit() == 0, timeout=2)
-            assert controller.requests.intent().mode == "paused"
-            assert controller.charging.state()["state"] == "charging"
-            assert journal.active() == local and not test.rig.bench.remote_stop.is_set()
+            assert (await c.tick())["fault"] == "native_observation_unavailable"
+            assert (await asyncio.wait_for(peer.failed_reads.get(), 2))["action"] == "getConfig"
+            assert c.charging.state()["state"] == state and bench.firmware.current == 6
+            lease = c.charging.lease
+            assert lease is not None
+            clock[0] = lease.deadline
+            c.charging.changed.set()
+
+            await until(lambda: refusals > 0, timeout=2)
+            await until(lambda: bench.firmware.effective_limit() == 0, timeout=2)
+            assert bench.received_limits[before:] and all(limit == 0 for limit in bench.received_limits[before:])
+            assert c.requests.intent().mode == "paused" and c.charging.state()["state"] == state
+            assert journal.active() == local and not bench.remote_stop.is_set()
+
+            if first_repair == "storage":
+                assert peer.failed_reads.empty()
+                journal.db.execute("DROP TRIGGER refuse_timed_cutoff")
+                await until(lambda: c.charging.state().get("stop_local") == local)
+                assert (await asyncio.wait_for(peer.failed_reads.get(), 2))["action"] == "getConfig"
+                assert c.charging.state()["state"] == "stopping"
+            elif first_repair == "native":
+                peer.unavailable = False
+                observed = (await c.native.observe()).physical
+                assert observed.transaction_open and observed.native_transaction_id == local
+                earlier = refusals
+                await until(lambda: refusals > earlier, timeout=2)
+                assert c.charging.state()["state"] == state
+            assert journal.active() == local and not bench.remote_stop.is_set()
+            assert bench.firmware.current == 0
         finally:
-            test.rig.peer.unavailable = False
-            journal.db.execute("DROP TRIGGER refuse_timed_cutoff")
+            peer.unavailable = False
+            journal.db.execute("DROP TRIGGER IF EXISTS refuse_timed_cutoff")
+
+        # Once both recover, supervision may retry Stop. It still needs that session's actual lifecycle report.
+        await until(lambda: c.charging.state().get("stop_local") == local)
+        await c.tick()
         assert (await actual_stop(test, local))["local_hold_verified"]
-        assert controller.charging.state()["stop_reason"] == "deadline"
-        assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
+        assert c.charging.state()["stop_reason"] == "deadline"
+        assert all(limit == 0 for limit in bench.received_limits[before:]) and len(starts(test.rig)) == 1
+        assert [frame[3] for frame in bench.device_calls[wire_start:] if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
 
 
 # Intent: a native timetable cannot satisfy a cloud test, even after the charger rejected an actual cloud Start.

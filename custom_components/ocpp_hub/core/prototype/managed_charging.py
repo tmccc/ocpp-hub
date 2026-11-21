@@ -1200,14 +1200,16 @@ class ManagedCharging:
     async def _hold_timed_cutoff(self, lease: ChargeLease) -> None:
         c, j = self.controller, self.journal
 
-        # Only the same expired lease and its accepted local lifecycle can request this fallback hold.
+        # A matching Start report identifies the session even before the first native power reading.
         def claim() -> bool:
             if self.lease is not lease or lease.normal or c.stopping or time.monotonic() < lease.deadline:
                 return False
             state, intent, local = self.state(), c.requests.intent(), j.active()
+            phase = state.get("state")
             if (
                 state.get("id") != lease.identifier
-                or state.get("state") != "charging"
+                or phase not in ACTIVE
+                or phase == "stopping"
                 or local is None
                 or local != self.timed_stop_target(state)
             ):

@@ -56,8 +56,14 @@ native closure, the charger’s Stop report and the cloud reply, then verify ori
 The [Home Assistant timed replays](../tests_ha_proxy/test_timed_system.py) use actual commissioning, a lost
 Start reply, HA reload on either side of the Stop, and both explicit Pause and automatic cutoff. They then
 exercise Return, change the selected current through HA, and finish a subsequent scheduled charge.
-The [timed cutoff tests](../tests/test_managed_test_charge.py) also hold a native read failure and a failed timed
-Stop write together. The exact timed session still receives a zero hold, and Stop waits for recovery of its own proof.
+The [timed cutoff tests](../tests/test_managed_test_charge.py) hold a native read failure and a failed timed Stop
+write together, including before first power has been recorded for a known local or cloud test session. They
+check the actual zero-current command while both failures persist, then restore the two paths in different orders
+and verify Stop targets the same session.
+
+The [Pause ordering tests](../tests/test_managed_controls.py) hold the outgoing positive profile for Start,
+Return or a current increase at the native validation boundary. Pause can take control before or after successful
+validation. In both orders, the simulated charger receives no positive profile from the superseded command.
 
 The focused interaction checks run in the ordinary engine suite. The finite families below have their
 own per-case manifest and recovery evidence.

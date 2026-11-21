@@ -4,7 +4,8 @@
 
 - Keep a fresh charger report after Boot distinct from a buffered report that reused its message ID.
 - Recheck historical iCS transaction mappings immediately before sending the query and when translating its reply.
-- Keep the timed charge's zero hold available if recording its Stop and reading the native charger both fail.
+- Keep the timed charge's zero hold available if recording its Stop and reading the native charger both fail,
+  including when the exact charge has started and its first power reading is still pending.
 - Keep Home Assistant Pause available through a failed status read when the last valid status permitted Pause.
 - Retain the digest of a malformed cloud Start reply for exact offline reconciliation.
 - Check standalone runtime pin changes at the release gate and mark unchecked Home Assistant archives with local files.

@@ -13,7 +13,10 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
+from ocpp_hub_core.prototype.trial_evidence import profile_projection
 
+from tests.charge_rig import owner_rig
+from tests.current_rig import adjustable
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.tls_support import tls as tls
 
@@ -26,6 +29,68 @@ def identifier() -> str:
 # Add only runtime envelope fields supplied by the service, rather than fabricating native proof.
 def envelope(status: dict[str, Any]) -> dict[str, Any]:
     return {**status, "running": True, "certificate_remaining_seconds": 86400}
+
+
+# Intent: a newer Pause revokes each older command at the actual positive profile send boundary.
+# Why: even a successful native validation cannot authorise a positive send after the command loses ownership.
+@pytest.mark.parametrize("command", ["start", "app_control", "set_current"], ids=["start", "return", "current"])
+@pytest.mark.parametrize("validated", [False, True], ids=["pause-before-proof", "pause-after-proof"])
+async def test_pause_revokes_pending_positive_profile(tmp_path, tls, unused_tcp_port, monkeypatch, command, validated):
+    selecting = command == "set_current"
+    rig_factory = adjustable if selecting else owner_rig
+    async with rig_factory(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, bench = test.controller, test.rig.bench
+        if not selecting:
+            c.command(identifier(), "pause", c.requests.intent().revision)
+            assert (await healthy(c))["local_hold_verified"]
+
+        peer = test.session.gateway.charger
+        validate = peer.validate_send
+        assert validate is not None
+        reached, resume = asyncio.Event(), asyncio.Event()
+        proposed: list[int | float] = []
+
+        # Hold the older write on either side of its real native validation, before the charger has received it.
+        async def hold_positive(action, payload):
+            if action != "SetChargingProfile" or not (limit := profile_projection(payload)["limit"]):
+                return await validate(action, payload)
+            result = await validate(action, payload) if validated else None
+            if validated:
+                assert callable(result)
+            proposed.append(limit)
+            reached.set()
+            await resume.wait()
+            return result if validated else await validate(action, payload)
+
+        monkeypatch.setattr(peer, "validate_send", hold_positive)
+        request, revision = identifier(), c.requests.intent().revision
+        mark = len(bench.received_limits)
+        assert c.command(request, command, revision, current_a=16 if selecting else None)["state"] == "accepted"
+        returning = asyncio.create_task(c.return_requested(request, revision)) if command == "app_control" else None
+        try:
+            await asyncio.wait_for(reached.wait(), 3)
+            assert proposed == [16 if selecting else 6]
+            assert all(limit == 0 for limit in bench.received_limits[mark:])
+            pause = identifier()
+            assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
+            winning_intent = c.requests.intent()
+            assert winning_intent.mode == "paused" and winning_intent.revision > revision
+            resume.set()
+
+            if returning is not None:
+                await asyncio.wait_for(asyncio.shield(returning), 5)
+            await c.charging.settle()
+            await c.current.settle()
+            status = await healthy(c)
+            assert status["local_hold_verified"]
+            assert status["station_ceiling_a"] == bench.firmware.effective_limit() == 0
+            assert c.requests.receipt(pause)["state"] == "completed" and c.requests.intent() == winning_intent
+            assert c.requests.receipt(request)["state"] == "failed" and c.current.selected() == 6
+            assert all(limit == 0 for limit in bench.received_limits[mark:]) and not starts(test.rig)
+        finally:
+            resume.set()
+            if returning is not None:
+                await asyncio.gather(returning, return_exceptions=True)
 
 
 # Intent: deliberate Stop becomes a healthy actual0 hold, with explicit return6 and no Start or history change.
