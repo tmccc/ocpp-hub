@@ -89,6 +89,7 @@ async def test_live_bound_owner_retirement_keeps_cloud_debt_atomic(
             failures = []
             retire = c.charging.retire_closed_at_zero
 
+            # Verify the poll reaches the injected write failure before reporting the retained fault.
             def observe_retirement(native):
                 try:
                     retire(native)
