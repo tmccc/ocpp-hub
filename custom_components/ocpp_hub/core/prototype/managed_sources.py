@@ -29,11 +29,14 @@ def confirmed_vendor_start(j: Journal, tag_digest: str, local: int | None) -> bo
     return bool(
         grant.get("local") == local
         and grant.get("digest") == tag_digest
-        and j.db.execute(
-            "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' "
-            "AND action='RemoteStartTransaction' AND state='confirmed'",
-            (grant.get("mutation"),),
-        ).fetchone()
+        and (
+            j.forwarded.status(grant.get("mutation")) == "Accepted"
+            or j.db.execute(
+                "SELECT 1 FROM mutations JOIN vendor_command_scope ON mutation=token WHERE token=? AND origin='vendor' "
+                "AND action='RemoteStartTransaction' AND wire_result='Accepted'",
+                (grant.get("mutation"),),
+            ).fetchone()
+        )
     )
 
 
@@ -52,7 +55,7 @@ def awaiting_owner_start(j: Journal, tag: str | None = None) -> bool:
         ):
             return True
     grant = j.get("vendor_start_grant", {})
-    if not grant or grant.get("local") is not None:
+    if not grant or grant.get("local") is not None or j.forwarded.status(grant.get("mutation")) == "Rejected":
         return False
     grant_digest = grant.get("digest")
     return (

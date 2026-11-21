@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Retain matching late charger replies on the same connection and distinguish a normal wait from an
+  unknown outcome. Keep local Start and Stop answers when the outgoing send is still finishing.
+- Retry cleanup for commands that never went out. Keep Pause and protective zero independent of failed
+  recovery notes and failed current-selection receipts.
+- Answer cloud requests that arrive during Boot and keep charger Start reports tied to their original
+  Boot. If Boot supersedes an unsent Return, retain zero and report that it was never sent.
 - Save definite replies to cloud Start and Stop against the original command. Retry journal writes without
   repeating the charger command, settle saved replies after restart and show when a known reply is still being saved.
 - Keep buffered charger reports in their arrival generation across Boot. Require completed cloud registration

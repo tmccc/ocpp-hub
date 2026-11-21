@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import sqlite3
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -267,26 +268,36 @@ class Peer:
         self.gate = PriorityGate()
         self._pending: dict[str, asyncio.Future[Frame]] = {}
         self._receivers: dict[str, tuple[CommandPriority, Callable[[Frame], None]]] = {}
+        self._late_receivers: OrderedDict[str, tuple[float, CommandPriority, Callable[[Frame], None]]] = OrderedDict()
         self.before_send: Callable[[str, dict[str, Any]], GateDecision | None] | None = None
         self.validate_send: Callable[[str, dict[str, Any]], Awaitable[Guard | GateDecision | None]] | None = None
         self.after_result: Callable[[str, dict[str, Any], Frame], None] | None = None
         self.diagnostics = RpcDiagnostics()
+
+    # An active caller can still settle this exact reply within its normal deadline.
+    def has_pending_call(self, wire: str | None) -> bool:
+        return wire is not None and wire in self._pending
 
     # Use the shared queue for state decisions made from replies, including during exception cleanup.
     def decide[T](self, decision: Callable[[], T], *, priority: CommandPriority = CommandPriority.NORMAL) -> T:
         processor = self.command_processor
         return decision() if processor is None else processor.decide(decision, priority=priority)
 
-    # Correlate replies by fresh, namespaced ids; unknown replies are ignored.
+    # A short additional window can still settle an issued command on this same connection.
     def receive(self, frame: Frame) -> None:
-        future = self._pending.get(frame[1])
-        self.diagnostics.reply(len(frame[1]), future is not None and not future.done())
-        if future is not None and not future.done():
+        wire = frame[1]
+        future = self._pending.get(wire)
+        waiting = future is not None and not future.done()
+        receiver = self._receivers.pop(wire, None)
+        late = self._late_receivers.pop(wire, None)
+        if receiver is None and late is not None and late[0] > time.monotonic():
+            receiver = (late[1], late[2])
+        self.diagnostics.reply(len(wire), waiting or receiver is not None)
+        if future is not None and waiting:
             future.set_result(frame)
-            receiver = self._receivers.pop(frame[1], None)
-            if receiver is not None:
-                priority, record = receiver
-                self.decide(lambda: record(frame), priority=priority)
+        if receiver is not None:
+            priority, record = receiver
+            self.decide(lambda: record(frame), priority=priority)
 
     # Send a request only after rechecking current authority inside the gate.
     async def call(
@@ -301,6 +312,7 @@ class Peer:
         *,
         on_reply: Callable[[str, Frame], None] | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
+        keep_late_reply: bool = False,
     ) -> Frame:
         return require_reply(
             await self.call_result(
@@ -313,6 +325,7 @@ class Peer:
                 on_dispatch,
                 on_reply=on_reply,
                 on_receive=on_receive,
+                keep_late_reply=keep_late_reply,
             )
         )
 
@@ -329,6 +342,7 @@ class Peer:
         *,
         on_reply: Callable[[str, Frame], None] | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
+        keep_late_reply: bool = False,
     ) -> CallResult:
         async with self.gate.enter(priority):
             return await self._call_locked(
@@ -341,6 +355,7 @@ class Peer:
                 priority > 0,
                 on_reply,
                 on_receive=on_receive,
+                keep_late_reply=keep_late_reply,
             )
 
     # Hold the gate across safety-cap and control RPCs so queued cloud work cannot interleave them.
@@ -353,9 +368,10 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         on_reply: Callable[[str, Frame], None] | None = None,
         on_sent: Callable[[str], None] | None = None,
+        on_receive: Callable[[str, Frame], None] | None = None,
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
         async with self.sequence_results(
-            priority, check, on_dispatch=on_dispatch, on_reply=on_reply, on_sent=on_sent
+            priority, check, on_dispatch=on_dispatch, on_reply=on_reply, on_sent=on_sent, on_receive=on_receive
         ) as result_call:
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
@@ -373,12 +389,22 @@ class Peer:
         on_dispatch: Callable[[str], None] | None = None,
         on_reply: Callable[[str, Frame], None] | None = None,
         on_sent: Callable[[str], None] | None = None,
+        on_receive: Callable[[str, Frame], None] | None = None,
     ) -> AsyncIterator[ResultCall]:
         async with self.gate.enter(priority):
             # Each call revalidates after native waits and before recording any resource intent.
             async def call(action: str, payload: dict[str, Any]) -> CallResult:
                 return await self._call_locked(
-                    action, payload, check, None, None, on_dispatch, priority > 0, on_reply, on_sent
+                    action,
+                    payload,
+                    check,
+                    None,
+                    None,
+                    on_dispatch,
+                    priority > 0,
+                    on_reply,
+                    on_sent,
+                    on_receive=on_receive,
                 )
 
             yield call
@@ -449,6 +475,7 @@ class Peer:
         on_sent: Callable[[str], None] | None = None,
         *,
         on_receive: Callable[[str, Frame], None] | None = None,
+        keep_late_reply: bool = False,
     ) -> CallResult:
         priority = CommandPriority.NORMAL if preemptible else CommandPriority.RESTRICT
         processor = self.command_processor
@@ -467,6 +494,7 @@ class Peer:
         future: asyncio.Future[Frame] = asyncio.get_running_loop().create_future()
         self._pending[unique_id] = future
         dispatched = False
+        processing_reply = False
         try:
             actual = self.decide(payload, priority=priority) if callable(payload) else payload
             validation = await self._validate(action, actual, future, preemptible)
@@ -518,18 +546,37 @@ class Peer:
                     self.decide(lambda: sent(action), priority=priority)
                 self.diagnostics.phase = "awaiting_reply"
                 answer = await future
+                processing_reply = True
                 result = self.decide(lambda: self._accept_reply(action, actual, answer, on_reply), priority=priority)
                 self.diagnostics.phase = "complete"
                 return result
         except (TimeoutError, OSError, UnavailableError, asyncio.CancelledError) as error:
-            if isinstance(error, (UnavailableError, asyncio.CancelledError)):
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            if (
+                dispatched
+                and not processing_reply
+                and future.done()
+                and not future.cancelled()
+                and future.exception() is None
+            ):
+                # The receiver has the actual reply even if writing the request never returned.
+                answer = future.result()
+                result = self.decide(lambda: self._accept_reply(action, actual, answer, on_reply), priority=priority)
+                self.diagnostics.phase = "complete"
+                return result
+            if isinstance(error, UnavailableError):
                 raise
             detail = "peer outcome is unconfirmed" if dispatched else "request was not sent; outgoing validation failed"
             raise UnavailableError(detail) from error
         finally:
             self.diagnostics.interrupted()
             self._pending.pop(unique_id, None)
-            self._receivers.pop(unique_id, None)
+            receiver = self._receivers.pop(unique_id, None)
+            if keep_late_reply and receiver is not None and self.sender is sender:
+                self._late_receivers[unique_id] = (time.monotonic() + 30.0, *receiver)
+                if len(self._late_receivers) > 32:
+                    self._late_receivers.popitem(last=False)
             if future.done() and not future.cancelled():
                 future.exception()
             elif not future.done():
@@ -553,6 +600,8 @@ class Peer:
     def detach(self) -> None:
         self.diagnostics.interrupted()
         self.sender = None
+        self._receivers.clear()
+        self._late_receivers.clear()
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(UnavailableError("peer disconnected"))

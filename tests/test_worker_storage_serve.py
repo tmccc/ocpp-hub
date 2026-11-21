@@ -220,6 +220,13 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         assert first["station_ceiling_a"] == 6
                         j = session.journal
                         fail_boundary(j, "current", failure)
+                        if failure == "statement":
+                            j.db.execute(
+                                "CREATE TEMP TRIGGER refuse_current_failure BEFORE INSERT ON meta "
+                                "WHEN NEW.key='managed_current_change' "
+                                "AND json_extract(NEW.value,'$.state')='uncertain' "
+                                "BEGIN SELECT RAISE(ABORT,'synthetic failure receipt refusal'); END"
+                            )
                         # Refuse the first automatic Pause proof before its scheduled task can win the race.
                         _reached, attempts = failing_cleanup(
                             j,
@@ -232,6 +239,17 @@ async def test_actual_serve_recovers_current_storage_and_two_later_sessions(
                         accepted = await call(api, "set_current", id=identifier, revision=revision, current_a=16)
                         assert accepted["ok"] and accepted["result"]["id"] == identifier
                         assert accepted["result"]["state"] == "accepted", accepted
+                        if failure == "statement":
+                            try:
+                                await until(
+                                    lambda: (
+                                        16 in rig.bench.received_limits[before_limits:]
+                                        and rig.bench.firmware.effective_limit() == 0
+                                    )
+                                )
+                                assert j.get("managed_current_change")["state"] == "pending"
+                            finally:
+                                j.db.execute("DROP TRIGGER refuse_current_failure")
                         await until(lambda: bool(attempts))
                         assert rig.bench.received_limits[before_limits:].count(16) == 1
                         change = j.get("managed_current_change")

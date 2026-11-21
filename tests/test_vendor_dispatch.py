@@ -15,7 +15,7 @@ from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from websockets.asyncio.server import serve
 
 from tests.charge_rig import positive_flow, ready
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import Bench, until
 from tests.tls_support import admission as admission
 from tests.tls_support import tls as tls
@@ -178,6 +178,132 @@ async def test_cloud_stop_keeps_reply_while_waiting_for_storage_and_closure(
         b.rig.peer.permission_enabled = False
         await until(lambda: journal.next_delivery() is None)
         assert sum(call[2] == "RemoteStopTransaction" for call in bench.device_calls) == 1
+
+
+# Intent: the same live charger can settle its exact reply after the request deadline.
+# Why: normal waiting, a missing answer, and a received answer still being saved have different outcomes.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("action", ["RemoteStartTransaction", "RemoteStopTransaction"])
+async def test_late_cloud_command_reply_settles_exactly_once(tmp_path, tls, unused_tcp_port, monkeypatch, action):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        g, j, bench = b.session.gateway, b.session.journal, b.rig.bench
+        g.charger.timeout = 0.25
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_answer = bench.firmware.answer
+        local = None
+        status = "Rejected"
+        payload = {"idTag": "CLOUD_OWNER"}
+        if action == "RemoteStopTransaction":
+            local = await positive_flow(b, "daily")
+            payload = {"transactionId": j.vendor_id(local)}
+            status = "Accepted"
+
+        # Only this fake charger response is delayed beyond the normal command deadline.
+        async def before_reply(name, _payload):
+            if name == action:
+                entered.set()
+                await release.wait()
+
+        # A rejected Start releases only its grant. An accepted Stop still awaits closure.
+        def answer(name, command):
+            actual = original_answer(name, command)
+            return {"status": status} if name == action else actual
+
+        monkeypatch.setattr(bench, "before_reply", before_reply)
+        monkeypatch.setattr(bench.firmware, "answer", answer)
+        j.db.execute(
+            "CREATE TEMP TRIGGER hold_late_reply BEFORE UPDATE ON vendor_command_scope "
+            "WHEN NEW.wire_result IN ('Accepted','Rejected') BEGIN SELECT RAISE(ABORT,'synthetic reply refusal'); END"
+        )
+        task = asyncio.create_task(bench.cloud_call("delayed-result", action, payload))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            initial = poll_base(b.controller)
+            assert initial["vendor_write_uncertain"] == 0 and not initial["operator_reconciliation_required"]
+            expired = await task
+            assert expired[:3] == [4, "delayed-result", "InternalError"]
+            assert poll_base(b.controller)["vendor_write_uncertain"] == 1
+            release.set()
+            await until(lambda: poll_base(b.controller)["vendor_reply_storage_pending"] == 1)
+            evidence = poll_base(b.controller)
+            assert not evidence["operator_reconciliation_required"] and not evidence["cloud_start_pending"]
+            blockers = snapshot(b.controller, evidence)["blockers"]
+            assert "vendor_reply_storage_pending" in blockers
+            assert "cloud_start_pending" not in blockers and "command_outcome_unknown" not in blockers
+        finally:
+            release.set()
+            j.db.execute("DROP TRIGGER hold_late_reply")
+            await asyncio.gather(task, return_exceptions=True)
+        await b.controller.tick()
+        row = j.db.execute("SELECT state,wire_result FROM mutations JOIN vendor_command_scope ON token=mutation")
+        assert tuple(row.fetchone()) == ("confirmed", status)
+        assert not j.get("uncertain_vendor_command") and not j.get("vendor_start_grant")
+        assert j.active() == local and sum(frame[2] == action for frame in bench.device_calls) == 1
+
+
+# Intent: an Accepted cloud Start can bind its real report under a newer verified Pause.
+# Why: the late lifecycle belongs in history even while storage cannot finish the command receipt.
+async def test_cloud_start_report_preserves_history_under_pause_while_reply_saves(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        j, g, c, bench = b.session.journal, b.session.gateway, b.controller, b.rig.bench
+        j.db.execute(
+            "CREATE TEMP TRIGGER defer_accepted_start BEFORE UPDATE ON mutations "
+            "WHEN NEW.action='RemoteStartTransaction' AND NEW.state='confirmed' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic start settlement refusal'); END"
+        )
+        try:
+            reply = await bench.cloud_call("accepted-before-pause", "RemoteStartTransaction", {"idTag": "CLOUD_OWNER"})
+            assert reply == [3, "accepted-before-pause", {"status": "Accepted"}]
+            c.command("b" * 32, "pause", c.requests.intent().revision)
+            await until(lambda: g.controls.ready and bench.firmware.effective_limit() == 0)
+            paused = c.requests.intent()
+            report = await bench.call(b.charger, "start-at-zero", "StartTransaction", START | {"idTag": "CLOUD_OWNER"})
+            assert report[0] == 3 and report[2]["idTagInfo"]["status"] == "Accepted"
+            assert j.active() == report[2]["transactionId"]
+            assert c.requests.intent() == paused and paused.mode == "paused"
+            assert bench.firmware.effective_limit() == 0
+        finally:
+            j.db.execute("DROP TRIGGER defer_accepted_start")
+        await c.tick()
+        assert sum(frame[2] == "RemoteStartTransaction" for frame in bench.device_calls) == 1
+
+
+# Intent: a fresh charger report can wait for the exact Boot response that preceded it.
+# Why: the charger can read the genuine Boot response before the sending coroutine finishes.
+async def test_start_report_waits_for_its_boot_send_to_finish(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        g, j, bench = b.session.gateway, b.session.journal, b.rig.bench
+        sender = g.charger.sender
+        assert sender is not None
+        finish_boot = asyncio.Event()
+
+        # Deliver the Boot response on the real socket while deliberately holding only its normal return.
+        async def drain_boot(raw):
+            await sender(raw)
+            if decode(raw)[:2] == [3, "boot-send-finishing"]:
+                await finish_boot.wait()
+
+        monkeypatch.setattr(g.charger, "sender", drain_boot)
+        report = None
+        try:
+            boot = await bench.call(b.charger, "boot-send-finishing", "BootNotification", BOOT)
+            assert boot[0] == 3 and boot[2]["status"] == "Accepted"
+            assert g.boot_observation is None
+            report = asyncio.create_task(
+                bench.call(b.charger, "fresh-after-boot", "StartTransaction", START | {"idTag": "NATIVE_TIMER"})
+            )
+            await until(lambda: len(g._tasks) >= 2)
+            assert j.active() is None and not report.done()
+            finish_boot.set()
+            answer = await report
+            assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+            assert j.active() == answer[2]["transactionId"]
+        finally:
+            finish_boot.set()
+            if report is not None:
+                await asyncio.gather(report, return_exceptions=True)
 
 
 # Intent: an accepted profile replacement without a transaction remains clearable after the old session ends.

@@ -236,6 +236,38 @@ def charger_history(records: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]
     return summarize_charger_history(records).sessions
 
 
+# Show evidence that has actually arrived, including replies which are still being saved.
+def vendor_command_status(c: ManagedController) -> dict[str, Any]:
+    g, j = c.session.gateway, c.session.journal
+    try:
+        vendor_pending = j.db.execute(
+            "SELECT token,state,wire_request,wire_result FROM mutations "
+            "LEFT JOIN vendor_command_scope ON mutation=token WHERE origin='vendor' AND state!='confirmed'"
+        )
+        known, uncertain = 0, 0
+        for row in vendor_pending:
+            if j.forwarded.awaits_storage(row["token"]):
+                known += 1
+            elif row["state"] == "uncertain" or (
+                row["wire_result"] not in ("prepared", "prepared_new_profile")
+                and not g.charger.has_pending_call(row["wire_request"])
+            ):
+                uncertain += 1
+        marker = j.get("uncertain_vendor_command", {})
+        unmatched_marker = bool(marker) and (
+            not isinstance(marker, dict) or j.forwarded.status(marker.get("mutation")) is None
+        )
+        return {
+            "vendor_write_uncertain": uncertain,
+            "vendor_reply_storage_pending": known,
+            "operator_reconciliation_required": unmatched_marker or bool(uncertain),
+        }
+    except sqlite3.Error:
+        return dict.fromkeys(
+            ("vendor_write_uncertain", "vendor_reply_storage_pending", "operator_reconciliation_required")
+        )
+
+
 # Both poll shapes share connection and intent fields; pending work deliberately omits durable-history fields.
 def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
     intent = c.requests.intent()
@@ -258,12 +290,8 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
     else:
         j = c.session.journal
         value.update(phase=j.phase.read().value, automatic_charge_restart=False)
+        value.update(vendor_command_status(c))
         try:
-            vendor_pending = j.db.execute(
-                "SELECT token FROM mutations WHERE origin='vendor' AND state!='confirmed'"
-            ).fetchall()
-            known = sum(j.forwarded.awaits_storage(row["token"]) for row in vendor_pending)
-            uncertain = len(vendor_pending) - known
             value.update(
                 pending_lifecycle_events=j.db.execute(
                     "SELECT COUNT(*) FROM outbox WHERE action IN ('StartTransaction','StopTransaction')"
@@ -271,17 +299,11 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
                 pending_observations=j.db.execute(
                     "SELECT COUNT(*) FROM outbox WHERE action NOT IN ('StartTransaction','StopTransaction')"
                 ).fetchone()[0],
-                vendor_write_uncertain=uncertain,
-                vendor_reply_storage_pending=known,
-                operator_reconciliation_required=bool(j.get("uncertain_vendor_command")) or bool(uncertain),
             )
         except sqlite3.Error:
             value.update(
                 pending_lifecycle_events=None,
                 pending_observations=None,
-                vendor_write_uncertain=None,
-                vendor_reply_storage_pending=None,
-                operator_reconciliation_required=None,
             )
     return value
 
@@ -517,6 +539,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         cloud_start_pending=g.authorisation.pending(),
         requested_current_a=c.current.selected(),
     )
+    result.update(vendor_command_status(c))
     if not runtime.charger_connected or g.charger.sender is None:
         result["charger_connected"] = False
     if not g.current_boot_seen(g._charger_epoch):

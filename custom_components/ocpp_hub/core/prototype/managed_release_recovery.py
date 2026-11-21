@@ -109,17 +109,20 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
     return release_evidence(c, fault) is not None
 
 
-# Call inside the existing Pause acceptance transaction after its new paused revision has been recorded.
+# Optional fault-release evidence belongs to the committed Pause and cannot prevent its protective hold.
 def record_release_pause(c: ManagedController, identifier: str) -> None:
     j = c.session.journal
     fault = j.fault.read({})
-    evidence = release_evidence(c, fault)
-    if evidence is None:
+    if not fault:
         return
-    intent = c.requests.intent()
-    if intent.mode != "paused":
-        raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
-    j.put(ACK, {"fault": fault, "pause_request": identifier, "revision": intent.revision, **evidence})
+    with j.atomic():
+        evidence = release_evidence(c, fault)
+        if evidence is None:
+            return
+        intent = c.requests.intent()
+        if intent.mode != "paused":
+            raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
+        j.put(ACK, {"fault": fault, "pause_request": identifier, "revision": intent.revision, **evidence})
 
 
 # Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.

@@ -661,7 +661,19 @@ class LocalControl:
 
         cap_error: UnavailableError | StationZeroStorageError | None = None
         answer: Frame | None = None
-        async with self.peer.sequence(0, check) as call:
+        local: int | None = None
+
+        # A real accepted Stop can arrive before the outgoing send finishes draining.
+        def received_stop(action: str, frame: Frame) -> None:
+            if (
+                action == "RemoteStopTransaction"
+                and local is not None
+                and frame[0] == 3
+                and frame[2] == {"status": "Accepted"}
+            ):
+                self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
+
+        async with self.peer.sequence(0, check, on_receive=received_stop) as call:
             if station_absent:
                 cap_error = UnavailableError("the missing station ceiling cannot establish a zero hold")
             else:
@@ -699,7 +711,6 @@ class LocalControl:
                         if cap_error is not None:
                             raise cap_error
                         raise StopReplyUnconfirmedError("transaction stop was not confirmed")
-                    self._stop_ack = StopAcknowledgement(epoch, revision, ticket, local, generation)
                     # The StopTransaction report may already have closed this session.
                     stop_guard = None
                     check()
@@ -810,6 +821,7 @@ class LocalControl:
 
         epoch, ticket, previous = self.peer.decide(claim)
         restoring_zero = False
+        saved_reply: bool | None = None
 
         # Positive permission may be revoked; the same exact ticket and Boot still permit its restrictive rollback.
         def check() -> None:
@@ -839,10 +851,16 @@ class LocalControl:
 
         # Receipt recording precedes fallible resource/result publication and never claims observed charging.
         def received(action: str, frame: Frame) -> None:
+            nonlocal saved_reply
             if action != "RemoteStartTransaction":
                 return
             if attempt is not None:
                 attempt.answer = frame
+            try:
+                saved_reply = self.journal.starts.record_reply(ticket, frame)
+            except sqlite3.Error:
+                if self.journal.db.in_transaction:
+                    raise
             if self.incident_observer is None or request_id is None:
                 return
             if frame[0] == 4:
@@ -855,7 +873,7 @@ class LocalControl:
                 reply = "other"
             self.observe_incident("start_reply", request_id, ticket, reply)
 
-        async with self.peer.sequence(1, check, on_dispatch=dispatch, on_reply=received, on_sent=sent) as call:
+        async with self.peer.sequence(1, check, on_dispatch=dispatch, on_receive=received, on_sent=sent) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
                 await self._cap(call, limit, epoch)
@@ -875,7 +893,8 @@ class LocalControl:
                 def settle(answer: Frame) -> None:
                     if attempt is not None:
                         attempt.answer = answer
-                    if not self.journal.starts.record_reply(ticket, answer):
+                    accepted = self.journal.starts.record_reply(ticket, answer) if saved_reply is None else saved_reply
+                    if not accepted:
                         raise UnavailableError("transaction start was not confirmed")
                     check()
                     publication = None
@@ -1049,7 +1068,7 @@ class LocalControl:
                         else WireReply.ERROR
                     )
 
-            async with self.peer.sequence_results(1, check, on_dispatch=dispatched, on_reply=received) as call:
+            async with self.peer.sequence_results(1, check, on_dispatch=dispatched, on_receive=received) as call:
                 # Both failure and pending rollback retain the same ticket, Boot and observed zero sequence.
                 async def rollback_zero() -> None:
                     # Only the current ticket may withdraw positive control before the zero write.
@@ -1119,6 +1138,11 @@ class LocalControl:
                     if attempt is not None:
                         attempt.positive_failure = error
                         attempt.initial_failure_kind = failure_kind(error)
+                        if not attempt.positive_may_have_dispatched and rollback_guard is not None:
+                            try:
+                                rollback_guard()
+                            except UnavailableError as retired:
+                                return Pending(Prerequisite.SUPERSEDED, "release Boot changed before dispatch", retired)
                     await rollback_zero()
                     if attempt is None and isinstance(error, ReleaseDeferredError):
                         # A deferred legacy release still settles only its own verified zero.

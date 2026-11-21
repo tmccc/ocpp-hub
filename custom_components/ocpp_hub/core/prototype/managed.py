@@ -176,13 +176,17 @@ class ManagedController:
             nonlocal ticket
             _, ticket = controls._claim(True, stopping=True)
             self.requests.record_pause_claim(self.requests.intent(), ticket)
-            record_release_pause(self, identifier)
 
         receipt = self.requests.accept(identifier, action, revision, claim)
         if action == "pause":
             if ticket is not None:
                 controls.observe_incident("pause_committed", identifier, ticket)
             self.schedule_pause()
+            try:
+                record_release_pause(self, identifier)
+            except sqlite3.Error:
+                if self.session.journal.db.in_transaction:
+                    raise
         return receipt
 
     # A newer accepted hold must get a turn even if the previous Stop is still leaving the wire gate.

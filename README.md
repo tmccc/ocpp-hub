@@ -53,6 +53,15 @@ take effect while an earlier reply is outstanding. The proxy applies that reply 
 A Start or Stop expires the previous charger observation even if the whole charge finishes before the next poll.
 The proxy rechecks the evidence for a charging command immediately before sending it.
 
+When the cloud asks the charger to Start or Stop, the proxy records the charger's answer against that request.
+If saving the answer fails, the proxy retries the save without repeating the command. A saved answer survives
+a restart. An accepted Stop still needs the charger's session-end report. Home Assistant distinguishes an answer
+that is being saved from an unknown outcome that keeps charging on hold.
+The proxy can still match a late answer to the original command for up to 30 seconds after its normal
+deadline, while the same charger connection remains open.
+If the proxy restarts with a saved reply still waiting for its final update, let this version finish that update
+before rolling back to an earlier version. The rollback check requires a settled journal.
+
 This branch provides a separate Linux/Python 3.14 service and a thin Home Assistant client. The installation was
 commissioned for its existing native 32 A ceiling on 10 November 2026. The selected offer is 6–32 A; Pause retains
 an independently verified zero hold. Explicit HA Start, Pause and Return use the managed control path, while the

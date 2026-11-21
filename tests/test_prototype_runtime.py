@@ -328,6 +328,7 @@ async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, 
             await bench.start(cloud.sockets[0].getsockname()[1])
             async with bench.charger() as charger:
                 await bench.boot(charger)
+                await until(lambda: bench.gateway.vendor_registration == "Accepted")
                 peer = bench.gateway.charger
                 sender = peer.sender
                 assert sender is not None
@@ -361,6 +362,12 @@ async def test_runtime_reads_a_reply_while_an_outgoing_response_waits(tmp_path, 
                     else:
                         await charger.send('[2,"held","Heartbeat",[]]')
                     await asyncio.wait_for(refusing.wait(), 1)
+                    if blocked == "boot":
+                        await bench.connections[-1].send(build_call("cloud-during-boot", "GetConfiguration", {}))
+                        await until(lambda: any(frame[1] == "cloud-during-boot" for frame in bench.calls))
+                        refusal = next(frame for frame in bench.calls if frame[1] == "cloud-during-boot")
+                        assert refusal[:3] == [4, "cloud-during-boot", "InternalError"]
+                        assert "command was not sent" in refusal[3]
                     if command is None:
                         command = asyncio.create_task(peer.call("GetConfiguration", {"key": ["HeartbeatInterval"]}))
                         request = decode(await asyncio.wait_for(charger.recv(), 1))

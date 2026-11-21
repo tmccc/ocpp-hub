@@ -623,6 +623,48 @@ async def test_matching_boot_before_child_claim_retires_unsent_return(tmp_path, 
             await asyncio.gather(consumer, return_exceptions=True)
 
 
+# Intent: a matching Boot supersedes a claimed Return before its first positive dispatch.
+# Why: a real but unsent claim cannot fault, publish current, or make its old Boot authorize a rollback.
+async def test_matching_boot_after_return_claim_retires_unsent_return(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, j = b.controller, b.session.gateway, b.session.journal
+        before = await pause_prefix(b)
+        entered, resume = asyncio.Event(), asyncio.Event()
+        validate = g.charger.validate_send
+        assert validate is not None
+
+        # Hold only the native validation of the positive profile, after the exact Return has claimed.
+        async def hold_positive(action, payload):
+            if (
+                action == "SetChargingProfile"
+                and payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] > 0
+            ):
+                attempt = g.controls.release_attempt
+                assert attempt is not None and attempt.ticket is not None and not attempt.positive_may_have_dispatched
+                entered.set()
+                await resume.wait()
+            return await validate(action, payload)
+
+        monkeypatch.setattr(g.charger, "validate_send", hold_positive)
+        returning = accepted_return(b, before)
+        consumer = asyncio.create_task(
+            c.recovery.restore(before["intent"], return_request=returning, claim_return=True)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            reply = await b.rig.bench.call(b.charger, "replacement-after-claim", "BootNotification", BOOT)
+            assert reply[0] == 3 and current_scope(g) != before["scope"]
+            resume.set()
+            progress = await asyncio.wait_for(consumer, 8)
+            assert progress.state is RestoreState.REQUEST_NOT_SENT
+            assert not positive_calls(b, before["wire"]) and not j.fault.latched()
+            assert c.requests.receipt(returning)["result"] == {"classification": "return_not_sent"}
+            assert c.requests.intent() == before["intent"] and b.rig.bench.firmware.effective_limit() == 0
+        finally:
+            resume.set()
+            await asyncio.gather(consumer, return_exceptions=True)
+
+
 # Intent: a real matching Boot after child COMMIT retires successful result A without faulting current authority B.
 # Why: a late observer must preserve the completed Return and verify the ceiling under the newer Boot.
 async def test_matching_boot_after_child_publication_retires_only_result(tmp_path, tls, unused_tcp_port, monkeypatch):

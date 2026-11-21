@@ -7,6 +7,7 @@ import sys
 import uuid
 
 from ocpp_hub_core.frames import build_call
+from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.local_control import LocalControl
 from ocpp_hub_core.prototype.managed_api import ManagementServer, ManagementSettings
 from ocpp_hub_core.prototype.managed_charging import ManagedCharging
@@ -20,6 +21,45 @@ from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.test_managed_normal_start import natural_stop
 from tests.tls_support import tls as tls
+
+
+# Intent: a definite local Start rejection is recorded while its outgoing send still waits.
+# Why: a send timeout cannot turn a known rejection into an issued Start or defeat the owner's zero hold.
+async def test_local_start_saves_rejection_before_send_finishes(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, j, bench = b.controller, b.session.gateway, b.session.journal, b.rig.bench
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        sender, answer = g.charger.sender, bench.firmware.answer
+        assert sender is not None
+        draining, release = asyncio.Event(), asyncio.Event()
+        g.charger.timeout = 0.5
+
+        # Allow the actual synthetic charger to answer this one Start while its sender is still waiting.
+        async def drain(raw):
+            await sender(raw)
+            frame = decode(raw)
+            if frame[0] == 2 and frame[2] == "RemoteStartTransaction":
+                draining.set()
+                await release.wait()
+
+        # Keep ordinary profile verification while giving the real Start a definite rejection.
+        def reject(action, payload):
+            return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
+
+        monkeypatch.setattr(g.charger, "sender", drain)
+        monkeypatch.setattr(bench.firmware, "answer", reject)
+        identifier = uuid.uuid4().hex
+        assert c.command(identifier, "start", c.requests.intent().revision)["state"] == "accepted"
+        try:
+            await asyncio.wait_for(draining.wait(), 5)
+            await until(lambda: j.starts.receipt().get("stage") == "rejected", timeout=0.45)
+            assert c.charging.worker is not None and not c.charging.worker.done()
+            await c.charging.settle()
+            assert j.starts.receipt().get("stage") == "rejected" and len(starts(b.rig)) == 1
+            assert c.requests.intent().mode == "paused" and bench.firmware.effective_limit() == 0
+        finally:
+            release.set()
 
 
 # Exercise one explicit real TLS frame ordering while observing the actual atomic publication boundary.

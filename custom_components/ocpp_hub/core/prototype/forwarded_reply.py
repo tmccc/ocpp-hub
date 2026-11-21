@@ -47,10 +47,10 @@ class ForwardedReplies:
         self._pending[mutation] = reply
         return reply
 
-    # A known refusal withdraws this grant while the journal write is pending.
-    def rejected(self, mutation: object) -> bool:
+    # A received outcome is available to lifecycle admission even while its write is pending.
+    def status(self, mutation: object) -> Literal["Accepted", "Rejected"] | None:
         reply = self._pending.get(mutation) if isinstance(mutation, str) else None
-        return reply is not None and reply.status == "Rejected"
+        return reply.status if reply is not None else None
 
     # Status can distinguish a known reply awaiting storage from an unanswered command.
     def awaits_storage(self, mutation: str) -> bool:
@@ -72,12 +72,18 @@ class ForwardedReplies:
                     row is None
                     or tuple(row)[:3] != ("vendor", reply.action, reply.wire)
                     or (row["state"], row["wire_result"])
-                    not in (("pending", "dispatched"), ("pending", reply.status), ("confirmed", reply.status))
+                    not in (
+                        ("pending", "dispatched"),
+                        ("uncertain", "dispatched"),
+                        ("pending", reply.status),
+                        ("confirmed", reply.status),
+                    )
                 ):
                     raise RecoveryRequiredError("charger reply no longer has its original forwarded command")
                 if row["wire_result"] == "dispatched":
                     j.record_vendor_result(reply.mutation, reply.status)
-            if row["state"] == "pending":
+                    j.db.execute("UPDATE mutations SET state='pending' WHERE token=?", (reply.mutation,))
+            if row["state"] != "confirmed":
                 with j.atomic():
                     self._settle(reply.mutation, reply.action, reply.status)
         except sqlite3.Error:
@@ -109,4 +115,7 @@ class ForwardedReplies:
             grant = j.get("vendor_start_grant", {})
             if grant.get("mutation") == mutation:
                 j.put("vendor_start_grant", {})
+        marker = j.get("uncertain_vendor_command", {})
+        if isinstance(marker, dict) and marker.get("mutation") == mutation:
+            j.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
         j.mutation_finished(mutation, True)

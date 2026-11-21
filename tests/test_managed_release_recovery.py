@@ -206,6 +206,28 @@ async def test_release_pause_acknowledgement_is_atomic_and_idempotent(tmp_path, 
             await c.pause_task
 
 
+# Intent: a failed optional recovery acknowledgement does not undo the owner Pause.
+# Why: fault release requires separate saved evidence, while the basic Pause must remain available.
+async def test_pause_commits_while_fault_acknowledgement_write_fails(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        fault = await fail_one_return(b, monkeypatch, "lost")
+        c, j = b.c, b.session.journal
+        before = c.requests.intent()
+        identifier = uuid.uuid4().hex
+        j.db.execute(
+            f"CREATE TEMP TRIGGER refuse_fault_ack BEFORE INSERT ON meta WHEN NEW.key='{ACK}' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic acknowledgement refusal'); END"
+        )
+        try:
+            receipt = c.command(identifier, "pause", before.revision)
+            assert receipt["state"] == "accepted"
+            assert c.requests.intent().mode == "paused" and c.requests.intent().revision == before.revision + 1
+            assert j.fault.read() == fault and not j.get(ACK)
+            assert b.rig.bench.firmware.effective_limit() == 0
+        finally:
+            j.db.execute("DROP TRIGGER refuse_fault_ack")
+
+
 # Intent: the acknowledgement helper itself performs only native reads before recording successful recovery.
 # Why: proving zero must never be a hidden charger write, Stop or positive release.
 async def test_release_reconciliation_helper_has_no_charger_rpc(tmp_path, tls, unused_tcp_port, monkeypatch):

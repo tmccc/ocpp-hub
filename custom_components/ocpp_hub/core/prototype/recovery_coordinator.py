@@ -463,7 +463,11 @@ class RecoveryCoordinator:
                 faulted=j.fault.latched(),
                 publication_allowed=not isinstance(decision, Pending),
             )
-            if disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT) and result.claimed:
+            if (
+                disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT)
+                and result.claimed
+                and result.effects.zero_verified
+            ):
                 with j.atomic():
                     if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
                         raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
@@ -495,7 +499,7 @@ class RecoveryCoordinator:
                     and result.effects.zero_verified
                     and not result.cleanup_failed
                     and not j.db.in_transaction
-                    and j.fault.classification() == "owner_release_unconfirmed"
+                    and j.fault.read({}).get("classification") == "owner_release_unconfirmed"
                 ):
                     raise RecoveryRequiredError(
                         "Return kept the verified zero hold after a storage failure"

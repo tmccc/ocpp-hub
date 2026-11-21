@@ -10,6 +10,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..control import HUB_PROFILE_ID
+from .command_processor import CommandPriority
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
 from .control_state import ControlState
 from .gateway import NativeStartReport, timestamp
@@ -472,6 +473,7 @@ class ManagedCurrentLimits:
             "type": type(error).__name__,
             "detail": str(error)[:1024],
         }
+        hold_ticket = None
         while not self._closing and not c.stopping:
             try:
                 outcome = c.commands.decide(
@@ -493,8 +495,48 @@ class ManagedCurrentLimits:
                 c.commands.decide(lambda: self.record_failure_diagnostic(cause))
                 return
             except sqlite3.Error:
-                # A later Pause is read again on every retry and retains its own revision and control ticket.
+                if not self.journal.db.in_transaction:
+                    hold_ticket = await self._protect_unsettled_apply(identifier, previous_value, expected, hold_ticket)
                 await asyncio.sleep(0.1)
+
+    # A failed receipt write cannot keep an applied but unverified current at the charger.
+    async def _protect_unsettled_apply(
+        self, identifier: str, previous: int, expected: ControlIntent, hold_ticket: str | None
+    ) -> str | None:
+        c, j = self.controller, self.journal
+        g = c.session.gateway
+        connection = current_control_scope(g)
+
+        # Keep the restrictive operation tied to the same current change and current commissioned connection.
+        def guard(ticket: str | None) -> None:
+            change = j.current_change.read()
+            if (
+                c.stopping
+                or c.requests.intent() != expected
+                or change.identifier != identifier
+                or not change.selecting
+                or not ticket
+                or j.control.read().values.get("ticket") != ticket
+                or not control_scope_matches(g, connection)
+                or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
+            ):
+                raise RecoveryRequiredError("failed current hold was superseded")
+
+        # Commit the zero claim separately from the command's failed receipt, preserving its previous selection.
+        def claim() -> str:
+            with j.atomic():
+                guard(j.current_change.read().value.get("ticket"))
+                j.control.project(j.control.read().values, resume_limit=previous)
+                _, ticket = g.controls._claim(True, stopping=True)
+                return ticket
+
+        try:
+            if hold_ticket is None:
+                hold_ticket = c.commands.decide(claim, priority=CommandPriority.RESTRICT)
+            await g.controls.ensure_ceiling(guard=lambda: guard(hold_ticket))
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
+            pass  # The same current worker retries while an exact owner still permits zero.
+        return hold_ticket
 
     # Decide which hold or overlapping session still owns this failed current selection.
     def _settle_failed_apply(

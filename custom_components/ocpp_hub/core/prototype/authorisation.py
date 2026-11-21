@@ -33,10 +33,14 @@ class VendorAuthorisation:
         )
         return token
 
-    # Expiry cannot prove that a cloud Start has finished awaiting its matching actual session.
+    # Expiry cannot finish a Start's lifecycle. An actual refusal can.
     def pending(self) -> bool:
         grant = self.journal.get("vendor_start_grant", {})
-        return bool(grant) and grant.get("local") is None
+        return (
+            bool(grant)
+            and grant.get("local") is None
+            and self.journal.forwarded.status(grant.get("mutation")) != "Rejected"
+        )
 
     # A grant authorises only its bounded pending start or the currently open transaction bound to that grant.
     def allows(self, tag: str, *, issuing: str | None = None) -> bool:
@@ -44,7 +48,7 @@ class VendorAuthorisation:
         if (
             grant.get("digest") != tag_key(tag)
             or (grant.get("prepared") is True and grant.get("token") != issuing)
-            or self.journal.forwarded.rejected(grant.get("mutation"))
+            or self.journal.forwarded.status(grant.get("mutation")) == "Rejected"
         ):
             return False
         local = grant.get("local")

@@ -204,7 +204,10 @@ async def test_missing_wire_reply_keeps_start_uncertain(tmp_path, tls, unused_tc
 
 # Intent: cancelling real native validation retires only prepared vendor work and closes its actual HTTP reader.
 # Why: no orphan validation task may retain the gate, grant or correlation entry after its caller exits.
-async def test_cancelled_native_validation_retires_unsent_vendor_work(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("storage_wait", [False, True])
+async def test_cancelled_native_validation_retires_unsent_vendor_work(
+    tmp_path, tls, unused_tcp_port, monkeypatch, storage_wait
+):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as test:
         g, j, peer = test.session.gateway, test.session.journal, test.rig.peer
         peer.arm = "hold"
@@ -213,11 +216,20 @@ async def test_cancelled_native_validation_retires_unsent_vendor_work(tmp_path, 
         try:
             await asyncio.wait_for(peer.entered.wait(), 2)
             assert j.get("vendor_start_grant") and not starts(test.rig)
+            if storage_wait:
+                j.db.execute(
+                    "CREATE TEMP TRIGGER refuse_unsent_cleanup BEFORE DELETE ON mutations "
+                    "WHEN OLD.origin='vendor' BEGIN SELECT RAISE(ABORT,'synthetic cleanup refusal'); END"
+                )
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             await asyncio.wait_for(peer.client_closed.wait(), 1)
             assert not peer.release.is_set()
+            if storage_wait:
+                assert j.get("vendor_start_grant")
+                j.db.execute("DROP TRIGGER refuse_unsent_cleanup")
+                await until(lambda: not j.get("vendor_start_grant"))
             assert not starts(test.rig) and not j.get("vendor_start_grant")
             assert not j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor'").fetchone()
             assert not j.get("uncertain_vendor_command")

@@ -374,22 +374,33 @@ class ResourceBook:
             and identifier == HUB_PROFILE_ID
             and profile_projection(payload)["limit"] == 0
         )
+        status = profile_status(action, answer)
         with _profile_storage(station_zero):
-            if profile_status(action, answer) == "Accepted":
-                if action == "SetChargingProfile":
-                    retire = identifier == HUB_PROFILE_ID and self.journal.get(_STATION_ZERO_PREDECESSOR) is not None
-                    with self.journal.atomic() if retire else nullcontext():
-                        self.journal.db.execute(
-                            "UPDATE trial_resources SET confirmed=desired,state='confirmed',observed_digest=NULL "
-                            "WHERE key=?",
-                            (key,),
-                        )
-                        if retire:
-                            self.journal.db.execute("DELETE FROM meta WHERE key=?", (_STATION_ZERO_PREDECESSOR,))
-                else:
-                    self.journal.db.execute("UPDATE trial_resources SET state='clear_acknowledged' WHERE key=?", (key,))
+            try:
+                self._save_profile_reply(action, identifier, key, status)
+            except sqlite3.Error:
+                if identifier == HUB_PROFILE_ID or status != "Accepted" or self.journal.db.in_transaction:
+                    raise
+                # The same peer owns the wire gate, so a rolled-back write can safely retry this exact reply.
+                self._save_profile_reply(action, identifier, key, status)
+
+    # A clear acknowledgement remains separate from verified physical absence.
+    def _save_profile_reply(self, action: str, identifier: int, key: str, status: str | None) -> None:
+        if status == "Accepted":
+            if action == "SetChargingProfile":
+                retire = identifier == HUB_PROFILE_ID and self.journal.get(_STATION_ZERO_PREDECESSOR) is not None
+                with self.journal.atomic() if retire else nullcontext():
+                    self.journal.db.execute(
+                        "UPDATE trial_resources SET confirmed=desired,state='confirmed',observed_digest=NULL "
+                        "WHERE key=?",
+                        (key,),
+                    )
+                    if retire:
+                        self.journal.db.execute("DELETE FROM meta WHERE key=?", (_STATION_ZERO_PREDECESSOR,))
             else:
-                self.journal.db.execute("UPDATE trial_resources SET state='uncertain' WHERE key=?", (key,))
+                self.journal.db.execute("UPDATE trial_resources SET state='clear_acknowledged' WHERE key=?", (key,))
+        else:
+            self.journal.db.execute("UPDATE trial_resources SET state='uncertain' WHERE key=?", (key,))
 
     # Inspect every owned-resource contradiction before publishing unrelated absence/confirmation observations.
     def _owned_conflict(self, current: dict[str, Resource], rows: list[Any]) -> tuple[str, str | None] | None:

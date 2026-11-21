@@ -57,6 +57,20 @@ def release_disposition(
 ) -> ReleaseDisposition:
     effects = result.effects
     if (
+        result.claimed
+        and result.pending is not None
+        and result.pending.reason is Prerequisite.SUPERSEDED
+        and result.failure is None
+        and not result.cancelled
+        and not result.cleanup_failed
+        and not effects.positive_dispatched
+        and not effects.positive_verified
+        and not effects.zero_dispatched
+        and not effects.zero_verified
+        and current != result.authority
+    ):
+        return ReleaseDisposition.WAIT if purpose == "automatic" else ReleaseDisposition.NOT_SENT
+    if (
         not result.claimed
         and result.pending is not None
         and result.failure is None

@@ -156,7 +156,22 @@ async def test_native_cleanup_preserves_originals_and_clears_station_last(
         original_plan = copy.deepcopy(rig.bench.firmware.plans)
         await session.command({"command": "release"})
         extra = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 100001, stack_level=2)
+        refused = []
+
+        # Refuse just the first journal publication of the real profile acceptance.
+        def refuse_first():
+            refused.append(True)
+            return len(refused) == 1
+
+        session.journal.db.create_function("refuse_first_extra_ack", 0, refuse_first)
+        session.journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_extra_ack BEFORE UPDATE ON trial_resources "
+            "WHEN NEW.key='profile:100001' AND NEW.state='confirmed' AND refuse_first_extra_ack() "
+            "BEGIN SELECT RAISE(ABORT,'synthetic first acknowledgement refusal'); END"
+        )
         assert (await session.gateway.charger.call("SetChargingProfile", extra))[2]["status"] == "Accepted"
+        assert len(refused) == 2
+        session.journal.db.execute("DROP TRIGGER refuse_extra_ack")
         assert rig.bench.firmware.effective_limit() == 6
         result = await session.command({"command": "native-bounded-handover"})
         assert result == {"profiles_restored": True, "native_limit_a": 6, "complete": False}

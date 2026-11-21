@@ -199,6 +199,7 @@ class Gateway:
         self._boot_retry = asyncio.Event()
         self._vendor_epoch = 0
         self._inbound = InboundCache(journal=journal)
+        self._unsent_vendor_cleanup: dict[str, tuple[str | None, VendorProfileWrite | None]] = {}
         self._observations = ObservationReceipts(journal)
         self._start_retry_waits: dict[str, tuple[str, float]] = {}
         self.failures: list[str] = []
@@ -225,6 +226,8 @@ class Gateway:
 
     # Retry the original recorded response and its independent connection receipt without sending either command again.
     def retry_reply_writes(self) -> None:
+        for mutation, (grant, profile) in tuple(self._unsent_vendor_cleanup.items()):
+            self._retire_unsent_vendor(mutation, grant, profile)
         self.journal.forwarded.retry()
         self._inbound.retry()
 
@@ -370,8 +373,6 @@ class Gateway:
         if frame[0] != 2:
             peer.receive(frame)
             return
-        if replies_only:
-            return
         boot = side == "charger" and frame[2] == "BootNotification"
         if boot:
             self._start_boot_response(current_epoch, str(frame[1]), frame[3])
@@ -389,7 +390,21 @@ class Gateway:
             except sqlite3.Error:
                 self._refuse_call(side, current_epoch, frame[1], "InternalError", "observation generation unavailable")
                 return
-        task = asyncio.create_task(self._answer(side, current_epoch, frame, current_control_scope(self), generation))
+        pending_start_boot = None
+        if side == "charger" and frame[2] == "StartTransaction":
+            if self._boot_response is not None and self._pending_boot is not None:
+                pending_start_boot = self._boot_response, self._pending_boot
+        task = asyncio.create_task(
+            self._answer(
+                side,
+                current_epoch,
+                frame,
+                current_control_scope(self),
+                generation,
+                replies_only=replies_only,
+                pending_start_boot=pending_start_boot,
+            )
+        )
         self._tasks.add(task)
         if reserved:
             self._reserved_stops[side] = task
@@ -411,6 +426,9 @@ class Gateway:
         frame: Frame,
         charger_scope: ControlScope | None,
         observation_generation: int | None,
+        *,
+        replies_only: bool = False,
+        pending_start_boot: tuple[asyncio.Task[None], str] | None = None,
     ) -> None:
         current = self._charger_epoch if side == "charger" else self._vendor_epoch
         if epoch != current:
@@ -418,8 +436,18 @@ class Gateway:
 
         # Core charger observations have their own durable receipts; heartbeat times are never cached.
         async def handle() -> str:
+            if replies_only:
+                return build_call_error(frame[1], "InternalError", "charger is not ready; command was not sent")
             if side == "charger":
                 boot = charger_scope[0].boot if charger_scope is not None else None
+                if boot is None and pending_start_boot is not None:
+                    boot_response, observation = pending_start_boot
+                    try:
+                        await asyncio.shield(boot_response)
+                    except TimeoutError, UnavailableError, OSError:
+                        pass
+                    if self._charger_epoch == epoch and self.boot_observation == observation:
+                        boot = observation
                 return await self._charger_call(frame, epoch, boot, observation_generation)
             return await self._vendor_call(frame, epoch, charger_scope)
 
@@ -1216,6 +1244,7 @@ class Gateway:
                 before_send=prepare_clear if action == "ClearChargingProfile" else None,
                 on_dispatch=on_dispatch,
                 on_receive=received if action in TRANSACTION_COMMANDS else None,
+                keep_late_reply=action in TRANSACTION_COMMANDS,
             )
             if forwarded_reply is not None:
                 return reply_as(answer, token)
@@ -1298,19 +1327,12 @@ class Gateway:
     ) -> None:
         if mutation is None and grant is None and profile is None:
             return
+        if not dispatched:
+            self._retire_unsent_vendor(mutation, grant, profile)
+            return
         try:
             with self.journal.atomic():
-                if not dispatched:
-                    if mutation is not None:
-                        self.journal.db.execute("DELETE FROM mutations WHERE token=?", (mutation,))
-                    if grant is not None:
-                        self.authorisation.revoke(grant)
-                    if profile is not None and profile.allocated:
-                        profiles = self.journal.get("vendor_profiles", {})
-                        if profiles.get(profile.vendor) == profile.local:
-                            profiles.pop(profile.vendor)
-                            self.journal.put("vendor_profiles", profiles)
-                elif mutation is not None:
+                if mutation is not None:
                     row = self.journal.db.execute("SELECT state FROM mutations WHERE token=?", (mutation,)).fetchone()
                     if row is not None and row[0] == "pending":
                         self.journal.mutation_finished(mutation, False)
@@ -1320,6 +1342,31 @@ class Gateway:
                         )
         except sqlite3.Error:
             self._record_failure("JournalUnavailable")
+
+    # A known unsent request retains its exact cleanup until the local write can commit.
+    def _retire_unsent_vendor(
+        self, mutation: str | None, grant: str | None, profile: VendorProfileWrite | None
+    ) -> None:
+        try:
+            with self.journal.atomic():
+                if mutation is not None:
+                    self.journal.db.execute("DELETE FROM mutations WHERE token=?", (mutation,))
+                if grant is not None:
+                    self.authorisation.revoke(grant)
+                if profile is not None and profile.allocated:
+                    profiles = self.journal.get("vendor_profiles", {})
+                    if profiles.get(profile.vendor) == profile.local:
+                        profiles.pop(profile.vendor)
+                        self.journal.put("vendor_profiles", profiles)
+        except sqlite3.Error:
+            if self.journal.db.in_transaction:
+                raise
+            if mutation is not None:
+                self._unsent_vendor_cleanup[mutation] = grant, profile
+            self._record_failure("JournalUnavailable")
+        else:
+            if mutation is not None:
+                self._unsent_vendor_cleanup.pop(mutation, None)
 
     # Commit the last accepted definition even if the old transaction stopped while its reply was in flight.
     def _accepted_vendor_profile(self, profile: VendorProfileWrite) -> None:
