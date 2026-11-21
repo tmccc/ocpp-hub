@@ -382,11 +382,12 @@ async def test_process_sigkill_after_newer_pause_commit(
         assert recovered["metadata"]["managed_owner_pause"] == claim
         if interrupt_recovery:
             gate = await child.gate(phase, pause)
-            assert not gate["transaction_open"]
+            assert gate["transaction_open"]
             pending = child.durable()
             assert pending["metadata"]["managed_control_intent"] == intent
             assert pending["metadata"]["control"]["ticket"] == claim["ticket"]
-            assert pending["metadata"]["control"]["uncertain"] is False
+            # The verified hold and its Pause receipt are still uncommitted at this cut.
+            assert pending["metadata"]["control"]["uncertain"] is True
             assert pending["metadata"]["managed_current_change"]["state"] == "cancelled"
             assert next(row for row in pending["requests"] if row["id"] == pause)["state"] == "accepted"
             require_zero_held(child.rig, mark)
@@ -399,6 +400,7 @@ async def test_process_sigkill_after_newer_pause_commit(
         assert status["control_revision"] == intent["revision"] and status["requested_current_a"] == 6
         recovered = child.durable()["metadata"]
         assert recovered["managed_owner_pause"] == claim and recovered["control"]["ticket"] == claim["ticket"]
+        assert recovered["control"]["uncertain"] is False
         change_receipt = (await child.request("receipt", request_id=change))["result"]
         assert change_receipt["state"] == "failed"
         assert [kill["generation"] for kill in child.kills] == ([1, 2] if interrupt_recovery else [1])
