@@ -14,8 +14,7 @@ from tests.native_schedule_support import timer_bench
 from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
-
-from .interaction_model import Control, Mode, Start, decisions
+from tests_model.interaction_model import Control, Mode, Start, decisions
 
 EVENTS = ("daily Start report", "Pause commits", "matching accepted captured")
 

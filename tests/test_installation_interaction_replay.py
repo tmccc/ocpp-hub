@@ -16,8 +16,7 @@ from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.test_native_bounded_handover import native_ready, restore_original_route, verify_original_backend
 from tests.tls_support import tls as tls
-
-from .installation_interactions import Installation, Phase, install_edges
+from tests_model.installation_interactions import Installation, Phase, install_edges
 
 CLOSURES = ("native session closed", "exact Stop report", "exact remaining delivery settled")
 

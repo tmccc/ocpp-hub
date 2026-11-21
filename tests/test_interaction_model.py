@@ -1,8 +1,8 @@
 """Explore every reachable state and enabled edge in each finite reference model."""
 
-from .exploration import explore, require_recovery
-from .interaction_delivery import Delivery, delivery_decisions, delivery_violation
-from .interaction_model import Control, Mode, Start, control_violation, decisions
+from tests_model.exploration import explore, require_recovery
+from tests_model.interaction_delivery import Delivery, delivery_decisions, delivery_violation
+from tests_model.interaction_model import Control, Mode, Start, control_violation, decisions
 
 
 # Given cooperating peers and no further invalidation, an intentional Pause may still be needed to recover.

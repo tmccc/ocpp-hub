@@ -1,11 +1,11 @@
 """Explore timed, commissioning and Home Assistant decisions through their observed boundaries."""
 
-from .exploration import explore, require_recovery
-from .home_interactions import Entry, Exchange, Home, Receipt, View, home_edges, home_violation
-from .installation_interactions import Installation, Phase, install_edges, install_violation
-from .system_interaction import System, Window, system_edges, system_violation
-from .timed_interactions import Active, Timed, timed_edges, timed_violation
-from .timed_interactions import TestPhase as TimedPhase
+from tests_model.exploration import explore, require_recovery
+from tests_model.home_interactions import Entry, Exchange, Home, Receipt, View, home_edges, home_violation
+from tests_model.installation_interactions import Installation, Phase, install_edges, install_violation
+from tests_model.system_interaction import System, Window, system_edges, system_violation
+from tests_model.timed_interactions import Active, Timed, timed_edges, timed_violation
+from tests_model.timed_interactions import TestPhase as TimedPhase
 
 
 # Only new deliberate work and recurring trouble are excluded once cooperation resumes.

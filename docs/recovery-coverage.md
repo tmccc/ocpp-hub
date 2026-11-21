@@ -29,10 +29,10 @@ that every state has a recovery path when failures cease and the required exact 
 arrives. The model represents ownership by whether a report belongs to the tracked request or session.
 It groups current values into retained and changed selections. The separate current families test literal amps.
 
-The [held-Start replays](../tests_model/test_complete_overlap.py) run all 40 orders in their grammar
+The [held-Start replays](../tests/test_complete_overlap.py) run all 40 orders in their grammar
 against the standalone service. They cover a failed Pause write, a newer Pause, Return and its UUID replay,
 lost or delivered Start replies, and process replacement. Each finishes with real simulated lifecycle reports
-and a subsequent charge. The [daily replays](../tests_model/test_interaction_replay.py) run all six orders
+and a subsequent charge. The [daily replays](../tests/test_interaction_replay.py) run all six orders
 of a scheduled Start report, a newer Pause and the actual reply to an already issued owner Start. They compare
 the observed outcome and owner after every event. The [native read regression](../tests/test_native_read_supersession.py)
 checks the ceiling read against a newer poll, an inventory refresh after Return, and a newer owner Pause.
@@ -40,22 +40,25 @@ A valid read and the resulting Start record share one turn in the decision queue
 
 ```sh
 TMPDIR=/absolute/task .venv/bin/python -B tools/offline_validate.py \
-    tests_model/test_interaction_model.py tests_model/test_interaction_replay.py \
-    tests_model/test_complete_overlap.py
+    tests/test_interaction_model.py tests/test_interaction_replay.py \
+    tests/test_complete_overlap.py
 ```
 
-The [system model](../tests_model/test_system_interactions.py) also explores the timed controls, installation
+The [system model](../tests/test_system_interactions.py) also explores the timed controls, installation
 and Home Assistant. A timed test keeps its own first-power proof, deadline and Stop target. Cleanup waits for
 native closure, the charger’s Stop report and the cloud’s reply before clearing profiles and restoring the
 original backend. The client sends a command once and uses its exact saved receipt to confirm it. The shared
 model explores those boundaries together so a reload, late reply or withdrawn installation proof can fall
 between admission, physical power, stopping and confirmation.
 
-The [cleanup replays](../tests_model/test_installation_interaction_replay.py) test all three legal orders of
+The [cleanup replays](../tests/test_installation_interaction_replay.py) test all three legal orders of
 native closure, the charger’s Stop report and the cloud reply, then verify original-backend restoration.
 The [Home Assistant timed replays](../tests_ha_proxy/test_timed_system.py) use actual commissioning, a lost
 Start reply, HA reload on either side of the Stop, and both explicit Pause and automatic cutoff. They then
 exercise Return, change the selected current through HA, and finish a subsequent scheduled charge.
+
+The focused interaction checks run in the ordinary engine suite. The finite families below have their
+own per-case manifest and recovery evidence.
 
 The models group opaque identifiers by their relation to the current request, connection and session. Their
 state counts apply to those rules and bounds. The combined model ties one timed request to one HA exchange.
