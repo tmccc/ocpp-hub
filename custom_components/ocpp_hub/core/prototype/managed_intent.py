@@ -16,6 +16,8 @@ from .store import Journal, RecoveryRequiredError
 OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
 OFFLINE_PAUSE = "managed_offline_pause"
+RELEASE_PAUSE_ACK = "managed_release_pause_acknowledgement"
+PAUSE_RELEASE_PROOF = "_release_ack"
 
 type ReturnFailure = Literal["return_not_sent", "return_not_confirmed"]
 
@@ -63,6 +65,65 @@ def decode_intent(value: object) -> ControlIntent:
     ):
         raise SecurityError("managed control intent is malformed")
     return ControlIntent(value["mode"], value["revision"])
+
+
+# Use the current Pause receipt when available and keep reading acknowledgements saved by older versions.
+def saved_pause_ack(journal: Journal) -> dict[str, Any] | None:
+    intent = journal.get("managed_control_intent")
+    if intent is None:
+        legacy = journal.get(RELEASE_PAUSE_ACK)
+        return legacy if isinstance(legacy, dict) else None
+    try:
+        current = decode_intent(intent)
+    except SecurityError:
+        return None
+    if current.mode != "paused":
+        return None
+    row = journal.db.execute(
+        "SELECT id,result FROM managed_requests WHERE action='pause' "
+        "AND state IN ('accepted','uncertain','completed') ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        result = json.loads(row["result"])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(result, dict):
+        return None
+    if PAUSE_RELEASE_PROOF in result:
+        ack, pause = result[PAUSE_RELEASE_PROOF], result.get("_pause")
+        if (
+            not isinstance(pause, dict)
+            or type(pause.get("revision")) is not int
+            or pause["revision"] != current.revision
+            or not isinstance(pause.get("hold"), str)
+            or not pause["hold"]
+        ):
+            return None
+    else:
+        ack = journal.get(RELEASE_PAUSE_ACK)
+    if (
+        isinstance(ack, dict)
+        and ack.get("pause_request") == row["id"]
+        and type(ack.get("revision")) is int
+        and ack["revision"] == current.revision
+    ):
+        return ack
+    return None
+
+
+# Consume only the matching Pause when recovery settles or a strict refusal invalidates its proof.
+def retire_pause_ack(journal: Journal, fault: dict[str, Any]) -> None:
+    ack = saved_pause_ack(journal)
+    if ack is not None and ack.get("fault") == fault and journal.get("managed_control_intent") is not None:
+        journal.db.execute(
+            "UPDATE managed_requests SET result=json_set(result,?,NULL) WHERE id=? AND json_type(result,?)='object'",
+            (f"$.{PAUSE_RELEASE_PROOF}", ack["pause_request"], f"$.{PAUSE_RELEASE_PROOF}"),
+        )
+    legacy = journal.get(RELEASE_PAUSE_ACK)
+    if isinstance(legacy, dict) and legacy.get("fault") == fault:
+        journal.db.execute("DELETE FROM meta WHERE key=?", (RELEASE_PAUSE_ACK,))
 
 
 # Apply the shared revision transition inside the caller's original transaction, without creating request work.
@@ -287,7 +348,13 @@ class ManagedRequests:
 
     # Store acceptance and the desired mode together; return requests cannot replace or overtake another return.
     def accept(
-        self, identifier: str, action: str, revision: int, on_pause: Callable[[], None] | None = None
+        self,
+        identifier: str,
+        action: str,
+        revision: int,
+        on_pause: Callable[[], None] | None = None,
+        *,
+        capture_release_proof: Callable[[], dict[str, Any] | None] | None = None,
     ) -> dict[str, Any]:
         existing = self.existing(identifier, action, revision)
         if existing is not None:
@@ -325,6 +392,8 @@ class ManagedRequests:
                     "OR state='uncertain' AND revision<=?)",
                     (json.dumps({"classification": "superseded_by_pause"}), current.revision),
                 )
+                if "_pause" in result and capture_release_proof is not None:
+                    result[PAUSE_RELEASE_PROOF] = capture_release_proof()
             insert_request(self.journal, identifier, action, revision, result)
         # Acceptance is already durable. An unrelated read must not prevent the command worker from launching.
         return {"id": identifier, "action": action, "state": "accepted", "result": {"accepted_at": accepted_at}}
@@ -338,6 +407,7 @@ class ManagedRequests:
         if command.action == "pause":
             result.pop("_pause", None)
             result.pop("_stop", None)
+            result.pop(PAUSE_RELEASE_PROOF, None)
         if command.action == "app_control":
             result.pop("_return", None)
             result.pop("_await_cloud", None)
@@ -609,7 +679,7 @@ class ManagedRequests:
                 "SELECT result FROM managed_requests WHERE id=?", (request.identifier,)
             ).fetchone()
             prior = json.loads(row["result"])
-            result.update({key: prior[key] for key in ("_pause", "_stop") if key in prior})
+            result.update({key: prior[key] for key in ("_pause", "_stop", PAUSE_RELEASE_PROOF) if key in prior})
             self.journal.db.execute(
                 "UPDATE managed_requests SET state='completed',result=? "
                 "WHERE id=? AND state IN ('accepted','uncertain')",

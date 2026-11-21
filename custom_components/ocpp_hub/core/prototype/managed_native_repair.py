@@ -11,13 +11,14 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .managed_denial_faults import denial_source_fault
+from .managed_intent import RELEASE_PAUSE_ACK, retire_pause_ack, saved_pause_ack
 from .native_faults import NativeContentError
 from .native_history import ORIGINAL_HISTORY_OMISSION, ORIGINAL_HISTORY_REFUSAL, MissingOriginalHistoryError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 
 AUDITS = "managed_native_repair_audits"
 REVOCATIONS = "managed_native_repair_revocations"
-ACK = "managed_release_pause_acknowledgement"
+ACK = RELEASE_PAUSE_ACK
 Outcome = Literal["validated", "availability", "superseded", "readiness", "measurement", "strict"]
 
 
@@ -145,7 +146,7 @@ class NativeRepairAudits:
         attempt = RepairAttempt(
             uuid.uuid4().hex,
             encoded(fault),
-            encoded(self.journal.get(ACK)),
+            encoded(saved_pause_ack(self.journal)),
             encoded(self.journal.get("managed_native_failure")),
             authority,
             sequence,
@@ -203,10 +204,7 @@ class NativeRepairAudits:
                         },
                     },
                 )
-                acknowledgement = journal.get(ACK)
-                if journal.fault.read() == fault and (
-                    isinstance(acknowledgement, dict) and acknowledgement.get("fault") == fault
-                ):
-                    journal.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
+                if journal.fault.read() == fault:
+                    retire_pause_ack(journal, fault)
             del audits[key]
             journal.put(AUDITS, audits)

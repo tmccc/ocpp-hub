@@ -17,6 +17,7 @@ from .managed_delivery_recovery import (
     delivery_recovery_evidence,
     pending_delivery_proofs,
 )
+from .managed_intent import RELEASE_PAUSE_ACK, retire_pause_ack, saved_pause_ack
 from .managed_native_repair import repair_pending, repair_revoked
 from .managed_settlement import charge_test_candidate, complete_record, current_candidate, require_record
 from .managed_start_delivery import DENIALS, complete_denied_start, denial_faults, denied_start_evidence
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from .managed import ManagedController
     from .trial_handover_evidence import HandoverEvidence
 
-ACK = "managed_release_pause_acknowledgement"
+ACK = RELEASE_PAUSE_ACK
 PROOF = "managed_release_reconciliation"
 FAULT = "owner_release_unconfirmed"
 
@@ -109,32 +110,22 @@ def recoverable_fault(c: ManagedController, fault: dict[str, Any]) -> bool:
     return release_evidence(c, fault) is not None
 
 
-# Capture fault-release evidence only for this already committed Pause.
+# Capture the current fault evidence inside the Pause acceptance transaction.
 def release_pause_ack(c: ManagedController, identifier: str) -> dict[str, Any] | None:
     j = c.session.journal
     fault = j.fault.read({})
     if not fault:
         return None
-    evidence = release_evidence(c, fault)
+    try:
+        evidence = release_evidence(c, fault)
+    except AttributeError, KeyError, TypeError, ValueError:
+        return None  # Malformed historical proof cannot delay the basic Pause.
     if evidence is None:
         return None
     intent = c.requests.intent()
     if intent.mode != "paused":
         raise RecoveryRequiredError("release acknowledgement requires an explicit paused intent")
     return {"fault": fault, "pause_request": identifier, "revision": intent.revision, **evidence}
-
-
-# A delayed write may acknowledge only the original Pause, fault and captured evidence.
-def publish_release_pause(c: ManagedController, ack: dict[str, Any]) -> None:
-    j, intent = c.session.journal, c.requests.intent()
-    fault = j.fault.read({})
-    if (
-        intent.mode == "paused"
-        and intent.revision == ack["revision"]
-        and fault == ack["fault"]
-        and acknowledged_evidence(c, fault, ack)
-    ):
-        j.put(ACK, ack)
 
 
 # Every post-await check retains the exact diagnostic/request snapshot acknowledged by this particular Pause.
@@ -150,7 +141,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     if c.native.repair_audits is not None:
         c.native.repair_audits.flush()
     fault = j.fault.read({})
-    ack = j.get(ACK, {})
+    ack = saved_pause_ack(j) or {}
     intent = c.requests.intent()
     if (
         not recoverable_fault(c, fault)
@@ -158,15 +149,6 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
         or not acknowledged_evidence(c, fault, ack)
         or intent.mode != "paused"
         or ack.get("revision") != intent.revision
-    ):
-        return False
-    request = j.db.execute(
-        "SELECT action,state FROM managed_requests WHERE id=?", (ack.get("pause_request"),)
-    ).fetchone()
-    if (
-        request is None
-        or request["action"] != "pause"
-        or request["state"] not in ("accepted", "uncertain", "completed")
     ):
         return False
     epoch, revision = g._charger_epoch, g.controls._revision
@@ -191,7 +173,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or repair_pending(j, fault)
             or repair_revoked(j, fault)
             or c.requests.intent() != intent
-            or j.get(ACK) != ack
+            or saved_pause_ack(j) != ack
             or j.fault.read() != fault
             or not recoverable_fault(c, fault)
             or not acknowledged_evidence(c, fault, ack)
@@ -307,7 +289,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
                 },
             )
             j.fault.clear()
-            j.db.execute("DELETE FROM meta WHERE key=?", (ACK,))
+            retire_pause_ack(j, fault)
             if delivery is not None:
                 complete_delivery_recovery(j, delivery, ack["pause_request"])
             if operator is not None:

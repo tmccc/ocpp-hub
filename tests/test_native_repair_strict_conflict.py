@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 from ocpp_hub_core.control import HUB_PROFILE_ID
+from ocpp_hub_core.prototype.managed_intent import saved_pause_ack
 from ocpp_hub_core.prototype.managed_native_repair import AUDITS, REVOCATIONS
 from ocpp_hub_core.prototype.managed_release_recovery import ACK, PROOF, recoverable_fault
 from ocpp_hub_core.prototype.store import fingerprint
@@ -92,6 +93,7 @@ async def test_legacy_native_repair_retains_strict_refusal_after_original_conten
         assert sequence < refusal["sequence"] <= c.native.read_sequence
         assert len(b.rig.peer.requests) > requests
         assert fingerprint(fault) not in j.get(AUDITS, {}) and j.get(ACK) is None
+        assert saved_pause_ack(j) is None
         after_refusal = {
             "fault_unchanged": j.get("managed_control_fault") == fault,
             "ack_unchanged": j.get(ACK) == acknowledgement,

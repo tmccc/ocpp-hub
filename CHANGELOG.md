@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep the fault evidence with the Pause that acknowledged it so recovery can still use that Pause after a restart.
 - Use one command outcome owner for the proxy, recovery and Home Assistant. Retain actual owner wire replies
   and session links on the original commands, including separate replies for a current change and its zero rollback.
 - Finish saved forwarded profile replies and exact local Start replies after a restart.

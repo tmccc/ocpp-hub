@@ -21,10 +21,9 @@ from .managed_current import (
 from .managed_current_recovery import capture_interrupted_collision
 from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault, stop_for_missing_station
-from .managed_intent import OFFLINE_PAUSE, ControlIntent, ManagedRequests, write_intent
+from .managed_intent import OFFLINE_PAUSE, RELEASE_PAUSE_ACK, ControlIntent, ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
 from .managed_release_recovery import (
-    publish_release_pause,
     reconcile_owner_release,
     release_evidence,
     release_pause_ack,
@@ -82,7 +81,6 @@ class ManagedController:
 
     # Construct after admission so the allocation bootstrap cannot see unrelated managed-service metadata.
     def __init__(self, session: TrialSession) -> None:
-        self._pending_release_ack: dict[str, Any] | None = None
         if session.native_bounded is None or session.gateway.policy.allow_local_start:
             raise SecurityError("managed operation requires bounded native authority and disabled local Start")
         if session.journal.get("trial_allocation") is None:
@@ -174,8 +172,10 @@ class ManagedController:
         if action == "app_control" and self.requests.intent().mode != "paused":
             raise RecoveryRequiredError("return requires a current paused intent")
 
+        journal = self.session.journal
         controls = self.session.gateway.controls
         ticket = None
+        pause_ack = None
 
         # This claim shares the intent transaction, so no accepted Pause can leave old shared authority committed.
         def claim() -> None:
@@ -183,31 +183,29 @@ class ManagedController:
             _, ticket = controls._claim(True, stopping=True)
             self.requests.record_pause_claim(self.requests.intent(), ticket)
 
-        receipt = self.requests.accept(identifier, action, revision, claim)
+        # Evidence is optional. A failed read cannot veto a Pause while its transaction remains intact.
+        def capture_release_proof() -> dict[str, Any] | None:
+            nonlocal pause_ack
+            try:
+                pause_ack = release_pause_ack(self, identifier)
+            except sqlite3.Error, RecoveryRequiredError, SecurityError:
+                if not journal.db.in_transaction:
+                    raise
+            return pause_ack
+
+        receipt = self.requests.accept(identifier, action, revision, claim, capture_release_proof=capture_release_proof)
         if action == "pause":
             if ticket is not None:
                 controls.observe_incident("pause_committed", identifier, ticket)
             self.schedule_pause()
-            self._pending_release_ack = None
-            try:
-                self._pending_release_ack = release_pause_ack(self, identifier)
-            except sqlite3.Error:
-                if self.session.journal.db.in_transaction:
-                    raise
-            self._retry_release_pause()
+            if pause_ack is not None:
+                try:
+                    journal.put(RELEASE_PAUSE_ACK, pause_ack)
+                except sqlite3.Error:
+                    if journal.db.in_transaction:
+                        raise
+                    # The original Pause already contains the proof. This copy serves older readers.
         return receipt
-
-    # Optional storage can recover while the durable Pause keeps its own control ticket.
-    def _retry_release_pause(self) -> None:
-        if self._pending_release_ack is None:
-            return
-        try:
-            publish_release_pause(self, self._pending_release_ack)
-        except sqlite3.Error:
-            if self.session.journal.db.in_transaction:
-                raise
-            return
-        self._pending_release_ack = None
 
     # A newer accepted hold must get a turn even if the previous Stop is still leaving the wire gate.
     def schedule_pause(self) -> asyncio.Task[None]:
@@ -970,7 +968,6 @@ class ManagedController:
     # A poll first joins owned work, then supervises, assesses current authority and publishes one view.
     async def _tick(self) -> dict[str, Any]:
         self.commands.decide(self.session.gateway.retry_reply_writes)
-        self.commands.decide(self._retry_release_pause)
         pending = await self._pending_work()
         if pending is not None:
             self.latest_native = None

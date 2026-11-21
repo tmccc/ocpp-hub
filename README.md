@@ -64,7 +64,9 @@ proxy then checks the current charger evidence and owner choice before allowing 
 
 The command journal keeps the original request, the charger reply, and the verified result available to
 control, recovery and Home Assistant. A command can have multiple charger replies, such as one for a new
-current and another for restoring zero. The charge history supplies actual session start and closure.
+current and another for restoring zero. The charge history supplies actual session start and closure. A Pause
+that acknowledges a fault keeps that evidence with its receipt. After a restart, the proxy can reuse that Pause
+for the same fault and check the charger again.
 If the proxy restarts with a saved reply still waiting for its final update, let this version finish that update
 before rolling back to an earlier version. The rollback check requires a settled journal.
 

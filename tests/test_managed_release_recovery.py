@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import pytest
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_intent import saved_pause_ack
 from ocpp_hub_core.prototype.managed_release_recovery import (
     ACK,
+    PROOF,
     reconcile_owner_release,
 )
 from ocpp_hub_core.prototype.rpc import UnavailableError
@@ -207,7 +209,7 @@ async def test_release_pause_acknowledgement_is_atomic_and_idempotent(tmp_path, 
 
 
 # Intent: a failed optional recovery acknowledgement does not undo the owner Pause.
-# Why: fault release requires separate saved evidence, while the basic Pause must remain available.
+# Why: the original Pause can support recovery even when the older acknowledgement record is unavailable.
 async def test_pause_commits_while_fault_acknowledgement_write_fails(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         fault = await fail_one_return(b, monkeypatch, "lost")
@@ -229,14 +231,93 @@ async def test_pause_commits_while_fault_acknowledgement_write_fails(tmp_path, t
         if c.pause_task is not None:
             await c.pause_task
         await c.hold_fault()
-        await c.tick()
-        if j.fault.latched():
-            assert j.get(ACK)["pause_request"] == identifier
         for _ in range(10):
+            await c.tick()
             if not j.fault.latched():
                 break
-            await c.tick()
         assert not j.fault.latched() and c.requests.intent().revision == before.revision + 1
+        assert j.get(PROOF)["pause_request"] == identifier
+
+
+# Intent: the original Pause acknowledges only its own fault after the journal and real TLS peers reconnect.
+# Why: failure to save the separate acknowledgement must leave the original Pause useful after restart.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("changed_fault", [False, True], ids=["same-fault", "new-fault"])
+async def test_release_pause_recovers_after_acknowledgement_write_failure_and_restart(
+    tmp_path, tls, unused_tcp_port, monkeypatch, changed_fault
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        fault = await fail_one_return(b, monkeypatch, "lost")
+        c, j, rig = b.c, b.session.journal, b.rig
+        identifier = uuid.uuid4().hex
+        j.db.execute(
+            f"CREATE TRIGGER refuse_fault_ack BEFORE INSERT ON meta WHEN NEW.key='{ACK}' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic acknowledgement refusal'); END"
+        )
+        receipt = c.command(identifier, "pause", c.requests.intent().revision)
+        assert receipt["state"] == "accepted"
+        assert c.requests.receipt(identifier) == receipt
+        intent = c.requests.intent()
+        assert intent.mode == "paused" and j.fault.read() == fault
+        if c.pause_task is not None:
+            await c.pause_task
+        assert j.get(ACK) is None and rig.bench.firmware.effective_limit() == 0
+
+        # Keep the same recoverable classification so only the exact fault identity can distinguish it.
+        if changed_fault:
+            fault = {**fault, "at_epoch": fault["at_epoch"] + 1}
+            j.put("managed_control_fault", fault)
+        positives = sum(limit > 0 for limit in rig.bench.received_limits)
+        await crash(b.session)
+
+        replacement = managed_session(rig)
+        await replacement.start()
+        resumed = ManagedController(replacement)
+        journal = replacement.journal
+        assert journal.get(ACK) is None and journal.fault.read() == fault
+        async with rig.charger(replacement) as charger:
+            await introduced(rig, replacement, charger, "pause-ack-replacement")
+            for _ in range(10):
+                await resumed.tick()
+                assert rig.bench.firmware.effective_limit() == 0
+                if not journal.fault.latched():
+                    break
+
+            assert resumed.requests.intent() == intent
+            assert sum(limit > 0 for limit in rig.bench.received_limits) == positives
+            assert journal.get(ACK) is None
+            if changed_fault:
+                assert journal.fault.read() == fault and journal.get(PROOF) is None
+            else:
+                assert not journal.fault.latched()
+                assert saved_pause_ack(journal) is None
+                assert journal.get(PROOF)["pause_request"] == identifier
+                assert journal.get(PROOF)["revision"] == intent.revision
+
+
+# Intent: malformed optional fault evidence cannot veto a request to Pause.
+# Why: recovery must leave unavailable proof unresolved while the original request still keeps zero in force.
+async def test_pause_commits_when_optional_fault_evidence_has_the_wrong_shape(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        fault = await fail_one_return(b, monkeypatch, "lost")
+        c, j = b.c, b.session.journal
+        identifier = uuid.uuid4().hex
+        revision = c.requests.intent().revision
+        j.put("managed_operator_debt_reconciliations", {"bad": []})
+        try:
+            receipt = c.command(identifier, "pause", revision)
+        finally:
+            j.db.execute("DELETE FROM meta WHERE key='managed_operator_debt_reconciliations'")
+        assert receipt["state"] == "accepted" and c.requests.receipt(identifier) == receipt
+        intent = c.requests.intent()
+        assert intent.mode == "paused" and intent.revision == revision + 1
+        assert saved_pause_ack(j) is None
+        if c.pause_task is not None:
+            await c.pause_task
+        await c.tick()
+        assert j.fault.read() == fault and b.rig.bench.firmware.effective_limit() == 0
 
 
 # Intent: the acknowledgement helper itself performs only native reads before recording successful recovery.
