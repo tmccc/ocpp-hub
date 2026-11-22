@@ -3,30 +3,21 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ..control import HUB_PROFILE_ID
 from .command_processor import CommandPriority
-from .control_state import ControlState
-from .gateway import NativeStartReport
-from .local_control import local_start_receipt
-from .managed_sources import confirmed_vendor_start, recorded_station_profile
-from .managed_start_binding import known_plan_source
+from .managed_sources import ORDINARY_SOURCE
 from .native_bounded import NativeReadinessError
-from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite, require_allowed
-from .rpc import UnavailableError
-from .store import RecoveryRequiredError, fingerprint
-from .trial_rollback import lifecycle_decision
+from .recovery_contracts import AuthorityStamp, GateDecision, Pending, Prerequisite, require_allowed
+from .store import fingerprint
 
 if TYPE_CHECKING:
     from .managed import ManagedController
     from .trial_handover_evidence import HandoverEvidence
 
-KEY = "managed_ordinary_recovery"
-SOURCE = "managed_ordinary_source"
+SOURCE = ORDINARY_SOURCE
 
 
 @dataclass(frozen=True)
@@ -44,61 +35,21 @@ class OrdinaryRecovery:
     # The existing controller retains all native/resource/zero and outgoing ownership guards.
     def __init__(self, controller: ManagedController) -> None:
         self.c = controller
+        self.control = controller.session.gateway.controls.decisions.recovery
         self.source_published = False
         self.completion: OrdinaryCompletion | None = None
 
-    # A verified normal local Start may join ordinary supervision only after its exact request really completed.
+    # Use the shared owner's exact normal-Start provenance.
     def verified_normal(self) -> bool:
-        c, j = self.c, self.c.session.journal
-        state, receipt = c.charging.state(), local_start_receipt(j)
-        local = state.get("local_transaction")
-        if (
-            c.charging.lease is not None
-            or state.get("kind") != "normal"
-            or state.get("source") != "local"
-            or state.get("state") != "running"
-            or state.get("start_rpc_accepted") is not True
-            or type(local) is not int
-            or receipt.get("local") != local
-            or receipt.get("stage") != "accepted"
-            or receipt.get("digest") != state.get("tag_digest")
-            or receipt.get("request_id") not in (None, state.get("id"))
-            or j.get("control", {}).get("start_pending")
-        ):
-            return False
-        request = j.db.execute(
-            "SELECT revision,result FROM managed_requests WHERE id=? AND action='start' AND state='completed'",
-            (state.get("id"),),
-        ).fetchone()
-        transaction = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
-        if request is None or transaction is None or request["revision"] + 1 != state.get("revision"):
-            return False
-        result = json.loads(request["result"])
-        return (
-            result.get("local_session_verified") is True
-            and result.get("timed") is False
-            and fingerprint(json.loads(transaction["start"])["idTag"].casefold()) == state.get("tag_digest")
-        )
+        return self.control.verified_normal(self)
 
-    # Timer/current/test state machines retain exclusive ownership of their own restoration obligations.
+    # Check that ordinary recovery owns the current app intent.
     def ordinary(self) -> bool:
-        c, j = self.c, self.c.session.journal
-        return (
-            not c.stopping
-            and (not j.fault.read())
-            and (j.phase.read().operating)
-            and (c.requests.intent().mode == "app")
-            and (not c.current.pending())
-            and (c.charging.lease is None)
-            and (c.charging.state().get("state") in (None, "completed") or self.verified_normal())
-            and (j.current_change.read().state not in ("interrupted", "uncertain"))
-        )
+        return self.control.ordinary(self)
 
-    # A newer explicit Pause or control revision immediately invalidates the saved positive recovery authority.
+    # Check whether the saved hold still belongs to this app intent.
     def active(self) -> bool:
-        saved = self.c.session.journal.get(KEY, {})
-        intent = self.c.requests.intent()
-        return saved.get("state") == "holding" and intent.mode == "app" and saved.get("revision") == intent.revision
+        return self.control.ordinary_active(self)
 
     # The immutable accepted Start binds identity; a connector number or native session number alone cannot do so.
     def start_digest(self, local: int | None) -> str | None:
@@ -109,216 +60,36 @@ class OrdinaryRecovery:
         ).fetchone()
         return fingerprint(json.loads(row["start"])) if row is not None else None
 
-    # Only the exact original native plan or a positively accepted command bound to this transaction proves source.
+    # Apply the shared owner's source proof without changing the ordinary recovery record.
     def source(self, native: HandoverEvidence) -> dict[str, Any] | None:
-        j = self.c.session.journal
-        local = j.active()
-        if local is None:
-            return {"kind": "idle"} if not native.physical.transaction_open else None
-        if not native.physical.transaction_open or native.physical.native_transaction_id != local:
-            return None
-        row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
-        if row is None or native.saved_schedule_digest != self.c.native.spec.saved_schedule_digest:
-            return None
-        tag = json.loads(row["start"])["idTag"].casefold()
-        digest = fingerprint(tag)
-        state = self.c.charging.state()
-        local_source = (
-            state.get("native_source") if state.get("local_transaction") == local and self.verified_normal() else None
-        )
-        expected_source = {
-            "marker": native.session_plan_id,
-            "start": fingerprint(json.loads(row["start"])),
-            "schedule": self.c.native.spec.saved_schedule_digest,
-        }
-        if local_source is not None and local_source != expected_source:
-            return None
-        grant = j.get("vendor_start_grant", {})
-        attested = grant.get("native_source")
-        if attested is not None and attested != {
-            "marker": native.session_plan_id,
-            "start": fingerprint(json.loads(row["start"])),
-            "schedule": self.c.native.spec.saved_schedule_digest,
-        }:
-            return None
-        for plan in (native.saved_schedule or {}).get("planList", []):
-            if plan.get("planId") == native.session_plan_id and str(plan.get("idTag", "")).casefold() == tag:
-                return {"kind": "daily", "plan": plan["planId"], "tag": digest}
-        if (
-            local_source == expected_source
-            and state.get("local_transaction") == local
-            and not known_plan_source(j, native)
-        ):
-            return {
-                "kind": "local",
-                "tag": digest,
-                "request": state["id"],
-                "receipt": fingerprint(local_start_receipt(j)),
-            }
-        if native.session_plan_id is not None and (known_plan_source(j, native) or attested is None):
-            return None  # An unknown marker needs the exact command-source attestation made during binding.
-        if confirmed_vendor_start(j, digest, local, settled=True):
-            return {"kind": "vendor", "tag": digest, "mutation": grant["mutation"]}
-        return None
+        return self.c.session.gateway.controls.decisions.schedule.ordinary_source(self, native)
 
-    # Publish or revoke source after every successful full native audit; an older proof cannot survive contradiction.
+    # Publish or revoke the latest source proof through the shared owner.
     def observe(self, native: HandoverEvidence) -> None:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        if not self.ordinary() or not g.current_boot_seen(g._charger_epoch):
-            return
-        self.source_published = False
-        local = j.active()
-        source = {
-            "revision": c.requests.intent().revision,
-            "local": local,
-            "start": self.start_digest(local),
-            "source": self.source(native),
-            "boot": g.boot_observation,
-            "epoch": g._charger_epoch,
-            "observed_at": native.physical.observed_at,
-            "native_digest": native.digest,
-        }
-        try:
-            j.put(SOURCE, source)
-        except sqlite3.Error:
-            return  # The previous proof cannot authorize recovery while publication is unavailable.
-        self.source_published = True
+        return self.control.observe_ordinary(self, native)
 
-    # The shared zero-only recovery works after reconnect as well as after a bounded ordinary telemetry outage.
+    # Check whether this introduction or an existing hold needs ordinary recovery.
     def needed(self) -> bool:
-        j = self.c.session.journal
-        return self.ordinary() and (self.active() or j.phase.read().value == "recovering")
+        return self.control.ordinary_needed(self)
 
-    # Either channel can close a real mapped session first; disagreement grants only a zero-output restrictive wait.
+    # Check whether the two reports describe the same session closing.
     def closure_gap(self, native: HandoverEvidence) -> bool:
-        j, physical = self.c.session.journal, native.physical
-        local, known = physical.native_transaction_id, j.active()
-        if (
-            not self.ordinary()
-            or physical.power_w != 0
-            or any(value != 0 for value in native.currents_a + native.powers_w)
-        ):
-            return False
-        if not physical.transaction_open and local is None and type(known) is int:
-            return (
-                j.db.execute(
-                    "SELECT 1 FROM transactions WHERE local=? AND stop IS NULL AND vendor IS NOT NULL", (known,)
-                ).fetchone()
-                is not None
-            )
-        if not physical.transaction_open or known is not None:
-            return False
-        # OCPP closed first. Only the latest connector lifecycle can explain an open native report at zero.
-        return j.latest_mapped_stop(local)
+        return self.control.ordinary_closure_gap(self, native)
 
-    # Existing commissioned ownership and a current matching Boot permit only zero while native HTTP is unavailable.
+    # Execute the zero proof under the shared owner's exact restrictive claim.
     async def hold(self, reason: str) -> None:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-
-        # Claim the exact current zero before the RPC, while keeping the call itself independent.
-        def claim() -> tuple[dict[str, Any], int, str | None]:
-            if not self.ordinary() or not g.current_boot_seen(g._charger_epoch):
-                raise RecoveryRequiredError("ordinary recovery awaits admitted current owner authority")
-            c.native.spec.require_boot(j.get("boot"))
-            if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
-                raise RecoveryRequiredError("ordinary zero hold requires the existing admitted station receipt")
-            current = j.get(KEY, {})
-            local = j.active()
-            if not self.active():
-                current = {
-                    "state": "holding",
-                    "revision": c.requests.intent().revision,
-                    "local": local,
-                    "start": self.start_digest(local),
-                    "selected_a": c.current.selected(),
-                    "reason": reason,
-                    "at_epoch": time.time(),
-                }
-                j.put(KEY, current)
-            elif current.get("local") is not None and local is None:
-                old = j.db.execute("SELECT stop FROM transactions WHERE local=?", (current["local"],)).fetchone()
-                if old is not None and old["stop"] is not None:
-                    current = {**current, "local": None, "start": None}
-                    j.put(KEY, current)
-            epoch, boot = g._charger_epoch, g.boot_observation
-            if not j.get("control", {}).get("inhibit") or j.get("control", {}).get("owner") != "local":
-                g.controls._claim(True, stopping=True)
-            j.phase.recover()
-            c.released_epoch = None
-            return current, epoch, boot
-
-        current, epoch, boot = c.commands.decide(claim, priority=CommandPriority.RESTRICT)
-
-        # A new owner intent, source epoch or overlapping state machine cannot inherit this station write.
-        def guard() -> None:
-            c.native.spec.require_boot(j.get("boot"))
-            if (
-                not self.ordinary()
-                or not self.active()
-                or j.get(KEY) != current
-                or g._charger_epoch != epoch
-                or g.boot_observation != boot
-                or not g.current_boot_seen(epoch)
-                or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
-                or g.controls.desired() != 0
-            ):
-                raise RecoveryRequiredError("ordinary zero hold was superseded")
-
-        await g.controls.ensure_ceiling(guard=guard)
+        guard = self.c.commands.decide(
+            lambda: self.control.claim_ordinary_hold(self, reason), priority=CommandPriority.RESTRICT
+        )
+        await self.c.session.gateway.controls.ensure_ceiling(guard=guard)
 
     # This guard also runs inside the real positive RPC gate after all native HTTP waits.
     def require_authority(self, local: int | None, *, introduced: bool = True) -> None:
         require_allowed(self.authority_decision(local, introduced=introduced))
 
-    # The same exact ordinary source and owner prerequisites apply before and inside the outgoing gate.
+    # Check the exact source and owner at the positive send gate.
     def authority_decision(self, local: int | None, *, introduced: bool = True) -> GateDecision:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        hold, source = j.get(KEY, {}), j.get(SOURCE, {})
-        grant, local_start = j.get("vendor_start_grant", {}), local_start_receipt(j)
-        if (
-            not self.source_published
-            or not self.ordinary()
-            or not self.active()
-            or hold.get("local") != local
-            or j.active() != local
-            or hold.get("start") != self.start_digest(local)
-            or hold.get("selected_a") != c.current.selected()
-            or source.get("revision") != c.requests.intent().revision
-            or source.get("local") != local
-            or source.get("start") != hold.get("start")
-            or not source.get("source")
-            or source.get("boot") != g.boot_observation
-            or source.get("epoch") != g._charger_epoch
-            or not g.current_boot_seen(g._charger_epoch)
-            or g.vendor.sender is None
-            or g.vendor_registration != "Accepted"
-            or not c.session.runtime.status.vendor_connected
-            or local is not None
-            and j.vendor_id(local) is None
-            or introduced
-            and c.native.introduced_epoch != g._charger_epoch
-            or introduced
-            and c.native.introduced_revision != g.controls._revision
-            or not 0 <= time.time() - source.get("observed_at", 0) <= 5
-            or j.get("trial_preservation_fault")
-            or j.get("trial_inventory_fault")
-            or g.vendor_write_evidence().unresolved
-            or j.get("control", {}).get("start_pending")
-            or grant
-            and (local is None or grant.get("local") != local)
-            or local_start.get("local") is None
-            and local_start.get("stage") in ("prepared", "issued", "accepted")
-            or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            or j.db.execute(
-                "SELECT 1 FROM transactions WHERE vendor IS NULL OR (stop IS NULL AND local IS NOT ?) LIMIT 1",
-                (local,),
-            ).fetchone()
-        ):
-            return Pending(
-                Prerequisite.SOURCE, "ordinary continuation awaits fresh source and reconciled owner authority"
-            )
-        c.native.spec.require_boot(j.get("boot"))
-        return ALLOW
+        return self.control.ordinary_authority(self, local, introduced=introduced)
 
     # Repair a superseded Boot's zero introduction only after the full current zero and source proof.
     def confirm_zero_introduction(self, native: HandoverEvidence, local: int | None) -> None:
@@ -326,196 +97,19 @@ class OrdinaryRecovery:
 
     # A zero-only introduction acknowledges current proof without replaying Start, Stop or another domain's duty.
     def zero_introduction_decision(self, native: HandoverEvidence, local: int | None) -> GateDecision:
-        return self.c.commands.decide(lambda: self._accept_zero_introduction(native, local))
+        return self.c.commands.decide(lambda: self.control.confirm_ordinary_zero(self, native, local))
 
-    # Record the zero proof and publish its exact Boot revision together.
-    def _accept_zero_introduction(self, native: HandoverEvidence, local: int | None) -> GateDecision:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        if c.native.introduction_pending or c.native.introduced_epoch != g._charger_epoch:
-            return Pending(Prerequisite.ZERO_PROOF, "ordinary recovery awaits completed charger introduction")
-        decision = self.authority_decision(local, introduced=False)
-        if isinstance(decision, Pending):
-            return decision
-        c.native.require(native, closed=local is None)
-        decision = c.native.session_decision(native)
-        if isinstance(decision, Pending):
-            return decision
-        control = j.get("control", {})
-        epoch, boot, revision, ticket = (
-            g._charger_epoch,
-            g.boot_observation,
-            g.controls._revision,
-            control.get("ticket"),
-        )
-        present = c.session.book.owned_present(native.physical)
-        station = [r for r in present if r.kind == "profile" and r.identifier == HUB_PROFILE_ID]
-        row = j.db.execute(
-            "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-        ).fetchone()
-        decision = lifecycle_decision(g, continuing_local=local)
-        if isinstance(decision, Pending):
-            return decision
-        if (
-            any(v != 0 for v in native.currents_a + native.powers_w)
-            or not ControlState(control).explicit_local_hold
-            or not g.controls.ready
-            or g.controls.desired() != 0
-            or not c.session.book.confirmed_station_zero(station, row)
-            or j.get("trial_binding")
-            != {
-                "configuration_digest": c.native.binding_digest(native),
-                "station": c.native.choice.value(),
-                "boot_digest": c.native.spec.boot_digest,
-            }
-            or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
-            or g.controls._operations
-            or g.charger._pending
-            or g.vendor._pending
-        ):
-            return Pending(Prerequisite.CLOUD, "ordinary introduction awaits confirmed zero and reconciled binding")
-        with j.atomic():
-            decision = self.authority_decision(local, introduced=False)
-            if isinstance(decision, Pending):
-                return decision
-            if (g._charger_epoch, g.boot_observation, g.controls._revision, j.get("control", {}).get("ticket")) != (
-                epoch,
-                boot,
-                revision,
-                ticket,
-            ):
-                return Pending(Prerequisite.SUPERSEDED, "ordinary zero introduction was superseded")
-            j.put(
-                "managed_ordinary_zero_introduction",
-                {
-                    "native_digest": native.digest,
-                    "boot": boot,
-                    "epoch": epoch,
-                    "revision": revision,
-                    "at_epoch": time.time(),
-                },
-            )
-            j.phase.introduced()
-        c.native.introduced_epoch, c.native.introduced_revision = epoch, revision
-        return ALLOW
-
-    # Native and journal source observations must still identify the same transaction at this effect boundary.
+    # Check that native and ledger observations still identify the same session.
     def session_decision(self, native: HandoverEvidence, local: int) -> GateDecision:
-        decision = self.authority_decision(local)
-        if isinstance(decision, Pending):
-            return decision
-        if (
-            not native.physical.transaction_open
-            or native.physical.native_transaction_id != local
-            or self.source(native) != self.c.session.journal.get(SOURCE, {}).get("source")
-        ):
-            return Pending(Prerequisite.SOURCE, "ordinary continuation source changed during verification")
-        return ALLOW
-
-    # A real daily Start can need its OCPP number before native HTTP publishes that number; zero remains mandatory.
-    async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        tag = payload.get("idTag")
-        hold = j.get(KEY, {})
-        if (
-            not self.ordinary()
-            or not self.active()
-            or hold.get("local") is not None
-            or hold.get("start") is not None
-            or j.active() is not None
-            or payload.get("connectorId") != 1
-            or not isinstance(tag, str)
-        ):
-            return None
-        epoch, boot, revision = g._charger_epoch, g.boot_observation, g.controls._revision
-        ticket = j.get("control", {}).get("ticket")
-        try:
-            native = await c.native.read(closed=True)
-            if not any(
-                str(plan.get("idTag", "")).casefold() == tag.casefold()
-                for plan in (native.saved_schedule or {}).get("planList", [])
-            ):
-                return None
-            self.confirm_zero_introduction(native, None)
-            self.require_authority(None)
-        except (RecoveryRequiredError, UnavailableError, TimeoutError) as error:
-            raise UnavailableError("ordinary daily report awaits fresh closed native zero") from error
-        source = j.get(SOURCE)
-        control = j.get("control", {})
-        station = j.db.execute(
-            "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-        ).fetchone()
-        receipt = tuple(station) if station is not None else None
-
-        # This is rechecked atomically after allocation, before its Start fact and binding can commit.
-        def guard(identifier: int | None) -> None:
-            current = j.get("control", {})
-            current_station = j.db.execute(
-                "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-            ).fetchone()
-            c.native.spec.require_boot(j.get("boot"))
-            c.native.require(native, closed=True)
-            if (
-                not self.ordinary()
-                or not self.active()
-                or j.get(KEY) != hold
-                or j.get(SOURCE) != source
-                or j.active() != identifier
-                or g._charger_epoch != epoch
-                or g.boot_observation != boot
-                or g.controls._revision != revision
-                or not g.current_boot_seen(epoch)
-                or current != control
-                or current.get("ticket") != ticket
-                or not ControlState(current).explicit_local_hold
-                or not g.controls.ready
-                or g.controls.desired() != 0
-                or (tuple(current_station) if current_station is not None else None) != receipt
-                or identifier is not None
-                and self.start_digest(identifier) != fingerprint(payload)
-            ):
-                raise RecoveryRequiredError("ordinary daily report was superseded before allocation")
-
-        guard(None)
-
-        # Binding the actual accepted wire report grants no current; later exact native plan/source is still required.
-        def accepted(identifier: int) -> None:
-            guard(identifier)
-            j.put(KEY, {**hold, "local": identifier, "start": self.start_digest(identifier)})
-            j.put(SOURCE, {**source, "local": identifier, "start": self.start_digest(identifier), "source": None})
-
-        return NativeStartReport(None, None, None, accepted)
+        return self.control.ordinary_session(self, native, local)
 
     # Retry the journal note under the exact release that already completed, without touching the charger.
     def finish_recovery(self) -> bool:
-        return self.c.commands.decide(self._settle_recovery)
-
-    # Settle the recovery receipt only for the release that completed.
-    def _settle_recovery(self) -> bool:
-        completed = self.completion
-        if completed is None:
-            return False
-        c, j, g = self.c, self.c.session.journal, self.c.session.gateway
-        try:
-            with j.atomic():
-                if (
-                    not c.stopping
-                    and j.phase.read().active
-                    and not j.fault.latched()
-                    and c.publication_is_current(completed.authority)
-                    and c.released_epoch == completed.authority.scope.epoch
-                    and g.controls.ready
-                    and g.controls.desired() > 0
-                    and j.get(KEY) == completed.hold
-                ):
-                    j.put(KEY, {**completed.hold, "state": "complete", "completed_at": completed.completed_at})
-        except sqlite3.Error:
-            return True
-        self.completion = None
-        return False
+        return self.c.commands.decide(lambda: self.control.settle_ordinary(self))
 
     # Fresh zero/source proof restores only the original intent and never emits a Start or Stop.
     async def recover(self) -> Pending | None:
-        c, j = self.c, self.c.session.journal
+        c = self.c
         await self.hold("restricted_introduction")
         try:
             native = await c.native.read_result()
@@ -525,23 +119,10 @@ class OrdinaryRecovery:
             return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
         if isinstance(native, Pending):
             return native
-        local = j.active()
-        unplugged_hold = j.get(KEY, {}).get("reason") == "unplugged_session_pending"
-        if self.closure_gap(native) or (unplugged_hold and native.physical.transaction_open):
-            return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
-        decision = self.zero_introduction_decision(native, local)
-        if isinstance(decision, Pending):
-            return decision
-        decision = self.authority_decision(local)
-        if isinstance(decision, Pending):
-            return decision
-        if local is not None:
-            decision = self.session_decision(native, local)
-            if isinstance(decision, Pending):
-                return decision
-        elif native.physical.transaction_open:
-            return Pending(Prerequisite.LIFECYCLE, "ordinary idle recovery cannot adopt a new native transaction")
-        hold = j.get(KEY)
+        ready = self.control.ordinary_preflight(self, native)
+        if isinstance(ready, Pending):
+            return ready
+        hold, local = ready
         progress = await c.recovery.restore(continuing_local=local)
         if not progress.shared:
             return progress.pending

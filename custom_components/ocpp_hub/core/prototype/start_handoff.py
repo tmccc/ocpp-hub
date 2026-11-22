@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..frames import Frame
 from .connection_scope import CloudAttemptScope
 from .managed_intent import ControlIntent
+
+
+@dataclass(frozen=True)
+class NativeStartReport:
+    """A held lifecycle report, with an optional verified native source, committed with the actual transaction."""
+
+    native_id: int | None
+    plan_id: int | None
+    attempt: tuple[str, int] | None
+    record: Callable[[int], None] = field(compare=False)
 
 
 @dataclass(frozen=True)

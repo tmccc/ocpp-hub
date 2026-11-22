@@ -265,16 +265,26 @@ async def test_local_pause_and_cloud_stop_share_one_charger_stop(tmp_path, tls, 
                 await asyncio.gather(first_task, *([second_task] if second_task is not None else []))
             cloud = second_task if first == "local" else first_task
             assert cloud is not None and cloud.result() == [3, request, {"status": "Accepted"}]
-            stops = [f[3] for f in rig.bench.device_calls[mark:] if f[2] == "RemoteStopTransaction"]
-            assert stops == [{"transactionId": local}]
-            assert j.active() == local and j.outcomes.accepted_stop(local)
+            stops = [f for f in rig.bench.device_calls[mark:] if f[2] == "RemoteStopTransaction"]
+            assert len(stops) == 1 and stops[0][3] == {"transactionId": local}
+            assert j.active() == local and j.outcomes.accepted_stop(local) and not j.outcomes.stop_report_closed(local)
             assert rig.bench.firmware.effective_limit() == 0 and c.requests.receipt(pause)["state"] == "accepted"
+            owner = j.outcomes.owner(pause, include_wires=True)
+            assert owner is not None
+            owner_stops = [
+                (wire.wire, wire.local, wire.reply) for wire in owner.wires if wire.action == "RemoteStopTransaction"
+            ]
             forwarded = j.db.execute(
-                "SELECT wire_result FROM vendor_command_scope WHERE request=?", (request,)
+                "SELECT wire_request,local,wire_result FROM vendor_command_scope WHERE request=?", (request,)
             ).fetchone()
-            assert (forwarded[0] if forwarded is not None else None) == ("Accepted" if first == "vendor" else None)
+            exact_reply = (stops[0][1], local, "Accepted")
+            if first == "local":
+                assert owner_stops == [exact_reply] and forwarded is None
+            else:
+                assert owner_stops == [] and forwarded is not None and tuple(forwarded) == exact_reply
 
             await close_daily(b, local, "native")
+            assert j.outcomes.stop_report_closed(local)
             assert (await mp.healthy(c))["local_hold_verified"] and c.requests.receipt(pause)["state"] == "completed"
             assert sum(f[2] == "StopTransaction" for f in rig.bench.lifecycle_wires) == 1
 
@@ -295,7 +305,8 @@ async def test_cloud_stop_reuses_late_local_acceptance_at_send_boundary(tmp_path
             send, held, entered = delay_reply(monkeypatch, rig, charger, "RemoteStopTransaction")
             with monkeypatch.context() as patch:
                 patch.setattr(g.charger, "timeout", 0.2)
-                c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                pause = uuid.uuid4().hex
+                assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
                 assert c.pause_task is not None
                 await asyncio.wait_for(entered.wait(), 3)
                 await asyncio.wait_for(c.pause_task, 3)
@@ -332,8 +343,74 @@ async def test_cloud_stop_reuses_late_local_acceptance_at_send_boundary(tmp_path
             assert [f[3] for f in rig.bench.device_calls[mark:] if f[2] == "RemoteStopTransaction"] == [
                 {"transactionId": local}
             ]
+            assert not j.outcomes.stop_report_closed(local) and c.requests.receipt(pause)["state"] == "accepted"
             await close_daily(b, local, "native")
-            assert (await mp.healthy(c))["local_hold_verified"]
+            assert j.outcomes.stop_report_closed(local)
+            assert (await mp.healthy(c))["local_hold_verified"] and c.requests.receipt(pause)["state"] == "completed"
+            assert sum(f[2] == "StopTransaction" for f in rig.bench.lifecycle_wires) == 1
+
+
+# Intent: a late vendor reply can cover a local Stop before its prepared send.
+# Why: the decision at the local wire boundary must see the same exact acceptance as the vendor path.
+@pytest.mark.recovery_replay
+async def test_local_pause_reuses_late_vendor_acceptance_at_send_boundary(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench) as rig:
+        async with running(rig, "local-stop-after-late-cloud-reply") as (session, c, charger):
+            await mp.healthy(c)
+            b = ChargeRig(rig, session, c, charger)
+            local = await positive_flow(b, "daily")
+            j, g = session.journal, session.gateway
+            vendor = j.vendor_id(local)
+            assert vendor is not None
+            mark = len(rig.bench.device_calls)
+            send, held, entered = delay_reply(monkeypatch, rig, charger, "RemoteStopTransaction")
+            request = uuid.uuid4().hex
+            with monkeypatch.context() as patch:
+                patch.setattr(g.charger, "timeout", 0.2)
+                vendor_task = asyncio.create_task(
+                    rig.bench.cloud_call(request, "RemoteStopTransaction", {"transactionId": vendor})
+                )
+                await asyncio.wait_for(entered.wait(), 3)
+                assert (await vendor_task)[:3] == [4, request, "InternalError"]
+            assert not j.outcomes.accepted_stop(local)
+
+            validating, resume = asyncio.Event(), asyncio.Event()
+            validate = g.charger.validate_send
+            assert validate is not None
+
+            # Hold the local Stop after it has established zero and before its final queued authorization.
+            async def hold_stop(action, payload):
+                if action == "RemoteStopTransaction":
+                    validating.set()
+                    await resume.wait()
+                return await validate(action, payload)
+
+            monkeypatch.setattr(g.charger, "validate_send", hold_stop)
+            pause = uuid.uuid4().hex
+            assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
+            assert c.pause_task is not None
+            try:
+                await asyncio.wait_for(validating.wait(), 3)
+                assert rig.bench.firmware.effective_limit() == 0
+                await send(held[0])
+                await until(lambda: j.outcomes.accepted_stop(local))
+            finally:
+                resume.set()
+                await c.pause_task
+
+            stops = [f for f in rig.bench.device_calls[mark:] if f[2] == "RemoteStopTransaction"]
+            assert len(stops) == 1 and stops[0][3] == {"transactionId": local}
+            forwarded = j.db.execute(
+                "SELECT wire_request,local,wire_result FROM vendor_command_scope WHERE request=?", (request,)
+            ).fetchone()
+            assert forwarded is not None and tuple(forwarded) == (stops[0][1], local, "Accepted")
+            owner = j.outcomes.owner(pause, include_wires=True)
+            assert owner is not None and all(wire.action != "RemoteStopTransaction" for wire in owner.wires)
+            assert not j.outcomes.stop_report_closed(local) and c.requests.receipt(pause)["state"] == "accepted"
+            await close_daily(b, local, "native")
+            assert j.outcomes.stop_report_closed(local)
+            assert (await mp.healthy(c))["local_hold_verified"] and c.requests.receipt(pause)["state"] == "completed"
+            assert sum(f[2] == "StopTransaction" for f in rig.bench.lifecycle_wires) == 1
 
 
 # Intent: a new vendor Stop can still reach the charger when the earlier Stop or present zero cannot cover it.

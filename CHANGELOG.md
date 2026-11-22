@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Use the shared controller to hold the charger at zero during outage recovery and decide when the saved
+  limit can be restored. Recheck the active charger connection, cloud acknowledgement, and charging records
+  before releasing the hold.
+- Use the shared controller to identify charges from the saved iCS timetable, protect pending manual
+  Starts with the same tag, and verify the exact scheduled session before restoring current.
+- Use the shared controller to accept Return to app control, check when the charger can leave zero, and
+  save the app authority with the exact Return receipt. A newer Pause takes priority over a waiting Return.
+- Use the shared controller for current selection, profile permission and recovery. Confirm the applied
+  limit independently, keep paused selections at zero, and preserve a newer Pause during recovery.
+- Use the shared charging controller for Start admission, dispatch, reports and completion. Preserve an
+  exact late reply while letting a newer Pause or charger restart revoke the earlier Start's authority.
+- Use the same control owner for shutdown and fault protection. Keep an unanswered Stop uncertain and
+  require the charger's closing report and independent zero proof before verifying shutdown.
+- Put local Pause admission, the final send decision for local and vendor-app Stop, and verified Pause
+  completion under the same controller. Keep a late reply tied to its original request and session.
 - Restore the saved iCS app/schedule setting after a clean offline recovery once the charger and cloud reports
   agree. A manual Pause or unresolved charging work still requires the owner's Return.
 - Use one Stop decision for local Pause and vendor-app Stop. Reuse the real acceptance of the same session

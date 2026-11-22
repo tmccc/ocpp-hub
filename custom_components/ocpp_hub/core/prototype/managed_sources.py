@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..control import HUB_PROFILE_ID
-from .local_control import local_start_receipt
 from .store import Journal, fingerprint
+
+if TYPE_CHECKING:
+    from .trial_handover_evidence import HandoverEvidence
+
+ORDINARY_HOLD = "managed_ordinary_recovery"
+ORDINARY_SOURCE = "managed_ordinary_source"
+
+
+# An advertised or previously owned native timer cannot be reinterpreted as an unrelated manual command.
+def known_plan_source(journal: Journal, native: HandoverEvidence) -> bool:
+    marker = native.session_plan_id
+    return marker is not None and (
+        any(plan.get("planId") == marker for plan in (native.saved_schedule or {}).get("planList", []))
+        or marker in journal.retired_plan_ids
+    )
 
 
 # Bind a restrictive write to the admitted installation and a station profile already owned by this journal.
@@ -42,7 +58,7 @@ def confirmed_vendor_start(j: Journal, tag_digest: str, local: int | None, *, se
 def awaiting_owner_start(j: Journal, tag: str | None = None) -> bool:
     digest = fingerprint(tag.casefold()) if tag is not None else None
     if j.get("control", {}).get("start_pending"):
-        owner = local_start_receipt(j)
+        owner = j.starts.receipt()
         owner_digest = owner.get("digest")
         if (
             digest is None

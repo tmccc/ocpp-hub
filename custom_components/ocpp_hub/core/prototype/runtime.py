@@ -8,7 +8,7 @@ import sqlite3
 import ssl
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, Self
 
 from websockets.asyncio.client import ClientConnection
@@ -299,41 +299,26 @@ class ConnectionRuntime:
 
     # Retry only the admitted current Boot's restrictive zero sequence; introduction and Stop are never replayed.
     async def _confirm_introduced_ceiling(self, epoch: int) -> None:
-        gateway, journal = self.gateway, self.gateway.journal
-        boot = gateway.boot_observation
-        metadata_revision = gateway.boot_metadata_revision
-        control_revision = gateway.controls._revision
-        ticket = journal.get("control", {}).get("ticket")
+        gateway = self.gateway
+        decisions = gateway.controls.decisions.recovery
+        claim = decisions.introduction_zero_claim(gateway, epoch)
         delay = self.settings.retry_min
-
-        # Only identical metadata under the same admitted owner can start another complete zero proof.
-        def same_authority() -> bool:
-            return (
-                not self._closing
-                and self.ceiling_enabled()
-                and gateway.current_boot_seen(epoch)
-                and boot is not None
-                and gateway.boot_metadata_revision == metadata_revision
-                and gateway.controls._revision == control_revision
-                and journal.get("control", {}).get("ticket") == ticket
-                and journal.get("native_bounded_handover", {}).get("stage") == "admitted"
-                and journal.phase.read().operating
-                and not journal.phase.starting
-                and journal.get("control", {}).get("inhibit") is True
-                and gateway.controls.desired() == 0
-            )
 
         # Every awaited operation still belongs to one actual Boot observation, never its superseded proof.
         def restricted() -> bool:
-            return same_authority() and gateway.boot_observation == boot
+            return decisions.same_zero_authority(self, claim) and gateway.boot_observation == claim.boot
 
         # A new identical Boot discards the old attempt; the next attempt repeats zero and composite verification.
         async def replace_observation() -> bool:
-            nonlocal boot
+            nonlocal claim
             if not gateway.current_boot_seen(epoch):
                 await self._wait_for_real_boot(epoch)
-            if same_authority() and gateway.boot_observation is not None and gateway.boot_observation != boot:
-                boot = gateway.boot_observation
+            if (
+                decisions.same_zero_authority(self, claim)
+                and gateway.boot_observation is not None
+                and gateway.boot_observation != claim.boot
+            ):
+                claim = replace(claim, boot=gateway.boot_observation)
                 return True
             return False
 

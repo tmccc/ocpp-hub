@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 from ocpp_hub_core.prototype.gateway import Gateway
 from ocpp_hub_core.prototype.installation_lifecycle import InstallationState
-from ocpp_hub_core.prototype.managed_faults import latch_managed_fault
 from ocpp_hub_core.prototype.native_faults import NativeContentError
 from ocpp_hub_core.prototype.store import Journal, fingerprint
 from ocpp_hub_core.prototype.trial_evidence import Evidence, Resource
@@ -255,7 +254,7 @@ def test_managed_fault_caller_retains_phase_scope(journal, phase):
     journal.put("control", control)
     journal.put("trial_phase", phase)
     revision = gateway.controls._revision
-    latch_managed_fault(gateway, "native_refused", diagnostic={"kind": "strict"})
+    gateway.controls.decisions.latch_fault("native_refused", diagnostic={"kind": "strict"})
     assert journal.get("managed_control_fault")["classification"] == "native_refused"
     assert journal.get("managed_native_failure") == {"kind": "strict"}
     assert journal.get("control") == {**control, "owner": "local", "inhibit": True, "uncertain": True}

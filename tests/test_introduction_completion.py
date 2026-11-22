@@ -46,7 +46,8 @@ async def test_ordinary_zero_cannot_publish_unfinished_introduction(
                 epoch, boot = g._charger_epoch, g.boot_observation
                 probe = current_probe(s.runtime, epoch)
                 assert probe is not None and not probe.done()
-                assert coroutine_locals(probe, NativeBoundedHandover.introduce.__code__)["epoch"] == epoch
+                claim = coroutine_locals(probe, NativeBoundedHandover.introduce.__code__)["claim"]
+                assert claim.epoch == epoch and claim.scope.boot == boot
                 before = len(rig.bench.device_calls)
                 assert (await c.tick())["state"] not in ("attention", "stopping")
                 await until(lambda: g.vendor_registration == "Accepted")

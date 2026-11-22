@@ -71,13 +71,15 @@ not a complete inventory: follow their imports, sibling cases, parameter generat
 | Installation lifecycle | [`installation_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/installation_lifecycle.py), `Journal.phase`; the sole phase/introduction-flag writer and shared phase predicates | `test_installation_lifecycle.py`, `test_persistence_bootstrap.py`, `test_native_bounded_handover.py` |
 | Live supervision and health | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `_tick()`; `supervision.py`, pure authority/health assessment; `managed_view.py`, poll publication and socket refresh | `test_supervision.py`, `test_managed_proxy.py`, `test_managed_observed_freshness.py` |
 | Recovery contracts and coordination | [`recovery_contracts.py`](../custom_components/ocpp_hub/core/prototype/recovery_contracts.py), prerequisites, call results, authority and owned effects; `recovery_policy.py`, pure recovery decisions and terminal progress; `recovery_coordinator.py`, `RecoveryCoordinator` | `test_recovery_contracts.py`, `test_release_publication.py`, `test_recovery_retirement.py` |
+| Outage and reconnect decisions | [`recovery_control.py`](../custom_components/ocpp_hub/core/prototype/recovery_control.py) is part of `ControlDecisions`. It owns outage Pause eligibility, ordinary zero holds, charger introduction and verification, and recovery source and release checks. | `test_managed_offline_recovery.py`, `test_managed_introduction_scope.py`, `test_ordinary_recovery.py`, `test_restrictive_introduction_retry.py` |
 | Start lifecycle and settlement | [`start_lifecycle.py`](../custom_components/ocpp_hub/core/prototype/start_lifecycle.py), `StartLifecycle`, typed persisted identity, receipt/pending/metadata writes and the lease slot; `start_settlement.py`, pure failure/retirement policy, shared evidence and scoped candidates | `test_start_lifecycle.py`, `test_start_settlement.py`, `test_control_slice_peer.py` |
-| Start and cancellation | [`managed_charging.py`](../custom_components/ocpp_hub/core/prototype/managed_charging.py), `ManagedCharging`; `managed_start_binding.py`; `managed_start_cancellation.py`; `start_handoff.py`; `local_control.py` | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
-| Selected current and failed holds | [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py), `ManagedCurrentLimits`; `managed_current_prepare.py`; `managed_current_recovery.py` | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
+| Start and cancellation | [`control_decisions.py`](../custom_components/ocpp_hub/core/prototype/control_decisions.py) owns Start admission, dispatch and publication. `ManagedCharging` runs the worker and deadline, `LocalControl` executes wire operations, and `managed_start_binding.py` connects incoming Start reports. | `test_managed_normal_start.py`, `test_managed_start_cancelled_outer.py`, `test_managed_start_child_commit.py` |
+| Saved daily schedule | [`schedule_control.py`](../custom_components/ocpp_hub/core/prototype/schedule_control.py) is part of `ControlDecisions`. It identifies scheduled sessions, keeps their reports separate from pending commands with the same tag, and checks the exact source before restoring current. | `test_managed_start_binding.py`, `test_ordinary_daily_report_recovery.py`, `test_managed_schedule_scenarios.py` |
+| Selected current and failed holds | `ControlDecisions` owns admission, send checks, completion and protective recovery. [`managed_current.py`](../custom_components/ocpp_hub/core/prototype/managed_current.py) runs the worker, `current_policy.py` checks prerequisites and source evidence, and `Journal.current_change` retains the outcome. | `test_managed_current.py`, `test_current_failed_idle_hold.py`, `test_current_failure_binding.py` |
 | Native evidence and resources | [`native_bounded_handover.py`](../custom_components/ocpp_hub/core/prototype/native_bounded_handover.py), `NativeBoundedHandover`; `trial_evidence.py`, `NativeObserver`; `native_http.py`; `native_history.py`; `trial_resources.py`, `ResourceBook` | `test_native_read_supersession.py`, `test_native_optional_storage.py`, `test_native_repair_strict_conflict.py` |
 | Persistence and cloud replies | [`store.py`](../custom_components/ocpp_hub/core/prototype/store.py), `Journal`; `delivery_reply.py`; `managed_start_delivery.py`; `managed_stop_delivery.py`; `vendor_read_recovery.py` | `test_stop_saved_reply_recovery.py`, `test_worker_storage_recovery.py`, `test_managed_start_delivery_recovery.py` |
 | Command outcomes | [`command_outcomes.py`](../custom_components/ocpp_hub/core/prototype/command_outcomes.py), `Journal.outcomes`; exact owner and forwarded wire steps, reply settlement, independent session proof and the current cloud delivery outcome. | `test_vendor_dispatch.py`, `test_pause_stop_recovery.py`, `test_real_process_death.py` |
-| Pause, Return and recovery | [`managed.py`](../custom_components/ocpp_hub/core/prototype/managed.py), `maintain_pause()`, `return_requested()`, `tick()`; `recovery_coordinator.py`, `advance()` and `restore()`; `ordinary_recovery.py`; `managed_recovery.py`; specialized `managed_*_recovery.py` siblings | `test_pause_stop_recovery.py`, `test_managed_offline_recovery.py`, `test_combined_recovery_proofs.py` |
+| Pause, Return and recovery | `control_decisions.py` for Pause and Return decisions; `managed.py` for polling and command entry; `recovery_coordinator.py` for the owned recovery task; `ordinary_recovery.py`, `managed_recovery.py` and specialized `managed_*_recovery.py` for domain recovery | `test_pause_stop_recovery.py`, `test_managed_offline_recovery.py`, `test_combined_recovery_proofs.py`, `test_release_publication.py` |
 | Status and diagnostics | [`managed_view.py`](../custom_components/ocpp_hub/core/prototype/managed_view.py), `health_snapshot()`; `managed_diagnostics.py`, `snapshot()`; [`tools/managed_reporting.py`](../tools/managed_reporting.py), `Reporting` | `test_managed_diagnostics.py`, `test_diagnostic_contracts.py`, `test_start_diagnostic_progress.py` |
 | HA API and lifecycle | [`ics_proxy/api.py`](../custom_components/ics_proxy/api.py), `ProxyClient`; `coordinator.py`, `ProxyCoordinator`; `notification.py`; entity and diagnostic modules | [`tests_ha_proxy/`](../tests_ha_proxy/): `test_freshness_recovery.py`, `test_current.py`, `test_diagnostics.py`, `test_inflight_lifecycle.py` |
 
@@ -98,15 +100,20 @@ An owner request can have several wire calls. The selected current and a rollbac
 replies. A pending write, an unanswered call and a known reply waiting for physical proof have different meanings.
 Older receipts keep their original layout and are read with the evidence they actually contain.
 
-`LocalControl.stop_decision` uses the same journal evidence for startup, reconnect, foreground Pause, fault
-and expired Start recovery, shutdown, and vendor-app Stop. The executor uses that decision again in its final queued
-check. A real accepted reply for the exact allocated session prevents another local Stop across Boot, reconnect,
-replacement and shutdown when the station zero holds. If saving an accepted owner or forwarded Stop fails, the outcome owner
-keeps an independent journal entry tied to that reply and retries the original write. If zero cannot be established
-or fresh native readings show draw, a protective Stop requires the current Boot and exact open target. A newer
-reading for that same session can change the decision up to the send boundary. Only the acceptance of the current
-protective attempt covers it. The charger report closes the recorded session, a
-fresh native reading verifies the Pause, and the cloud reply settles delivery before Return can restore current.
+`LocalControl` uses one `ControlDecisions` for Pause claims, local and vendor Stop dispatch, and verified Pause
+completion. The same owner revokes positive control during shutdown, decides the exact final Stop and verifies
+its outcome. It latches strict faults and permits a zero hold only on the retained owned profile. If that
+profile is missing, independent evidence can authorize a protective Stop of the exact known session.
+Introduction binds an existing Pause through the same owner. The gateway binds the vendor request and translates
+its reply. The journal records actual replies and closure reports. Expired Start recovery uses the shared Stop
+verdict with its original request, session and Boot checks. A real accepted reply for the exact allocated
+session prevents another local Stop across Boot, reconnect, replacement and shutdown when the station zero
+holds. If saving an accepted owner or forwarded Stop fails, the outcome owner keeps an independent journal
+entry tied to that reply and retries the original write.
+If zero cannot be established or fresh native readings show draw, a protective Stop requires the current Boot
+and exact open target. A newer reading for that same session can change the decision up to the send boundary.
+Only the acceptance of the current protective attempt covers it. The charger report closes the recorded session,
+a fresh native reading verifies the Pause, and the cloud reply settles delivery before Return can restore current.
 Normal Pause and shutdown share the closed-session and physical zero checks. Return uses the same station zero
 proof and also requires cloud delivery to settle. Ordinary recovery keeps the session at zero after an accepted
 forwarded Stop or an unresolved shutdown Stop until its report arrives. The shutdown claim records whether an
@@ -141,9 +148,10 @@ The main poll reads top to bottom: settle owned work, maintain faults, supervise
 authority, publish a view. `_supervise()` keeps native and recovery effects explicit. The poll and API both use
 `ControlProof` in `supervision.py` to keep the observed shared grant or physical zero only while the matching
 authority remains current. An unsettled delivery blocks readiness while a verified zero can remain visible.
-The controller owns the fault latch and decodes cloud grants after local readiness. `ManagedRequests` owns
-Return receipt completion from the release evidence supplied by the recovery coordinator. Live command and
-commit guards recheck their own evidence. Pending and observed status share fields in `managed_view.py`.
+`ControlDecisions` owns the strict fault latch. The poll decodes cloud grants after local readiness.
+`ControlDecisions` decides when to settle Return from release evidence. `ManagedRequests` writes the receipt and
+preserves its original request and wire binding.
+Live command and commit guards recheck their own evidence. Pending and observed status share fields in `managed_view.py`.
 
 `Journal.starts` is the synchronous Start lifecycle owner; pending-bit updates use `Journal.control`. It reads
 the existing journal keys into a typed
@@ -170,12 +178,11 @@ never consumes independent cloud delivery debt.
 writes use `write_intent`, including admission-time recovery on a bare journal; that function performs no request
 startup sweep. Its pure `ControlIntent.next` advances revisions or explicitly coalesces legacy read recovery.
 `ManagedRequests` shares the transaction/current-intent check for Start and Return app publication,
-while their separate request outcomes and original callback order remain. The management driver claims Return
-after busy/stopping waits and before completion launch; direct restore keeps its accepted-before-publication
-contract. Return's receipt owner interprets release progress, preserves the original wire binding and handles
-completion from verified release or older already-shared authority. Controller/native/send guards, owner
-Pause/Stop markers, independent cloud debt and task lifetime remain
-separate responsibilities. `test_control_lifecycle.py` covers stored transitions and real SQL/COMMIT rollback;
+while their separate request outcomes and original callback order remain. `ControlDecisions` claims Return
+after busy/stopping waits and before completion launch. Direct restore keeps its accepted-before-publication
+contract. The same owner checks whether to complete the exact request after verified release or after observing
+current shared authority. The recovery task and native executor supply the charger and cloud evidence.
+`test_control_lifecycle.py` covers stored transitions and real SQL/COMMIT rollback;
 `test_control_lifecycle_peer.py` covers actual scheduling, capacity and the retained legacy healthy-status path.
 
 The former control grammar and boundary observer are test references under `tests_model/control_slice.py`,
@@ -201,8 +208,8 @@ typed deferred retry loop. `audited_epoch` records completed admission auditing;
 native bodies and the runtime's introduction service through probe creation, retry sleeps and joined retirement.
 Ordinary zero repair cannot publish completion while that work remains pending. A newer Pause may use audited
 provenance only after the work retires and its own fresh closed-zero proof succeeds. Completed setup alone does
-not prove zero or publish shared authority. `managed_faults.py` shares the strict diagnostic latch with ordinary
-supervision.
+not prove zero or publish shared authority. Introduction and ordinary supervision use the same strict fault latch in
+`control_decisions.py`.
 `test_introduction_readiness_retry.py` separates pending prerequisites from simultaneous content contradictions;
 `test_introduction_completion.py` covers foreground zero, a newer Pause and the retry-sleep gap at 6 A and 32 A.
 `test_introduction_write_retry.py` injects real post-read SQLite write failures into the replay-safe prefix;
@@ -221,19 +228,32 @@ A pending last call does not mean an earlier positive profile was never sent.
 Legacy Frame/require adapters translate pending data only at compatibility edges;
 business recovery does not classify exception messages or cause chains.
 
-`recovery_coordinator.py` owns common preflight, release, result interpretation and
-completion. Current, ordinary, expired-Start and connection callers consume
+`recovery_coordinator.py` runs the owned recovery task and gathers the evidence for release. `ControlDecisions`
+checks admission and send permission, judges the physical result and governs publication. Current, ordinary,
+expired-Start and connection callers consume
 `RestoreProgress` before settling their own records. Domain obligations can coexist;
 visiting one during a poll does not discharge another. An authority snapshot never
 permits a later send: the executor checks current intent, Boot, revision and ticket
 at the actual effect and SQL publication boundaries.
 
+`RecoveryControl` binds the restrictive hold to the authenticated charger connection. Local acknowledgement
+can retain queued observations at zero while the cloud is unavailable. Automatic release after an offline
+Pause requires its exact saved revision, current cloud acknowledgement and settled charging records.
+Continuation of an open session requires fresh proof of its original Start and source. If saving a completed
+release fails, recovery retries the journal write under the same authority.
+
 `RecoveryCoordinator._restore_owned` uses `_prepare_restore` for the initial observation, optional recovery,
-verified observation and required recheck before handing the attempt to `_run_release`. A Pending ends this attempt. The existing
-recovery policy maps release disposition to terminal progress; claimed-zero acknowledgement and fault effects stay
-in the driver. Initial closure/session checks, post-resume ticket capture, final native proof and every live
-send/publication guard keep their original order. `test_recovery_contracts.py` covers terminal mapping; real HTTP
-and SQLite witnesses in preflight, retirement and publication tests establish the independent effect boundaries.
+verified observation and required recheck before handing the attempt to `_run_release`. A Pending ends this attempt.
+`ControlDecisions` uses the recovery policy to map the result to terminal progress, acknowledge a verified zero hold or
+raise a fault. The coordinator retains and retries an exact receipt write if storage temporarily fails.
+`test_recovery_contracts.py` covers terminal mapping. Real HTTP and SQLite witnesses in preflight, retirement and
+publication tests establish the independent effect boundaries.
+
+The charger runs its saved iCS timetable. The full native audit feeds the shared controller schedule evidence
+in order, first matching command sources, then evaluating overlapping current changes, then publishing ordinary
+recovery source evidence. A delayed scheduled Start report can receive its session number under a verified zero
+hold. The controller checks the original hold and charger connection again inside that allocation. Raising the
+ceiling requires a later native reading that identifies the exact scheduled session.
 
 `ResourceBook.confirmed_station_zero` compares the caller's already selected native station with its confirmed
 resource receipt. Pause, reconnect, shutdown and release paths share that predicate with their own profile
@@ -285,6 +305,9 @@ function entry alone does not establish which of those boundaries occurred.
 
 Intent, selected current, effective station offer and measured current are different values. Local readiness and
 cloud connectivity are also separate facts. Follow these distinctions through the database and HA rendering.
+Changing the current while paused updates the saved value at verified zero. The app-mode path requires the
+charger reply and an independent read of the new profile. A vendor profile uses the controller's authority
+checks and stays within the station ceiling.
 The journal's requests, allocation, mappings, queued events, saved replies, mutation receipts and history survive
 process replacement; process-local tasks and cached observations need fresh evidence. Do not infer completion from
 task exit, a non-error response or an earlier healthy snapshot.

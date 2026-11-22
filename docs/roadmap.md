@@ -8,6 +8,27 @@ The repository has two deployment domains: the standalone iCS proxy with its thi
 older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
 Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
+- [~] One controller owns managed Pause admission, the local and vendor Stop send decision, and verified
+  Pause completion. The simulated charger covers both request orders and late replies from either origin.
+- [~] The same controller owns shutdown and fault protection. Shutdown can verify closure only after the
+  real charger report and a separate zero reading. A missing station profile permits Stop only for the
+  independently confirmed session.
+- [~] The shared controller owns Start admission, dispatch and publication for local and vendor requests.
+  It accepts charger reports against their own Boot and source, and keeps late replies tied to their
+  original command. An expired Start can protect only its own independently confirmed session.
+- [~] The shared controller decides which current request can act and when it is verified. An app-mode
+  change requires an independent read of the applied limit. A paused change saves the selection at
+  verified zero. If a selection overlaps a session, recovery can restore only the previous verified limit.
+- [~] The shared controller accepts Return to app control, checks the current Pause and charger connection
+  before restoring the selected limit, and saves the new authority with the exact Return receipt. Tests cover
+  a newer Pause, reconnects, and interruption around the final save.
+- [~] The shared controller identifies sessions from the saved daily schedule and keeps them separate from
+  manual Starts with the same tag. A delayed scheduled report can get a session number at verified zero.
+  Fresh evidence of the same session and plan is required before restoring current.
+- [~] The shared controller owns outage holds, reconnect checks and recovery permission. A clean interruption
+  can restore the selected limit after fresh charger and cloud checks. An owner Pause keeps its hold, and
+  unfinished charging records must settle before release.
+
 ## Automatic recovery after a charger outage — 22 November 2026
 
 - [x] The standalone iCS proxy is running `d476559`. A clean idle recovery restores the saved app/schedule

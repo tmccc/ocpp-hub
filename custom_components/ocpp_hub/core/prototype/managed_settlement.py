@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .local_control import local_start_receipt
 from .managed_records import TerminalCurrent
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .start_settlement import RetirementCandidate
 from .store import RecoveryRequiredError, fingerprint
 
@@ -51,7 +49,7 @@ def require_settled_debt(c: ManagedController) -> None:
     from .trial_rollback import require_lifecycle_idle
 
     j = c.session.journal
-    receipt = local_start_receipt(j)
+    receipt = j.starts.receipt()
     require_lifecycle_idle(c.session.gateway)
     if (
         j.get("vendor_start_grant")
@@ -62,25 +60,6 @@ def require_settled_debt(c: ManagedController) -> None:
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
     ):
         raise RecoveryRequiredError("terminal settlement awaits actual Start and lifecycle reconciliation")
-
-
-# Automatic Return never assumes authority over an outstanding owner operation or an unsettled session.
-def offline_return_decision(c: ManagedController) -> GateDecision:
-    j, g = c.session.journal, c.session.gateway
-    if (
-        j.fault.latched()
-        or g.vendor_write_evidence().unfinished
-        or c.charging.return_blocked()
-        or (c.charging.worker is not None and not c.charging.worker.done())
-        or (c.current.worker is not None and not c.current.worker.done())
-        or j.current_change.read().unresolved
-    ):
-        return Pending(Prerequisite.RECONCILIATION, "offline Pause awaits existing control work")
-    try:
-        require_settled_debt(c)
-    except RecoveryRequiredError as error:
-        return Pending(Prerequisite.LIFECYCLE, "offline Pause awaits settled charging records", error)
-    return ALLOW
 
 
 # Record an internal restrictive winner in the same transaction as its intent and control claim.

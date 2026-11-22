@@ -151,7 +151,8 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
         lifecycle_id = uuid.uuid4().hex
         burst, entries, observer_errors = {}, [], []
         decisions = {}
-        report_code = g._record_start.__code__
+        owner = g.controls.decisions
+        report_code = owner.record_start_report.__code__
         stage_code = j.starts.record.__code__
         assert c.commands is g.command_processor is g.charger.command_processor is g.vendor.command_processor
 
@@ -180,7 +181,7 @@ async def lifecycle_handoff(tmp_path, tls, unused_tcp_port_factory, monkeypatch,
         # Observe real function entry without adding an await or changing any production method or verdict.
         def observe_entry(frame, event, arg):
             try:
-                if event == "call" and frame.f_code is report_code and frame.f_locals.get("self") is g:
+                if event == "call" and frame.f_code is report_code and frame.f_locals.get("self") is owner:
                     decisions["report"] = c.commands._deciding
                 if (
                     event == "call"

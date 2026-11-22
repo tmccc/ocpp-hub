@@ -2,165 +2,20 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from .local_control import local_start_receipt
-from .managed_sources import confirmed_vendor_start
-from .store import Journal, fingerprint
-
 if TYPE_CHECKING:
-    from .gateway import Gateway, NativeStartReport
+    from .gateway import NativeStartReport
     from .managed_charging import ManagedCharging
-    from .trial_handover_evidence import HandoverEvidence
-
-
-# An advertised or previously owned native timer cannot be reinterpreted as an unrelated manual command.
-def known_plan_source(journal: Journal, native: HandoverEvidence) -> bool:
-    marker = native.session_plan_id
-    return marker is not None and (
-        any(plan.get("planId") == marker for plan in (native.saved_schedule or {}).get("planList", []))
-        or marker in journal.retired_plan_ids
-    )
-
-
-class ManagedStartBinding:
-    """Keep the acknowledged command pending until the two independent session reports agree."""
-
-    # Store only tag digests for the verified original timetable; its identity already binds the installation.
-    def __init__(self, gateway: Gateway, original: str, charging: ManagedCharging) -> None:
-        self.gateway = gateway
-        self.journal = gateway.journal
-        self.original = original
-        self.charging = charging
-
-    # Preserve the exact pending requests at allocation, before a later acknowledgement, Pause, or restart.
-    def defer(self, local: int, tag: str) -> bool:
-        j = self.journal
-        digest = fingerprint(tag.casefold())
-        owner, vendor = local_start_receipt(j), j.get("vendor_start_grant", {})
-        local_match = bool(
-            j.get("control", {}).get("start_pending")
-            and owner.get("local") is None
-            and owner.get("stage") in ("issued", "accepted")
-            and owner.get("digest") == digest
-        )
-        cloud_match = bool(
-            vendor.get("prepared") is not True
-            and vendor.get("local") is None
-            and vendor.get("digest") == digest
-            and vendor.get("token")
-        )
-        if not (local_match or cloud_match):
-            return False
-        catalogue = j.get("managed_schedule_tags")
-        if catalogue is not None and digest not in catalogue:
-            return False
-        j.put(
-            "managed_deferred_start",
-            {
-                "local": local,
-                "owner": local_match,
-                "ticket": owner.get("ticket"),
-                "vendor": vendor.get("token") if cloud_match else None,
-            },
-        )
-        return True
-
-    # Classify the same ledger ID using a verified native read. A scheduled transaction never spends a command.
-    def observe(self, n: HandoverEvidence) -> None:
-        j = self.journal
-        if n.saved_schedule is None:
-            return
-        plans = n.saved_schedule["planList"]
-        digest = n.saved_schedule_digest
-        if digest == self.original:
-            catalogue: dict[str, list[int]] = {}
-            for plan in plans:
-                tag, identifier = plan.get("idTag"), plan.get("planId")
-                if isinstance(tag, str) and type(identifier) is int:
-                    catalogue.setdefault(fingerprint(tag.casefold()), []).append(identifier)
-            if catalogue != j.get("managed_schedule_tags"):
-                j.put("managed_schedule_tags", catalogue)
-        self.attest_bound_vendor(n, digest)
-        pending = j.get("managed_deferred_start", {})
-        local = pending.get("local")
-        if (
-            local is None
-            or local != j.active()
-            or local != n.physical.native_transaction_id
-            or not n.physical.transaction_open
-        ):
-            return
-        start = json.loads(j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()["start"])
-        tag = start["idTag"]
-        catalogue = j.get("managed_schedule_tags")
-        if catalogue is None:
-            return
-        digest = fingerprint(tag.casefold())
-        if known_plan_source(j, n) or digest in catalogue and n.session_plan_id is None:
-            return
-        if pending["owner"] and pending["vendor"] is not None:
-            return
-        with j.atomic():
-            if pending["owner"] and local_start_receipt(j).get("ticket") == pending["ticket"]:
-                self.gateway.controls.bind_start(tag, local)
-                self.charging.started(local, start)
-            elif pending["vendor"] is not None and j.get("vendor_start_grant", {}).get("token") == pending["vendor"]:
-                self.gateway.authorisation.consume(tag, local)
-                grant = j.get("vendor_start_grant", {})
-                j.put(
-                    "vendor_start_grant",
-                    {
-                        **grant,
-                        "native_source": {
-                            "marker": n.session_plan_id,
-                            "start": fingerprint(start),
-                            "schedule": self.original,
-                        },
-                    },
-                )
-            j.put("managed_deferred_start", {})
-        j.outcomes.retain_bound_owner_start()
-
-    # Distinct tags bind at allocation; their first complete native read must pin the same source as deferred tags.
-    def attest_bound_vendor(self, n: HandoverEvidence, schedule: str | None) -> None:
-        j = self.journal
-        grant = j.get("vendor_start_grant", {})
-        local = grant.get("local")
-        if (
-            "native_source" in grant
-            or local is None
-            or local != j.active()
-            or local != n.physical.native_transaction_id
-            or not n.physical.transaction_open
-            or schedule != self.original
-            or known_plan_source(j, n)
-        ):
-            return
-        row = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
-        if row is None:
-            return
-        start = json.loads(row["start"])
-        if not confirmed_vendor_start(j, fingerprint(start["idTag"].casefold()), local, settled=True):
-            return
-        j.put(
-            "vendor_start_grant",
-            {
-                **grant,
-                "native_source": {"marker": n.session_plan_id, "start": fingerprint(start), "schedule": self.original},
-            },
-        )
 
 
 class ManagedStartReports:
-    """Wire the reported Start flow to the managed charging and source owners."""
+    """Pass charger Start reports to the shared control owner."""
 
-    # Integrate both owners when the controller is fully constructed.
-    def __init__(self, charging: ManagedCharging, binding: ManagedStartBinding) -> None:
+    # Use the existing managed charging worker and its controller.
+    def __init__(self, charging: ManagedCharging) -> None:
         self.charging = charging
-        self.binding = binding
 
     # A protected owner Start may first need a zero hold.
     async def prepare_hold(self, payload: dict[str, Any]) -> None:
@@ -168,7 +23,8 @@ class ManagedStartReports:
 
     # Use the independently observed native occurrence and schedule.
     async def identify(self, payload: dict[str, Any]) -> NativeStartReport | None:
-        return await self.charging.prepare_native_report(payload)
+        c = self.charging.controller
+        return await c.session.gateway.controls.decisions.schedule.prepare_native_report(c, payload)
 
     # Check the owned station ceiling in the same decision that accepts the Start report.
     async def commit_at_verified_ceiling(self, commit: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -180,7 +36,7 @@ class ManagedStartReports:
 
     # Keep the command pending while its source is still ambiguous.
     def defer_binding(self, local: int, tag: str) -> bool:
-        return self.binding.defer(local, tag)
+        return self.charging.controller.session.gateway.controls.decisions.schedule.defer_start_binding(local, tag)
 
     # Publish the recorded Start to the active charging operation.
     def recorded(self, local: int, payload: dict[str, Any]) -> None:

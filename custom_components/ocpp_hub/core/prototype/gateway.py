@@ -11,9 +11,9 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..frames import ERROR_FORMATION_VIOLATION, Frame, build_call_error, build_call_result
@@ -29,11 +29,12 @@ from .command_outcomes import (
 )
 from .command_processor import CommandPriority, CommandProcessor
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
+from .control_decisions import StopZeroEvidence, VendorStopAlreadyAcceptedError
 from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, data_value, known_write
-from .local_control import LocalControl, StopDecision
+from .local_control import LocalControl
 from .managed_start_delivery import (
     latch_start_delivery_fault,
     record_start_denial,
@@ -49,6 +50,7 @@ from .plans import PlanBook
 from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, profile_status, reply_as
 from .security import SecurityError
+from .start_handoff import NativeStartReport as NativeStartReport
 from .start_handoff import OwnedStartResult, StartHandoff
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
@@ -69,10 +71,6 @@ class MalformedReplyError(DeniedError):
 
 class MalformedCallError(DeniedError):
     """A malformed request with a usable correlation ID."""
-
-
-class _VendorStopAlreadyAcceptedError(Exception):
-    """The exact Stop is already accepted and the same session still has verified zero."""
 
 
 # Reject malformed or non-finite input before handing it to the upstream frame vocabulary.
@@ -132,16 +130,6 @@ def timestamp(value: Any) -> datetime:
         raise DeniedError("timestamp is outside the supported UTC range") from None
 
 
-@dataclass(frozen=True)
-class NativeStartReport:
-    """A held lifecycle report, with an optional verified native source, committed with the actual transaction."""
-
-    native_id: int | None
-    plan_id: int | None
-    attempt: tuple[str, int] | None
-    record: Callable[[int], None] = field(compare=False)
-
-
 class StartReports(Protocol):
     """Managed hooks for this one charger lifecycle report, in gateway dispatch order."""
 
@@ -162,16 +150,6 @@ class StartReports(Protocol):
 
     # Record the observed Start inside its journal transaction.
     def recorded(self, local: int, payload: dict[str, Any]) -> None: ...
-
-
-class StopZeroEvidence(Protocol):
-    """Independent zero observations for reusing a previous charger Stop reply."""
-
-    # Refresh only when a prior Stop may already cover this session.
-    async def refresh_stop_zero(self, local: int) -> None: ...
-
-    # Report whether the latest evidence still covers the exact open session at zero.
-    def stop_zero_verified(self, local: int) -> bool: ...
 
 
 class Gateway:
@@ -202,7 +180,6 @@ class Gateway:
         self._refusals: dict[str, asyncio.Task[None]] = {}
         self._flush_lock = asyncio.Lock()
         self._boot_lock = asyncio.Lock()
-        self._start_renewals: dict[tuple[str, int, int, str | None, str | None], asyncio.Future[bool]] = {}
         self._vendor_ready = False
         self.vendor_interval = 60
         self.vendor_registration = "disconnected"
@@ -253,20 +230,13 @@ class Gateway:
     def vendor_write_evidence(self) -> VendorWriteEvidence:
         return self.journal.outcomes.vendor_evidence(self.charger.has_pending_call)
 
-    # Restrict new transports or changed introductions before they can authorize any charging-capable request.
-    def _restrict_trial_introduction(self) -> None:
-        if self.journal.phase.read().active and self.journal.get("trial_binding") is not None:
-            with self.journal.atomic():
-                control = self.journal.get("control", {})
-                self.journal.phase.restrict(control)
-
     # Attach only an already admitted transport; the gateway never opens sockets itself.
     def attach_charger(self, sender: Sender) -> int:
         return self.decide(lambda: self._attach_charger(sender), priority=CommandPriority.RESTRICT)
 
     # Apply the connection change and retire previous evidence in the same turn.
     def _attach_charger(self, sender: Sender) -> int:
-        self._restrict_trial_introduction()
+        self.controls.decisions.recovery.restrict_introduction()
         epoch = self.journal.connection_epoch()
         self.charger.detach()
         self._charger_epoch = epoch
@@ -667,123 +637,19 @@ class Gateway:
             text = build_call_error(token, "InternalError", "outcome unavailable; success was not confirmed")
         return text
 
-    # Hold, authorize and fence a reported Start before committing its real lifecycle.
+    # Pass the validated report timestamp and transport identity to the control owner.
     async def _reported_start(
         self, receipt: str, payload: dict[str, Any], epoch: int, boot: str | None
     ) -> dict[str, Any]:
         occurred = timestamp(payload.get("timestamp"))
-
-        # A replay can return its stored result, while a new Start must retain its original introduction.
-        def check() -> None:
-            self._require_epoch("charger", epoch)
-            if (
-                self.journal.phase.read().supervised
-                and (boot is None or self.boot_observation != boot)
-                and not self.journal.known_start(payload)
-            ):
-                raise UnavailableError("reported Start belongs to a retired charger Boot")
-
-        # Recheck the report and any captured hold at the one turn that can create a lifecycle entry.
-        def commit(native: NativeStartReport | None, ticket: str | None) -> dict[str, Any]:
-            check()
-            if not self.journal.known_start(payload) and self.journal.get("control", {}).get("ticket") != ticket:
-                raise DeniedError("a newer owner operation superseded the reported start")
-            return self._record_start(receipt, payload, occurred, native)
-
-        check()
-        if self.journal.known_start(payload):
-            return await self.decide_report(lambda: commit(None, None))
-        if self.start_reports is not None and not self.journal.known_start(payload):
-            await self.start_reports.prepare_hold(payload)
-            check()
-        ticket = self.journal.get("control", {}).get("ticket")
-        if self.policy.strict_cloud_authorization:
-            try:
-                await self._renew_direct_start(payload, epoch, check_origin=check)
-            except DeniedError, UnavailableError:
-                if not self.journal.known_start(payload):
-                    raise
-            check()
-        if not self.journal.known_start(payload) and self._tag_allowed(payload.get("idTag")):
-            await self.controls.ensure_ceiling()
-            check()
-        if self.journal.get("control", {}).get("ticket") != ticket and not self.journal.known_start(payload):
-            raise DeniedError("a newer owner operation superseded the start")
-        native_report = None
-        if self.start_reports is not None and not self.journal.known_start(payload):
-            native_report = await self.start_reports.identify(payload)
-            tag = payload.get("idTag")
-            if (
-                native_report is not None
-                and self.policy.strict_cloud_authorization
-                and isinstance(tag, str)
-                and self._tag_info(tag)["status"] != "Accepted"
-                and self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp(), payload["timestamp"]) is None
-            ):
-                await self._renew_direct_start(payload, epoch, held_native=True, check_origin=check)
-                refreshed = await self.start_reports.identify(payload)
-                if refreshed is None or refreshed != native_report:
-                    raise DeniedError("the native occurrence changed during cloud authorization")
-                native_report = refreshed
-            if native_report is None and not self.journal.known_start(payload):
-                try:
-                    return await self.start_reports.commit_at_verified_ceiling(lambda: commit(None, ticket))
-                except DeniedError, UnavailableError, SecurityError:
-                    if not self.journal.known_start(payload):
-                        raise
-            check()
-            if self.journal.get("control", {}).get("ticket") != ticket and not self.journal.known_start(payload):
-                raise DeniedError("a newer owner operation superseded the reported start")
-        return await self.decide_report(lambda: commit(native_report, ticket))
-
-    # Validate the report and commit its command/native binding with the new transaction.
-    def _record_start(
-        self, token: str, payload: dict[str, Any], occurred: datetime, native_report: NativeStartReport | None
-    ) -> dict[str, Any]:
-        integer(payload.get("connectorId"), 1, 1)
-        number(payload.get("meterStart"), 1e12)
-        tag = payload.get("idTag")
-        if not isinstance(tag, str):
-            raise DeniedError("a reported start requires a tag")
-        known = self.journal.known_start(payload)
-        historical = None
-        if (
-            not known
-            and self.policy.strict_cloud_authorization
-            and (native_report is not None or self.start_reports is not None and self.start_reports.permits_held(tag))
-        ):
-            historical = self.auth_info.accepted_for_delayed_report(tag, occurred.timestamp(), payload["timestamp"])
-        if not known and not self._tag_allowed(
-            tag, lifecycle=True, historical=historical is not None, native_report=native_report is not None
-        ):
-            raise DeniedError("tag is not approved for local authorization")
-
-        # Permission binding and the pending flag belong to the very same commit as the new Start fact.
-        def accepted(local: int) -> None:
-            if native_report is not None:
-                native_report.record(local)
-            elif self.start_reports is None or not self.start_reports.defer_binding(local, payload["idTag"]):
-                self.authorisation.consume(payload["idTag"], local)
-                self.controls.bind_start(payload["idTag"], local)
-            if self.start_reports is not None:
-                self.start_reports.recorded(local, payload)
-
-        info = historical or (self._tag_info(tag) if self.policy.strict_cloud_authorization and not known else None)
-        if info is not None:
-            if info["status"] != "Accepted":
-                raise DeniedError("authorization changed before accepting the new session")
-            if historical is None and not self._local_tag(tag):
-                self.auth_info.require_dynamic(info)
-        answer = self.journal.start(token, payload, accepted, info)
-        self.journal.outcomes.retain_bound_owner_start()
-        return answer
+        return await self.controls.decisions.reported_start(self, receipt, payload, epoch, boot, occurred)
 
     # Commit the newest Boot in arrival order, with no task or await able to publish older proof over it.
     def _boot_reply(self, token: str, payload: dict[str, Any]) -> str:
         try:
             previous_boot = self.journal.get("boot")
             if previous_boot is not None and previous_boot != payload:
-                self._restrict_trial_introduction()
+                self.controls.decisions.recovery.restrict_introduction()
                 self.controls.invalidate()
             with self.journal.atomic():
                 self._observations.boot(self._charger_epoch)
@@ -940,85 +806,6 @@ class Gateway:
             return info
         return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
 
-    # A native daily schedule can renew a cloud decision that expired or previously denied permission.
-    async def _renew_direct_start(
-        self,
-        payload: dict[str, Any],
-        epoch: int,
-        *,
-        held_native: bool = False,
-        check_origin: Callable[[], None] | None = None,
-    ) -> None:
-        tag = payload.get("idTag")
-        if (
-            not isinstance(tag, str)
-            or not self._local_tag(tag)
-            or self.retiring()
-            and not held_native
-            or self.vendor.sender is None
-            or self.journal.known_start(payload)
-            or self.journal.active() is not None
-            or self.journal.get("control", {}).get("inhibit")
-            and not held_native
-            or self.journal.phase.starting
-            or not self.journal.phase.read().legacy_active
-            and not (held_native and self.journal.phase.read().value == "recovering")
-            or self.authorisation.allows(tag)
-        ):
-            return
-        stored = self.auth_info.stored(tag)
-        if stored is None or self._tag_info(tag)["status"] == "Accepted":
-            return
-        integer(payload.get("connectorId"), 1, 1)
-        number(payload.get("meterStart"), 1e12)
-        ticket = self.journal.get("control", {}).get("ticket")
-
-        # Work from a retired plug connection or superseded owner operation cannot renew current authority.
-        def guard() -> None:
-            self._require_epoch("charger", epoch)
-            if check_origin is not None:
-                check_origin()
-            if (
-                self.journal.get("control", {}).get("ticket") != ticket
-                or self.auth_info.stored(tag) != stored
-                or self.retiring()
-                and not held_native
-                or held_native
-                and (not self.controls.ready or self.controls.desired() != 0)
-            ):
-                raise DeniedError("scheduled start authority changed during renewal")
-
-        # Share even a timeout or unchanged denial across this burst of retries. A later burst may retry.
-        key = (tag.casefold(), epoch, self._vendor_epoch, ticket, self.boot_observation)
-        pending = self._start_renewals.get(key)
-        if pending is not None:
-            if not await asyncio.shield(pending):
-                raise UnavailableError("scheduled start renewal was unavailable")
-            return
-        pending = asyncio.get_running_loop().create_future()
-        self._start_renewals[key] = pending
-        received = False
-        try:
-            try:
-                await self._cloud_authorize(tag, guard=guard)
-            except DeniedError:
-                # An ordinary Authorize can publish a fresh decision while this Start waits for the vendor gate.
-                self._require_epoch("charger", epoch)
-                self._require_epoch("vendor", key[2])
-                current = self.auth_info.get(tag)
-                if (
-                    self.journal.get("control", {}).get("ticket") != ticket
-                    or current is None
-                    or current["status"] != "Accepted"
-                    or not held_native
-                    and not self._tag_allowed(tag)
-                ):
-                    raise
-            received = True
-        finally:
-            pending.set_result(received)
-            del self._start_renewals[key]
-
     # Preserve the actual correlated backend decision, checking generation after every await.
     async def _cloud_authorize(self, tag: str, guard: Callable[[], None] | None = None) -> dict[str, Any]:
         epoch = self._vendor_epoch
@@ -1126,7 +913,7 @@ class Gateway:
                 with self.journal.atomic():
                     self.journal.record_vendor_result(mutation, "dispatched")
                     if grant is not None:
-                        self.authorisation.issue(grant)
+                        self.controls.decisions.issue_vendor_start(self, grant)
             dispatched = True
 
         # The peer records the actual answer before another owner or a failed local write can supersede it.
@@ -1250,50 +1037,27 @@ class Gateway:
                 await self.command_processor.run(require_origin, priority=priority)
             if write and action != "RemoteStopTransaction":
                 await self.controls.ensure_ceiling(guard=require_origin)
-            if action == "RemoteStartTransaction" and self.policy.strict_cloud_authorization:
-                require_origin()
-                info = await self._cloud_authorize(original["idTag"], guard=require_origin)
-                if info["status"] != "Accepted":
-                    raise DeniedError("cloud refused the trial start tag")
-                if not self._local_tag(original["idTag"]):
-                    self.auth_info.require_dynamic(info)
+            if action == "RemoteStartTransaction":
+                await self.controls.decisions.authorize_vendor_start(self, original["idTag"], require_origin)
 
-            # Wait behind earlier charger requests before reading a possible zero hold for this Stop.
-            async def refresh_stop_zero() -> None:
-                assert stop_evidence is not None and local_transaction is not None
-
-                # An ordinary first Stop can be forwarded promptly without an extra native read.
-                def maybe_reuse() -> bool:
-                    require_origin()
-                    return (
-                        self.controls.ready
-                        and self.controls.desired() == 0
-                        and self.controls.stop_decision(local_transaction)
-                        in (StopDecision.ACCEPTED, StopDecision.WAIT_FOR_REPORT)
-                    )
-
-                if self.decide(maybe_reuse, priority=priority):
-                    await stop_evidence.refresh_stop_zero(local_transaction)
-
-            # Both checks run inside the gate. The final one sees the latest reply, lifecycle and zero evidence.
-            def check_stop() -> None:
-                assert stop_evidence is not None and local_transaction is not None
-                decision = self.controls.stop_decision(
-                    local_transaction, reuse_allowed=stop_evidence.stop_zero_verified(local_transaction)
+            refresh_stop_zero: Callable[[], Awaitable[None]] | None = None
+            check_stop: Callable[[], None] | None = None
+            if stop_evidence is not None:
+                if local_transaction is None or connection is None:
+                    raise UnavailableError("cloud command belongs to a retired charger Boot")
+                refresh_stop_zero = partial(
+                    self.controls.decisions.prepare_vendor_stop, local_transaction, stop_evidence, require_origin
                 )
-                if decision is StopDecision.ACCEPTED:
-                    raise _VendorStopAlreadyAcceptedError
-                if decision is StopDecision.WAIT_FOR_REPORT:
-                    raise RecoveryRequiredError("cloud Stop awaits the charger's original report")
-                if decision is StopDecision.CLOSED:
-                    raise DeniedError("cloud Stop lost its original open session")
+                check_stop = partial(
+                    self.controls.decisions.require_vendor_stop, local_transaction, connection[0].boot, stop_evidence
+                )
 
             # Allocate profile ids and mutation intent only after the in-gate policy check succeeds.
             def prepare() -> dict[str, Any]:
                 nonlocal mutation, query, ics_write, grant, profile_write, translated
                 require_origin()
                 self._check_vendor(action, original)
-                if stop_evidence is not None:
+                if check_stop is not None:
                     check_stop()
                 with self.journal.atomic():
                     if action == "DataTransfer" and is_transaction_query(original):
@@ -1315,18 +1079,11 @@ class Gateway:
                                 vendor_profile not in old_profiles,
                             )
                     if action == "RemoteStartTransaction":
-                        if self.policy.strict_cloud_authorization:
-                            info = self.auth_info.get(original["idTag"])
-                            if info is None or info["status"] != "Accepted":
-                                raise DeniedError("trial authorization expired before forwarding")
-                            if not self._local_tag(original["idTag"]):
-                                self.auth_info.require_dynamic(info)
-                        grant = self.authorisation.reserve(original["idTag"], prepared=True)
+                        grant = self.controls.decisions.reserve_vendor_start(self, original["idTag"])
                     if self.policy.kind(action, original) == "write" and action != "ClearChargingProfile":
                         mutation = prepare_mutation(profile_write.local if profile_write is not None else None)
                         if grant is not None:
-                            current_grant = self.journal.get("vendor_start_grant", {})
-                            self.journal.put("vendor_start_grant", {**current_grant, "mutation": mutation})
+                            self.controls.decisions.bind_vendor_start(mutation)
                 translated = payload
                 return payload
 
@@ -1343,21 +1100,7 @@ class Gateway:
                     if row is None or tuple(row) != ("vendor", action, fingerprint(original), "pending"):
                         raise DeniedError("this vendor request no longer owns its pending mutation")
                 if action == "RemoteStartTransaction":
-                    if self.policy.strict_cloud_authorization:
-                        info = self.auth_info.get(original["idTag"])
-                        if info is None or info["status"] != "Accepted":
-                            raise DeniedError("cloud authorization expired during native validation")
-                        if not self._local_tag(original["idTag"]):
-                            self.auth_info.require_dynamic(info)
-                    if grant is not None:
-                        saved = self.journal.get("vendor_start_grant", {})
-                        if (
-                            saved.get("token") != grant
-                            or saved.get("local") is not None
-                            or not self.authorisation.allows(original["idTag"], issuing=grant)
-                            or not self._tag_allowed(original["idTag"], issuing_grant=grant)
-                        ):
-                            raise DeniedError("this vendor start no longer owns its current tag grant")
+                    self.controls.decisions.require_vendor_start(self, original["idTag"], grant)
 
             # Native clear validation must see the existing lifecycle debt before this clear is recorded.
             def prepare_clear() -> None:
@@ -1375,18 +1118,12 @@ class Gateway:
                 priority=priority,
                 check=check,
                 token=wire,
-                before_send=(
-                    prepare_clear
-                    if action == "ClearChargingProfile"
-                    else check_stop
-                    if stop_evidence is not None
-                    else None
-                ),
+                before_send=prepare_clear if action == "ClearChargingProfile" else check_stop,
                 on_dispatch=on_dispatch,
                 on_reply=owns_profile_reply if action in PROFILE_COMMANDS else None,
                 on_receive=received if write else None,
                 keep_late_reply=action in TRANSACTION_COMMANDS,
-                prepare_call=refresh_stop_zero if stop_evidence is not None else None,
+                prepare_call=refresh_stop_zero,
             )
             if write and forwarded_reply is None and profile_reply is None and other_reply is None:
                 raise UnavailableError("charger write did not return a recognized outcome")
@@ -1400,7 +1137,7 @@ class Gateway:
 
                 return reply_as(self.decide(project_history, priority=priority), token)
             return reply_as(answer, token)
-        except _VendorStopAlreadyAcceptedError:
+        except VendorStopAlreadyAcceptedError:
             return build_call_result(token, {"status": "Accepted"})
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
@@ -1443,37 +1180,9 @@ class Gateway:
         kind = self.policy.kind(action, payload)
         if kind == "write" and self.vendor_registration != "Accepted":
             raise UnavailableError("cloud controls await completed registration")
-        if (
-            kind == "write"
-            and action != "RemoteStopTransaction"
-            and (self.retiring() or not self.journal.phase.read().legacy_active or self.journal.phase.starting)
-        ):
-            raise DeniedError("trial vendor controls are frozen")
-        control = self.journal.get("control", {})
-        if kind == "write" and action != "RemoteStopTransaction":
-            if self.journal.current_change.read().recovering:
-                raise DeniedError("cloud writes await settlement of the current selection")
-            if own_mutation is None:
-                self.journal.require_vendor_writes_reconciled()
-            elif self.journal.db.execute(
-                "SELECT 1 FROM mutations WHERE origin='vendor' AND state!='confirmed' AND token!=? LIMIT 1",
-                (own_mutation,),
-            ).fetchone():
-                raise RecoveryRequiredError("another vendor write still requires reconciliation")
-            if require_cap and not self.controls.ready:
-                raise UnavailableError("station ceiling is not confirmed for this charger connection")
-        if (
-            kind == "write"
-            and action != "RemoteStopTransaction"
-            and (control.get("owner") == "local" or control.get("inhibit"))
-        ):
-            raise DeniedError("explicit local control has priority")
-        if action == "RemoteStartTransaction" and (
-            self.journal.active() is not None or self.journal.get("control", {}).get("start_pending")
-        ):
-            raise DeniedError("a transaction is already unresolved on this connector")
-        if action == "RemoteStartTransaction" and self.journal.current_change.read().selecting:
-            raise DeniedError("cloud Start awaits verification of the current selection")
+        self.controls.decisions.require_vendor_control(
+            self, action, write=kind == "write", require_cap=require_cap, own_mutation=own_mutation
+        )
 
     # Identify only cloud writes that translate a cloud transaction ID to the current local session.
     @staticmethod
@@ -1564,7 +1273,7 @@ class Gateway:
             raise DeniedError("current authorization does not permit a new local start")
         return await self.controls.start(tag)
 
-    # One exact-scoped owned Start publishes authority in its child, while retaining truthful failed wire outcomes.
+    # The owner captures the managed scope before the local wire executor starts any work.
     async def start_managed_result(
         self,
         tag: str,
@@ -1574,28 +1283,8 @@ class Gateway:
         on_prepared: Callable[[], None] | None = None,
         handoff: StartHandoff | None = None,
     ) -> OwnedStartResult:
-        connection = current_control_scope(self)
-
-        # Restrictive rollback retains the exact source even after the positive management grant is revoked.
-        def source() -> None:
-            if not control_scope_matches(self, connection):
-                raise UnavailableError("managed Start belongs to a superseded Boot observation")
-
-        # Revocation or a newer Pause can invalidate authorization while native evidence is awaited.
-        def check() -> None:
-            guard()
-            if not self._local_start_allowed(tag):
-                raise DeniedError("managed test tag authorization is no longer current")
-
-        check()
-        return await self.controls.start_managed_result(
-            tag,
-            check,
-            request_id=request_id,
-            on_prepared=on_prepared,
-            scope_guard=source,
-            scope=connection[0] if connection is not None else None,
-            handoff=handoff,
+        return await self.controls.decisions.start_managed_result(
+            self, tag, guard, request_id=request_id, on_prepared=on_prepared, handoff=handoff
         )
 
     # A local Stop can carry the current owner Pause through introduction to its exact wire reply.
@@ -1604,50 +1293,7 @@ class Gateway:
     ) -> Frame:
         if not self.journal.get("managed_mode"):
             return await self.controls.stop(station_flowing=station_flowing)
-        connection, local = current_control_scope(self), self.journal.active()
-        intent, request = None, None
-        if requests is not None:
-            try:
-                pending, ownership = requests.pause_request(), requests.pause_ownership()
-            except sqlite3.Error, SecurityError:
-                if self.journal.db.in_transaction:
-                    raise
-                # The existing protective Stop still has authority if the optional request link is unreadable.
-            else:
-                if (
-                    pending is not None
-                    and pending.revision == ownership.intent.revision
-                    and ownership.owns_ticket(pending.hold)
-                ):
-                    intent, request = ownership.intent, pending
-
-        # Preserve this boot, target and Pause across the wait, including legitimate closure before the Stop reply.
-        def guard() -> None:
-            if (
-                self.retiring()
-                or not control_scope_matches(self, connection)
-                or self.journal.active() not in (None, local)
-                or intent is not None
-                and requests is not None
-                and requests.intent() != intent
-            ):
-                raise UnavailableError("local Stop belongs to a superseded Boot, transaction or Pause")
-
-        # Introduction and the foreground Pause bind the same ticket to the same request.
-        def bind(ticket: str) -> None:
-            if requests is not None and intent is not None and connection is not None:
-                requests.bind_pause_stop(intent, ticket, request, local, connection[0].boot)
-
-        # Join an existing Pause Stop or retain the original request on this connection's own wire evidence.
-        # The protective send still uses the original introduction claim and its independent zero proof.
-        return await self.controls.stop(
-            expected_local=local,
-            guard=guard,
-            station_flowing=station_flowing,
-            on_claim=bind,
-            owner=("pause", intent, request, local, connection) if request is not None else None,
-            request_id=request.identifier if request is not None else None,
-        )
+        return await self.controls.decisions.stop_after_introduction(self, station_flowing, requests)
 
     # Releasing ownership confirms the physical resume ceiling before permitting vendor writes again.
     async def release(self, acknowledge_uncertainty: bool = False) -> None:

@@ -81,8 +81,8 @@ validation. In both orders, the simulated charger receives no positive profile f
 
 The [shared Stop tests](../tests/test_managed_cloud_zero_controls.py) overlap local Pause and vendor-app Stop
 in both orders and hold the first charger reply until the second request queues. Each order sends one charger
-Stop and delivers one real closure report. A late acceptance can also cover a prepared vendor request at the final
-send check. An unanswered shutdown Stop waits at proven zero, and a prior refusal, renewed draw or unavailable zero
+Stop and delivers one real closure report. A late acceptance from either path can cover the other request at its
+final send check. An unanswered shutdown Stop waits at proven zero, and a prior refusal, renewed draw or unavailable zero
 evidence lets the vendor send a real Stop to the same open session.
 
 The [issued-command tests](../tests/test_issued_pause_reconnect.py) let the charger receive Start or apply a

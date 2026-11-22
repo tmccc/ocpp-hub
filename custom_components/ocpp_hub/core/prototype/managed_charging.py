@@ -3,36 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from .command_processor import CommandPriority
-from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope, current_scope
-from .control_state import ControlState
-from .gateway import NativeStartReport
-from .local_control import StopProof, local_start_receipt, retire_unsent_local_start
-from .managed_facts import ManagedFacts
-from .managed_intent import ControlIntent, request_pending, write_intent
-from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
-from .managed_sources import confirmed_vendor_start, recorded_station_profile
-from .managed_start_binding import known_plan_source
+from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope
+from .control_decisions import ACTIVE, ExpiredStartStop
+from .local_control import local_start_receipt
+from .managed_intent import ControlIntent, write_intent
+from .managed_settlement import claim_internal_pause, current_candidate
+from .managed_sources import confirmed_vendor_start, known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
 from .native_bounded import readiness_decision
 from .native_faults import _NativeMeasurementError
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite, require_allowed
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
-from .start_settlement import (
-    StartFailureAction,
-    StartFailureFacts,
-    settle_start,
-)
 from .store import Journal, RecoveryRequiredError, StationZeroStorageError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
@@ -41,7 +33,6 @@ if TYPE_CHECKING:
 
 DURATION = 120
 STARTUP_BUDGET = 60
-ACTIVE = frozenset({"armed", "starting", "awaiting_power", "charging", "running", "stopping"})
 
 
 @dataclass(frozen=True)
@@ -114,7 +105,9 @@ class ManagedCharging:
                     claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.journal.starts.retire_refused()
-        controller.native.observation_listener = self.record_source
+        controller.native.observation_listener = partial(
+            controller.session.gateway.controls.decisions.schedule.record_start_source, self
+        )
         controller.native.positive_guard = self.positive_decision
 
     # Keep one journal owner and the same durable management receipt table as Pause/Return.
@@ -198,88 +191,26 @@ class ManagedCharging:
     def available(self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False) -> bool:
         return self.start_refusal(native, local=local, normal=normal) is None
 
-    # Report the first failed prerequisite in admission order.
+    # Display the same Start decision used when accepting a request.
     def start_refusal(
         self, native: HandoverEvidence | None = None, *, local: bool = True, normal: bool = False
     ) -> str | None:
-        c, j = self.controller, self.journal
-        g = c.session.gateway
-        facts = ManagedFacts(c)
-        if c.stopping:
-            return "service_stopping"
-        if not (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused"):
-            return "intent_not_startable"
-        if j.fault.latched():
-            return "fault_latched"
-        if not j.phase.read().active:
-            return "installation_not_active"
-        if not g.controls.ready:
-            return "station_ceiling_unconfirmed"
-        if g.controls.desired() != (0 if c.requests.intent().mode == "paused" else c.current.selected()):
-            return "station_ceiling_differs_from_selection"
-        if not normal and c.current.selected() != 6:
-            return "timed_test_requires_six_amperes"
-        if c.current.pending():
-            return "current_update_pending"
-        if g.policy.allow_local_start:
-            return "legacy_start_enabled"
-        if local and not any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
-            if not normal or self.authorization_status() != "renewal_required":
-                return "start_authorization_unavailable"
-        if j.get("control", {}).get("uncertain"):
-            return "control_uncertain"
-        if j.get("control", {}).get("start_pending"):
-            return "start_pending"
-        if j.active() is not None:
-            return "transaction_open"
-        if j.get("vendor_start_grant"):
-            return "vendor_start_pending"
-        if not facts.cloud_queue_empty(lifecycle_only=normal):
-            return "cloud_delivery_pending"
-        if not facts.mutations_confirmed():
-            return "mutation_unconfirmed"
-        if c.requests.return_in_progress():
-            return "return_pending"
-        if not c.requests.has_capacity():
-            return "request_capacity_exhausted"
-        if self.state().get("state") in ACTIVE:
-            return "managed_start_active"
-        if not facts.boot_current():
-            return "boot_unconfirmed"
-        if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
-            return "timed_test_requires_cloud"
-        if native is not None:
-            if c.native.last_verified_at == 0:
-                return "native_observation_stale"
-            if native.physical.connection != "Plug":
-                return "vehicle_not_plugged_in"
-            if native.physical.transaction_open:
-                return "native_transaction_open"
-            if native.physical.power_w != 0:
-                return "native_power_nonzero"
-        return None
+        return self.controller.session.gateway.controls.decisions.start_refusal(
+            self, native, local=local, normal=normal
+        )
 
-    # Acceptance and its one-shot deadline commit before any positive effect; duplicate identifiers return receipts.
+    # The decision owner accepts the request and launches work only after its journal commit.
     def accept(self, identifier: str, action: str, revision: int) -> dict[str, Any]:
+        return self.controller.session.gateway.controls.decisions.accept_start(
+            self, identifier, action, revision, STARTUP_BUDGET, DURATION
+        )
+
+    # Capture the existing data and time budget for the accepted Start.
+    def _start_lease(self, identifier: str, action: str, revision: int) -> ChargeLease:
         c, j = self.controller, self.journal
-        previous = c.requests.existing(identifier, action, revision)
-        if previous is not None:
-            return previous
-        native = c.current_native_sample()
-        if (
-            revision != c.requests.intent().revision
-            or native is None
-            or not 0 <= time.time() - native.physical.observed_at <= 15
-            or not self.available(native, local=action in ("start", "start_test"), normal=action == "start")
-        ):
-            raise RecoveryRequiredError(
-                "Start requires fresh idle authority, current approval or online renewal, and no pending work"
-                if action == "start"
-                else "test requires current shared six-ampere authority and no pending work"
-            )
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"
-        lease = ChargeLease(
+        return ChargeLease(
             identifier,
             source,
             revision,
@@ -296,76 +227,17 @@ class ManagedCharging:
             current_a=c.current.selected(),
             accepted_boot=g.boot_observation,
         )
-        j.starts.admit(lease, action, STARTUP_BUDGET, DURATION)
+
+    # The worker and deadline keep their existing lifetimes after the request is recorded.
+    def _launch_start(self, lease: ChargeLease) -> None:
+        c = self.controller
         self.timer = asyncio.create_task(self._deadline(lease))
-        if source == "local":
+        if lease.source == "local":
             self.worker = c.commands.start(lambda: self._start(lease))
-        return c.requests.receipt(identifier)
 
-    # Pause, deadline, shutdown, introduction, permission changes and a replaced request all revoke positive sends.
+    # All preparation, dispatch and lifecycle users recheck the same live lease.
     def guard(self, lease: ChargeLease, *, stopping: bool = False) -> None:
-        c, j = self.controller, self.journal
-        g = c.session.gateway
-        state = self.state()
-        if (
-            self.lease is not lease
-            or c.stopping
-            or time.monotonic() >= lease.deadline
-            or c.requests.intent() != ControlIntent(lease.mode, lease.revision)
-            or g._charger_epoch != lease.epoch
-            or g.controls._revision != lease.control_revision
-            or not g.current_boot_seen(lease.epoch)
-            or lease.accepted_boot is not None
-            and g.boot_observation != lease.accepted_boot
-            or fingerprint(j.identity) != lease.identity
-            or c.native.spec.digest != lease.spec
-            or g.policy.allow_local_start
-            or not 6 <= g.policy.max_current_a <= 32
-            or c.current.selected() != lease.current_a
-            or c.current.pending()
-            or j.fault.latched()
-            or not j.phase.read().active
-            or state.get("id") != lease.identifier
-            or state.get("state") not in ACTIVE
-            or state.get("state") == "stopping"
-            or lease.source == "local"
-            and state.get("state") == "starting"
-            and not request_pending(j, lease.identifier, "start" if lease.normal else "start_test", lease.revision)
-            or c.requests.return_in_progress()
-            or not stopping
-            and j.get("control", {}).get("stop_epoch", 0) != lease.stop_epoch
-            or lease.source == "local"
-            and j.db.execute(
-                "SELECT 1 FROM mutations WHERE rowid>? AND origin='vendor' AND action='RemoteStartTransaction' LIMIT 1",
-                (lease.first_mutation,),
-            ).fetchone()
-        ):
-            raise DeniedError("managed test Start permission expired or was superseded")
-
-    # A normal Start can request one fresh cloud decision before any charger effect, under exact current authority.
-    async def _renew_start_tag(self, lease: ChargeLease) -> str | None:
-        c, g = self.controller, self.controller.session.gateway
-        if any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
-            return None
-        if self.authorization_status() != "renewal_required":
-            raise DeniedError("a current local Start approval is unavailable")
-        tag = next(tag for tag in sorted(g.policy.allowed_tags) if g.local_start_expired(tag))
-        authority, stored = c.authority(), g.auth_info.stored(tag)
-        if authority is None:
-            raise DeniedError("Start approval renewal requires current connection authority")
-
-        # A newer owner operation, Boot metadata or tag decision must win over this pending cloud reply.
-        def guard() -> None:
-            self.guard(lease)
-            if c.authority() != authority or g.auth_info.stored(tag) != stored:
-                raise DeniedError("Start approval renewal was superseded")
-
-        guard()
-        await g._cloud_authorize(tag, guard=guard)
-        self.guard(lease)
-        if c.authority() != authority or not g._local_start_allowed(tag):
-            raise DeniedError("the manufacturer did not provide a current local Start approval")
-        return tag
+        self.controller.session.gateway.controls.decisions.require_start_lease(self, lease, stopping=stopping)
 
     # The service owns the worker after client disappearance; failures revoke only this Start's authority.
     async def _start(self, lease: ChargeLease) -> None:
@@ -374,15 +246,11 @@ class ManagedCharging:
         try:
             previous_current = current_candidate(c) if lease.normal else None
             self.guard(lease)
-            renewed_tag = await self._renew_start_tag(lease) if lease.normal else None
+            decisions = c.session.gateway.controls.decisions
+            renewed_tag = await decisions.renew_local_start(self, lease) if lease.normal else None
             self.guard(lease)
             initial = await c.settled_native()
-            c.native.require(initial, closed=True)
-            if initial.physical.connection != "Plug":
-                raise DeniedError("test requires a freshly connected idle vehicle")
-            self.guard(lease)
-            if j.active() is not None:
-                raise DeniedError("another session began before the Start's idle hold")
+            decisions.require_idle_start(self, lease, initial)
             effects = True
 
             # Capture this exact restrictive claim even if the outer worker is cancelled while its child finishes.
@@ -393,19 +261,7 @@ class ManagedCharging:
                     if lease.initial_zero_ticket is None:
                         effects = False
                     raise DeniedError("another session began during the Start's idle hold")
-                control, g = j.get("control", {}), c.session.gateway
-                if lease.initial_zero_ticket is None and control.get("stop_epoch", 0) == lease.stop_epoch:
-                    return  # LocalControl checks once before synchronously making its own claim.
-                if (
-                    control.get("stop_epoch") != lease.stop_epoch + 1
-                    or not ControlState(control).explicit_local_hold
-                    or not isinstance(control.get("ticket"), str)
-                    or lease.initial_zero_ticket not in (None, control["ticket"])
-                    or lease.initial_zero_boot not in (None, g.boot_observation)
-                ):
-                    raise DeniedError("initial Start hold was superseded")
-                lease.initial_zero_ticket, lease.initial_zero_boot = control["ticket"], g.boot_observation
-                lease.initial_zero_stop_epoch = control["stop_epoch"]
+                decisions.bind_initial_start_zero(lease)
 
             await c.session.gateway.controls.stop(guard=initial_zero_guard)
             self.guard(lease, stopping=True)
@@ -420,38 +276,15 @@ class ManagedCharging:
             if native.physical.connection != "Plug":
                 raise DeniedError("test requires a connected vehicle")
             self.guard(lease)
-            tags = sorted(
-                tag for tag in c.session.gateway.policy.allowed_tags if c.session.gateway._local_start_allowed(tag)
-            )
-            if not tags:
-                raise DeniedError("no current approved local tag is available for this test")
-            tag = renewed_tag if renewed_tag is not None else tags[0]
-            if not c.session.gateway._local_start_allowed(tag):
-                raise DeniedError("the selected local Start approval was superseded")
+            tag = decisions.choose_start_tag(c.session.gateway, renewed_tag)
 
             # Commit the attempt marker with LocalControl's receipt, never before its owned task first executes.
             def prepared() -> None:
-                self.guard(lease)
-                j.starts.prepared_metadata(lease, fingerprint(tag.casefold()))
-                lease.start_scope = current_scope(c.session.gateway)
+                decisions.prepare_start_publication(self, lease, tag)
 
             # This synchronous writer joins the child's transaction; it never opens a nested atomic block.
             def publish(context: StartHandoffContext) -> StartPublication:
-                self.guard(lease)
-                expected = ControlIntent(lease.mode, lease.revision)
-                authority = AuthorityStamp(expected, context.scope, context.control_revision, context.ticket)
-                if not c.publication_is_current(authority):
-                    raise RecoveryRequiredError("owned Start publication was superseded")
-                if lease.normal:
-                    c.requests.start_published(lease.identifier, expected, lease.epoch)
-                    if previous_current is not None:
-                        try:
-                            require_record(c, previous_current)
-                        except RecoveryRequiredError:
-                            pass  # A newer current request retains its own independently owned outcome.
-                        else:
-                            complete_record(c, previous_current)
-                return j.starts.published(lease, context, c.requests.intent())
+                return decisions.publish_start(self, lease, context, previous_current)
 
             # Only successful COMMIT can change these in-memory authorities; no await separates publication.
             def committed(publication: StartPublication) -> None:
@@ -495,41 +328,9 @@ class ManagedCharging:
                 self.changed.set()
                 await asyncio.sleep(0.1)
 
-    # Use the failed reply's lease and actual recorded effects before settling Start.
+    # Retry lifecycle settlement through the same owner as admission and publication.
     def _settle_failed_start(self, lease: ChargeLease, error: Exception, effects: bool) -> None:
-        j = self.journal
-        record = j.starts.load(wire=False, request_id=lease.identifier)
-        facts = StartFailureFacts(
-            lease.identifier, "start" if lease.normal else "start_test", self.lease is lease, effects
-        )
-        decision = settle_start(record, facts)
-        if decision.action is StartFailureAction.UNRELATED:
-            return
-        assert record is not None and record.request is not None
-        cause = {
-            "id": lease.identifier,
-            "action": record.request.action,
-            "revision": record.request.revision,
-            "type": type(error).__name__,
-            "detail": str(error)[:1024],
-            "at_epoch": time.time(),
-            "effects_started": effects,
-        }
-        record = j.starts.load(ledger=False)
-        decision = settle_start(record, facts)
-        if decision.retire_prepared:
-            assert record is not None
-            retire_unsent_local_start(j, record.receipt.ticket)
-        if decision.action is StartFailureAction.DIAGNOSTIC_ONLY:
-            self.record_failure_diagnostic(cause)
-            return  # A deadline or later proof already owns the state and immutable terminal receipt.
-        if decision.action is StartFailureAction.FAIL_PREFLIGHT:
-            j.starts.fail_preflight(lease.identifier, cause)
-            self.changed.set()
-            j.starts.retire_refused()
-        else:
-            self.stop(lease, "start_not_confirmed", failure=cause)
-        self.record_failure_diagnostic(cause)
+        self.controller.session.gateway.controls.decisions.settle_failed_start(self, lease, error, effects)
 
     # Compatibility diagnostics cannot keep a settled worker alive or undo its request-bound durable cause.
     def record_failure_diagnostic(self, cause: dict[str, Any]) -> None:
@@ -541,14 +342,9 @@ class ManagedCharging:
         except sqlite3.Error:
             pass  # The critical state already records this operation's failure, or a newer outcome won.
 
-    # Bind an actual accepted Start inside its ledger transaction, including sessions ending between native polls.
+    # The report caller supplies the actual allocated session to the authority owner.
     def started(self, local: int, payload: dict[str, Any]) -> None:
-        lease = self.lease
-        if lease is not None:
-            try:
-                self.journal.starts.managed_bound(lease, local, payload.get("idTag"), lambda: self.guard(lease))
-            except DeniedError:
-                return
+        self.controller.session.gateway.controls.decisions.bind_managed_start(self, local, payload)
 
     # A real bound Start/Stop pair completes without changing current authority or stopping a later app session.
     def finish_closed_normal(self, lease: ChargeLease) -> bool:
@@ -557,64 +353,13 @@ class ManagedCharging:
             self.changed.set()
         return finished
 
-    # Keep verified source evidence on its actual Boot; an ACK never identifies an unrelated native transaction.
-    def record_source(self, native: HandoverEvidence) -> None:
-        g = self.controller.session.gateway
-        self.source = (native, g.boot_observation, g.controls._revision)
-        state, lease = self.state(), self.lease
-        if state.get("state") == "completed" or state.get("independent_seen"):
-            return
-        if (
-            not (lease is not None and lease.normal and lease.identifier == state.get("id"))
-            and not self.scoped_normal_stop()
-        ):
-            return
-        local = self.journal.active()
-        if local is not None and self.independent_daily(native, local):
-            self.journal.starts.independent_seen(state)
-
-    # The verified original plan and matching ledger identify the daily even when the owner uses its tag.
+    # Ask the shared owner whether this exact sample identifies an independent daily.
     def independent_daily(self, native: HandoverEvidence, local: int) -> bool:
-        state, j = self.state(), self.journal
-        if (
-            state.get("kind") != "normal"
-            or not isinstance(state.get("tag_digest"), str)
-            or not native.physical.transaction_open
-            or native.physical.native_transaction_id != local
-            or j.active() != local
-            or native.physical.connection == "Unplug"
-            or native.saved_schedule is None
-            or local_start_receipt(j).get("local") == local
-        ):
-            return False
-        row = j.db.execute("SELECT start FROM transactions WHERE local=? AND stop IS NULL", (local,)).fetchone()
-        if row is None:
-            return False
-        tag = json.loads(row["start"])["idTag"].casefold()
-        return bool(
-            any(
-                plan["planId"] == native.session_plan_id
-                and isinstance(plan.get("idTag"), str)
-                and plan["idTag"].casefold() == tag
-                and plan.get("kindType") == "Recurring"
-                for plan in native.saved_schedule["planList"]
-            )
-        )
+        return self.controller.session.gateway.controls.decisions.schedule.independent_daily(self, native, local)
 
-    # Cached evidence authorizes only this same transaction on the same fresh, authenticated introduction.
+    # Continue a daily only while its verified source still belongs to this Boot and session.
     def current_daily(self, local: int) -> bool:
-        c, g = self.controller, self.controller.session.gateway
-        if self.source is None:
-            return False
-        native, boot, revision = self.source
-        return bool(
-            boot is not None
-            and boot == g.boot_observation
-            and revision == g.controls._revision
-            and c.native.last_verified_at == native.physical.observed_at
-            and 0 <= c.native.observation_age() <= 5
-            and self.independent_daily(native, local)
-        )
+        return self.controller.session.gateway.controls.decisions.schedule.current_daily(self, local)
 
     # A newer explicit Pause owns unrestricted Stop; an expired normal Start owns only its exact receipt.
     def scoped_normal_stop(self) -> bool:
@@ -671,59 +416,9 @@ class ManagedCharging:
             return Pending(Prerequisite.LIFECYCLE, "expired Start awaits actual owner closure")
         return ALLOW
 
-    # Zero authority does not borrow Stop authority from whichever daily transaction happens to be open.
+    # The decision owner also protects the exact Start after its permission has expired.
     async def hold_expired(self) -> None:
-        c, j = self.controller, self.journal
-        g, expected = c.session.gateway, c.requests.intent()
-        connection, identifier = current_control_scope(g), self.state().get("id")
-
-        # Restrictive writes remain bound to this request, current intent, commissioned device and actual Boot.
-        def guard() -> None:
-            if (
-                c.stopping
-                or self.state().get("id") != identifier
-                or not self.scoped_normal_stop()
-                or c.requests.intent() != expected
-                or not control_scope_matches(g, connection)
-                or fingerprint(j.get("boot")) != c.native.spec.boot_digest
-                or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
-            ):
-                raise RecoveryRequiredError("expired Start zero authority was superseded")
-
-        # Take or reuse the current zero claim within the same turn that checks the expired Start's ownership.
-        def claim() -> str:
-            guard()
-            control = j.get("control", {})
-            ticket = control.get("ticket")
-            if control.get("inhibit") and isinstance(ticket, str):
-                return ticket
-            return g.controls._claim(True, stopping=True)[1]
-
-        ticket = c.commands.decide(claim, priority=CommandPriority.RESTRICT)
-
-        # A newer hold cannot inherit a verification completed for this particular Start.
-        def require_ticket() -> None:
-            guard()
-            if j.get("control", {}).get("ticket") != ticket:
-                raise RecoveryRequiredError("expired Start zero ticket was superseded")
-
-        await g.controls.ensure_ceiling(guard=require_ticket)
-
-        # Confirm only the station zero. The separate Start receipt and real lifecycle remain outstanding.
-        def settle() -> None:
-            require_ticket()
-            g.controls._complete(ticket, uncertain=False)
-
-        c.commands.decide(settle, priority=CommandPriority.RESTRICT)
-
-    # Each ordinary recovery owner validates its own delayed original-plan report under its existing zero.
-    async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
-        c = self.controller
-        if self.journal.current_change.read().recovering:
-            return await c.current.prepare_native_report(payload)
-        if c.ordinary.active():
-            return await c.ordinary.prepare_native_report(payload)
-        return None
+        await self.controller.session.gateway.controls.decisions.hold_expired_start(self)
 
     # Match an already issued owner command without replaying its Start or guessing a lifecycle number.
     def matches_pending_start(self, tag: str) -> bool:
@@ -778,23 +473,9 @@ class ManagedCharging:
             if not self.can_record_owner(tag):
                 raise UnavailableError("the acknowledged owner report awaits verified Pause zero")
 
-    # The held listener consumes an existing receipt under verified zero and cannot authorize another Start.
+    # Ask the owner whether an already-issued Start may report under the existing hold.
     def can_record_owner(self, tag: str) -> bool:
-        c, g = self.controller, self.controller.session.gateway
-        return bool(
-            (
-                c.stopping
-                or c.requests.intent().mode == "paused"
-                or self.scoped_normal_stop()
-                and c.requests.intent().mode == "app"
-            )
-            and self.matches_pending_start(tag)
-            and self.journal.active() is None
-            and not self.journal.fault.latched()
-            and g.controls.ready
-            and g.controls.desired() == 0
-            and self.report_hold_authorized()
-        )
+        return self.controller.session.gateway.controls.decisions.can_record_owner_start(self, tag)
 
     # Reconcile expired authority independently of the short lease and retain the original Start reporting debt.
     async def reconcile_expired(self) -> bool:
@@ -882,51 +563,13 @@ class ManagedCharging:
                 return True
             c.native.require_known_session(native)
 
-            # Recheck the original Start, current intent and charger connection at the actual Stop boundary.
-            def guard() -> None:
-                receipt = local_start_receipt(j)
-                if (
-                    c.stopping
-                    or c.requests.intent() != expected
-                    or not self.scoped_normal_stop()
-                    or self.state().get("id") != state.get("id")
-                    or not control_scope_matches(g, connection)
-                    or receipt.get("local") != closing
-                    or receipt.get("digest") != state.get("tag_digest")
-                    or j.active() not in (None, closing)
-                    or not c.native.commissioned_binding_matches(native)
-                ):
-                    raise RecoveryRequiredError("expired owner Stop was superseded")
-
-            # An expired normal Start uses the same draw check as an explicit Pause.
-            def station_flowing() -> bool:
-                return c.native.still_drawing(native, sequence)
-
-            # If the zero call failed, refresh the exact active session before permitting a protective Stop.
-            async def prove_stop(local: int, ceiling_failed: bool, _awaiting_report: bool) -> StopProof:
-                if not ceiling_failed:
-                    return StopProof(guard, station_flowing)
-                fresh = await read_session(local)
-                fresh_sequence = c.native.last_resolved_read
-
-                # The wire guard may run after a later read, closure or Boot has retired this protection.
-                def require_fresh_target() -> None:
-                    guard()
-                    fresh.physical.require_fresh(j.identity, 5)
-                    if (
-                        fresh_sequence != c.native.last_resolved_read
-                        or not fresh.physical.transaction_open
-                        or fresh.physical.native_transaction_id != local
-                        or j.active() != local
-                        or not c.native.commissioned_binding_matches(fresh)
-                    ):
-                        raise RecoveryRequiredError("expired Start Stop awaits the current active session")
-
-                c.commands.decide(require_fresh_target, priority=CommandPriority.RESTRICT)
-                return StopProof(require_fresh_target)
-
-            if g.controls.stop_work_needed(closing, station_flowing=station_flowing):
-                await g.controls.stop(expected_local=closing, guard=guard, prove_stop=prove_stop)
+            await g.controls.decisions.stop_expired_start(
+                self,
+                ExpiredStartStop(
+                    closing, expected, state.get("id"), state.get("tag_digest"), connection, native, sequence
+                ),
+                read_session,
+            )
         except (
             DeniedError,
             SecurityError,
@@ -1051,40 +694,9 @@ class ManagedCharging:
             lease.deadline = min(lease.hard_deadline, flow.deadline + (15 if lease.source == "cloud" else 0))
             self.changed.set()
 
-    # A failed normal Start can reclaim only zero from its own unchanged ticket beneath the original owner Pause.
+    # Consult the same owner before reclaiming zero from this failed Start.
     def failed_start_zero_needed(self, lease: ChargeLease, reason: str, failure: dict[str, Any] | None) -> bool:
-        c, j, g = self.controller, self.journal, self.controller.session.gateway
-        intent, state, receipt, control = (
-            c.requests.intent(),
-            self.state(),
-            local_start_receipt(j),
-            j.get("control", {}),
-        )
-        return bool(
-            self.lease is lease
-            and lease.normal
-            and reason == "start_not_confirmed"
-            and failure is not None
-            and failure.get("id") == lease.identifier
-            and failure.get("effects_started") is True
-            and lease.mode == intent.mode == "paused"
-            and lease.revision == intent.revision
-            and lease.start_scope is not None
-            and control_scope_matches(g, (lease.start_scope, lease.control_revision))
-            and state.get("id") == lease.identifier
-            and state.get("source") == "local"
-            and state.get("start_attempted") is True
-            and receipt.get("request_id") == lease.identifier
-            and receipt.get("digest") == state.get("tag_digest")
-            and receipt.get("stage") in ("issued", "accepted")
-            and receipt.get("ticket")
-            and control.get("ticket") == receipt["ticket"]
-            and control.get("owner") in ("local", "shared")
-            and control.get("inhibit") is False
-            and j.phase.read().active
-            and not j.fault.latched()
-            and not c.stopping
-        )
+        return self.controller.session.gateway.controls.decisions.failed_start_zero_needed(self, lease, reason, failure)
 
     # An internal timed-test Pause can hold zero without stopping a different charging session.
     def timed_pause_leaves_session(self, local: int | None) -> bool:
@@ -1107,33 +719,6 @@ class ManagedCharging:
     def recovery_zero_only(self) -> bool:
         return self.scoped_normal_stop() or self.timed_pause_leaves_session(self.journal.active())
 
-    # An independently identified daily remains with the app when an unrelated test expires.
-    def retire_test_beside_daily(self, lease: ChargeLease, state: dict[str, Any], target: int | None) -> bool:
-        c, j = self.controller, self.journal
-        active, current = j.active(), self.source
-        if (
-            lease.normal
-            or active is None
-            or active == target
-            or current is None
-            or c.requests.intent() != ControlIntent("app", lease.revision)
-            or j.get("control", {}).get("start_pending")
-            or j.get("vendor_start_grant")
-        ):
-            return False
-        native, boot, revision = current
-        g = c.session.gateway
-        if (
-            (boot, revision) != (g.boot_observation, g.controls._revision)
-            or not 0 <= time.time() - native.physical.observed_at <= 15
-            or (c.ordinary.source(native) or {}).get("kind") != "daily"
-        ):
-            return False
-        j.starts.retire_independent_test(lease, state)
-        j.starts.set_lease(None)
-        self.changed.set()
-        return True
-
     # Record the protective Pause independently of any subsequent timed-test result.
     def _claim_test_pause(self, intent: ControlIntent, identifier: str) -> None:
         write_intent(self.journal, intent, "paused")
@@ -1149,7 +734,7 @@ class ManagedCharging:
         if c.stopping:
             return
         target = None if lease.normal else j.starts.timed_stop_target(state)
-        if self.retire_test_beside_daily(lease, state, target):
+        if c.session.gateway.controls.decisions.schedule.retire_test_beside_daily(self, lease, state, target):
             return
         with j.atomic():
             intent = c.requests.intent()

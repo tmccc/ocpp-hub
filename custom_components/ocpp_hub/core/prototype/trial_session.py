@@ -11,15 +11,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..control import HUB_PROFILE_ID
 from .command_processor import CommandPriority
-from .connection_scope import control_scope_matches, current_control_scope
 from .gateway import Gateway
-from .local_control import StopProof, StopReplyUnconfirmedError, join_retirement, recover_unreported_local_start
+from .local_control import join_retirement, recover_unreported_local_start
 from .managed_current import managed_current_ceiling
-from .managed_faults import ManagedRefusal, latch_managed_fault
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, readiness_decision
 from .native_bounded_handover import NativeBoundedHandover
 from .native_faults import (
@@ -45,6 +43,14 @@ from .trial_evidence import NativeObserver
 from .trial_handover_evidence import HandoverEvidence, ObserveHandover
 from .trial_resources import Baseline, ResourceBook
 from .trial_transport import TrialTransport
+
+
+@dataclass(frozen=True)
+class ManagedRefusal:
+    """A proved introduction refusal retained until its diagnostic and restrictive latch commit together."""
+
+    classification: str
+    diagnostic: dict[str, Any]
 
 
 # State must be protected before SQLite creates any side files; preflight itself creates nothing.
@@ -351,7 +357,7 @@ class TrialSession:
             return
         self.gateway.controls.invalidate()
         try:
-            latch_managed_fault(self.gateway, refusal.classification, diagnostic=refusal.diagnostic)
+            self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=refusal.diagnostic)
         except sqlite3.Error as error:
             raise IntroductionDeferredError("strict introduction refusal awaits durable diagnostic") from error
         self._introduction_refusal = None
@@ -449,7 +455,7 @@ class TrialSession:
                     native = await self.native_bounded.read(selected_current=selected, closing_local=known_local)
             except _NativeMeasurementError as error:
                 refusal = self._measured_refusal(error, selected)
-                latch_managed_fault(self.gateway, refusal.classification, diagnostic=refusal.diagnostic)
+                self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=refusal.diagnostic)
             except MissingOriginalHistoryError as error:
                 if (
                     self.journal.get("managed_mode")
@@ -459,7 +465,7 @@ class TrialSession:
                 ):
                     refusal = self._native_refusal(error)
                     diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}
-                    latch_managed_fault(self.gateway, refusal.classification, diagnostic=diagnostic)
+                    self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=diagnostic)
                 raise
             else:
                 self.gateway.decide(lambda: self._accept_startup_observation(native), priority=CommandPriority.RESTRICT)
@@ -473,23 +479,9 @@ class TrialSession:
         await self.runtime.start()
         self.started = True
 
-    # Establish startup's actual session and resources before publishing the restricted introduction.
+    # Publish startup's checked session and restrictive hold through the shared owner.
     def _accept_startup_observation(self, native: HandoverEvidence) -> None:
-        if self.journal.get("trial_binding") is None:
-            self.native_bounded.require_known_session(native)
-        else:
-            self.native_bounded.require_recovery_session(native)
-        self.book.owned_present(native.physical)
-        self.journal.control.hold(self.journal.get("control", {}))
-        if self.journal.get("trial_binding") is None:
-            self.native_bounded.spec.require_admission(native, self.journal.identity)
-            if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
-                raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
-            self.journal.require_allocation()
-            self.journal.phase.activate()
-            self.journal.phase.begin_introduction()
-        else:
-            self.journal.phase.recover()
+        self.gateway.controls.decisions.recovery.accept_startup(self, native)
 
     # A small explicit operator interface keeps all controls inside the original gateway ownership rules.
     async def command(self, value: dict[str, Any]) -> dict[str, Any]:
@@ -566,11 +558,7 @@ class TrialSession:
         try:
             if self.started and self.journal.phase.read().supervised:
                 try:
-                    if self.gateway.charger.sender is None:
-                        control = self.journal.get("control", {})
-                        self.journal.control.hold(control)
-                        raise UnavailableError("charger disconnected before the final physical hold")
-                    local = self.journal.active()
+                    local = self.gateway.controls.decisions.shutdown_target()
                     try:
                         await self._request_shutdown_stop(attempt, local)
                     finally:
@@ -607,92 +595,13 @@ class TrialSession:
                 self.journal.close()
                 self.closed = True
 
-    # Give final shutdown its own restrictive turn while the charger receiver is still open.
+    # Route final Stop through the owner while the charger receiver can still report closure.
     async def _request_shutdown_stop(self, attempt: str, local: int | None) -> None:
-        g, j, native = self.gateway, self.journal, self.native_bounded
-        if not j.get("managed_mode"):
-            await g.stop()
+        gateway = self.gateway
+        if not self.journal.get("managed_mode"):
+            await gateway.stop()
             return
-        connection = current_control_scope(g)
-
-        # A shutdown never borrows another owner's Stop claim, including on the same socket.
-        def bind(ticket: str) -> None:
-            j.outcomes.claim_shutdown_stop(attempt, local, ticket, connection[0].boot if connection else None)
-
-        # Give the zero write its own authority. A Stop must still belong to the original live Boot.
-        async def prove(local: int, ceiling_failed: bool, awaiting_report: bool) -> StopProof:
-            # Bind shutdown Stop to the commissioned Boot and the same active transaction.
-            def require_scope() -> None:
-                if (
-                    not control_scope_matches(g, connection)
-                    or j.active() != local
-                    or fingerprint(j.get("boot")) != native.spec.boot_digest
-                ):
-                    raise RecoveryRequiredError("shutdown Stop lost its original connection or transaction")
-
-            require_scope()
-            if not ceiling_failed and not awaiting_report:
-                return StopProof(require_scope)
-
-            # A saved Stop can cover a current zero, once fresh native evidence has checked for resumed draw.
-            try:
-                async with asyncio.timeout(5):
-                    sample = await native.read(closing_local=local, stop_only=True)
-            except _NativeMeasurementError as error:
-                if error.authority != native.authority() or error.sequence != native.last_resolved_read:
-                    raise
-                sample = error.native
-                require_allowed(readiness_decision(sample, False, native.allow_unplugged, local))
-            except (
-                NativeTransportUnavailableError,
-                NativeReadinessError,
-                StaleEvidenceError,
-                UnavailableError,
-                TimeoutError,
-            ):
-                if not ceiling_failed:
-                    return StopProof(require_scope)
-                raise
-            sequence = native.last_resolved_read
-
-            # Use the same changing draw evidence as normal Pause and reconnect, even at final dispatch.
-            def station_flowing() -> bool:
-                return native.still_drawing(sample, sequence) and native.commissioned_binding_matches(sample)
-
-            if not ceiling_failed and not station_flowing():
-                return StopProof(require_scope)
-            native.require_known_session(sample)
-
-            # Recheck the independent session proof before sending Stop without a confirmed zero.
-            def guard() -> None:
-                require_scope()
-                sample.physical.require_fresh(j.identity, 5)
-                if (
-                    not sample.physical.transaction_open
-                    or sample.physical.history is None
-                    or native.last_resolved_read != sequence
-                    or not native.commissioned_binding_matches(sample)
-                ):
-                    raise RecoveryRequiredError("shutdown Stop awaits current proof of the known transaction")
-
-            return StopProof(guard if ceiling_failed else require_scope, station_flowing)
-
-        try:
-            await g.controls.stop(
-                expected_local=local,
-                prove_stop=prove,
-                on_claim=bind,
-                owner=("shutdown", attempt, local, connection),
-                priority=CommandPriority.SHUTDOWN,
-            )
-        except StopReplyUnconfirmedError:
-            # Closure and an owned physical zero can still be confirmed by the independent final checks.
-            pass
-        except RecoveryRequiredError:
-            # The final send check can retire this Stop after the charger's exact closure commits.
-            session = j.outcomes.session(local)
-            if session is None or not session.closed:
-                raise
+        await gateway.controls.decisions.stop_for_shutdown(gateway, self.native_bounded, attempt, local)
 
     # Keep the receiver alive to journal the real Stop, even if confirming zero failed.
     async def _wait_for_shutdown_closure(self, attempt: str, stopping_local: int | None) -> None:
@@ -704,39 +613,20 @@ class TrialSession:
             finally:
                 await self._wait_for_shutdown_reports(late, accept_late_start=False)
 
-    # The final result records independent closure, never a guessed acknowledgement of the Stop RPC.
-    def _record_shutdown_outcome(self, attempt: str, state: str) -> None:
-        # Publish the disposition with the exact lifecycle and the current shutdown attempt still in view.
-        def record() -> None:
-            j = self.journal
-            current = j.get("trial_shutdown_attempt", {})
-            if state == "verified" and (
-                not j.outcomes.stop_report_closed(current.get("local") if current.get("id") == attempt else None)
-                or j.control.read().values.get("start_pending")
-                or self.gateway.authorisation.pending()
-            ):
-                raise RecoveryRequiredError("shutdown still awaits an exact lifecycle report")
-            with j.atomic():
-                j.outcomes.record_shutdown_stop(attempt, state)
-                if state == "verified":
-                    j.db.execute("DELETE FROM meta WHERE key='trial_shutdown_uncertain'")
-                else:
-                    j.put("trial_shutdown_uncertain", True)
-
-        self.gateway.decide(record, priority=CommandPriority.SHUTDOWN)
+    # Publish the owner's final decision while the journal is still open.
+    def _record_shutdown_outcome(self, attempt: str, state: Literal["verified", "uncertain"]) -> None:
+        self.gateway.controls.decisions.record_shutdown_outcome(self.gateway, attempt, state)
 
     # Wait for closure and verified zero, or return a late Start so shutdown can Stop it explicitly.
     async def _wait_for_shutdown_reports(self, stopping_local: int | None, *, accept_late_start: bool) -> int | None:
         async with asyncio.timeout(5):
             while True:
-                local = self.journal.active()
-                if accept_late_start and local is not None and local != stopping_local:
-                    return local
-                if (
-                    self.journal.outcomes.stop_report_closed(stopping_local)
-                    and not self.journal.get("control", {}).get("start_pending")
-                    and not self.gateway.authorisation.pending()
-                ):
+                late, settled = self.gateway.controls.decisions.shutdown_report_progress(
+                    self.gateway, stopping_local, accept_late_start=accept_late_start
+                )
+                if late is not None:
+                    return late
+                if settled:
                     break
                 await asyncio.sleep(0.05)
             if self.journal.get("managed_mode"):
@@ -757,9 +647,5 @@ class TrialSession:
             ):
                 await asyncio.sleep(0.05)
                 continue
-            reason = self.gateway.decide(
-                lambda: self.native_bounded.stop_zero_refusal(native, local=local), priority=CommandPriority.SHUTDOWN
-            )
-            if reason is not None:
-                raise RecoveryRequiredError("shutdown awaits the independently verified station zero")
+            self.gateway.controls.decisions.require_shutdown_zero(self.native_bounded, native, local)
             return
