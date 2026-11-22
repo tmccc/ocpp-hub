@@ -1108,7 +1108,7 @@ class ManagedController:
         except UnavailableError, TimeoutError:
             return PollStatus("stopping" if self.stopping else "degraded", "native_observation_unavailable")
         except ControlSupersededError, RecoveryRequiredError:
-            return PollStatus("reconciling")
+            return PollStatus("stopping" if self.stopping else "reconciling")
         except StationCeilingLostError:
             await stop_for_missing_station(self)
             return PollStatus("attention", j.fault.classification() if j.fault.latched() else STATION_CEILING_LOST)

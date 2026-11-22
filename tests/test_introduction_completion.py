@@ -138,7 +138,7 @@ async def test_new_pause_repairs_superseded_late_introduction_zero(
                 await until(lambda: probe.done() and not c.native.introduction_pending)
                 assert not c.native.introduction_pending and c.native.audited_epoch == epoch
                 assert c.native.introduced_epoch != epoch
-                assert s.runtime.status.charger_fault.classification == "DeniedError"
+                assert s.runtime.status.charger_fault.classification == "ControlSupersededError"
                 await close_session(rig, s, charger, local)
                 status = await healthy(c)
                 assert status["local_hold_verified"] and c.requests.receipt(pause)["state"] == "completed"
