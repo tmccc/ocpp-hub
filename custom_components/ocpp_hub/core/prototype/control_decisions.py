@@ -39,7 +39,6 @@ from .managed_records import CurrentFailure
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .managed_settlement import (
     charge_test_candidate,
-    claim_internal_pause,
     complete_record,
     current_candidate,
     internal_pause_matches,
@@ -769,7 +768,7 @@ class ControlDecisions:
             with j.atomic():
                 if outcome is CurrentFailure.HOLD_IDLE:
                     write_intent(j, intent, "paused")
-                    claim_internal_pause(c, "current", identifier)
+                    self._claim_internal_pause(c, "current", identifier)
                 control = j.get("control", {})
                 if control.get("inhibit") is True and j.current_change.read().identifier == identifier:
                     j.control.project(control, resume_limit=previous)
@@ -866,7 +865,7 @@ class ControlDecisions:
                 return
             with self.journal.atomic():
                 write_intent(self.journal, intent, "paused")
-                claim_internal_pause(controller, "current", change["id"])
+                self._claim_internal_pause(controller, "current", change["id"])
                 control = self.journal.get("control")
                 self.journal.control.project(control, resume_limit=previous)
                 self.journal.current_change.replace({**change, "state": outcome})
@@ -971,7 +970,7 @@ class ControlDecisions:
             # Preserve the existing fail-closed policy when replacement confirms there was no overlapping session.
             with j.atomic():
                 write_intent(j, expected, "paused")
-                claim_internal_pause(c, "current", change["id"])
+                self._claim_internal_pause(c, "current", change["id"])
                 j.control.project(j.get("control"), resume_limit=change["previous_a"])
                 j.current_change.replace({**current.value, "state": "interrupted"})
             return False, None
@@ -1442,10 +1441,54 @@ class ControlDecisions:
             and self.journal.starts.timed_stop_target(test) != local
         )
 
+    # Record an internal restrictive winner in the same transaction as its intent and control claim.
+    def _claim_internal_pause(self, c: ManagedController, source: str, identifier: str) -> None:
+        g, j = c.session.gateway, c.session.journal
+        _, ticket = g.controls._claim(True, stopping=True)
+        j.put(
+            "managed_internal_pause",
+            {
+                "ticket": ticket,
+                "revision": c.requests.intent().revision,
+                "source": source,
+                "id": identifier,
+                "epoch": g._charger_epoch,
+                "boot": g.boot_observation,
+            },
+        )
+
+    # Restore an interrupted Start's exact receipt and the restrictive claim in its original transaction.
+    def restore_charging_request(self, charging: ManagedCharging) -> None:
+        controller = charging.controller
+        saved = charging.state()
+        if saved.get("state") in ACTIVE:
+            with self.journal.atomic():
+                ownership = controller.requests.pause_ownership()
+                intent = ownership.intent
+                receipt = self.journal.starts.receipt()
+                refused = (
+                    receipt.get("request_id") == saved["id"]
+                    and receipt.get("stage") == "rejected"
+                    and receipt.get("local") is None
+                )
+                preserve = (
+                    saved.get("kind") == "normal"
+                    and intent.mode == "app"
+                    and self.journal.get("control", {}).get("start_pending") is True
+                    and receipt.get("local") is None
+                    and receipt.get("stage") in ("issued", "accepted")
+                )
+                if not ownership.supersedes(saved.get("revision")):
+                    if not preserve:
+                        write_intent(self.journal, intent, "paused", coalesce=refused)
+                    self._claim_internal_pause(controller, "test", saved["id"])
+                self.journal.starts.interrupted(saved, preserve)
+        self.journal.starts.retire_refused()
+
     # Record the protective Pause independently of any subsequent timed-test result.
     def _claim_test_pause(self, c: ManagedController, intent: ControlIntent, identifier: str) -> None:
         write_intent(self.journal, intent, "paused")
-        claim_internal_pause(c, "test", identifier)
+        self._claim_internal_pause(c, "test", identifier)
         c.requests.charge_stopped()
 
     # Retire only the timed test's target, or the matching normal Start's own pending evidence.

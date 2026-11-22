@@ -79,7 +79,6 @@ class ManagedController:
         self.strict_failure_seen = False
         self.history_omission_only = True
         self.native_unavailable = 0
-        self.stopping = False
         expected = managed_service_mode(self.native.spec)
         saved = session.journal.get("managed_mode")
         if saved is not None and saved != expected:

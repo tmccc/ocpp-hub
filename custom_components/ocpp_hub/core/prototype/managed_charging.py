@@ -11,10 +11,9 @@ from typing import TYPE_CHECKING, Any
 
 from .command_processor import CommandPriority
 from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope
-from .control_decisions import ACTIVE, ExpiredStartStop
+from .control_decisions import ExpiredStartStop
 from .local_control import local_start_receipt
-from .managed_intent import write_intent
-from .managed_settlement import claim_internal_pause, current_candidate
+from .managed_settlement import current_candidate
 from .managed_sources import confirmed_vendor_start, known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
@@ -81,30 +80,7 @@ class ManagedCharging:
         self.timer: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
         self.source: tuple[HandoverEvidence, str | None, int] | None = None
-        saved = self.state()
-        if saved.get("state") in ACTIVE:
-            with self.journal.atomic():
-                ownership = controller.requests.pause_ownership()
-                intent = ownership.intent
-                receipt = self.journal.starts.receipt()
-                refused = (
-                    receipt.get("request_id") == saved["id"]
-                    and receipt.get("stage") == "rejected"
-                    and receipt.get("local") is None
-                )
-                preserve = (
-                    saved.get("kind") == "normal"
-                    and intent.mode == "app"
-                    and self.journal.get("control", {}).get("start_pending") is True
-                    and receipt.get("local") is None
-                    and receipt.get("stage") in ("issued", "accepted")
-                )
-                if not ownership.supersedes(saved.get("revision")):
-                    if not preserve:
-                        write_intent(self.journal, intent, "paused", coalesce=refused)
-                    claim_internal_pause(controller, "test", saved["id"])
-                self.journal.starts.interrupted(saved, preserve)
-        self.journal.starts.retire_refused()
+        controller.session.gateway.controls.decisions.restore_charging_request(self)
         controller.native.observation_listener = partial(
             controller.session.gateway.controls.decisions.schedule.record_start_source, self
         )
@@ -695,10 +671,6 @@ class ManagedCharging:
                 raise RecoveryRequiredError("verified test flow awaits receipt publication") from error
             lease.deadline = min(lease.hard_deadline, flow.deadline + (15 if lease.source == "cloud" else 0))
             self.changed.set()
-
-    # Consult the same owner before reclaiming zero from this failed Start.
-    def failed_start_zero_needed(self, lease: ChargeLease, reason: str, failure: dict[str, Any] | None) -> bool:
-        return self.controller.session.gateway.controls.decisions.failed_start_zero_needed(self, lease, reason, failure)
 
     # Let the owner check whether this timed Pause may Stop the current session.
     def timed_pause_leaves_session(self, local: int | None) -> bool:

@@ -62,23 +62,6 @@ def require_settled_debt(c: ManagedController) -> None:
         raise RecoveryRequiredError("terminal settlement awaits actual Start and lifecycle reconciliation")
 
 
-# Record an internal restrictive winner in the same transaction as its intent and control claim.
-def claim_internal_pause(c: ManagedController, source: str, identifier: str) -> None:
-    g, j = c.session.gateway, c.session.journal
-    _, ticket = g.controls._claim(True, stopping=True)
-    j.put(
-        "managed_internal_pause",
-        {
-            "ticket": ticket,
-            "revision": c.requests.intent().revision,
-            "source": source,
-            "id": identifier,
-            "epoch": g._charger_epoch,
-            "boot": g.boot_observation,
-        },
-    )
-
-
 # This restrictive claim can settle on the same connection after fresh zero proof of the current commissioned Boot.
 def internal_pause_matches(c: ManagedController) -> bool:
     g, j = c.session.gateway, c.session.journal
