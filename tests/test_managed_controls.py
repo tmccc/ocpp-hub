@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 from ocpp_hub_core.prototype.trial_evidence import profile_projection
 
 from tests.charge_rig import owner_rig
-from tests.current_rig import adjustable
+from tests.current_rig import adjustable, commissioned
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.tls_support import tls as tls
 
@@ -91,6 +92,56 @@ async def test_pause_revokes_pending_positive_profile(tmp_path, tls, unused_tcp_
             resume.set()
             if returning is not None:
                 await asyncio.gather(returning, return_exceptions=True)
+
+
+# Intent: Start and Return recheck zero and the owned station profile at their actual positive send.
+# Why: a newer independent native reading can revoke the preflight before the charger receives that write.
+@pytest.mark.parametrize("command", ["start", "app_control"], ids=["start", "return"])
+@pytest.mark.parametrize("drift", ["output", "profile"])
+async def test_positive_send_checks_fresh_zero_and_station(tmp_path, tls, unused_tcp_port, monkeypatch, command, drift):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        controller, bench = b.controller, b.rig.bench
+        controller.command(identifier(), "pause", controller.requests.intent().revision)
+        assert (await healthy(controller))["local_hold_verified"]
+        peer = b.session.gateway.charger
+        validate = peer.validate_send
+        assert validate is not None
+        attempts = []
+        actual_native = b.rig.peer.native
+
+        # Change only the independent native sample seen in the real final validation call.
+        async def changed_at_send(action, payload):
+            if action != "SetChargingProfile" or profile_projection(payload)["limit"] == 0:
+                return await validate(action, payload)
+            attempts.append(action)
+            profile = bench.firmware.profiles[HUB_PROFILE_ID]
+
+            # A plugged, closed session can still report an unexpected connector limit.
+            def unexpected_output(key):
+                value = actual_native(key)
+                if key == "CONNECTOR":
+                    value[0]["outLimit"] = 160
+                return value
+
+            with monkeypatch.context() as patch:
+                if drift == "output":
+                    patch.setattr(b.rig.peer, "native", unexpected_output)
+                else:
+                    patch.setitem(profile, "stackLevel", profile["stackLevel"] + 1)
+                return await validate(action, payload)
+
+        monkeypatch.setattr(peer, "validate_send", changed_at_send)
+        request, revision = identifier(), controller.requests.intent().revision
+        mark = len(bench.received_limits)
+        assert controller.command(request, command, revision)["state"] == "accepted"
+        async with asyncio.timeout(5):
+            if command == "app_control":
+                await controller.return_requested(request, revision)
+            else:
+                await controller.charging.settle()
+        assert attempts == ["SetChargingProfile"]
+        assert all(limit == 0 for limit in bench.received_limits[mark:])
+        assert controller.requests.intent().mode == "paused" and not starts(b.rig)
 
 
 # Intent: deliberate Stop becomes a healthy actual0 hold, with explicit return6 and no Start or history change.

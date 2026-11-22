@@ -27,6 +27,7 @@ from .native_faults import (
     MEASURED_FAULT,
     STATION_CEILING_LOST,
     MeasuredOutputLimitError,
+    NativeContentError,
     _NativeMeasurementError,
     diagnostic_type,
 )
@@ -393,18 +394,26 @@ class TrialSession:
         if self.book.station_ceiling_lost():
             # The listener can receive actual Boot and Stop evidence without recreating the missing profile.
             return ManagedRefusal(STATION_CEILING_LOST, {"type": "StationCeilingLost", "at_epoch": time.time()})
-        station = j.db.execute(
+        receipt = j.db.execute(
             "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
         ).fetchone()
-        if (
-            station is None
-            or station["state"] != "confirmed"
-            or not any(
-                resource.identifier == HUB_PROFILE_ID and encoded(resource.canonical) == station["confirmed"]
-                for resource in present
-            )
-        ):
+        if receipt is None or receipt["state"] != "confirmed":
             raise error
+        station = next(
+            (
+                resource
+                for resource in present
+                if resource.identifier == HUB_PROFILE_ID and encoded(resource.canonical) == receipt["confirmed"]
+            ),
+            None,
+        )
+        if station is None:
+            raise error
+        try:
+            # Reconnect reserves zero before the charger has changed its previously confirmed profile.
+            native.require_selected_output(sample, retained_ceiling=min(selected, station.canonical["limit"]))
+        except NativeContentError as refusal:
+            return self._native_refusal(refusal)
         measured = error.measured.selected(selected) if managed_current_ceiling(j, spec) == 32 else error.measured
         failure = MeasuredOutputLimitError(sample, measured, spec.digest, selected)
         return ManagedRefusal(
@@ -672,6 +681,14 @@ class TrialSession:
         except StopReplyUnconfirmedError:
             # Closure and an owned physical zero can still be confirmed by the independent final checks.
             pass
+        except RecoveryRequiredError:
+            # The final send check can retire this Stop after the charger's exact closure commits.
+            if (
+                local is None
+                or j.db.execute("SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (local,)).fetchone()
+                is None
+            ):
+                raise
 
     # Keep the receiver alive to journal the real Stop, even if confirming zero failed.
     async def _wait_for_shutdown_closure(self, attempt: str, stopping_local: int | None) -> None:
@@ -712,7 +729,13 @@ class TrialSession:
         while True:
             try:
                 native = await self.native_bounded.read(closed=True, owned=True)
-            except NativeReadinessError, NativeTransportUnavailableError, StaleEvidenceError, _NativeMeasurementError:
+            except (
+                NativeReadinessError,
+                NativeTransportUnavailableError,
+                StaleEvidenceError,
+                UnavailableError,
+                _NativeMeasurementError,
+            ):
                 await asyncio.sleep(0.05)
                 continue
             self.native_bounded.require_known_session(native)

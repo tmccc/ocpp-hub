@@ -536,6 +536,48 @@ async def test_source_changes_before_positive_send(tmp_path, tls, unused_tcp_por
         await assert_daily_recovery(b, local, original, True)
 
 
+# Intent: continuing an independent daily session also requires a fresh zero immediately before positive dispatch.
+# Why: the current overlap's prior zero sample cannot authorize a release after the reported output changes.
+async def test_current_overlap_checks_fresh_zero_at_send(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        original = copy.deepcopy(b.device.plans[9])
+        async with interrupted_increase(b, True) as (_, release):
+            local = await b.start_plan(9)
+            await b.c.native.read()
+            release.set()
+        peer = b.session.gateway.charger
+        validate, native = peer.validate_send, b.rig.peer.native
+        attempts = []
+
+        # Report an unsupported release condition only in the newer read, without replacing proxy validation.
+        def positive_output(key):
+            value = native(key)
+            if key == "CONNECTOR":
+                value[0]["outLimit"] = 10
+            return value
+
+        # Change only the independent connector reading for the actual positive station command.
+        async def changed_at_send(action, payload):
+            if (
+                action != "SetChargingProfile"
+                or payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+            ):
+                return await validate(action, payload)
+            attempts.append(action)
+            with monkeypatch.context() as patch:
+                patch.setattr(b.rig.peer, "native", positive_output)
+                return await validate(action, payload)
+
+        mark = len(b.rig.bench.received_limits)
+        with monkeypatch.context() as patch:
+            patch.setattr(peer, "validate_send", changed_at_send)
+            await b.c.tick()
+        assert attempts == ["SetChargingProfile"] and b.device.effective_limit() == 0
+        assert all(limit == 0 for limit in b.rig.bench.received_limits[mark:])
+        assert b.session.journal.active() == local and not b.stops()
+        await assert_daily_recovery(b, local, original, True)
+
+
 # Intent: repeated unavailable native reads retain zero recovery instead of consuming permission or inventing Pause.
 # Why: loss of source evidence must remain recoverable once the same daily transaction is positively identified.
 async def test_native_outage_during_recovery(tmp_path, tls, unused_tcp_port, monkeypatch):

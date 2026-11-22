@@ -6,7 +6,13 @@
 - Keep the receiver and its zero hold available while a restarted proxy waits for native closure after
   an exact saved Stop.
 - Stop an already accepted owner session that reports after the first session closes during shutdown.
-- Commit exact saved cloud Start and Stop acknowledgements while the cloud is offline.
+- Commit exact received cloud Start and Stop acknowledgements during a disconnect or incomplete cloud registration.
+- Verify shutdown when a real closure arrives before its pending Stop sends. Retry briefly unavailable final native
+  readings during ordinary recovery.
+- Recheck the exact session, native zero and held station profile just before a Start or Return sends positive current.
+- Keep a mixed output and meter refusal strict across proxy replacement and charger reconnection.
+- Require the legacy fault format for historical scheduled-attempt parser recovery, and bind rollback checks to
+  both runtime pin files.
 - Retain briefly unwritten transition reports and retry them in order, including at shutdown.
 - Check exact native configuration types during operation and close interactive commissioning on input EOF.
 - Require audited engine qualification on the standalone runtime pins. Restore the previous Home Assistant

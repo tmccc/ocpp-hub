@@ -78,8 +78,14 @@ been saved and while the charger still reports the same session at zero. They ex
 unplugged reports, replay the Stop and verify fresh closure before the positive ceiling returns.
 The [shutdown overlap test](../tests/test_managed_start_binding.py) closes a daily session and then closes
 the separate late report of an already accepted owner Start. Each Stop uses its own transaction.
-The [cloud storage tests](../tests/test_cloud_ack_storage.py) also take the cloud offline during replacement.
-The proxy commits the stored Start or Stop acknowledgement locally and retains any later undelivered report.
+The [shutdown checks](../tests/test_trial_session.py) also cover a real session closure before the pending Stop
+sends and a single unavailable native read during ordinary recovery. The
+[cloud storage tests](../tests/test_cloud_ack_storage.py) cover stored acknowledgements across replacement and
+acknowledgements received just before storage fails and the cloud disconnects. They verify local settlement after
+storage recovers, with the cloud still offline or waiting for registration. Later undelivered reports stay queued.
+The [positive send checks](../tests/test_managed_controls.py) vary the last native zero and station reading after
+valid Start and Return preflights. [Current recovery](../tests/test_managed_current_overlap.py) checks the same zero
+condition while an exact daily session is waiting to resume.
 
 The focused interaction checks run in the ordinary engine suite. The finite families below have their
 own per-case manifest and recovery evidence.

@@ -92,7 +92,10 @@ PREVIOUS = Build(
     "71141220fceddd3dc0349a84e430a65d56dc908e43fee2d20327b6ba93b42c7d",
     False,
 )
-REQUIREMENTS = "2773b4a9f9b16cfe90626e328db61ff281810c3f53d9a86f3178c0b54455586d"
+REQUIREMENTS = {
+    "requirements-offline.txt": "2773b4a9f9b16cfe90626e328db61ff281810c3f53d9a86f3178c0b54455586d",
+    "requirements-trial.txt": "a268619caa4ebd0df15d06d4c11d084c76fe6d9e4fd4cbbc563898def9350dbe",
+}
 REHEARSED_SCHEMA = "1b3d8757ddca8f860ff1d69e9d092839efcf948bda9a70524e04aa361bd9c8a4"
 MIGRATED_SCHEMA = "0b08c43048c89c897d8224d2335e43294652dd9ba58fd940030a61437c776f0d"
 
@@ -140,7 +143,7 @@ def require(condition: bool, reason: str) -> None:
         raise RollbackRefusedError(reason)
 
 
-# Bind the exact core and entry-point bytes using the same fingerprint as each build's reporting.
+# Bind the exact service source and both the installation and rehearsal runtime pins.
 def build_matches(root: Path, build: Build) -> bool:
     core = root / "custom_components/ocpp_hub/core"
     names = sorted(core.rglob("*.py"))
@@ -155,10 +158,13 @@ def build_matches(root: Path, build: Build) -> bool:
             if path.is_symlink() or not path.is_file():
                 return False
             digest.update(str(path.relative_to(root)).encode() + b"\0" + path.read_bytes() + b"\0")
-        pins = (root / "requirements-offline.txt").read_bytes()
+        for name, expected in REQUIREMENTS.items():
+            path = root / name
+            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                return False
     except OSError:
         return False
-    return digest.hexdigest() == build.digest and hashlib.sha256(pins).hexdigest() == REQUIREMENTS
+    return digest.hexdigest() == build.digest
 
 
 # Compare the complete schema, including triggers and index predicates, with the known predecessor's layout.

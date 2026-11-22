@@ -10,6 +10,7 @@ from ocpp_hub_core import commands
 from ocpp_hub_core.control import HUB_PROFILE_ID
 from ocpp_hub_core.prototype.gateway import decode
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_release_recovery import recoverable_fault
 from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.native_faults import MEASURED_FAULT, STATION_CEILING_LOST
 
@@ -468,6 +469,59 @@ async def test_excessive_composite_after_boot_holds_zero(tmp_path, tls, unused_t
         status = await c.tick()
         assert status["fault"] == "station_composite_current_exceeded"
         assert firmware.effective_limit() == 0 and b.session.journal.active() is None
+
+
+# Intent: startup and a new charger connection keep a mixed output/measurement refusal strict.
+# Why: the exact retained station profile is the relevant ceiling before reconnect zero is sent.
+@pytest.mark.parametrize("replacement", [False, True], ids=["new-connection", "replacement"])
+@pytest.mark.parametrize("excess_output", [False, True], ids=["measurement-only", "mixed"])
+async def test_restart_preserves_native_fault_classification(
+    tmp_path, tls, unused_tcp_port, monkeypatch, replacement, excess_output
+):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        rig = b.rig
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        assert (await healthy(b.controller))["station_ceiling_a"] == 6
+        actual = rig.peer.native
+
+        # Vary independent output and meter fields without changing the retained station profile or session.
+        def excess(key):
+            result = actual(key)
+            if key == "METER":
+                result[0]["meterData"].update(cur=[120, 0, 0], power=[2880, 0, 0, 2880])
+            if key == "CONNECTOR" and excess_output:
+                result[0]["outLimit"] = 160
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.peer, "native", excess)
+            if replacement:
+                await crash(b.session)
+                session = managed_session(rig)
+                await session.start()
+                controller = ManagedController(session)
+            else:
+                session, controller = b.session, b.controller
+                await b.charger.close()
+                await until(lambda: session.gateway.charger.sender is None)
+            async with rig.charger(session) as charger:
+                assert (await rig.bench.call(charger, "reconnect-with-native-excess", "BootNotification", BOOT))[0] == 3
+                journal = session.journal
+                await until(journal.fault.latched)
+                fault = journal.fault.read()
+                assert fault["classification"] == (
+                    "native_authority_or_preservation_failed" if excess_output else MEASURED_FAULT
+                )
+                if excess_output:
+                    assert not recoverable_fault(controller, fault)
+                assert journal.active() == local
+                patch.undo()
+                await controller.hold_fault()
+                assert rig.bench.firmware.effective_limit() == 0
+                stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+                assert (await rig.bench.call(charger, "reconnect-excess-stop", "StopTransaction", stop))[0] == 3
+                rig.peer.permission_enabled = False
+                rig.bench.cp, rig.bench.connection = "B", "Plug"
 
 
 # Intent: a real measured excess after Boot keeps the selected-current fault's existing recoverable classification.

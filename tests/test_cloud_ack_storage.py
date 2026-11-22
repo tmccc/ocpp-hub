@@ -147,6 +147,8 @@ class ReplyGate:
     async def send(self, raw):
         frame = decode(raw)
         action = self.actions.get(frame[1])
+        if frame[0] == 3 and action == "BootNotification" and self.bench.registration_pending:
+            raw = build_call_result(frame[1], frame[2] | {"status": "Pending", "interval": 30})
         if frame[0] == 3 and (info := self.bench.reply_authorization.get(action)) is not None:
             frame[2]["idTagInfo"] = info
             raw = build_call_result(frame[1], frame[2])
@@ -167,6 +169,7 @@ class StorageBench(StartReplyBench):
         super().__init__(*args, **kwargs)
         self.held_reply = None
         self.reply_authorization = {}
+        self.registration_pending = False
 
     # Run the independent backend through its actual reply gate.
     async def vendor(self, connection):
@@ -386,6 +389,14 @@ async def replace_and_recover(stack, b, fault, held, action, tmp_path, capsys, c
     return recovered
 
 
+# Use a real unserved local port for later attempts without replacing either transport's code.
+def unavailable_cloud(session, address):
+    transport = session.runtime.transport
+    url = urlsplit(transport.config.vendor_url)
+    endpoint = urlunsplit(url._replace(netloc=f"127.0.0.1:{address[1]}"))
+    transport.config = replace(transport.config, vendor_url=endpoint)
+
+
 # Intent: a genuine saved Start or Stop reply settles after replacement even while the cloud is unavailable.
 # Why: committing a stored reply is local work and reopening a cloud connection cannot make that reply more exact.
 @pytest.mark.parametrize("action", ["StartTransaction", "StopTransaction"])
@@ -404,10 +415,7 @@ async def test_replacement_settles_saved_cloud_ack_offline(tmp_path, tls, unused
         with socket.socket() as unavailable:
             unavailable.bind(("127.0.0.1", 0))
             session = mp.managed_session(b.rig)
-            transport = session.runtime.transport
-            url = urlsplit(transport.config.vendor_url)
-            endpoint = urlunsplit(url._replace(netloc=f"127.0.0.1:{unavailable.getsockname()[1]}"))
-            transport.config = replace(transport.config, vendor_url=endpoint)
+            unavailable_cloud(session, unavailable.getsockname())
             await session.start()
             controller = ManagedController(session)
             async with b.rig.charger(session) as charger:
@@ -429,6 +437,55 @@ async def test_replacement_settles_saved_cloud_ack_offline(tmp_path, tls, unused
                 else:
                     assert head is None and session.journal.active() is None
                 assert wire_count(b.rig, held.token) == 1
+
+
+# Intent: persist an exact positive reply already received when storage recovers after the cloud disconnects.
+# Why: keeping an accepted Start only in memory would turn it into operator recovery debt at process replacement.
+@pytest.mark.parametrize("action", ["StartTransaction", "StopTransaction"])
+@pytest.mark.parametrize("registration_pending", [False, True], ids=["offline", "registration-pending"])
+async def test_offline_ack_can_finish_after_reply_save_recovers(
+    tmp_path, tls, unused_tcp_port, monkeypatch, action, registration_pending
+):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 32, cli_route=True, bench_type=StorageBench
+    ) as b:
+        journal = b.session.journal
+        held, local = await enqueue(b, action, 0)
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_cloud_reply BEFORE INSERT ON delivery_replies "
+            "BEGIN SELECT RAISE(ABORT,'synthetic reply storage failure'); END"
+        )
+        held.release.set()
+        await until(lambda: b.session.runtime.status.delivery_blocked)
+        assert journal.outcomes.delivery_reply is not None
+        assert journal.outcomes.delivery_reply.answer == held.answer
+        assert_retained(journal, held, saved=False)
+
+        with socket.socket() as unavailable:
+            unavailable.bind(("127.0.0.1", 0))
+            b.rig.bench.registration_pending = registration_pending
+            if not registration_pending:
+                unavailable_cloud(b.session, unavailable.getsockname())
+            await b.rig.bench.cloud.close()
+            if registration_pending:
+                await until(lambda: b.session.gateway.vendor_registration == "Pending")
+                assert b.session.runtime.status.vendor_connected
+            else:
+                await until(lambda: not b.session.runtime.status.vendor_connected)
+            journal.db.execute("DROP TRIGGER refuse_cloud_reply")
+            await b.controller.tick()
+            assert wire_count(b.rig, held.token) == 1
+            assert journal.outcomes.delivery_reply is None
+            assert not b.session.runtime.status.delivery_blocked
+            await crash(b.session)
+            config = b.rig.prepared.config
+            with closing(Journal(config.journal, config.identity)) as reopened:
+                head = reopened.next_delivery()
+                if action == "StartTransaction":
+                    assert reopened.vendor_id(local) == held.answer[2]["transactionId"]
+                    assert head is not None and head.action == "StopTransaction" and head.state == "queued"
+                else:
+                    assert head is None and reopened.active() is None
 
 
 # Intent: two real storage faults per case recover authority, exact mapping and later outage protection.

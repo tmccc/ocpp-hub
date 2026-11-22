@@ -115,7 +115,8 @@ a copy. Gateway initialization also creates the table for saved authorization re
 
 The read-only rollback checker accepts only the build pairs and journal formats listed here. The installed
 `11b1515` build and its predecessor `f40f7ed` passed the separate installation-week rehearsal. The historical
-checker reports `build_pair_unrehearsed` for this pair.
+checker reports `build_pair_unrehearsed` for this pair. For supported pairs, it checks both the installation
+and rehearsal requirement files alongside the service source.
 
 The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and from `051500f`, `3fdace8` and
 `73b1856`, and `10597b0` on saved copies of the migrated journal. Each rehearsal used one advancing SQLite journal.
@@ -151,7 +152,8 @@ git archive 7a08f2ade3b9e597099aaece2aef2f8542852a41 | tar -x -C "$TMPDIR/previo
   --rollback-current="$TMPDIR/current" --rollback-previous="$TMPDIR/previous"
 ```
 
-The rehearsal uses the same simulated charger, vendor and journal across both releases. It verifies a genuine
+The first archived build creates the journal. The rehearsal uses the same simulated charger, vendor and journal
+across both releases. It verifies a genuine
 managed charge and its delivery, the original newer Pause after the switch, and two later charges after Return.
 Separate cases prove refusal before the previous process starts. The cross-build rehearsal takes explicit source
 snapshots alongside the usual release qualification.

@@ -47,6 +47,7 @@ class ReleaseAttempt:
     published: bool = False
     published_authority: AuthorityStamp | None = None
     request_id: str | None = None
+    continuing_local: int | None = None
     wires: OwnerWireScope | None = None
 
     # The positive reply belongs to the exact issued Set, even if rollback later sends a different Set to zero.

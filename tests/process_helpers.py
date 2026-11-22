@@ -43,7 +43,9 @@ class ServiceProcess:
         )
 
     # Start the real service from the selected build, optionally arming one observation before charger Boot.
-    async def start(self, *, arm: tuple[str, str] | None = None, source: Path | None = None):
+    async def start(
+        self, *, arm: tuple[str, str] | None = None, source: Path | None = None, commission_route: bool = False
+    ):
         self.generation += 1
         self.events = asyncio.Queue()
         log = (self.directory / f"process-{self.generation}.stderr.log").open("w")
@@ -74,6 +76,8 @@ class ServiceProcess:
                     break
                 except OSError:
                     await asyncio.sleep(0.05)
+        if commission_route:
+            self.rig.route_to_trial()
         if arm is not None:
             await self.arm(*arm)
         self.reader = asyncio.create_task(self.rig.bench.read_charger(self.socket))

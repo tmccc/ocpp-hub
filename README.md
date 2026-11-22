@@ -1033,8 +1033,8 @@ installation with the previously acknowledged archive-missing policy, the older 
 history fault. To reconcile that specific fault, stop the standalone service and run
 `tools/acknowledge_native_history.py reconcile-start-attempts` with its existing private configuration
 and native specification arguments. It checks the matching schedule attempt, native configuration, owned
-zero hold and settled journal, then records a paused intent. Verify Pause after restart before using Return
-to restore the previous app/schedule permission.
+zero hold, settled journal and legacy fault format, then records a paused intent. Verify Pause after restart
+before using Return to restore the previous app/schedule permission.
 
 The proxy supports the charger's original daily schedules and managed Start, Pause, Return and current
 selection. One-off temporary schedules have been retired. An unfinished old one-off record blocks startup

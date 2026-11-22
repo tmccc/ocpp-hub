@@ -18,10 +18,11 @@ import pytest
 from ocpp_hub_core.prototype.managed import ManagedController
 from ocpp_hub_core.prototype.managed_current import capability_value
 from ocpp_hub_core.prototype.managed_intent import ManagedRequests
+from ocpp_hub_core.prototype.native_faults import NativeContentError, diagnostic_type
 from ocpp_hub_core.prototype.native_history import audit_history, history_policy
 from ocpp_hub_core.prototype.native_history_recovery import acknowledge_history_policy
 from ocpp_hub_core.prototype.security import SecurityError
-from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError
+from ocpp_hub_core.prototype.store import Journal, RecoveryRequiredError, fingerprint
 from ocpp_hub_core.prototype.trial_resources import ResourceBook
 
 from tests.charge_rig import ChargeRig
@@ -743,6 +744,24 @@ async def test_recover_unassigned_start_to_verified_pause(
         with pytest.raises(RecoveryRequiredError):
             acknowledge_start_attempts(journal, fault.book, rig.spec, old_attempt)
         attempt["startTime"] += 60
+        original_native = rig.peer.native
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.peer, "native", lambda key: [] if key == "STATE" else original_native(key))
+            with pytest.raises(NativeContentError) as refusal:
+                await rig.prepared.observer.observe_handover()
+        modern_failure = {
+            "at_epoch": now,
+            "type": diagnostic_type(refusal.value),
+            "detail": str(refusal.value),
+        }
+        assert modern_failure == failure
+        journal.put("managed_native_failure", modern_failure)
+        journal.put("managed_control_fault", fault_record | {"native_failure_digest": fingerprint(modern_failure)})
+        before = database(journal)
+        with pytest.raises(RecoveryRequiredError):
+            acknowledge_start_attempts(journal, fault.book, rig.spec, native)
+        assert database(journal) == before
+        journal.put("managed_control_fault", fault_record)
         journal.db.execute(
             "CREATE TEMP TRIGGER reject_recovery BEFORE INSERT ON meta WHEN NEW.key='native_start_attempt_recovery' "
             "BEGIN SELECT RAISE(ABORT,'failed receipt write'); END"

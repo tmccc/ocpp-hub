@@ -166,9 +166,12 @@ def record_history_policy(
 
 # Identify the particular native refusal whose own latch the offline tool is allowed to retire.
 def matches_history_fault(fault: dict[str, Any], failure: dict[str, Any], detail: str) -> bool:
-    if detail == ORIGINAL_HISTORY_REFUSAL and "native_failure_digest" in fault:
-        # In the current format the final diagnostic text can also occur after a different strict refusal.
-        if failure.get("source") not in (ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION):
+    if "native_failure_digest" in fault:
+        # The scheduled-attempt parser repair applies only to legacy faults. Require exact source for current faults.
+        if detail != ORIGINAL_HISTORY_REFUSAL or failure.get("source") not in (
+            ORIGINAL_HISTORY_OMISSION,
+            STARTUP_HISTORY_OMISSION,
+        ):
             return False
         if fault["native_failure_digest"] != fingerprint(failure):
             return False

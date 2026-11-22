@@ -417,11 +417,12 @@ class NativeBoundedHandover:
         return measured
 
     # The independent connector limit must agree after the station profile's presence has been verified.
-    def require_selected_output(self, native: HandoverEvidence) -> None:
+    def require_selected_output(self, native: HandoverEvidence, *, retained_ceiling: float | None = None) -> None:
         gateway = self.gateway
+        ceiling = gateway.controls.desired() if retained_ceiling is None else retained_ceiling
         if (
             native.physical.transaction_open
-            and native.output_limit_a > gateway.controls.desired()
+            and native.output_limit_a > ceiling
             and gateway.journal.current_change.read().settled_or_missing
         ):
             self.last_verified_at = 0
@@ -999,6 +1000,19 @@ class NativeBoundedHandover:
             raise DeniedError("the managed station ceiling is missing from the fresh native inventory")
         if action == "RemoteStartTransaction" and self.gateway.journal.get("managed_mode"):
             self.book.require_confirmed_station(native.physical.resources, self.gateway.controls.desired())
+        if action == "SetChargingProfile" and profile_projection(payload)["id"] == HUB_PROFILE_ID:
+            journal = self.gateway.journal
+            release = self.gateway.controls.release_attempt
+            start = local_start_receipt(journal)
+            preparing_start = (
+                journal.get("managed_mode")
+                and start.get("stage") == "prepared"
+                and start.get("ticket") == journal.control.read().values.get("ticket")
+            )
+            if release is not None or preparing_start:
+                decision = self._confirm_send_zero(native, release.continuing_local if release is not None else None)
+                if isinstance(decision, Pending):
+                    return decision
         self.require_selected(native)
         self.require_selected_output(native)
         change = self.gateway.journal.current_change.read().value
@@ -1036,6 +1050,24 @@ class NativeBoundedHandover:
             ):
                 raise RecoveryRequiredError("native bounded positive controls remain frozen")
         return None
+
+    # Confirm the same held session and station zero on the observation used for this positive send.
+    def _confirm_send_zero(self, native: HandoverEvidence, continuing_local: int | None) -> GateDecision:
+        physical = native.physical
+        if (
+            self.gateway.journal.active() != continuing_local
+            or physical.native_transaction_id != continuing_local
+            or physical.transaction_open != (continuing_local is not None)
+        ):
+            return Pending(Prerequisite.LIFECYCLE, "the held session changed before the positive write")
+        decision = readiness_decision(native, continuing_local is None, self.allow_unplugged)
+        if isinstance(decision, Pending):
+            return decision
+        if native.output_limit_a != 0 or any(value != 0 for value in native.currents_a + native.powers_w):
+            return Pending(Prerequisite.ZERO_PROOF, "the positive write awaits actual zero output")
+        self.book.owned_present(physical, record_unchanged=False)
+        self.book.require_confirmed_station(physical.resources, 0)
+        return ALLOW
 
     # During cleanup, wait only for the two independent reports of the session this cleanup started with.
     def _cleanup_closure_pending(self, native: HandoverEvidence, closing_local: int | None) -> bool:

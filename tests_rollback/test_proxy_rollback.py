@@ -3,21 +3,43 @@
 import asyncio
 import copy
 import json
+import shutil
 import sqlite3
 import uuid
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from types import SimpleNamespace
 
-from tests.managed_rig import starts
+import pytest
+from ocpp_hub_core.prototype.trial_session import save_private
+
+from tests.connected_rig import strategy_file
+from tests.managed_rig import managed_bench, starts
 from tests.model_tls_support import model_tls as model_tls
 from tests.model_tls_support import tls_for_case
 from tests.native_peer_failures import InterruptedNativePeer
-from tests.process_helpers import process_rig
+from tests.process_helpers import ServiceProcess
 from tests.prototype_rig import START
 from tests.recovery_barriers import require_zero_held
 from tests.runtime_rig import until
 from tools.check_proxy_rollback import check_rollback, main
+
+
+# Let the first rehearsed build create its journal while the parent owns only independent device peers.
+@asynccontextmanager
+async def rollback_rig(directory, tls, listener, management):
+    async with managed_bench(directory, tls, listener, native_peer=InterruptedNativePeer, cli_route=True) as rig:
+        config = directory / "trial.json"
+        value = json.loads(config.read_text())
+        value["local_tags"] = ["APP_OWNER", "NATIVE_TIMER"]
+        save_private(config, value)
+        strategy = strategy_file(rig, directory)
+        save_private(directory / "process-strategy.json", json.loads(strategy.read_text()))
+        child = ServiceProcess(rig, directory, management, "fast-poll")
+        try:
+            yield child
+        finally:
+            await child.close()
 
 
 # Intent: a refused rollback identifies each source only if its bytes match the rehearsed build.
@@ -31,6 +53,23 @@ def test_unrehearsed_build_reports_only_verified_commit(tmp_path, builds):
     wrong_current = check_rollback(config, previous, previous)
     assert wrong_current.reason == "build_pair_unrehearsed"
     assert wrong_current.current_commit is None and wrong_current.previous_commit is not None
+
+
+# Intent: a pinned rollback pair must match the service's actual installation requirements as well as its code.
+# Why: testing another WebSocket version gives no rollback evidence for a source tree with changed service pins.
+@pytest.mark.parametrize("side", ["current", "previous"])
+def test_rollback_rejects_changed_service_pin(tmp_path, builds, side):
+    current, previous = builds
+    changed = tmp_path / "changed"
+    shutil.copytree(current if side == "current" else previous, changed)
+    (changed / "requirements-trial.txt").write_text("websockets==16.0\n")
+    config = SimpleNamespace(journal=tmp_path / "unused.sqlite3")
+    result = check_rollback(
+        config, changed if side == "current" else current, changed if side == "previous" else previous
+    )
+    assert result.reason == "build_pair_unrehearsed"
+    assert (result.current_commit is None) == (side == "current")
+    assert (result.previous_commit is None) == (side == "previous")
 
 
 # Select only actual lifecycle commands from the simulated cloud's transcript.
@@ -92,22 +131,12 @@ async def completed_charge_and_pause(child):
 
 # Intent: a previous release resumes the exact newer Pause and uses history written by the newer release.
 # Why: restarting an older build on a copied pre-upgrade journal would conceal lost work and ownership.
-async def test_previous_build_keeps_advanced_journal(
-    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, builds, capsys
-):
+async def test_previous_build_keeps_advanced_journal(tmp_path, model_tls, unused_tcp_port_factory, builds, capsys):
     current, previous = builds
     port = unused_tcp_port_factory
-    async with process_rig(
-        tmp_path,
-        tls_for_case(tmp_path, model_tls),
-        port(),
-        port(),
-        monkeypatch,
-        native_peer=InterruptedNativePeer,
-        timing="fast-poll",
-    ) as child:
+    async with rollback_rig(tmp_path, tls_for_case(tmp_path, model_tls), port(), port()) as child:
         # Open the journal under the old build first so schema provenance also belongs to that release.
-        await child.start(source=previous)
+        await child.start(source=previous, commission_route=True)
         await child.status()
         original_journal = child.rig.prepared.config.journal.stat()
         await child.close()
@@ -185,15 +214,11 @@ async def test_previous_build_keeps_advanced_journal(
 
 # Intent: an actually sent Start whose reply stayed unknown prevents the older build from launching.
 # Why: a process exit and physical inactivity cannot settle the original command's possible outcome.
-async def test_unresolved_start_blocks_previous_build(
-    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, builds
-):
+async def test_unresolved_start_blocks_previous_build(tmp_path, model_tls, unused_tcp_port_factory, builds):
     current, previous = builds
     port = unused_tcp_port_factory
-    async with process_rig(
-        tmp_path, tls_for_case(tmp_path, model_tls), port(), port(), monkeypatch, timing="fast-poll"
-    ) as child:
-        await child.start(source=current)
+    async with rollback_rig(tmp_path, tls_for_case(tmp_path, model_tls), port(), port()) as child:
+        await child.start(source=current, commission_route=True)
         status = await child.status()
         seen, release = asyncio.Event(), asyncio.Event()
         bench = child.rig.bench
@@ -225,15 +250,11 @@ async def test_unresolved_start_blocks_previous_build(
 
 # Intent: refuse an unknown schema or unsupported target before inspecting a stopped eligible journal.
 # Why: SQLite being readable and a target path existing are weaker conditions than rehearsed compatibility.
-async def test_unrehearsed_state_or_build_blocks_switch(
-    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, builds
-):
+async def test_unrehearsed_state_or_build_blocks_switch(tmp_path, model_tls, unused_tcp_port_factory, builds):
     current, previous = builds
     port = unused_tcp_port_factory
-    async with process_rig(
-        tmp_path, tls_for_case(tmp_path, model_tls), port(), port(), monkeypatch, timing="fast-poll"
-    ) as child:
-        await child.start(source=current)
+    async with rollback_rig(tmp_path, tls_for_case(tmp_path, model_tls), port(), port()) as child:
+        await child.start(source=current, commission_route=True)
         status = await child.status()
         paused = await child.request("pause", revision=status["control_revision"])
         assert paused["ok"]
@@ -249,16 +270,17 @@ async def test_unrehearsed_state_or_build_blocks_switch(
         assert child.generation == generation and child.durable() == snapshot
 
         with closing(sqlite3.connect(config.journal)) as db, db:
-            original = db.execute("SELECT value FROM meta WHERE key='managed_current_prepare_intent'").fetchone()[0]
-            preparing = {**json.loads(original), "stage": "native_write_intent"}
-            db.execute("UPDATE meta SET value=? WHERE key='managed_current_prepare_intent'", (json.dumps(preparing),))
+            db.execute(
+                "INSERT INTO meta VALUES ('managed_current_prepare_intent', ?)",
+                (json.dumps({"stage": "native_write_intent"}),),
+            )
         changed = child.durable()
         proof = await checked_switch(child, current, previous)
         assert not proof.allowed and proof.reason == "unresolved_current_preparation"
         assert child.generation == generation and child.durable() == changed
 
         with closing(sqlite3.connect(config.journal)) as db, db:
-            db.execute("UPDATE meta SET value=? WHERE key='managed_current_prepare_intent'", (original,))
+            db.execute("DELETE FROM meta WHERE key='managed_current_prepare_intent'")
             profile = db.execute("SELECT desired FROM trial_resources WHERE key='profile:7001'").fetchone()[0]
             nonzero = json.dumps({**json.loads(profile), "limit": 6})
             db.execute("UPDATE trial_resources SET desired=?,confirmed=? WHERE key='profile:7001'", (nonzero, nonzero))

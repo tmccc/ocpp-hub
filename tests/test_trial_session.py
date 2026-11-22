@@ -222,6 +222,42 @@ async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(
             assert saved["local"] == local and saved["state"] == "verified" and saved["boot"]
 
 
+# Intent: a genuinely closed session cancels its unsent shutdown Stop without losing the measured zero proof.
+# Why: a charger can finish on its own between station zero and final command dispatch.
+async def test_shutdown_verifies_closure_before_remote_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await healthy(b.controller)
+        peer = b.session.gateway.charger
+        validate = peer.validate_send
+        assert validate is not None
+        reached, resume = asyncio.Event(), asyncio.Event()
+
+        # Let the actual send validation finish, then wait while the independent receiver processes closure.
+        async def hold_stop(action, payload):
+            result = await validate(action, payload)
+            if action == "RemoteStopTransaction":
+                reached.set()
+                await resume.wait()
+            return result
+
+        monkeypatch.setattr(peer, "validate_send", hold_stop)
+        b.controller.request_stop()
+        shutdown = asyncio.create_task(b.session.close())
+        try:
+            await asyncio.wait_for(reached.wait(), 3)
+            assert b.session.gateway.controls.ready and b.session.gateway.controls.desired() == 0
+            stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+            assert (await b.rig.bench.call(b.charger, "closed-before-shutdown-stop", "StopTransaction", stop))[0] == 3
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        finally:
+            resume.set()
+            await shutdown
+        assert b.session.final_status["shutdown_attempt_uncertain"] is False
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in b.rig.bench.device_calls)
+
+
 # Intent: a saved Stop is not enough to verify a final hold while the actual native session still reports open.
 # Why: the two device reports can arrive in either order after a genuine charge.
 async def test_managed_shutdown_requires_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -414,11 +450,17 @@ async def test_different_commissioning_spec_does_not_recover_the_existing_journa
 
 # Intent: shutdown can verify a genuine closed zero after one unavailable native response.
 # Why: retrying the read inside the existing deadline can complete the result without another charger command.
-async def test_shutdown_retries_one_unavailable_native_confirmation(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("recovering", [False, True], ids=["normal", "ordinary-recovery"])
+async def test_shutdown_retries_one_unavailable_native_confirmation(
+    tmp_path, tls, unused_tcp_port, monkeypatch, recovering
+):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=NativeAuditPeer) as b:
         c, peer = b.controller, b.rig.peer
         assert (await healthy(c))["charging_session_open"] is False
         assert not b.session.journal.active()
+        if recovering:
+            await c.ordinary.hold("native_observation_unavailable")
+            assert c.ordinary.active() and b.rig.bench.firmware.effective_limit() == 0
         first = len(b.rig.bench.device_calls)
         peer.arm = "503"
         await b.session.close()
@@ -426,6 +468,10 @@ async def test_shutdown_retries_one_unavailable_native_confirmation(tmp_path, tl
         assert b.session.final_status["shutdown_attempt_uncertain"] is False
         assert b.rig.bench.firmware.effective_limit() == 0
         wire = b.rig.bench.device_calls[first:]
-        assert [frame[2] for frame in wire if frame[2] in ("SetChargingProfile", "RemoteStopTransaction")] == [
-            "SetChargingProfile"
-        ]
+        profile_writes = [frame for frame in wire if frame[2] == "SetChargingProfile"]
+        assert profile_writes or recovering
+        assert all(
+            frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+            for frame in profile_writes
+        )
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in wire)
