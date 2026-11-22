@@ -17,7 +17,7 @@ from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
-from .store import RecoveryRequiredError, fingerprint
+from .store import JournalStartBusy, RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
     from .managed import ManagedController
@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 
 STOP_SESSION = "stop_session"
 CONFIRMATION_SECONDS = 20
+CLOSED_REQUESTS = (
+    "action=? AND state IN ('accepted','running','uncertain') AND EXISTS ("
+    "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
+    "AND stop IS NOT NULL)"
+)
 
 
 @dataclass(frozen=True)
@@ -146,25 +151,31 @@ class ManagedSessionStop:
 
     # Retire the client wait without resending or erasing a Stop that might still take effect.
     def expire(self, *, replaced: bool = False) -> None:
-        db = self.controller.session.journal.db
-        db.execute(
-            "UPDATE managed_requests SET state='failed',result=json_set(result,'$.classification','stop_rejected') "
-            "WHERE action=? AND state IN ('running','uncertain') AND EXISTS ("
+        self._update_receipts(
+            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
+            (),
+            "action=? AND state IN ('running','uncertain') AND EXISTS ("
             "SELECT 1 FROM owner_command_wires WHERE request=managed_requests.id AND reply='Rejected')",
             (STOP_SESSION,),
         )
-        db.execute(
-            "UPDATE managed_requests SET state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
-            "THEN 'uncertain' ELSE 'failed' END, result=json_set(result,'$.classification',?) "
-            "WHERE action=? AND state IN ('accepted','running') "
-            "AND (? OR json_extract(result,'$.accepted_at')<=?)",
-            (
-                "process_replaced" if replaced else "stop_not_confirmed",
-                STOP_SESSION,
-                replaced,
-                time.time() - CONFIRMATION_SECONDS,
-            ),
+        self._update_receipts(
+            "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
+            "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
+            ("process_replaced" if replaced else "stop_not_confirmed",),
+            "action=? AND state IN ('accepted','running') AND (? OR json_extract(result,'$.accepted_at')<=?)",
+            (STOP_SESSION, replaced, time.time() - CONFIRMATION_SECONDS),
         )
+
+    # Only a real receipt transition needs a write lock. A busy begin can wait for the next poll.
+    def _update_receipts(self, assignments: str, values: tuple[Any, ...], where: str, binding: tuple[Any, ...]) -> None:
+        j = self.controller.session.journal
+        if j.db.execute(f"SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", binding).fetchone() is None:
+            return
+        try:
+            with j.atomic(retry_busy=True):
+                j.db.execute(f"UPDATE managed_requests SET {assignments} WHERE {where}", values + binding)
+        except JournalStartBusy:
+            return  # The existing receipt is still accurate because the write never began.
 
     # A fresh native observation and the genuine Stop report must agree before a receipt completes.
     def observed(self, native: HandoverEvidence) -> None:
@@ -178,11 +189,10 @@ class ManagedSessionStop:
             and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
         ):
             return
-        j.db.execute(
-            "UPDATE managed_requests SET state='completed',result=json_set(result,'$.session_stopped',json('true')) "
-            "WHERE action=? AND state IN ('accepted','running','uncertain') AND EXISTS ("
-            "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
-            "AND stop IS NOT NULL)",
+        self._update_receipts(
+            "state='completed',result=json_set(result,'$.session_stopped',json('true'))",
+            (),
+            CLOSED_REQUESTS,
             (STOP_SESSION,),
         )
 
@@ -192,9 +202,7 @@ class ManagedSessionStop:
         if (
             c.stopping
             or j.db.execute(
-                "SELECT 1 FROM managed_requests r JOIN transactions t "
-                "ON t.local=json_extract(r.result,'$._session_stop.local') "
-                "WHERE r.action=? AND r.state IN ('accepted','running','uncertain') AND t.stop IS NOT NULL LIMIT 1",
+                f"SELECT 1 FROM managed_requests WHERE {CLOSED_REQUESTS} LIMIT 1",
                 (STOP_SESSION,),
             ).fetchone()
             is None
