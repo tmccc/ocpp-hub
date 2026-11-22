@@ -29,8 +29,9 @@ python3.14 -m venv .venv
   --qualification-report /absolute/task/qualification.json
 ```
 
-`--quick` runs static checks only, including strict typing for the core and HA-free client API, compilation of both
-integrations, version/translation/YAML checks and `git diff --check`. The line limit is120 characters, including comments.
+`--quick` runs static checks only, including strict typing for the core and HA-free client API, compilation and
+translation checks for both integrations, version and YAML checks, and `git diff --check`.
+The line limit is120 characters, including comments.
 Full validation re-audits raw execution evidence against the current clean commit; it never treats a report's own
 success flag as proof or silently launches the combined suite in a single process. An explicit `--tests-only -k`
 selection is useful for development and is labelled targeted, with the remaining suites outside that result.

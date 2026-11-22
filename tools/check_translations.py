@@ -18,14 +18,15 @@ import re
 import sys
 from pathlib import Path
 
-COMPONENT = Path(__file__).resolve().parents[1] / "custom_components" / "ocpp_hub"
 
-
-# Return the translation files hassfest validates for this integration.
-# Strings.json and every language file follow the same schema.
-def translation_files(component: Path = COMPONENT) -> list[Path]:
-    files = [component / "strings.json", *sorted((component / "translations").glob("*.json"))]
-    return [path for path in files if path.exists()]
+# Return both integrations' source strings and language files, or those of the requested integration.
+def translation_files(component: Path | None = None) -> list[Path]:
+    root = Path(__file__).resolve().parents[1] / "custom_components"
+    components = (component,) if component is not None else (root / "ocpp_hub", root / "ics_proxy")
+    files = []
+    for directory in components:
+        files.extend([directory / "strings.json", *sorted((directory / "translations").glob("*.json"))])
+    return files
 
 
 # Validate the `issues` section of one parsed translation file.
@@ -68,11 +69,19 @@ def main() -> int:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
-            print(f"{path.name}: invalid JSON: {error}")
+            print(f"{path}: invalid JSON: {error}")
+            failed = True
+            continue
+        except OSError, UnicodeError:
+            print(f"{path}: could not read translation file")
+            failed = True
+            continue
+        if not isinstance(data, dict):
+            print(f"{path}: translation data must be an object")
             failed = True
             continue
         for problem in [*issue_problems(data), *html_problems(data)]:
-            print(f"{path.name}: {problem}")
+            print(f"{path}: {problem}")
             failed = True
     print("translations: FAILED" if failed else "translations: ok")
     return 1 if failed else 0

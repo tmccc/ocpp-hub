@@ -13,7 +13,7 @@ from .command_processor import CommandPriority
 from .composite import STATION_COMPOSITE_FAULT, ExcessiveCompositeError
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
-from .local_control import local_start_receipt
+from .local_control import ControlSupersededError, local_start_receipt
 from .managed_charging import ManagedCharging
 from .managed_current import (
     ManagedCurrentLimits,
@@ -1110,7 +1110,7 @@ class ManagedController:
             return PollStatus("degraded", "native_observation_unavailable")
         except UnavailableError, TimeoutError:
             return PollStatus("stopping" if self.stopping else "degraded", "native_observation_unavailable")
-        except RecoveryRequiredError:
+        except ControlSupersededError, RecoveryRequiredError:
             return PollStatus("reconciling")
         except StationCeilingLostError:
             await stop_for_missing_station(self)

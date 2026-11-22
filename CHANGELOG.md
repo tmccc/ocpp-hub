@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Treat a superseded ceiling check as pending control work and check the thin client's translations locally.
 - Retire both charger sockets when a failed replacement leaves the earlier connection unusable.
 - Keep the receiver and its zero hold available while a restarted proxy waits for native closure after
   an exact saved Stop.

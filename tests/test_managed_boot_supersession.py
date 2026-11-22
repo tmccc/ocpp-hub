@@ -443,6 +443,30 @@ async def test_failed_boot_during_introduction_waits_for_new_proof(tmp_path, tls
             assert g.controls.ready and not j.fault.latched()
 
 
+# Intent: a Pause that supersedes an in-flight ceiling check adds no native contradiction.
+# Why: a completed reply from the old operation says nothing about the new owner's charger authority.
+async def test_pause_during_retained_ceiling_check_is_not_a_native_fault(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
+        c, g = b.controller, b.session.gateway
+        await healthy(c)
+        send, held, entered = delay_reply(monkeypatch, b.rig, b.charger, "GetCompositeSchedule")
+        assert (await b.rig.bench.call(b.charger, "boot-before-pause", "BootNotification", BOOT))[0] == 3
+        await until(g.controls.ceiling_needs_recheck)
+        poll = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            pause = uuid.uuid4().hex
+            assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
+        finally:
+            if held:
+                await send(held[0])
+            status = await poll
+        assert status["state"] == "reconciling"
+        assert not c.failures and not c.strict_failure_seen
+        assert b.session.journal.get("managed_native_failure") is None
+        assert (await healthy(c))["local_hold_verified"]
+
+
 # Intent: a complete new composite above the selected limit triggers a protective hold even while idle.
 # Why: the real configured profile and zero current at idle cannot overrule an unsafe effective schedule.
 @pytest.mark.parametrize("first_observer", ["poll", "cloud"])

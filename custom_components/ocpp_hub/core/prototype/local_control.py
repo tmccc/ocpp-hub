@@ -329,7 +329,7 @@ class LocalControl:
             if boot != self.boot() or revision != self._revision:
                 raise UnavailableError("device introduction changed during station verification")
             if self.journal.get("control", {}).get("ticket") != ticket or self.desired() != desired:
-                raise DeniedError("a newer local operation superseded station verification")
+                raise ControlSupersededError("a newer local operation superseded station verification")
             return ALLOW
 
         try:
@@ -464,7 +464,7 @@ class LocalControl:
             if boot != self.boot():
                 raise UnavailableError("station verification belongs to an earlier Boot")
             if self.desired() != limit or self.journal.get("control", {}).get("ticket") != ticket:
-                raise DeniedError("desired ceiling changed during preparation")
+                raise ControlSupersededError("desired ceiling changed during preparation")
             return ALLOW
 
         scope = (

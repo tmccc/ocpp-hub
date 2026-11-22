@@ -26,3 +26,18 @@ def test_shipped_translations_are_clean() -> None:
     for path in translations.translation_files():
         data = json.loads(path.read_text(encoding="utf-8"))
         assert translations.html_problems(data) == [] and translations.issue_problems(data) == [], path
+
+
+# Intent: the local release check visits the active thin client's own source strings.
+# Why: a translation mistake in the deployed client must fail the same check as a mistake in the older integration.
+def test_check_reports_bad_proxy_translation(tmp_path, monkeypatch, capsys):
+    legacy = tmp_path / "custom_components" / "ocpp_hub"
+    legacy.mkdir(parents=True)
+    (legacy / "strings.json").write_text("{}")
+    component = tmp_path / "custom_components" / "ics_proxy"
+    component.mkdir(parents=True)
+    (component / "strings.json").write_text(json.dumps({"test": "Use <port>"}))
+    monkeypatch.setattr(translations, "__file__", str(tmp_path / "tools" / "check_translations.py"))
+
+    assert translations.main() == 1
+    assert "ics_proxy/strings.json" in capsys.readouterr().out
