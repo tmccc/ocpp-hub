@@ -11,6 +11,7 @@ from ocpp_hub_core.prototype.store import fingerprint
 from tests.process_helpers import process_rig
 from tests.tls_support import tls as tls
 from tests_installation.migrated_layout import seed_old_layout
+from tools import check_proxy_rollback as rollback
 from tools.check_proxy_rollback import RollbackRefusedError, check_snapshot, stopped_journal
 
 
@@ -117,6 +118,22 @@ async def test_migrated_snapshot_requires_intact_history_and_later_pause(
         with stopped_journal(config.journal) as db:
             assert check_snapshot(db, config, migrated_only=True) == status["control_revision"]
         assert proxy.durable() == snapshot
+
+        current, previous = tmp_path / "current-fixture", tmp_path / "previous-fixture"
+        with closing(sqlite3.connect(config.journal)) as db, db:
+            db.execute("INSERT INTO meta VALUES('managed_temporary_schedule','[{}]')")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                rollback,
+                "build_matches",
+                lambda root, build: (
+                    (root, build) in ((current, rollback.MIGRATED_RELEASES[0]), (previous, rollback.PREVIOUS))
+                ),
+            )
+            refusal = rollback.check_rollback(config, current, previous)
+        assert not refusal.allowed and refusal.reason == "journal_unavailable_or_malformed"
+        with closing(sqlite3.connect(config.journal)) as db, db:
+            db.execute("DELETE FROM meta WHERE key='managed_temporary_schedule'")
 
         with closing(sqlite3.connect(config.journal)) as db, db:
             pending = {"local": 1001, "owner": True, "ticket": "a" * 32, "vendor": None}

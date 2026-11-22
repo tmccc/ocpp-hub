@@ -110,7 +110,7 @@ def release_disposition(
     if (
         result.claimed
         and result.pending is not None
-        and (purpose == "automatic" or result.pending.reason is Prerequisite.CLOUD_ACK)
+        and (purpose == "automatic" or result.pending.reason in (Prerequisite.CLOUD_ACK, Prerequisite.SUPERSEDED))
         and result.failure is None
         and not result.cancelled
         and not result.cleanup_failed

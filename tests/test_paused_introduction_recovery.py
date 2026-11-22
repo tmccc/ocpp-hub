@@ -20,6 +20,7 @@ from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import BOOT
 from tests.recovery_barriers import fresh_daily_values, returned_to_app
 from tests.runtime_rig import until
+from tests.test_managed_boot_supersession import delay_reply
 from tests.tls_support import tls as tls
 
 
@@ -99,8 +100,14 @@ async def test_partial_paused_introduction_recovers_after_genuine_stop(
                 )
                 await mp.healthy(b.controller)
                 pause_id = uuid.uuid4().hex
-                b.controller.command(pause_id, "pause", b.controller.requests.intent().revision)
-                await b.controller.pause_task
+                # Reconnect can exercise an unanswered Stop only if the original acceptance was withheld.
+                with monkeypatch.context() as patch:
+                    if fault.startswith("stop-"):
+                        delay_reply(patch, rig, b.charger, "RemoteStopTransaction")
+                        patch.setattr(b.session.gateway.charger, "timeout", 0.2)
+                    b.controller.command(pause_id, "pause", b.controller.requests.intent().revision)
+                    await b.controller.pause_task
+                assert b.session.gateway.controls.stop_acknowledged(local) is (fault == "zero-timeout")
                 assert rig.bench.firmware.effective_limit() == 0 and b.session.journal.active() == local
                 await b.controller.charging.close()
                 await crash(b.session)

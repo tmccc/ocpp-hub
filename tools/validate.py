@@ -273,6 +273,7 @@ def main() -> int:
         check_yaml(python, results)
         run_step("compileall", [python, "-m", "compileall", "-q", "-f", "custom_components/"], results)
         run_step("git diff --check", ["git", "diff", "--check", "HEAD"], results)
+        run_step("committed whitespace", ["git", "show", "--check", "--format=", "HEAD"], results)
 
     if not args.quick and args.expression:
         command = [python, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", "tests/", "-k", args.expression]

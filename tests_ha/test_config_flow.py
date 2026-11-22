@@ -13,6 +13,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ocpp_hub.const import (
     CONF_MAX_CURRENT,
     CONF_PORT,
+    CONF_SCHEDULE_INSIDE,
+    CONF_SCHEDULE_OUTSIDE,
     CONF_VENDOR_COMMANDS,
     CONF_VENDOR_PASSWORD,
     CONF_VENDOR_URL,
@@ -72,6 +74,15 @@ async def test_options_are_stored(hass: HomeAssistant) -> None:
         CONF_VENDOR_COMMANDS: "reject",
         CONF_MAX_CURRENT: 16,
     }
+
+
+# Intent: the options form saves plan limits without a schedule helper.
+# Why: the app and the set-plan service also use the saved inside and outside limits.
+async def test_plan_limits_are_saved_without_a_helper(hass: HomeAssistant) -> None:
+    entry = _entry(hass)
+    result = await _submit(hass, entry, {CONF_SCHEDULE_INSIDE: 14, CONF_SCHEDULE_OUTSIDE: 6})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_SCHEDULE_INSIDE] == 14 and entry.options[CONF_SCHEDULE_OUTSIDE] == 6
 
 
 # Intent: an unusable address or half a credential pair is refused on the field it belongs to, with a message code.

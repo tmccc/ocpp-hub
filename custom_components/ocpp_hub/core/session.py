@@ -358,6 +358,13 @@ class ChargerSession:
         result = frame[2]
         return result if isinstance(result, dict) else {}
 
+    # A transaction-scoped reply can publish only while its original connector and transaction are current.
+    def owns_transaction(self, connector_id: object, transaction_id: object) -> bool:
+        if type(connector_id) is not int or type(transaction_id) is not int or not self._snapshot.connected:
+            return False
+        connector = self._snapshot.connectors.get(connector_id)
+        return connector is not None and connector.transaction_id == transaction_id
+
     # Remember the limit the charger accepted and the purpose it accepted it as.
     # The snapshot is what Home Assistant shows, and the purpose spares the next write the purposes that were refused.
     # A session whose connection has ended records nothing: the charger may already be on a newer session, and an
@@ -403,28 +410,43 @@ class ChargerSession:
             vendor_limit_restored=False,
         )
 
-    # Compare the limits restored from storage with what the charger says is in effect. When the lowest limit known
-    # agrees with it, the restored limits are confirmed. When it does not, the restored sides are gone from the charger
-    # (or changed) and are dropped, while a side written on this connection stays. A charger that said nothing confirms
-    # nothing, and they stay marked as restored.
+    # An aggregate schedule can contradict an individual restored limit or corroborate one unambiguous value.
     def _reconcile_restored(self, composite: float | None) -> dict[str, Any]:
         snapshot = self._snapshot
         if not snapshot.limits_restored or composite is None:
             return {}
         known = [x for x in (snapshot.charge_limit_a, snapshot.vendor_limit_a) if x is not None]
-        if known and abs(min(known) - composite) < 0.01:
-            return {"hub_limit_restored": False, "vendor_limit_restored": False}
-        changes: dict[str, Any] = {"hub_limit_restored": False, "vendor_limit_restored": False}
-        if snapshot.hub_limit_restored:
-            changes |= {"charge_limit_a": None, "limit_purpose": None}
-        if snapshot.vendor_limit_restored:
+        unique = sum(abs(value - composite) < 0.01 for value in known) == 1
+        single_restored = not (snapshot.hub_limit_restored and snapshot.vendor_limit_restored)
+        changes: dict[str, Any] = {}
+        hub, vendor = snapshot.charge_limit_a, snapshot.vendor_limit_a
+        if snapshot.hub_limit_restored and hub is not None and composite - hub >= 0.01:
+            changes |= {"hub_limit_restored": False, "charge_limit_a": None, "limit_purpose": None}
+        elif (
+            snapshot.hub_limit_restored
+            and hub is not None
+            and unique
+            and single_restored
+            and abs(hub - composite) < 0.01
+        ):
+            changes["hub_limit_restored"] = False
+        if snapshot.vendor_limit_restored and vendor is not None and composite - vendor >= 0.01:
             changes |= {
+                "vendor_limit_restored": False,
                 "vendor_limit_a": None,
                 "vendor_profile_id": None,
                 "vendor_purpose": None,
                 "vendor_profile_connector_id": None,
                 "vendor_profile_stack_level": None,
             }
+        elif (
+            snapshot.vendor_limit_restored
+            and vendor is not None
+            and unique
+            and single_restored
+            and abs(vendor - composite) < 0.01
+        ):
+            changes["vendor_limit_restored"] = False
         return changes
 
     # Ask for the limit in effect in a task of its own, so a charger that answers slowly or never does not hold up the
@@ -568,10 +590,10 @@ class ChargerSession:
     # Setup waits and sends requests of its own, so it must not block the answer.
     def _boot_notification(self, payload: dict[str, Any]) -> dict[str, Any]:
         info = ChargerInfo(
-            vendor=payload.get("chargePointVendor"),
-            model=payload.get("chargePointModel"),
-            serial=payload.get("chargePointSerialNumber"),
-            firmware=payload.get("firmwareVersion"),
+            vendor=_text(payload.get("chargePointVendor")),
+            model=_text(payload.get("chargePointModel")),
+            serial=_text(payload.get("chargePointSerialNumber")),
+            firmware=_text(payload.get("firmwareVersion")),
         )
         self._update(info=info)
         if self._setup_task is None or self._setup_task.done():
@@ -609,6 +631,13 @@ class ChargerSession:
             return {}
         connectors = dict(self._snapshot.connectors)
         running = self._running_connector(payload)
+        if (
+            running is not None
+            and "transactionId" not in payload
+            and running.started_at is not None
+            and sample.sampled_at < running.started_at
+        ):
+            return {}
         previous = self._snapshot.meter
         named = payload.get("connectorId")
         if (
@@ -625,8 +654,16 @@ class ChargerSession:
         ):
             return {}  # A reading from another charge cannot become the active charge's live meter data.
         if running is not None:
-            connectors[running.connector_id] = replace(running, stats=running.stats.add(sample))
-        self._update(meter=merge_samples(previous, sample), connectors=connectors)
+            energy = running.last_energy
+            if sample.energy_wh is not None and (energy is None or sample.sampled_at >= energy[0]):
+                energy = sample.sampled_at, sample.energy_wh
+            connectors[running.connector_id] = replace(running, stats=running.stats.add(sample), last_energy=energy)
+        meter = (
+            previous
+            if previous is not None and sample.sampled_at < previous.sampled_at
+            else merge_samples(previous, sample)
+        )
+        self._update(meter=meter, connectors=connectors)
         return {}
 
     # Match a reported transaction exactly. Untagged readings may use the named or sole running connector.
@@ -683,6 +720,7 @@ class ChargerSession:
                 {"timestamp": started_at.isoformat(), "reason": "Other", "meterStop": payload.get("meterStart")},
             )
             self._listener.on_session_finished(interrupted)
+            self._retire_transaction_limits(connector_id)
         self._update_connector(
             replace(
                 connector,
@@ -692,6 +730,7 @@ class ChargerSession:
                 started_at=started_at,
                 stats=ChargeStats(),
                 start_identity=identity,
+                last_energy=None,
             )
         )
         self._listener.on_start_committed(self.cp_id, transaction_id, payload)
@@ -714,18 +753,25 @@ class ChargerSession:
                         started_at=None,
                         stats=ChargeStats(),
                         start_identity=None,
+                        last_energy=None,
                     )
                 )
                 self._listener.on_session_finished(finished)
-                if self._snapshot.limit_purpose == commands.PURPOSE_TX:
-                    # A charge profile ends with its charge; the next charge is not limited by it.
-                    self.record_limit(None, None)
-                if self._snapshot.vendor_purpose == commands.PURPOSE_TX:
-                    self.record_vendor_limit(None, None, None)
-                # What the charger said before may have been a profile of this charge; ask again.
-                self._update(composite_limit_a=None)
-                self.request_effective_limit()
+                self._retire_transaction_limits(connector.connector_id)
         return {"idTagInfo": {"status": "Accepted"}}
+
+    # A stopped or replaced transaction can retire only the charge profiles on its connector.
+    def _retire_transaction_limits(self, connector_id: int) -> None:
+        snapshot = self._snapshot
+        if connector_id == PRIMARY_CONNECTOR and snapshot.limit_purpose == commands.PURPOSE_TX:
+            self.record_limit(None, None)
+        if snapshot.vendor_purpose == commands.PURPOSE_TX and snapshot.vendor_profile_connector_id in (
+            None,
+            connector_id,
+        ):
+            self.record_vendor_limit(None, None, None)
+        self._update(composite_limit_a=None)
+        self.request_effective_limit()
 
     # The charge that a StopTransaction ends. Its energy is the meter at the stop minus the meter at the start, or, when
     # the charger sent no stop reading, the last meter value seen; None when the start reading is missing.
@@ -734,7 +780,7 @@ class ChargerSession:
     ) -> ChargeSession:
         ended_at = parse_timestamp(payload.get("timestamp"), self._clock())
         meter_stop = _finite(payload.get("meterStop"))
-        last = self._snapshot.meter.energy_wh if self._snapshot.meter is not None else None
+        last = connector.last_energy[1] if connector.last_energy is not None else None
         end_reading = meter_stop if meter_stop is not None else last
         start_reading = connector.meter_start_wh
         energy = (
@@ -849,10 +895,16 @@ class ChargerSession:
             except CallError as error:
                 failure = error
                 continue
+            items = answer.get("configurationKey", [])
+            if not isinstance(items, list):
+                failure = CallError("charger configuration response is malformed")
+                continue
             answered += 1
-            for item in answer.get("configurationKey", []):
+            for item in items:
                 if isinstance(item, dict) and item.get("key") == key:
-                    self._store_configuration(key, str(item.get("value", "")))
+                    value = item.get("value")
+                    if isinstance(value, str):
+                        self._store_configuration(key, value)
         if failure is not None and answered == 0:
             raise failure
 

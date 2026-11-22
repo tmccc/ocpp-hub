@@ -43,8 +43,8 @@ The diagram shows ownership and communication, not every call. The service creat
 unscoped local Start disabled, then creates `ManagedController` and `ManagementServer`. Explicit guarded management
 `start` is supported through `ManagedCharging`; do not mistake it for that disabled legacy Start.
 
-Shared modules outside `prototype/` include `commands.py`, `control.py`, `frames.py`, `metering.py`, `model.py`,
-`readings.py` and `session.py`. Follow actual imports and calls rather than excluding their parent directory.
+Shared code outside `prototype/` includes the command and frame builders and the station profile ID in
+`control.py`. The older integration runs its own metering, readings and session code outside `prototype/`.
 TrialSession requires the explicit native-bounded specification for commissioning and managed operation. The plain
 commissioning and experimental vehicle-pause modes are retired. Native evidence, actual cleanup and original-backend
 restoration remain. The older HA layer and vendor mirror are a separate review domain; directory location alone does
@@ -98,6 +98,24 @@ An owner request can have several wire calls. The selected current and a rollbac
 replies. A pending write, an unanswered call and a known reply waiting for physical proof have different meanings.
 Older receipts keep their original layout and are read with the evidence they actually contain.
 
+`LocalControl.stop_decision` uses the same journal evidence for startup, reconnect, foreground Pause, fault
+and expired Start recovery, shutdown, and vendor-app Stop. The executor uses that decision again in its final queued
+check. A real accepted reply for the exact allocated session prevents another local Stop across Boot, reconnect,
+replacement and shutdown when the station zero holds. If saving an accepted owner or forwarded Stop fails, the outcome owner
+keeps an independent journal entry tied to that reply and retries the original write. If zero cannot be established
+or fresh native readings show draw, a protective Stop requires the current Boot and exact open target. A newer
+reading for that same session can change the decision up to the send boundary. Only the acceptance of the current
+protective attempt covers it. The charger report closes the recorded session, a
+fresh native reading verifies the Pause, and the cloud reply settles delivery before Return can restore current.
+Normal Pause and shutdown share the closed-session and physical zero checks. Return uses the same station zero
+proof and also requires cloud delivery to settle. Ordinary recovery keeps the session at zero after an accepted
+forwarded Stop or an unresolved shutdown Stop until its report arrives. The shutdown claim records whether an
+older Stop is still unanswered, and only its original live executor can attest that the current attempt never
+dispatched. An unsent or rejected attempt cannot erase an earlier unanswered Stop. A new cloud Stop checks
+the exact open mapping inside the charger gate and can reuse a real previous acceptance after fresh zero proof.
+It answers with the new request ID. An unanswered shutdown attempt can require waiting for the report at zero.
+Missing zero proof or renewed draw allows a real protective send through the existing guards.
+
 `Journal.control` is the only production writer of the existing physical-authority record. `ControlState` preserves
 raw extra fields and missing-key defaults; its shared/hold predicates distinguish legacy truthy flags from explicit
 Boolean proof. Admission replaces the record; claim, hold, current selection and Start projection transitions merge
@@ -123,22 +141,26 @@ The main poll reads top to bottom: settle owned work, maintain faults, supervise
 authority, publish a view. `_supervise()` keeps native and recovery effects explicit. The poll and API both use
 `ControlProof` in `supervision.py` to keep the observed shared grant or physical zero only while the matching
 authority remains current. An unsettled delivery blocks readiness while a verified zero can remain visible.
-The controller still owns the fault latch and Return completion. It decodes cloud grants only after local
-readiness. Live command and commit guards recheck their own evidence. Pending and observed status share common
-fields in `managed_view.py`.
+The controller owns the fault latch and decodes cloud grants after local readiness. `ManagedRequests` owns
+Return receipt completion from the release evidence supplied by the recovery coordinator. Live command and
+commit guards recheck their own evidence. Pending and observed status share fields in `managed_view.py`.
 
 `Journal.starts` is the synchronous Start lifecycle owner; pending-bit updates use `Journal.control`. It reads
 the existing journal keys into a typed
 `ChargeStart`, treats the current wire receipt as canonical, and checks metadata projections before correlating
 local closure. Published acceptance, actual wire outcome, stored pending obligation and the current in-memory
 lease remain distinct. Normal, timed and cloud tests share the metadata key, so their writes pass through this
-owner. Generic `ManagedRequests` startup still marks unfinished request rows `process_replaced`; it restores no
-lease or positive permission.
+owner. Live and recovered Start replies use the same receipt transition. `ManagedRequests` marks unfinished
+positive requests as `process_replaced` and retains Return's original ticket and Boot binding. A new operation
+must establish fresh positive permission. The Start and current recovery workers claim and settle the zero hold
+through the same queue as their live commands.
 
-`start_settlement` holds the pure failure and caller-named retirement policies. `ChargeStart` preserves raw
+`start_settlement` holds the pure failure and retirement policies. `ChargeStart` preserves raw
 legacy markers and opaque result bytes. Preflight, unissued-at-zero, closed-at-zero, generic test settlement and
-cancelled-unprepared rules retain different evidence and update contracts; the selector does not choose a priority
-between them. `RetirementCandidate` freezes only the original rule's preimage. Generic settlement includes its
+cancelled-unprepared rules retain their own evidence and update contracts. `Journal.starts` selects the local-zero
+transitions for polling and expiry, and selects retirement after lifecycle delivery settles. It uses the same timed
+Start grant or local receipt to identify first power and a possible Stop target. `RetirementCandidate` freezes the
+original rule's preimage. Generic settlement includes its
 selected session and exact lease identity; cancellation uses raw receipt bytes; closed-zero also pins pending.
 `Journal.starts.retire` applies the selected outcome through one filtered request writer. The async caller retains
 native proof, task/cancellation ownership, restrictive execution and post-COMMIT memory changes. Local completion
@@ -150,8 +172,9 @@ startup sweep. Its pure `ControlIntent.next` advances revisions or explicitly co
 `ManagedRequests` shares the transaction/current-intent check for Start and Return app publication,
 while their separate request outcomes and original callback order remain. The management driver claims Return
 after busy/stopping waits and before completion launch; direct restore keeps its accepted-before-publication
-contract. Queue refusal records uncertainty, and the owned completion settles later waits or
-failures. Controller/native/send guards, owner Pause/Stop markers, independent cloud debt and task lifetime remain
+contract. Return's receipt owner interprets release progress, preserves the original wire binding and handles
+completion from verified release or older already-shared authority. Controller/native/send guards, owner
+Pause/Stop markers, independent cloud debt and task lifetime remain
 separate responsibilities. `test_control_lifecycle.py` covers stored transitions and real SQL/COMMIT rollback;
 `test_control_lifecycle_peer.py` covers actual scheduling, capacity and the retained legacy healthy-status path.
 
@@ -160,11 +183,13 @@ The former control grammar and boundary observer are test references under `test
 modules. Their original tests remain, alongside real peer and process-death checks of the production owner.
 See the [developer guide](developer.md#control-transitions-and-start-settlement) for the stored-state contract.
 
+`Journal.current_change` verifies the exact request and target when it publishes a current selection. Its failed
+selection lookup and retirement also serve Pause, restoration of the previous limit, and acknowledged fault recovery.
 `managed_settlement.py` binds terminal current records, owner-held Start candidates and internal Pause claims to
 caller-owned zero proofs. `managed_release_recovery.py` verifies the current Pause, closed native zero, original
 daily timetable and owned station receipt before retiring a fault. Start with
 `test_managed_settlement_regressions.py` for real-peer recovery and storage-failure cases. `test_runtime_boot_retry.py`
-covers repeated read-only probes; `test_managed_cached_authorization.py` and
+covers repeated read-only probes after wire or journal read failures; `test_managed_cached_authorization.py` and
 `test_managed_cloud_pending_return.py` cover cloud decisions, retained permissions and timed-test Return settlement.
 `test_managed_start_authorization.py` covers guarded normal-Start renewal of aged Accepted tags through actual
 upstream TLS replies, refusals and superseding authority. The existing HA control-mode diagnostic explains
@@ -183,7 +208,9 @@ supervision.
 `test_introduction_write_retry.py` injects real post-read SQLite write failures into the replay-safe prefix;
 later Stop-capable work stays outside that retry boundary.
 For command timing, follow `Peer._validate()` through its priority gate and then the independent send/reply deadline;
-`test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch.
+`test_rpc_validation_deadlines.py` covers preemption before dispatch and retained uncertainty after dispatch. Start and Return finish an owned zero rollback
+before yielding the outgoing gate. The Return owner distinguishes an interruption before its
+positive send from one that follows a possible physical effect.
 
 `connection_scope.py` separates introduction lineage from exact Boot-bound cloud
 and resume evidence. `recovery_contracts.py` separates a named pending prerequisite,
@@ -201,17 +228,17 @@ visiting one during a poll does not discharge another. An authority snapshot nev
 permits a later send: the executor checks current intent, Boot, revision and ticket
 at the actual effect and SQL publication boundaries.
 
-`RecoveryCoordinator._run_restore` directly sequences initial observation/check, optional recovery, verified
-observation and required recheck before release. A Pending ends this attempt. The existing
+`RecoveryCoordinator._restore_owned` uses `_prepare_restore` for the initial observation, optional recovery,
+verified observation and required recheck before handing the attempt to `_run_release`. A Pending ends this attempt. The existing
 recovery policy maps release disposition to terminal progress; claimed-zero acknowledgement and fault effects stay
 in the driver. Initial closure/session checks, post-resume ticket capture, final native proof and every live
 send/publication guard keep their original order. `test_recovery_contracts.py` covers terminal mapping; real HTTP
 and SQLite witnesses in preflight, retirement and publication tests establish the independent effect boundaries.
 
 `ResourceBook.confirmed_station_zero` compares the caller's already selected native station with its confirmed
-resource receipt. Seven consumers share that predicate while keeping their distinct profile filters, SQL reads,
-early lifecycle waits and error policy. It decodes receipt JSON only when called at the original Boolean position.
-The weaker cleanup presence check also belongs to ResourceBook. Neither check grants a send or Stop permission.
+resource receipt. Pause, reconnect, shutdown and release paths share that predicate with their own profile
+filters, SQL reads, early lifecycle waits and error policy. It decodes receipt JSON only when called at the original Boolean position.
+ResourceBook also checks profile presence during cleanup. Neither check grants a send or Stop permission.
 
 `ReleaseHandoff` joins final release metadata, explicit Return intent/receipt and
 shared control in the wire child's transaction. `start_handoff.py` similarly joins

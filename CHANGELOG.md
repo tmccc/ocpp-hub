@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+- Use one Stop decision for local Pause and vendor-app Stop. Reuse the real acceptance of the same session
+  when fresh readings confirm zero, and allow a protective Stop when zero is lost or cannot be verified.
+- Preserve an unanswered shutdown Stop through later shutdowns. Resume a known session after a proven unsent
+  Stop once ordinary checks pass. Reconnect can protect the same session if the charger refuses the new zero.
+  Retry the read-only Boot probe after a temporary journal read failure.
+- Let the owned Start or Return restore zero before the next queued call. A Return interrupted before
+  dispatch with verified zero can end without a charger fault. A Return queued behind Pause waits for the
+  charger’s own closure report after the Stop reply arrives.
+- Retain the exact charger acceptance of an owner or forwarded Stop across restart when the usual reply write
+  temporarily fails. Protect an exact expired Start even when the charger refuses zero, and use the latest exact
+  charger reading when a protective Stop is about to send.
+- Ignore unusable meter reports and older untagged readings after a new legacy session starts. Require an exact
+  successful charger reply before publishing legacy commands as accepted. Restore the previous legacy SSH install
+  if the installation report fails or the connection drops before verification. Prune old rollback archives only
+  after the install succeeds.
+- Keep legacy profile replies with the session that was current at dispatch, including forwarded profiles without
+  a transaction ID. A pending idle profile cannot publish a limit for a charge that started while it waited.
+- Keep the cloud connection available after a denied Start when the charger refuses zero. Preserve the specific
+  reason when an offline configuration or certificate check refuses a file.
+- Keep a legacy current reply with its original charge and finish an app timetable edit after vendor reconnect.
+  Retire a profile replaced at the same stack and preserve a stored plan when its profile was already absent.
+- Leave per-phase current unknown when the charger only reports an aggregate. Keep the visible proxy outage
+  notice stable across Home Assistant setup retries.
+- Restore legacy SSH component files when the pre-restart check refuses them. Retain the new rollback archive
+  when older backups use different names. Pin the image and interpreter in the qualification runtime fingerprint.
+
+- Use the same Stop decision during startup, reconnect, Pause and shutdown. Keep charger closure, measured zero
+  and cloud delivery distinct, and settle the original Pause after replacement without repeating its Stop.
+- Share Start settlement between polling, expiry and recovery. Keep Return outcomes and failed current selection
+  retirement with their own journal records.
+- Recheck native draw immediately before a protective Stop for Pause and expired Start. Keep a forwarded Stop
+  acceptance while its session remains open, even when the journal prunes older command receipts.
+- Keep an unresolved timed-charge receipt open at zero until its Stop report reaches the cloud. Settle older saved
+  receipts with the same proof if their charge record was already marked complete.
+- Clear an earlier shutdown warning after a verified shutdown. Report busy management connections as a definite
+  refusal when the server closes them before command admission.
+- Keep live and finished legacy energy tied to its own connector. Settle a sent legacy profile reply after vendor
+  reconnect and retire the old charge profile when a replacement Start closes its transaction.
+- Verify legacy SSH candidate files before publishing, and hold the same component lock as Docker through a
+  requested restart. Include host system mounts in qualification fingerprints and report failed worker cleanup.
+
+- Keep current at zero while an accepted app Stop or an unresolved shutdown Stop awaits its own charger report.
+  Check fresh draw before reusing a shutdown Stop, and allow a protective Stop if a previously verified zero is lost.
+- Settle an exact, approved saved cloud Stop reply during a cloud outage before attempting another delivery.
+- Retire the previous charger reader before the older integration attaches a replacement. Keep energy readings
+  with their own connector and transaction, skip unusable meter samples, and preserve uncertainty about restored profiles.
+- Serialize legacy SSH installation and restore the previous component on a failed directory move. Include explicit
+  auxiliary runtime mounts in the test runtime fingerprint and check the exact Stop count in the simulated week.
+- Reuse a charger-accepted Stop for the exact session through Boot, proxy replacement and shutdown while zero
+  holds. Keep the original Pause receipt, wait for the charger's Stop report and fresh physical zero, and wait for cloud
+  acknowledgement before restoring app control.
+- Give live and recovered Start replies the same receipt transition, retain the exact Return binding after
+  replacement, and order Start and current recovery holds through the command queue.
 - Treat a superseded ceiling check as pending control work and check the thin client's translations locally.
 - Retire both charger sockets when a failed replacement leaves the earlier connection unusable.
 - Keep the receiver and its zero hold available while a restarted proxy waits for native closure after

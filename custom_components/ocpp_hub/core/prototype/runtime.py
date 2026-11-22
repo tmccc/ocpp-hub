@@ -240,7 +240,7 @@ class ConnectionRuntime:
                     raise UnavailableError("charger refused the read-only boot probe")
                 await asyncio.wait_for(self.gateway.wait_for_boot(epoch), self.settings.boot_probe_after)
                 return
-            except (UnavailableError, TimeoutError) as error:
+            except (UnavailableError, TimeoutError, sqlite3.Error) as error:
                 if self.gateway.current_boot_seen(epoch):
                     return  # A genuine Boot can finish while the read-only probe is waiting for its gate.
                 self.status.last_failure = "BootOrCeilingUnavailable"

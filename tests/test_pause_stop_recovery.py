@@ -14,6 +14,7 @@ from tests.charge_rig import positive_flow
 from tests.cloud_start_helpers import StartReplyBench
 from tests.current_rig import commissioned, release_bench
 from tests.native_peer_failures import InterruptedNativePeer
+from tests.peer_mutation_helpers import matches_operation
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
@@ -78,10 +79,10 @@ async def test_second_pause_sends_its_stop_without_waiting_for_poll(tmp_path, tl
         assert outcome.sessions[0].closed
 
 
-# Intent: an actual identical Boot retires an earlier Stop ACK, including a reply arriving after that Boot.
-# Why: a late accepted reply must retain its original generation instead of suppressing the current Pause's Stop.
-@pytest.mark.parametrize("timing", ["during_reply", "after_reply"])
-async def test_boot_cannot_reuse_earlier_stop_ack(tmp_path, tls, unused_tcp_port, monkeypatch, timing):
+# Intent: an identical Boot reuses the exact acceptance while zero holds and can protect renewed native draw.
+# Why: the old reply continues to identify the session, while a fresh nonzero meter can contradict the hold.
+@pytest.mark.parametrize("timing", ["during_reply", "after_reply", "native-draw-after-reply"])
+async def test_boot_preserves_exact_stop_ack(tmp_path, tls, unused_tcp_port, monkeypatch, timing):
     async with release_bench(tmp_path, tls, unused_tcp_port, 6, native_peer=InterruptedNativePeer) as b:
         c, rig, g = b.c, b.rig, b.session.gateway
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
@@ -101,7 +102,7 @@ async def test_boot_cannot_reuse_earlier_stop_ack(tmp_path, tls, unused_tcp_port
         boot = g.boot_observation
         try:
             await asyncio.wait_for(entered.wait(), 3)
-            if timing == "after_reply":
+            if timing != "during_reply":
                 release.set()
                 await c.pause_task
                 assert g.controls.stop_acknowledged(local)
@@ -110,16 +111,110 @@ async def test_boot_cannot_reuse_earlier_stop_ack(tmp_path, tls, unused_tcp_port
             release.set()
             assert (await boot_call)[0] == 3
             await c.pause_task
-            assert not g.controls.stop_acknowledged(local)
-            await c.tick()
+            assert g.controls.stop_acknowledged(local)
+            native = rig.peer.native
+
+            # Report independently measured flow despite the device's zero profile and composite response.
+            def flowing(key):
+                value = native(key)
+                if key == "METER":
+                    value[0]["meterData"].update(cur=[15, 0, 0], power=[360, 0, 0, 360])
+                return value
+
+            with monkeypatch.context() as patch:
+                if timing == "native-draw-after-reply":
+                    patch.setattr(rig.peer, "native", flowing)
+                await c.tick()
             stops = [f for f in rig.bench.device_calls if f[2] == "RemoteStopTransaction"]
-            assert len(stops) == 2 and all(f[3] == {"transactionId": local} for f in stops)
+            count = 2 if timing == "native-draw-after-reply" else 1
+            assert [f[3] for f in stops] == [{"transactionId": local}] * count
+            assert g.controls.stop_acknowledged(local, protective=True) is (count == 2)
             assert g.controls.stop_acknowledged(local) and c.requests.receipt(request)["state"] == "accepted"
             await genuine_stop(b, local)
             assert (await mp.healthy(c))["local_hold_verified"] and not mp.starts(rig)
         finally:
             release.set()
             rig.bench.before_reply = None
+
+
+# Intent: a paused reconnect with a retained Stop can still protect a known session if zero fails on its new Boot.
+# Why: instantaneous zero draw cannot establish a zero ceiling when the peer refuses to apply it.
+async def test_reconnect_with_accepted_stop_protects_failed_zero(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        c, rig, g = b.c, b.rig, b.session.gateway
+        local = await positive_flow(b, "daily")
+        await mp.healthy(c)
+        answer = rig.bench.firmware.answer
+
+        # Refuse a real zero write before the simulated charger applies it.
+        def refuse_zero(action, payload):
+            if matches_operation("zero", action, payload):
+                return {"status": "Rejected"}
+            return answer(action, payload)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.bench.firmware, "answer", refuse_zero)
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+            await asyncio.wait_for(asyncio.shield(c.pause_task), 4)
+            assert g.controls.stop_acknowledged(local, protective=True)
+            assert not g.controls.ready and rig.bench.firmware.effective_limit() == 6
+            assert rig.bench.firmware.requested_current == 0
+
+            await b.charger.close()
+            await until(lambda: g.charger.sender is None)
+            async with rig.charger(b.session) as charger:
+                reply = await rig.bench.call(charger, uuid.uuid4().hex, "BootNotification", BOOT)
+                assert reply[0] == 3
+                await until(lambda: g.controls.stop_acknowledged(local, protective=True))
+                assert not g.controls.ready and b.session.journal.active() == local
+                for _ in range(3):
+                    assert not (await c.tick())["owner_control_enabled"]
+                stops = [f[3] for f in rig.bench.device_calls if f[2] == "RemoteStopTransaction"]
+                assert stops == [{"transactionId": local}] * 2
+
+
+# Intent: a newer native zero cancels repeat Stop before the already accepted session has reported closure.
+# Why: the protection decision awaits independent profile replies after observing native draw.
+async def test_superseded_draw_cannot_repeat_accepted_pause_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
+        c, rig, g = b.c, b.rig, b.session.gateway
+        local = await positive_flow(b, "daily")
+        await mp.healthy(c)
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+        assert g.controls.stop_acknowledged(local)
+        original = rig.peer.native
+        drawing = True
+        profile_sent, complete_profile = asyncio.Event(), asyncio.Event()
+
+        # Use independent native meter readings that stop showing draw during the real profile wait.
+        def sample(key):
+            value = original(key)
+            if key == "METER" and drawing:
+                value[0]["meterData"].update(cur=[15, 0, 0], power=[360, 0, 0, 360])
+            return value
+
+        # Delay the applied protective profile before the worker can continue to its Stop.
+        async def hold_profile(action, payload):
+            if action == "SetChargingProfile":
+                profile_sent.set()
+                await complete_profile.wait()
+
+        monkeypatch.setattr(rig.peer, "native", sample)
+        rig.bench.before_reply = hold_profile
+        task = c.schedule_pause()
+        try:
+            await asyncio.wait_for(profile_sent.wait(), 3)
+            drawing = False
+            fresh = await c.native.read(closing_local=local, stop_only=True)
+            assert fresh.physical.power_w == 0
+        finally:
+            complete_profile.set()
+            await asyncio.wait_for(asyncio.shield(task), 3)
+            rig.bench.before_reply = None
+        assert [f[3] for f in rig.bench.device_calls if f[2] == "RemoteStopTransaction"] == [{"transactionId": local}]
+        assert b.session.journal.active() == local and rig.bench.firmware.effective_limit() == 0
+        await genuine_stop(b, local)
 
 
 # Intent: native availability healing should permit a previously accepted known-session Pause to complete Stop.

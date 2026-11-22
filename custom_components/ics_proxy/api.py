@@ -96,20 +96,23 @@ class ProxyClient:
                 ) as connection:
                     sending = True
                     await connection.send_json({"id": identifier, "command": command, **fields})
-                    if command == "receipt":
-                        message = await connection.receive()
-                        if message.type in (
-                            aiohttp.WSMsgType.CLOSE,
-                            aiohttp.WSMsgType.CLOSING,
-                            aiohttp.WSMsgType.CLOSED,
-                        ):
-                            raise ReceiptUnavailableError("The saved command result is temporarily unavailable")
-                        # The WebSocket parser reports invalid or oversized frames as ERROR.
-                        if message.type is not aiohttp.WSMsgType.TEXT:
-                            raise TypeError("The local charger proxy returned a non-text receipt")
-                        response = message.json()
-                    else:
-                        response = await connection.receive_json()
+                    message = await connection.receive()
+                    if command == "receipt" and message.type in (
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSING,
+                        aiohttp.WSMsgType.CLOSED,
+                    ):
+                        raise ReceiptUnavailableError("The saved command result is temporarily unavailable")
+                    # The server uses these close reasons before a client can enter command admission.
+                    if (
+                        message.type is aiohttp.WSMsgType.CLOSE
+                        and message.data == 1013
+                        and message.extra in ("Busy", "Idle connection replaced")
+                    ):
+                        raise ProxyError("The local charger proxy was too busy to accept this request")
+                    if message.type is not aiohttp.WSMsgType.TEXT:
+                        raise TypeError("The local charger proxy returned a non-text response")
+                    response = message.json()
         except (aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError) as error:
             if command == "receipt" and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
                 raise ReceiptUnavailableError("The saved command result is temporarily unavailable") from None

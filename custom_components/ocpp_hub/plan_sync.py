@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -65,9 +65,11 @@ class PlanSync:
         self._keep(cp_id, windows)
 
     # The app wrote a planning: write it to the charger as a profile, and keep it as the plan when that worked.
-    async def app_wrote(self, cp_id: str, windows: list[PlanWindow]) -> bool:
+    async def app_wrote(
+        self, cp_id: str, windows: list[PlanWindow], *, before_send: Callable[[], None] | None = None
+    ) -> bool:
         try:
-            await self.set_plan(cp_id, windows)
+            await self.set_plan(cp_id, windows, before_send=before_send)
         except (ControlError, SchedulePlanError) as error:
             _LOGGER.warning("[plan] The planning of the app for %s could not be applied: %s", cp_id, error)
             return False
@@ -105,17 +107,21 @@ class PlanSync:
     # Set the plan: turn the windows into one recurring profile and write it, then keep the plan. An empty plan clears
     # the hub's profile instead, because a profile of nothing but the outside limit would hold the charger at that limit
     # all week. Raises ControlError or SchedulePlanError when it cannot be written, and keeps the old plan then.
-    async def set_plan(self, cp_id: str, windows: list[PlanWindow]) -> None:
+    async def set_plan(
+        self, cp_id: str, windows: list[PlanWindow], *, before_send: Callable[[], None] | None = None
+    ) -> None:
         async with self._locks[cp_id]:
             on = self.planning_on(cp_id)
-            await self._apply(cp_id, windows, on)
+            await self._apply(cp_id, windows, on, before_send=before_send)
             if self.planning_on(cp_id) == on:
                 self._store.set_profile_sync_error(cp_id, None)
             self._keep(cp_id, windows)
 
     # Write the plan to the charger as a profile, or clear the profile when the planning is off, while the snapshot
     # guard knows that the write is the plan's own.
-    async def _apply(self, cp_id: str, windows: list[PlanWindow], on: bool) -> None:
+    async def _apply(
+        self, cp_id: str, windows: list[PlanWindow], on: bool, *, before_send: Callable[[], None] | None = None
+    ) -> None:
         control = self._central.control(cp_id) if self._central is not None else None
         if control is None:
             raise ControlError("not_connected", "the charger is not connected")
@@ -129,9 +135,11 @@ class PlanSync:
                 float(0 if outside is None else outside),  # type: ignore[arg-type]
             )
         if on and plan is not None:
-            await control.set_schedule(anchor_for(plan), plan.periods, plan.kind, from_plan=True)
+            await control.set_schedule(
+                anchor_for(plan), plan.periods, plan.kind, from_plan=True, before_send=before_send
+            )
         else:
-            await control.clear_current_limit(from_plan=True)
+            await control.clear_current_limit(from_plan=True, before_send=before_send)
 
     # Save the plans now; used when the entry unloads.
     async def async_flush(self) -> None:

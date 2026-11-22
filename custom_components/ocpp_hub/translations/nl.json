@@ -198,6 +198,9 @@
     "control_rejected": {
       "message": "De lader weigerde het verzoek ({detail})."
     },
+    "control_session_changed": {
+      "message": "De laadsessie is gewijzigd voordat de stroomlimiet kon worden bevestigd."
+    },
     "control_no_charge": {
       "message": "Er loopt geen lading, dus er valt niets te stoppen."
     },

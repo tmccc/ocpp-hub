@@ -6,6 +6,7 @@ from typing import Any
 from ..frames import Frame, parse_frame
 from .auth_info import AuthorizationObservation, validate_info
 from .managed_start_delivery import ATTEMPTS, RETRIES
+from .managed_stop_delivery import approved_stop_metadata
 from .policy import DeniedError
 from .store import Delivery, Journal, RecoveryRequiredError, encoded
 
@@ -102,7 +103,7 @@ class DeliveryReply:
             raise RecoveryRequiredError("received cloud reply no longer identifies the exact sent delivery")
 
     # A known accepted mapping or Stop ACK needs a local commit retry; denial and invalid outcomes retain quarantine.
-    def storage_only(self, journal: Journal) -> bool:
+    def storage_only(self, journal: Journal, item: Delivery | None = None) -> bool:
         if self.action not in ("StartTransaction", "StopTransaction"):
             return True
         if self.answer[0] != 3:
@@ -117,7 +118,9 @@ class DeliveryReply:
             if "idTagInfo" in result:
                 validate_info(result["idTagInfo"])
         except DeniedError:
-            return False
+            return (
+                self.action == "StopTransaction" and item is not None and approved_stop_metadata(journal, item, result)
+            )
         return self.action == "StopTransaction" or (
             type(result.get("transactionId")) is int
             and 0 <= result["transactionId"] < 2**31

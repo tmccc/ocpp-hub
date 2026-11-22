@@ -220,6 +220,26 @@ async def test_a_restored_limit_is_checked_against_the_charger(start_hub) -> Non
     assert confirmed.listener.latest.charge_limit_a == 0.0 and not confirmed.listener.latest.limits_restored
 
 
+# Intent: a matching aggregate preserves uncertainty about each separately restored profile.
+# Why: the lower profile can explain the effect even if the higher profile disappeared during a restart.
+async def test_composite_does_not_confirm_two_restored_profiles(start_hub) -> None:
+    hub = await start_hub()
+    hub.central.restore_limits(
+        {
+            "TEST0001": LimitMemory(
+                hub_a=16, hub_purpose="ChargePointMaxProfile", vendor_a=6, vendor_purpose="ChargePointMaxProfile"
+            ),
+        }
+    )
+    charger = await hub.charger()
+    charger.composite_limit = 6
+    await charger.boot()
+    await hub.central.session("TEST0001").refresh_effective_limit()
+    shown = hub.listener.latest
+    assert shown.composite_limit_a == 6 and shown.charge_limit_a == 16 and shown.vendor_limit_a == 6
+    assert shown.hub_limit_restored and shown.vendor_limit_restored
+
+
 # Intent: stored limits that are damaged, not finite, negative or beyond any charger are refused when read back.
 # Why: the storage file can be edited or damaged, and a number from it must never reach the screen or the vendor
 # unchecked.

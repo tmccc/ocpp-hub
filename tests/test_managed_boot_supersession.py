@@ -259,25 +259,39 @@ async def test_lost_ceiling_refuses_positive_selection(tmp_path, tls, unused_tcp
 
 # Intent: loss of the owned ceiling stops exactly the known charge during normal operation or after restart.
 # Why: a real Stop reply does not establish closure, recreate the missing profile, or silently verify Pause.
-@pytest.mark.parametrize("boundary", ["live", "reconnect", "restart", "loss_write"])
+@pytest.mark.parametrize(
+    "boundary", ["live", "reconnect", "restart", "loss_write", "prior-stop", "prior-stop-live", "prior-stop-no-draw"]
+)
 async def test_lost_ceiling_stops_the_known_open_session(tmp_path, tls, unused_tcp_port, monkeypatch, boundary):
     async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
         rig, firmware = b.rig, b.rig.bench.firmware
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         assert (await healthy(b.controller))["current_a"] == 16
+        if boundary.startswith("prior-stop"):
+            c = b.controller
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+            await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+            assert b.session.gateway.controls.stop_acknowledged(local)
+            assert firmware.effective_limit() == 0
+            if boundary != "prior-stop-no-draw":
+                firmware.requested_current = 32
         intent = b.controller.requests.intent()
         firmware.profiles.pop(HUB_PROFILE_ID)
-        assert firmware.current == 32
+        assert firmware.current == (0 if boundary == "prior-stop-no-draw" else 32)
         mark = len(rig.bench.device_calls)
 
         # Require a genuine Stop exchange, then deliver the independent device's lifecycle closure separately.
         async def expect_stop(c, charger):
             g, j = c.session.gateway, c.session.journal
             vendor = j.vendor_id(local)
-            async with asyncio.timeout(8):
-                while not g.controls.stop_acknowledged(local):
-                    await c.tick()
-                    await asyncio.sleep(0.02)
+            if boundary == "prior-stop-no-draw":
+                # Startup alone must see the missing hold and own the protective decision for this session.
+                await until(lambda: g.controls.stop_acknowledged(local, protective=True))
+            else:
+                async with asyncio.timeout(8):
+                    while not g.controls.stop_acknowledged(local, protective=True):
+                        await c.tick()
+                        await asyncio.sleep(0.02)
             assert c.requests.intent() == intent and j.active() == local
             assert j.fault.classification() == STATION_CEILING_LOST
             assert firmware.current == 0 and firmware.effective_limit() == 32
@@ -313,7 +327,7 @@ async def test_lost_ceiling_stops_the_known_open_session(tmp_path, tls, unused_t
             finally:
                 j.db.execute("DROP TRIGGER refuse_absence")
             return
-        if boundary == "live":
+        if boundary in ("live", "prior-stop-live"):
             await expect_stop(b.controller, b.charger)
             return
 

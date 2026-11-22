@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 
 import pytest
 from ocpp_hub_core.prototype import managed_start_delivery
+from ocpp_hub_core.prototype.trial_evidence import profile_projection
 
 from tests import managed_rig as mp
 from tests.charge_rig import ChargeRig, ready
@@ -54,6 +55,43 @@ async def test_late_cloud_start_acknowledgement_preserves_original_session(tmp_p
             assert status["desired_control"] == "app" and status["station_ceiling_a"] == 6
         finally:
             release.set()
+
+
+# Intent: a failed charger zero after a cloud refusal leaves the same cloud connection available for closure.
+# Why: an independent charger-side failure must not interrupt delivery of the already mapped session's Stop.
+async def test_cloud_start_denial_keeps_connection_when_zero_is_refused(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, bench_type=StartReplyBench) as b:
+        bench, gateway, journal = b.rig.bench, b.session.gateway, b.session.journal
+        vendor_epoch = gateway._vendor_epoch
+        actual_answer = bench.firmware.answer
+        refused = asyncio.Event()
+
+        # Refuse only the zero requested after the actual cloud Start denial.
+        def answer(action, payload):
+            if action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0:
+                refused.set()
+                return {"status": "Rejected"}
+            return actual_answer(action, payload)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(bench.firmware, "answer", answer)
+            bench.start_replies[:] = ["Blocked"]
+            opened = await bench.call(
+                b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            assert opened[0] == 3
+            local = opened[2]["transactionId"]
+            await asyncio.wait_for(refused.wait(), 3)
+            assert journal.vendor_id(local) is not None and journal.fault.latched()
+            stopped = await bench.call(
+                b.charger,
+                uuid.uuid4().hex,
+                "StopTransaction",
+                {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"},
+            )
+            assert stopped[0] == 3
+            await until(lambda: bench.backend_starts[0]["closed"])
+            assert gateway._vendor_epoch == vendor_epoch and b.session.runtime.status.vendor_connected
 
 
 # Intent: an exact late error on the original cloud connection releases the documented retry.

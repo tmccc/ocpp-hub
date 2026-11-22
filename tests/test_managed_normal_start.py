@@ -17,6 +17,7 @@ from ocpp_hub_core.prototype.policy import DeniedError
 from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from ocpp_hub_core.prototype.security import SecurityError
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
+from ocpp_hub_core.prototype.trial_evidence import profile_projection
 from websockets.asyncio.client import connect
 
 from tests.charge_rig import ChargeRig, actual_stop, owner_rig, owner_start, positive_flow
@@ -86,6 +87,70 @@ async def test_regular_start_continues_until_explicit_pause(
         controller.command(uuid.uuid4().hex, "pause", controller.requests.intent().revision)
         assert (await actual_stop(test, local))["local_hold_verified"]
         assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
+
+
+# Intent: an expired Start applies zero before waiting on native readings, and still Stops if zero is refused.
+# Why: neither a slow reading nor a failed limit can leave the exact known session without protection.
+@pytest.mark.parametrize("scenario", ["zero-before-read", "zero-refused", "native-closed"])
+async def test_expired_start_protects_its_exact_session(tmp_path, tls, unused_tcp_port, monkeypatch, scenario):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j, bench = test.controller, test.session.journal, test.rig.bench
+        request = uuid.uuid4().hex
+        c.command(request, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        assert bench.firmware.current == 6 and c.charging.lease is not None
+        actual_answer = bench.firmware.answer
+        actual_read = c.native.read
+        refused = []
+        reading, resume = asyncio.Event(), asyncio.Event()
+        read_count = 0
+        refuse_zero = scenario != "zero-before-read"
+
+        # Leave the independently observed station profile intact while refusing attempts to change it to zero.
+        def answer(action, payload):
+            if refuse_zero and action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0:
+                refused.append(payload)
+                return {"status": "Rejected"}
+            return actual_answer(action, payload)
+
+        # Delay the first open reading, or close the device session before the later protective read.
+        async def read(*args, **kwargs):
+            nonlocal read_count
+            if kwargs.get("closing_local") == local:
+                read_count += 1
+                if scenario == "native-closed" and read_count == 2:
+                    bench.firmware.active = None
+                    bench.cp, bench.connection = "B", "Plug"
+                    test.rig.peer.permission_enabled = False
+                if not refuse_zero:
+                    reading.set()
+                    await resume.wait()
+            return await actual_read(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(bench.firmware, "answer", answer)
+            patch.setattr(c.native, "read", read)
+            c.charging.lease.deadline = time.monotonic() - 1
+            c.charging.changed.set()
+            try:
+                if not refuse_zero:
+                    await asyncio.wait_for(reading.wait(), 4)
+                    assert bench.firmware.effective_limit() == 0
+            finally:
+                resume.set()
+            await until(lambda: c.pause_task is not None and c.pause_task.done())
+            stops = [call[3] for call in bench.device_calls if call[2] == "RemoteStopTransaction"]
+            assert bool(refused) is refuse_zero and j.active() == local
+            if scenario == "native-closed":
+                assert read_count >= 2 and not stops
+            else:
+                assert stops == [{"transactionId": local}] and bench.firmware.current == 0
+        if scenario == "native-closed":
+            await natural_stop(test, local)
+            assert (await healthy(c))["local_hold_verified"]
+        else:
+            assert (await actual_stop(test, local))["local_hold_verified"]
 
 
 # Intent: an unsupported Start reply cannot publish app control from an existing Pause.

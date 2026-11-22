@@ -7,10 +7,13 @@ import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..frames import Frame
 from .managed_intent import ControlIntent, insert_request
+from .policy import DeniedError
+from .security import SecurityError
 from .start_handoff import StartHandoffContext, StartPublication
 from .start_settlement import (
     ChargeStart,
@@ -29,6 +32,14 @@ if TYPE_CHECKING:
     from .managed_charging import ChargeLease
     from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
+
+
+@dataclass(frozen=True)
+class TimedStartSource:
+    """The exact session observed for a timed Start, with cloud provenance when available."""
+
+    local: int
+    cloud_start: tuple[str, str] | None = None
 
 
 class StartLifecycle:
@@ -156,6 +167,137 @@ class StartLifecycle:
     def receipt_ended(self) -> bool:
         record = self.load()
         return record is not None and idle_receipt_ended(record)
+
+    # An already failed request can retire before native observation if its exact Start was never sent.
+    def retire_refused(self) -> None:
+        candidate = self.retirement(RetirementRule.REFUSED)
+        if candidate is not None:
+            self.retire(candidate)
+
+    # Live polling and expiry share the local-zero transitions, separately from cloud delivery.
+    def retire_local_zero(self, require_zero: Callable[[], None], *, closed_only: bool = False) -> tuple[bool, bool]:
+        unissued = None if closed_only else self.retirement(RetirementRule.UNISSUED)
+        closed = self.retirement(RetirementRule.CLOSED)
+        if unissued is None and closed is None:
+            return False, False
+        try:
+            require_zero()
+        except SecurityError, DeniedError, RecoveryRequiredError:
+            return False, False
+        if unissued is not None:
+            self.retire(unissued)
+            closed = self.retirement(RetirementRule.CLOSED)
+        if closed is not None:
+            try:
+                with self.journal.atomic():
+                    self.retire(closed)
+            except sqlite3.Error as error:
+                if self.journal.db.in_transaction:
+                    raise
+                raise RecoveryRequiredError("verified normal Start closure awaits retirement") from error
+            self.lease = None
+        return unissued is not None, closed is not None
+
+    # Fault supervision needs a native read only when a closed Start still has an unsettled local outcome.
+    def fault_closure_pending(self) -> bool:
+        candidate = self.retirement(RetirementRule.CLOSED)
+        if candidate is None:
+            return False
+        record = candidate.record
+        return record.phase != "completed" or (
+            record.request is not None and record.request.state in candidate.decision.states
+        )
+
+    # Only this Start owner selects retirement once the caller can establish settled delivery at zero.
+    def delivered_at_zero(self, *, worker_pending: bool, timed_only: bool) -> RetirementCandidate | None:
+        candidate = self.retirement(RetirementRule.GENERIC, worker_pending=worker_pending)
+        if timed_only and candidate is not None and not candidate.record.pending_local_test:
+            return None
+        return candidate
+
+    # Historical ended evidence can retire an expired projection, independently of the original receipt outcome.
+    def ended_at_idle(self, native: HandoverEvidence, *, unissued: bool = False) -> bool:
+        j = self.journal
+        return (
+            not j.get("control", {}).get("start_pending")
+            and j.active() is None
+            and not native.physical.transaction_open
+            and (unissued or self.receipt_ended())
+        )
+
+    # Recovery and polling can only complete the same expired projection that still has idle proof.
+    def finish_expired(self, identifier: object, native: HandoverEvidence, *, unissued: bool = False) -> None:
+        state = self.journal.get("managed_test_charge", {})
+        if (
+            state.get("id") == identifier
+            and state.get("state") != "completed"
+            and state.get("expired_normal")
+            and self.ended_at_idle(native, unissued=unissued)
+        ):
+            self.complete_metadata(state)
+
+    # Finish a timed charge's activity without abandoning any outstanding receipt that still needs delivery proof.
+    def finish_timed_hold(self, lease: ChargeLease, observed_at: float) -> bool:
+        record = self.load(wire=False)
+        if (
+            self.lease is not lease
+            or record is None
+            or record.identifier != lease.identifier
+            or record.phase != "stopping"
+            or record.pending_local_test
+        ):
+            return False
+        self.complete_metadata(json.loads(record.body), stopped_at=observed_at)
+        self.lease = None
+        return True
+
+    # A cloud test can act only on the original confirmed grant issued after its admission.
+    def _timed_cloud_source(self, floor: int) -> TimedStartSource | None:
+        j = self.journal
+        grant = j.get("vendor_start_grant", {})
+        local, token, mutation = grant.get("local"), grant.get("token"), grant.get("mutation")
+        if (
+            type(local) is not int
+            or not isinstance(token, str)
+            or not isinstance(mutation, str)
+            or j.db.execute(
+                "SELECT 1 FROM mutations WHERE rowid>? AND token=? AND origin='vendor' "
+                "AND action='RemoteStartTransaction' AND state='confirmed' LIMIT 1",
+                (floor, mutation),
+            ).fetchone()
+            is None
+        ):
+            return None
+        return TimedStartSource(local, (token, mutation))
+
+    # Decide whether an independent positive reading belongs to the timed test that requested it.
+    def timed_flow_source(self, lease: ChargeLease, local: int) -> TimedStartSource | None:
+        state = self.journal.get("managed_test_charge", {})
+        if self.lease is not lease or state.get("id") != lease.identifier:
+            return None
+        cloud = self._timed_cloud_source(lease.first_mutation)
+        if cloud is not None and cloud.local == local:
+            return cloud if lease.source == "cloud" else None
+        if lease.source == "local" and state.get("start_rpc_accepted") and self.receipt().get("local") == local:
+            return TimedStartSource(local)
+        return None
+
+    # The same grant or local receipt can identify a Stop target before first power has been recorded.
+    def timed_stop_target(self, state: dict[str, Any]) -> int | None:
+        for key in ("stop_local", "local_transaction"):
+            recorded = state.get(key)
+            if type(recorded) is int:
+                return recorded
+        if state.get("source") == "local":
+            receipt = self.receipt()
+            local = receipt.get("local")
+            if receipt.get("request_id") == state.get("id") and type(local) is int:
+                return local
+        elif type(state.get("mutation_floor")) is int:
+            source = self._timed_cloud_source(state["mutation_floor"])
+            if source is not None:
+                return source.local
+        return None
 
     # Compatibility callers can release or publish the sole lease slot without maintaining another copy.
     def set_lease(self, lease: ChargeLease | None) -> None:
@@ -407,21 +549,26 @@ class StartLifecycle:
             if j.db.in_transaction:
                 raise
             raise RecoveryRequiredError("verified normal Start closure awaits publication") from error
-        if not allow_open or lease is None or not lease.normal or record.published is not True or native is None:
+        if (
+            not allow_open
+            or lease is None
+            or not lease.normal
+            or record.identifier != lease.identifier
+            or record.published is not True
+        ):
             return False
-        closed = session is not None and session.stop is not None
         opened = (
             local is not None and native.physical.transaction_open and native.physical.native_transaction_id == local
         )
-        if (opened or closed) and session is not None:
-            charging = opened and native.physical.power_w > 10
+        if opened and session is not None:
+            charging = native.physical.power_w > 10
             try:
                 with j.atomic():
                     j.put(
                         "managed_test_charge",
                         {
                             **state,
-                            "state": "completed" if closed else "running",
+                            "state": "running",
                             "local_transaction": local,
                             "session_started_at": time.time(),
                             "charging": charging,
@@ -433,7 +580,7 @@ class StartLifecycle:
                                         "schedule": native.saved_schedule_digest,
                                     }
                                 }
-                                if opened and not known_source
+                                if not known_source
                                 else {}
                             ),
                         },
@@ -446,9 +593,8 @@ class StartLifecycle:
             except sqlite3.Error as error:
                 if j.db.in_transaction:
                     raise
-                if opened:
-                    # Keep this lease for publication and require the next poll to refresh the evidence.
-                    lease.deadline = max(lease.deadline, time.monotonic() + 15)
+                # Keep this lease for publication and require the next poll to refresh the evidence.
+                lease.deadline = max(lease.deadline, time.monotonic() + 15)
                 raise RecoveryRequiredError("verified normal Start awaits receipt publication") from error
             self.lease = None
         return True
@@ -477,7 +623,13 @@ class StartLifecycle:
     def record_reply(self, ticket: str, answer: Frame) -> bool:
         if answer[0] != 3 or answer[2] not in ({"status": "Accepted"}, {"status": "Rejected"}):
             return False
-        stage = "accepted" if answer[2] == {"status": "Accepted"} else "rejected"
+        return self.record_reply_status(ticket, answer[2]["status"])
+
+    # Live and saved wire replies settle through the same Start receipt transition.
+    def record_reply_status(self, ticket: str, status: str) -> bool:
+        if status not in ("Accepted", "Rejected"):
+            return False
+        stage = "accepted" if status == "Accepted" else "rejected"
         try:
             self.record(ticket, stage)
         except sqlite3.Error:

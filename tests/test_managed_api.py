@@ -140,6 +140,10 @@ async def test_management_connections_leave_pause_available(tmp_path, tls, unuse
                         await asyncio.wait_for(owner.wait_closed(), 2)
                     else:
                         await asyncio.wait_for(dashboards[0].wait_closed(), 2)
+                        assert (dashboards[0].close_code, dashboards[0].close_reason) == (
+                            1013,
+                            "Idle connection replaced",
+                        )
                         assert (await call(dashboards[-1], "status"))["ok"]
         finally:
             release.set()

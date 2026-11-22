@@ -95,6 +95,7 @@ class ConnectorState:
     started_at: datetime | None = None
     stats: ChargeStats = field(default_factory=ChargeStats)
     start_identity: StartIdentity | None = None
+    last_energy: tuple[datetime, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)

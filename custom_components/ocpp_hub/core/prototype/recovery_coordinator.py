@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .connection_scope import control_scope_matches, current_control_scope
 from .managed_current import current_source_decision
-from .managed_intent import ControlIntent, ReturnFailure
+from .managed_intent import ControlIntent, ReturnSettlement
 from .policy import DeniedError
 from .recovery_contracts import (
     ALLOW,
@@ -23,13 +22,11 @@ from .recovery_contracts import (
     RestoreState,
 )
 from .recovery_policy import (
-    PreflightDisposition,
     RecoveryFacts,
     RecoveryObligation,
     RecoveryWork,
     ReleaseDisposition,
     next_recovery_work,
-    preflight_disposition,
     release_disposition,
     restore_progress,
 )
@@ -41,16 +38,6 @@ from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
     from .managed import ManagedController
-
-
-@dataclass(frozen=True)
-class ReturnSettlement:
-    """One known request's journal update, independent of its physical work."""
-
-    identifier: str
-    intent: ControlIntent
-    failure: ReturnFailure | None = None
-    await_cloud: bool = False
 
 
 class RecoveryCoordinator:
@@ -227,7 +214,7 @@ class RecoveryCoordinator:
             )
         except DeniedError:
             if claim_return and return_request is not None:
-                self._settle_return(ReturnSettlement(return_request, expected, failure="return_not_sent"))
+                self._settle_return(ReturnSettlement.failed(return_request, expected, possibly_sent=False))
             raise
         return self._task
 
@@ -264,26 +251,18 @@ class RecoveryCoordinator:
                 progress = prepared
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             if return_request is not None:
-                failure: ReturnFailure = (
-                    "return_not_confirmed"
-                    if attempt is not None and attempt.positive_may_have_dispatched
-                    else "return_not_sent"
+                self._settle_return(
+                    ReturnSettlement.failed(
+                        return_request,
+                        expected_intent,
+                        possibly_sent=bool(attempt and attempt.positive_may_have_dispatched),
+                    )
                 )
-                self._settle_return(ReturnSettlement(return_request, expected_intent, failure=failure))
             raise
-        if return_request is not None and not progress.shared:
-            if progress.state is RestoreState.REQUEST_NOT_SENT:
-                self._settle_return(ReturnSettlement(return_request, expected_intent, failure="return_not_sent"))
-                return progress
-            operation = progress.operation
-            await_cloud = False
-            if (operation is None or not operation.claimed) and progress.pending is not None:
-                disposition = preflight_disposition("explicit", progress.pending)
-                if disposition is PreflightDisposition.NOT_SENT:
-                    self._settle_return(ReturnSettlement(return_request, expected_intent, failure="return_not_sent"))
-                    return RestoreProgress(RestoreState.REQUEST_NOT_SENT, progress.pending, operation)
-                await_cloud = progress.pending.reason is Prerequisite.CLOUD_ACK
-            self._settle_return(ReturnSettlement(return_request, expected_intent, await_cloud=await_cloud))
+        if return_request is not None:
+            settlement, progress = ReturnSettlement.observed(return_request, expected_intent, progress)
+            if settlement is not None:
+                self._settle_return(settlement)
         return progress
 
     # Check the current facts and bind the accepted request before a positive command can start.
@@ -314,6 +293,8 @@ class RecoveryCoordinator:
         def guard() -> GateDecision:
             if c.stopping or not c.requests.return_current(return_request, expected_intent):
                 return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
+            if continuing_local is not None and j.outcomes.awaits_stop_report(continuing_local):
+                return Pending(Prerequisite.LIFECYCLE, "continuation awaits the Stop's lifecycle report")
             if not cloud_current():
                 reason = (
                     Prerequisite.CLOUD

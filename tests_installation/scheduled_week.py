@@ -173,6 +173,7 @@ class ScheduledWeek:
                 await release.wait()
 
         before = {row["id"] for row in self.proxy.durable()["requests"]}
+        mark = len(self.bench.device_calls)
         await entry.runtime_data.async_refresh()
         self.bench.before_reply = hold_zero
         press = asyncio.create_task(press_button(hass, "pause"))
@@ -190,13 +191,16 @@ class ScheduledWeek:
             assert self.firmware.active == charge.local and self.firmware.current == 0
             release.set()
             await asyncio.wait_for(self.bench.remote_stop.wait(), 8)
-            stops = [
-                frame[3]["transactionId"] for frame in self.bench.device_calls if frame[2] == "RemoteStopTransaction"
-            ]
-            assert stops and set(stops) == {charge.local}
             await self.finish(charge, early=True)
             await press
-            return await self.proxy.completed_control(pause["id"])
+            completed = await self.proxy.completed_control(pause["id"])
+            stops = [
+                frame[3]["transactionId"]
+                for frame in self.bench.device_calls[mark:]
+                if frame[2] == "RemoteStopTransaction"
+            ]
+            assert stops == [charge.local]
+            return completed
         finally:
             release.set()
             self.bench.before_reply = None

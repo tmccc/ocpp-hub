@@ -26,6 +26,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit
@@ -149,18 +151,117 @@ def compare(local: dict[str, str], remote: dict[str, str]) -> tuple[list[str], l
 # Build the POSIX sh run on the server: back up the old copy, unpack stdin next to it, swap, prune old backups.
 # Unpacking completely before replacing means a broken transfer leaves the running integration untouched;
 # the script avoids GNU-only flags because the SSH add-on runs BusyBox.
-def remote_install_script(target: Target, keep: int = KEEP_BACKUPS) -> str:
-    d, b, parent = target.remote_dir, target.backup_dir, f"{target.config_dir}/custom_components"
-    return " && ".join(
-        [
-            f"mkdir -p '{b}' '{parent}'",
-            f"if [ -d '{d}' ]; then tar -C '{parent}' -czf '{b}/ocpp_hub-'$(date +%Y%m%d-%H%M%S)'.tar.gz' ocpp_hub; fi",
-            f"rm -rf '{parent}/.ocpp_hub-new' && mkdir '{parent}/.ocpp_hub-new'",
-            f"tar -C '{parent}/.ocpp_hub-new' -xf -",
-            f"rm -rf '{d}' && mv '{parent}/.ocpp_hub-new' '{d}'",
-            f"ls -1t '{b}' | tail -n +{keep + 1} | while read f; do rm -f '{b}'/\"$f\"; done",
-        ]
-    )
+def remote_install_script(
+    target: Target, expected: dict[str, str], keep: int = KEEP_BACKUPS, *, activation_owner: str = ""
+) -> str:
+    parent = shlex.quote(f"{target.config_dir}/custom_components")
+    manifest = "\n".join(f"{digest}  ./{name}" for name, digest in expected.items())
+    return f"""set -eu
+target={shlex.quote(target.remote_dir)}
+backups={shlex.quote(target.backup_dir)}
+parent={parent}
+owner={shlex.quote(activation_owner)}
+lock="$backups/.install-lock"
+mkdir -p "$backups" "$parent"
+if ! mkdir "$lock"; then
+    printf '%s\\n' 'Another Home Assistant install holds the target lock.' >&2
+    exit 1
+fi
+scratch=
+{_restore_staged_component()}
+{_publish_staged_backup(keep)}
+cleanup() {{
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$status" -eq 0 ] && [ -n "$owner" ]; then exit 0; fi
+    if [ -n "$scratch" ]; then
+        if [ "$status" -ne 0 ] && ! restore_previous; then
+            printf '%s\\n' 'The installation lock and staging directory remain for recovery.' >&2
+            exit 1
+        fi
+        rm -rf "$scratch"
+    fi
+    if [ "$status" -ne 0 ] || [ -z "$owner" ]; then
+        if [ -n "$owner" ]; then rm -f "$lock/$owner"; fi
+        rmdir "$lock"
+    fi
+    exit "$status"
+}}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if [ -n "$owner" ]; then
+    touch "$lock/$owner"
+    staging="$parent/.ocpp_hub-install.$owner"
+    (umask 077; mkdir "$staging")
+    scratch="$staging"
+else
+    scratch=$(mktemp -d "$parent/.ocpp_hub-install.XXXXXX")
+fi
+mkdir "$scratch/candidate"
+tar -C "$scratch/candidate" -xf -
+(cd "$scratch/candidate" && find . -type f -exec sha256sum {{}} +) > "$scratch/files"
+printf '%s\\n' {shlex.quote(manifest)} | LC_ALL=C sort > "$scratch/expected"
+LC_ALL=C sort "$scratch/files" > "$scratch/actual"
+if ! cmp -s "$scratch/expected" "$scratch/actual"; then
+    printf '%s\\n' 'The staged Home Assistant component differs from the expected files.' >&2
+    exit 1
+fi
+if [ -d "$target" ]; then
+    tar -C "$parent" -czf "$scratch/backup.tar.gz" ocpp_hub
+    mv "$target" "$scratch/previous"
+fi
+touch "$scratch/swap-ready"
+mv "$scratch/candidate" "$target"
+cat "$scratch/files"
+if [ -z "$owner" ]; then publish_backup; fi
+"""
+
+
+# Recover the same staged files whether the remote script or its caller detects an interrupted install.
+def _restore_staged_component() -> str:
+    return """restore_previous() {
+    if [ -f "$scratch/swap-ready" ] && [ ! -e "$scratch/candidate" ] &&
+       [ ! -e "$scratch/rejected" ] && [ -e "$target" ]; then
+        mv "$target" "$scratch/rejected" || return 1
+    fi
+    if [ -d "$scratch/previous" ] && [ ! -e "$target" ]; then
+        mv "$scratch/previous" "$target" || return 1
+    fi
+}"""
+
+
+# Keep earlier archives until an install has passed verification and any requested activation.
+def _publish_staged_backup(keep: int) -> str:
+    return f"""publish_backup() {{
+    if [ -f "$scratch/backup.tar.gz" ]; then
+        name="ocpp_hub-$(date +%Y%m%d-%H%M%S)-${{scratch##*.}}.tar.gz"
+        mv "$scratch/backup.tar.gz" "$backups/$name"
+    fi
+    set -- "$backups"/ocpp_hub-*.tar.gz
+    if [ -f "$1" ]; then
+        ls -1t "$@" | tail -n +{keep + 1} | while IFS= read -r old; do rm -f "$old"; done
+    fi
+}}"""
+
+
+# The exact activation owner can restore the staged original before giving up its target lock.
+def remote_unlock_script(target: Target, owner: str, *, restore: bool = False, keep: int = KEEP_BACKUPS) -> str:
+    lock = shlex.quote(f"{target.backup_dir}/.install-lock")
+    scratch = shlex.quote(f"{target.config_dir}/custom_components/.ocpp_hub-install.{owner}")
+    return f"""set -eu
+lock={lock}
+backups={shlex.quote(target.backup_dir)}
+claim="$lock"/{shlex.quote(owner)}
+scratch={scratch}
+target={shlex.quote(target.remote_dir)}
+{_restore_staged_component()}
+{_publish_staged_backup(keep)}
+if [ ! -f "$claim" ]; then exit 0; fi
+if [ "{int(restore)}" -eq 1 ]; then restore_previous; else publish_backup; fi
+rm -rf "$scratch"
+rm "$claim"
+rmdir "$lock"
+"""
 
 
 # Wrap a script in `sudo -n sh -c` when needed; stdin (the tar stream) passes straight through.
@@ -254,30 +355,52 @@ def prepare_archive(
 
 # Open the shared connection, install the files, and verify every file by checksum.
 # The swap is only reported as done when the server copy is byte-identical to the local files.
-def deploy(target: Target, archive: bytes, expected: dict[str, str], control_path: str, batch: bool = False) -> None:
+def deploy(
+    target: Target,
+    archive: bytes,
+    expected: dict[str, str],
+    control_path: str,
+    batch: bool = False,
+    *,
+    activate: Callable[[], None] | None = None,
+    check_activation: Callable[[], None] | None = None,
+) -> None:
     # Build an ssh command line for this target on the shared connection.
     # Every remote step must use the same control path and batch setting.
     def ssh(*remote: str, master: bool = False) -> list[str]:
         return ssh_command(target, control_path, *remote, master=master, batch=batch)
 
     subprocess.run(ssh("true", master=True), check=True)
+    owner = uuid.uuid4().hex
+    restore = True
     try:
-        subprocess.run(ssh(privileged(remote_install_script(target), target.sudo)), input=archive, check=True)
         listing = subprocess.run(
-            ssh(f"cd '{target.remote_dir}' && find . -type f -exec sha256sum {{}} +"),
-            capture_output=True,
-            text=True,
+            ssh(privileged(remote_install_script(target, expected, activation_owner=owner), target.sudo)),
+            input=archive,
+            stdout=subprocess.PIPE,
             check=True,
-        ).stdout
+        ).stdout.decode()
         missing, extra, different = compare(expected, parse_sha256sum(listing))
         if missing or extra or different:
             raise SystemExit(f"Verification failed. missing={missing} unexpected={extra} different={different}")
         print(f"Deployed and verified {len(expected)} files in {target.remote_dir}")
+        if check_activation is not None:
+            check_activation()
+        # After a restart can reach Core it may already be running the new files.
+        restore = False
+        if activate is not None:
+            activate()
     finally:
-        subprocess.run(
-            ["ssh", "-O", "exit", "-o", f"ControlPath={control_path}", f"{target.user}@{target.host}"],
-            capture_output=True,
-        )
+        try:
+            finish = remote_unlock_script(target, owner, restore=restore)
+            completed = subprocess.run(ssh(privileged(finish, target.sudo)), check=False)
+            if completed.returncode:
+                raise SystemExit("Could not finish the SSH installation. Check the staged files and target lock.")
+        finally:
+            subprocess.run(
+                ["ssh", "-O", "exit", "-o", f"ControlPath={control_path}", f"{target.user}@{target.host}"],
+                capture_output=True,
+            )
 
 
 @dataclass(frozen=True)
@@ -429,6 +552,7 @@ def main() -> int:
         print("Dry run: would run the checks, back up, deploy and verify. Nothing was changed.")
         return 0
     access = restart_access(env, args.ha_api_config) if args.restart and confirm_restart(args.yes, args.batch) else None
+    activate, check_activation = None, None
     if access is not None:
         api = ssh_restart_api(target, access)
 
@@ -437,15 +561,30 @@ def main() -> int:
             return ha_restart.uptime(api, access.uptime_entity, target.config_dir)
 
         ssh_before = lifetime()
+
+        # Restore the staged original if Core refuses the new files before receiving a restart request.
+        def check_activation() -> None:
+            ha_restart.check_restart(api, ssh_before, lifetime)
+
+        # Keep installation ownership through confirmation of the new Core lifetime.
+        def activate() -> None:
+            ha_restart.request_restart(api, ssh_before, lifetime)
+            print("Verified Home Assistant is running with a new Core start time.")
+
     with tempfile.TemporaryDirectory() as tmp:
         _, archive, expected = prepare_archive(
             INTEGRATION, Path(tmp), skip_checks=args.skip_checks, collection_executors=args.collection_executors
         )
-        deploy(target, archive, expected, os.path.join(tmp, "ssh-%C"), args.batch)
-    if access is not None:
-        ha_restart.restart(api, ssh_before, lifetime)
-        print("Verified Home Assistant is running with a new Core start time.")
-    else:
+        deploy(
+            target,
+            archive,
+            expected,
+            os.path.join(tmp, "ssh-%C"),
+            args.batch,
+            activate=activate,
+            check_activation=check_activation,
+        )
+    if access is None:
         print("Next: restart Home Assistant (a changed integration is loaded after a restart).")
     return 0
 

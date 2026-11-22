@@ -83,9 +83,9 @@ def schedule_options(form: Mapping[str, Any]) -> dict[str, Any]:
     options: dict[str, Any] = {}
     if form.get(CONF_SCHEDULE_ENTITY):
         options[CONF_SCHEDULE_ENTITY] = form[CONF_SCHEDULE_ENTITY]
-        for key in (CONF_SCHEDULE_INSIDE, CONF_SCHEDULE_OUTSIDE):
-            if form.get(key) is not None:
-                options[key] = float(form[key])
+    for key in (CONF_SCHEDULE_INSIDE, CONF_SCHEDULE_OUTSIDE):
+        if form.get(key) is not None:
+            options[key] = float(form[key])
     return options
 
 

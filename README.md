@@ -57,16 +57,23 @@ When the cloud asks the charger to Start or Stop, the proxy records the charger'
 If saving the answer fails, the proxy retries the save without repeating the command. A saved answer survives
 a restart. An accepted Stop still needs the charger's session-end report. Home Assistant distinguishes an answer
 that is being saved from an unknown outcome that keeps charging on hold.
-For up to 30 seconds after the normal deadline, the proxy can still match a late answer for a local Start,
-a forwarded Start or Stop, or a Start report sent to the cloud. The original connection must remain open.
+For up to 30 seconds after the normal deadline, the proxy can still match a late answer for a local or
+forwarded Start or Stop, or a Start report sent to the cloud. The original connection must remain open.
 A missing answer can hold charging at zero. A subsequent matching answer can settle that hold, and the
 proxy then checks the current charger evidence and owner choice before allowing charging.
 
 The command journal keeps the original request, the charger reply, and the verified result available to
 control, recovery and Home Assistant. A command can have multiple charger replies, such as one for a new
-current and another for restoring zero. The charge history supplies actual session start and closure. A Pause
-that acknowledges a fault keeps that evidence with its receipt. After a restart, the proxy can reuse that Pause
-for the same fault and check the charger again.
+current and another for restoring zero. A saved accepted Stop stays with the same session through reconnect,
+proxy replacement, and shutdown. If the usual write fails, an independent journal entry can preserve the exact
+accepted reply for the replacement. A Pause completes after the charger reports closure and a fresh charger
+reading verifies zero. Return waits for the cloud to acknowledge the session report before restoring current.
+Local Pause and vendor-app Stop share the same session decision. A new vendor request can reuse the charger's
+earlier acceptance for that session after fresh readings confirm zero. The reply carries the new request ID.
+If a fresh reading shows draw or the zero limit cannot be confirmed, the proxy can send a protective Stop to
+the exact open session. Recovery waits at zero for the closure report after an accepted app Stop or an unfinished
+shutdown Stop. A Pause that acknowledges a fault keeps that evidence with its receipt. After a restart, the
+proxy can reuse that Pause for the same fault and check the charger again.
 If the proxy restarts with a saved reply still waiting for its final update, let this version finish that update
 before rolling back to an earlier version. The rollback check requires a settled journal.
 
@@ -771,7 +778,9 @@ ordinary recovery in the same transaction. Fresh zero, native source and current
 unchanged original app intent; this emits no Start. A newer Pause, Boot or control claim cannot inherit that
 restoration. A pending explicit Pause can retry its exact known-session Stop after native availability recovers,
 including when a fully validated sample fails only its measured output bound. A fault alone grants no Stop.
-An accepted Stop waits for its genuine closure report; a new Boot invalidates reuse of its old acknowledgement.
+An accepted Stop stays with the same session through a new Boot and awaits the charger’s closure report. A new
+Boot needs its own zero proof. A confirmed unsent shutdown Stop permits ordinary recovery once its other
+checks pass. A possibly sent shutdown Stop keeps zero while the same session awaits closure.
 
 Unanswered inflight cloud reports and Stops can retry after cleanup storage recovers, using their original
 delivery identity. Cancellation retains its original outcome even if the best-effort cleanup write fails.
@@ -1148,6 +1157,8 @@ charger's correlated result or error. Unknown commands and undocumented iCS vari
   they cannot publish successful ownership. Unknown outcomes block later writes until explicit reconciliation.
 - Routine observations and lifecycle delivery have separate bounded budgets. Each accepted open transaction reserves
   its Stop slot, so routine telemetry cannot strand transaction closure, including a legacy full observation queue.
+  A blocked delivery can fill the observation queue. New observations are then refused, so status and meter data
+  can become stale until delivery resumes.
   Accepted events retain their bodies and FIFO order. Full lifecycle capacity refuses new Starts before acknowledgement;
   neither capacity nor recovery silently drops already accepted history.
 

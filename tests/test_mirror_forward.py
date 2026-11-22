@@ -6,7 +6,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from ocpp_hub_core.control import HUB_PROFILE_ID, ControlPolicy
+from ocpp_hub_core.control import HUB_PROFILE_ID, ControlError, ControlPolicy
 from ocpp_hub_core.mirror_forward import Forward, Refuse, plan_forward
 from ocpp_hub_core.mirror_link import MAX_FORWARDS
 from ocpp_hub_core.txid_map import TransactionIdMap
@@ -65,6 +65,101 @@ async def test_a_forwarded_command_reaches_the_charger_and_its_answer_returns(st
 
     assert call[2] == "RemoteStartTransaction" and call[3] == {"idTag": "VENDOR", "connectorId": 1}
     assert answer[0] == 3 and answer[2] == {"status": "Accepted"}
+
+
+# Intent: a sent profile update still settles when only the vendor connection changes.
+# Why: the actual charger can apply and acknowledge it while the original vendor socket is gone.
+async def test_sent_profile_result_survives_vendor_disconnect(start_rig) -> None:
+    rig, charger = await _forwarding_rig(start_rig)
+    caller = asyncio.create_task(rig.vendor.command("SetChargingProfile", PROFILE))
+    sent = await charger.next_hub_call()
+    assert sent[2] == "SetChargingProfile"
+    before = rig.vendor.connection_count
+    await rig.vendor.stop()
+    caller.cancel()
+    await asyncio.gather(caller, return_exceptions=True)
+    await rig.vendor.start()
+    await eventually(lambda: rig.vendor.connection_count > before, message="vendor connection was not replaced")
+    await charger.answer(sent, {"status": "Accepted"})
+    await eventually(lambda: rig.hub.listener.latest.vendor_limit_a == 10.0, message="charger profile reply was lost")
+
+
+# Intent: a late per-transaction limit reply applies only to the original still-current transaction.
+# Why: another Start can replace the original transaction before the real charger answers.
+@pytest.mark.parametrize("source", ["local", "vendor"])
+async def test_old_transaction_profile_reply_cannot_set_replacement_limit(start_rig, source):
+    rig, charger = await _forwarding_rig(start_rig)
+    started = await charger.call(
+        "StartTransaction", {"connectorId": 1, "idTag": "A", "meterStart": 0, "timestamp": "2026-10-21T08:00:00Z"}
+    )
+    first = started[2]["transactionId"]
+    session = rig.hub.central.session(CHARGER)
+    if source == "vendor":
+        await eventually(lambda: len(rig.mirror._transactions.get(CHARGER, ())) == 1, message="ids not paired")
+        mapped = rig.mirror._transactions[CHARGER].to_vendor(first)
+        profile = {**PROFILE["csChargingProfiles"], "chargingProfilePurpose": "TxProfile", "transactionId": mapped}
+        task = asyncio.create_task(rig.vendor.command("SetChargingProfile", {**PROFILE, "csChargingProfiles": profile}))
+    else:
+        session.record_limit(None, "TxProfile")
+        task = asyncio.create_task(rig.hub.central.control(CHARGER).set_current_limit(10))
+    sent = await charger.next_hub_call()
+    assert sent[2] == "SetChargingProfile" and sent[3]["csChargingProfiles"]["transactionId"] == first
+    replacement = await charger.call(
+        "StartTransaction", {"connectorId": 1, "idTag": "B", "meterStart": 100, "timestamp": "2026-10-21T08:30:00Z"}
+    )
+    assert replacement[2]["transactionId"] != first
+    await charger.answer(sent, {"status": "Accepted"})
+    if source == "vendor":
+        assert (await task)[2] == {"status": "Accepted"}
+    else:
+        with pytest.raises(ControlError, match="requested charge ended"):
+            await task
+    assert session.snapshot.connectors[1].transaction_id == replacement[2]["transactionId"]
+    assert session.snapshot.vendor_limit_a is None and session.snapshot.charge_limit_a is None
+
+
+# Intent: a vendor TxProfile without an ID belongs to the session running when the charger receives it.
+# Why: a real acceptance can update that session, but a late reply cannot update its replacement.
+@pytest.mark.parametrize("replace_session", [False, True])
+@pytest.mark.parametrize("null_id", [False, True])
+async def test_forwarded_profile_without_id_keeps_its_session(start_rig, replace_session, null_id):
+    rig, charger = await _forwarding_rig(start_rig)
+    first = await charger.call(
+        "StartTransaction", {"connectorId": 1, "idTag": "A", "meterStart": 0, "timestamp": "2026-10-21T08:00:00Z"}
+    )
+    profile = {**PROFILE["csChargingProfiles"], "chargingProfilePurpose": "TxProfile"}
+    if null_id:
+        profile["transactionId"] = None
+    task = asyncio.create_task(rig.vendor.command("SetChargingProfile", {**PROFILE, "csChargingProfiles": profile}))
+    sent = await charger.next_hub_call()
+    assert sent[3]["csChargingProfiles"] == profile
+    if replace_session:
+        second = await charger.call(
+            "StartTransaction", {"connectorId": 1, "idTag": "B", "meterStart": 100, "timestamp": "2026-10-21T08:30:00Z"}
+        )
+        assert second[2]["transactionId"] != first[2]["transactionId"]
+    await charger.answer(sent, {"status": "Accepted"})
+    assert (await task)[2] == {"status": "Accepted"}
+    assert rig.hub.central.session(CHARGER).snapshot.vendor_limit_a == (None if replace_session else 10)
+
+
+# Intent: accepted vendor profile changes retire only the hub profile the charger actually replaced.
+# Why: a same-stack edit must clear a stale hub limit, while a clear of an absent profile must keep a dormant plan.
+@pytest.mark.parametrize("change", ["same-stack", "another-stack", "clear-absent"])
+async def test_forwarded_profile_change_tracks_actual_hub_profile(start_rig, change):
+    rig, charger = await _forwarding_rig(start_rig)
+    session = rig.hub.central.session(CHARGER)
+    if change == "clear-absent":
+        task = asyncio.create_task(rig.vendor.command("ClearChargingProfile", {}))
+    else:
+        session.record_limit(0, "TxDefaultProfile", from_plan=True)
+        profile = {**PROFILE["csChargingProfiles"], "stackLevel": int(change == "another-stack")}
+        task = asyncio.create_task(rig.vendor.command("SetChargingProfile", {**PROFILE, "csChargingProfiles": profile}))
+    await charger.answer(await charger.next_hub_call(), {"status": "Accepted"})
+    assert (await task)[2] == {"status": "Accepted"}
+    assert session.snapshot.charge_limit_a == (0 if change == "another-stack" else None)
+    assert session.snapshot.vendor_limit_a == (None if change == "clear-absent" else 10)
+    assert session.snapshot.external_profile_writes == int(change == "same-stack")
 
 
 # Intent: a successful clear forgets only the known profiles matching its ID, purpose, connector and stack.

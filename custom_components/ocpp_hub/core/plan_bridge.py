@@ -7,7 +7,7 @@ from the plan it holds (and take over what the app writes), instead of passing t
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -22,7 +22,9 @@ class PlanHandler(Protocol):
 
     def plan(self, cp_id: str) -> list[PlanWindow] | None: ...
 
-    async def app_wrote(self, cp_id: str, windows: list[PlanWindow]) -> bool: ...
+    async def app_wrote(
+        self, cp_id: str, windows: list[PlanWindow], *, before_send: Callable[[], None] | None = None
+    ) -> bool: ...
 
     def imported(self, cp_id: str, windows: list[PlanWindow]) -> None: ...
 

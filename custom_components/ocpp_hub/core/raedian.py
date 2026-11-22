@@ -64,7 +64,9 @@ def check_byte(frame_without_check: bytes) -> int:
 
 
 # Read a frame from its hex text. A frame whose length, size or check byte does not agree is refused.
-def parse_frame(text: str) -> RaedianFrame:
+def parse_frame(text: object) -> RaedianFrame:
+    if not isinstance(text, str):
+        raise FrameError("frame contents must be text")
     try:
         data = bytes.fromhex(text)
     except ValueError as error:

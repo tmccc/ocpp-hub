@@ -23,6 +23,20 @@ async def test_boot_is_accepted_and_identity_is_recorded(start_hub) -> None:
     assert hub.listener.latest.connected and hub.listener.connected == ["TEST0001"]
 
 
+# Intent: malformed optional boot identity fields stay unknown and valid fields remain available.
+# Why: the accepted charger identity is also used in Home Assistant's registry and display code.
+async def test_boot_identity_skips_unusable_fields(start_hub) -> None:
+    hub = await start_hub()
+    charger = await hub.charger()
+    result = await charger.call(
+        "BootNotification",
+        {"chargePointVendor": 42, "chargePointModel": "VALID", "firmwareVersion": {"version": "unknown"}},
+    )
+    assert result[0] == 3
+    info = hub.listener.latest.info
+    assert info.vendor is None and info.model == "VALID" and info.firmware is None
+
+
 # Intent: a heartbeat is answered with the current time.
 # Why: chargers set their clock from it and treat a missing answer as a dead link.
 async def test_heartbeat_returns_time(start_hub) -> None:
@@ -162,6 +176,26 @@ async def test_post_boot_setup_reads_configuration_and_features(start_hub) -> No
     assert hub.listener.latest.features == {"Core", "FirmwareManagement", "SmartCharging"}
     assert hub.listener.latest.configuration["MeterValuesSampledData"] == change[3]["value"]
     assert "AuthorizationKey" not in hub.listener.latest.configuration
+
+
+# Intent: a malformed configuration entry leaves later configuration reads usable on the same connection.
+# Why: a charger can return null for one key while supplying valid data for the next.
+async def test_malformed_configuration_does_not_end_the_read_sequence(start_hub) -> None:
+    from ocpp_hub_core.session import CONFIG_KEYS
+
+    hub = await start_hub()
+    charger = await hub.charger()
+    session = hub.central.session("TEST0001")
+    assert session is not None
+    read = asyncio.create_task(session._read_configuration())
+    for index, key in enumerate(CONFIG_KEYS):
+        request = await charger.next_hub_call()
+        assert request[2:] == ["GetConfiguration", {"key": [key]}]
+        value = None if index == 0 else [{"key": key, "value": "fixture"}]
+        await charger.answer(request, {"configurationKey": value})
+    await read
+    assert CONFIG_KEYS[0] not in session.snapshot.configuration
+    assert session.snapshot.configuration[CONFIG_KEYS[-1]] == "fixture"
 
 
 # Intent: a metering setting the charger already has is not written again.

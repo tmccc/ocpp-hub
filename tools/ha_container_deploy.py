@@ -13,8 +13,8 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from functools import partial
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -70,6 +70,20 @@ def exchange_directories(staged: Path, installed: Path) -> None:
         raise OSError(error, f"atomic HA component replacement failed: {os.strerror(error)}")
 
 
+# Serialize container and SSH installs for the same component throughout activation.
+@contextmanager
+def installation_lock(backups: Path) -> Iterator[None]:
+    """Share the installed component's lock with both deployment transports."""
+    with (backups / ".install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        shared = backups / ".install-lock"
+        shared.mkdir()
+        try:
+            yield
+        finally:
+            shared.rmdir()
+
+
 # Back up the previous directory and publish only a fully validated replacement.
 def install(
     config: Path,
@@ -99,8 +113,7 @@ def install(
         if actual != expected:
             raise ValueError("staged component verification failed")
 
-        with (backups / ".install.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with installation_lock(backups):
             restart = prepare_restart() if prepare_restart is not None else None
             if target.is_symlink() or (target.exists() and not target.is_dir()):
                 raise ValueError("component path must be a directory")
@@ -143,7 +156,9 @@ def install(
                 except (Exception, SystemExit) as error:
                     # Core may have restarted using the candidate. Keep those files and the previous backup.
                     raise SystemExit(f"{error} The new component remains installed.") from None
-            for old in sorted(backups.glob(domain + "-*.tar.gz"), reverse=True)[3:]:
+            older = [path for path in backups.glob(domain + "-*.tar.gz") if path != backup]
+            keep = 2 if backup is not None else 3
+            for old in sorted(older, key=lambda path: path.stat().st_mtime_ns, reverse=True)[keep:]:
                 old.unlink()
     return {"domain": domain, "verified_files": len(files), "backup_created": replacing}
 

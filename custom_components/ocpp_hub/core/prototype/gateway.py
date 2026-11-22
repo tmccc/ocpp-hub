@@ -33,7 +33,7 @@ from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
 from .ics_writes import IcsWrite, data_value, known_write
-from .local_control import LocalControl
+from .local_control import LocalControl, StopDecision
 from .managed_start_delivery import (
     latch_start_delivery_fault,
     record_start_denial,
@@ -69,6 +69,10 @@ class MalformedReplyError(DeniedError):
 
 class MalformedCallError(DeniedError):
     """A malformed request with a usable correlation ID."""
+
+
+class _VendorStopAlreadyAcceptedError(Exception):
+    """The exact Stop is already accepted and the same session still has verified zero."""
 
 
 # Reject malformed or non-finite input before handing it to the upstream frame vocabulary.
@@ -160,6 +164,16 @@ class StartReports(Protocol):
     def recorded(self, local: int, payload: dict[str, Any]) -> None: ...
 
 
+class StopZeroEvidence(Protocol):
+    """Independent zero observations for reusing a previous charger Stop reply."""
+
+    # Refresh only when a prior Stop may already cover this session.
+    async def refresh_stop_zero(self, local: int) -> None: ...
+
+    # Report whether the latest evidence still covers the exact open session at zero.
+    def stop_zero_verified(self, local: int) -> bool: ...
+
+
 class Gateway:
     """One admitted charger, independent local control, and one fixed vendor mirror."""
 
@@ -179,6 +193,7 @@ class Gateway:
         self.authorisation = VendorAuthorisation(journal, self.policy.vendor_tag_ttl_s)
         self.auth_info = InfoBook(journal, protected_tags=self.policy.allowed_tags)
         self.start_reports: StartReports | None = None
+        self.stop_zero_evidence: StopZeroEvidence | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
         self._tasks: set[asyncio.Task[None]] = set()
@@ -777,7 +792,6 @@ class Gateway:
                 # A later return to the same body cannot erase an intervening introduction revocation.
                 self.boot_metadata_revision += 1
             self._pending_boot = uuid.uuid4().hex
-            self.controls.forget_stop_ack()
             self._boot_retry.clear()
         except DeniedError, ConflictError:
             return build_call_error(
@@ -1086,7 +1100,7 @@ class Gateway:
         if kind == "write" and self.journal.get("control", {}).get("owner") == "local":
             raise DeniedError("local owner blocks vendor extension writes")
 
-    # Forward a real vendor request and its exact result/error instead of inventing successful acknowledgements.
+    # Forward the vendor request or return an exact previous Stop acceptance when zero still holds.
     async def _vendor_call(self, frame: Frame, epoch: int, charger_scope: ControlScope | None) -> str:
         token, action = str(frame[1]), str(frame[2])
         original: dict[str, Any] = frame[3]
@@ -1194,6 +1208,7 @@ class Gateway:
                 local_transaction = self.journal.local_id(vendor_transaction)
                 if local_transaction is None:
                     raise DeniedError("cloud command does not name an active transaction")
+            stop_evidence = self.stop_zero_evidence if supervised and action == "RemoteStopTransaction" else None
 
             # A cloud number can be reassigned while this command waits for the charger or native evidence.
             def require_transaction() -> None:
@@ -1243,11 +1258,43 @@ class Gateway:
                 if not self._local_tag(original["idTag"]):
                     self.auth_info.require_dynamic(info)
 
+            # Wait behind earlier charger requests before reading a possible zero hold for this Stop.
+            async def refresh_stop_zero() -> None:
+                assert stop_evidence is not None and local_transaction is not None
+
+                # An ordinary first Stop can be forwarded promptly without an extra native read.
+                def maybe_reuse() -> bool:
+                    require_origin()
+                    return (
+                        self.controls.ready
+                        and self.controls.desired() == 0
+                        and self.controls.stop_decision(local_transaction)
+                        in (StopDecision.ACCEPTED, StopDecision.WAIT_FOR_REPORT)
+                    )
+
+                if self.decide(maybe_reuse, priority=priority):
+                    await stop_evidence.refresh_stop_zero(local_transaction)
+
+            # Both checks run inside the gate. The final one sees the latest reply, lifecycle and zero evidence.
+            def check_stop() -> None:
+                assert stop_evidence is not None and local_transaction is not None
+                decision = self.controls.stop_decision(
+                    local_transaction, reuse_allowed=stop_evidence.stop_zero_verified(local_transaction)
+                )
+                if decision is StopDecision.ACCEPTED:
+                    raise _VendorStopAlreadyAcceptedError
+                if decision is StopDecision.WAIT_FOR_REPORT:
+                    raise RecoveryRequiredError("cloud Stop awaits the charger's original report")
+                if decision is StopDecision.CLOSED:
+                    raise DeniedError("cloud Stop lost its original open session")
+
             # Allocate profile ids and mutation intent only after the in-gate policy check succeeds.
             def prepare() -> dict[str, Any]:
                 nonlocal mutation, query, ics_write, grant, profile_write, translated
                 require_origin()
                 self._check_vendor(action, original)
+                if stop_evidence is not None:
+                    check_stop()
                 with self.journal.atomic():
                     if action == "DataTransfer" and is_transaction_query(original):
                         query = TransactionQuery.from_request(original, self.journal.historical_local_id)
@@ -1328,11 +1375,18 @@ class Gateway:
                 priority=priority,
                 check=check,
                 token=wire,
-                before_send=prepare_clear if action == "ClearChargingProfile" else None,
+                before_send=(
+                    prepare_clear
+                    if action == "ClearChargingProfile"
+                    else check_stop
+                    if stop_evidence is not None
+                    else None
+                ),
                 on_dispatch=on_dispatch,
                 on_reply=owns_profile_reply if action in PROFILE_COMMANDS else None,
                 on_receive=received if write else None,
                 keep_late_reply=action in TRANSACTION_COMMANDS,
+                prepare_call=refresh_stop_zero if stop_evidence is not None else None,
             )
             if write and forwarded_reply is None and profile_reply is None and other_reply is None:
                 raise UnavailableError("charger write did not return a recognized outcome")
@@ -1346,6 +1400,8 @@ class Gateway:
 
                 return reply_as(self.decide(project_history, priority=priority), token)
             return reply_as(answer, token)
+        except _VendorStopAlreadyAcceptedError:
+            return build_call_result(token, {"status": "Accepted"})
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:
@@ -1543,9 +1599,11 @@ class Gateway:
         )
 
     # A local Stop can carry the current owner Pause through introduction to its exact wire reply.
-    async def stop(self, *, requests: ManagedRequests | None = None) -> Frame:
+    async def stop(
+        self, station_flowing: Callable[[], bool] | None = None, *, requests: ManagedRequests | None = None
+    ) -> Frame:
         if not self.journal.get("managed_mode"):
-            return await self.controls.stop()
+            return await self.controls.stop(station_flowing=station_flowing)
         connection, local = current_control_scope(self), self.journal.active()
         intent, request = None, None
         if requests is not None:
@@ -1575,11 +1633,18 @@ class Gateway:
             ):
                 raise UnavailableError("local Stop belongs to a superseded Boot, transaction or Pause")
 
+        # Introduction and the foreground Pause bind the same ticket to the same request.
+        def bind(ticket: str) -> None:
+            if requests is not None and intent is not None and connection is not None:
+                requests.bind_pause_stop(intent, ticket, request, local, connection[0].boot)
+
         # Join an existing Pause Stop or retain the original request on this connection's own wire evidence.
         # The protective send still uses the original introduction claim and its independent zero proof.
         return await self.controls.stop(
             expected_local=local,
             guard=guard,
+            station_flowing=station_flowing,
+            on_claim=bind,
             owner=("pause", intent, request, local, connection) if request is not None else None,
             request_id=request.identifier if request is not None else None,
         )
@@ -1738,7 +1803,13 @@ class Gateway:
                 if disposition == "deferred":
                     return
                 if disposition == "denied":
-                    await self.controls.ensure_ceiling()
+                    try:
+                        await self.controls.ensure_ceiling()
+                    except (DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
+                        # The denial and hold are durable. The cloud can still receive the session's later reports.
+                        raise RecoveryRequiredError(
+                            "cloud denied the mapped local session; zero needs verification"
+                        ) from error
                     raise RecoveryRequiredError("cloud denied the mapped local session; zero hold retained")
 
     # A retiring socket may finish the exact Start already sent, within the original reply timeout.
@@ -1775,9 +1846,11 @@ class Gateway:
         if current is not None and saved is not None and current != saved:
             raise RecoveryRequiredError("cloud reply requires exact delivery reconciliation")
         reply = current or saved
-        if reply is None or reply.answer[0] != 3 or not reply.storage_only(self.journal):
+        if reply is None or reply.answer[0] != 3:
             return False
         reply.require(head)
+        if not reply.storage_only(self.journal, head):
+            return False
         self.journal.outcomes.retain_delivery(reply)
         return self._settle_delivery(head) == "acknowledged"
 

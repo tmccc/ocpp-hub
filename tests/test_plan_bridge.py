@@ -40,6 +40,16 @@ def test_planning_messages_are_told_apart() -> None:
     assert classify(_message(b"\x00", command=0xB1)) is None
     assert classify({"vendorId": "OTHER", "messageId": "x"}) is None
     assert classify({"vendorId": "READIAN", "messageId": "RemoteConfiguration", "data": "not json"}) is None
+    assert isinstance(
+        classify(
+            {
+                "vendorId": "READIAN",
+                "messageId": "RemoteConfiguration",
+                "data": json.dumps({"instructType": f"{raedian.COMMAND_PLAN:02x}", "originalData": None}),
+            }
+        ),
+        PlanUnreadable,
+    )
 
 
 # Intent: the acknowledgement and the plan answer are frames of the charger in the session of the question, and the plan
@@ -86,7 +96,7 @@ class FakePlan:
         return self.windows
 
     # The app wrote a plan: remember it unless this stand-in is set to refuse.
-    async def app_wrote(self, cp_id: str, windows: list[PlanWindow]) -> bool:
+    async def app_wrote(self, cp_id: str, windows: list[PlanWindow], *, before_send=None) -> bool:
         self.written.append(windows)
         if self.accept:
             self.windows = windows

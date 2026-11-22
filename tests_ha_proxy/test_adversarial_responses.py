@@ -13,6 +13,19 @@ from tests_ha_proxy.test_client import setup
 from tests_ha_proxy.test_setup_outage_notice import _async_get_or_create_notifications
 
 
+# Intent: a busy or displaced management socket tells the client that Pause was never admitted.
+# Why: a definite pre-admission close should never be mistaken for a lost reply to an accepted command.
+@pytest.mark.parametrize("reason", ["Idle connection replaced", "Busy"])
+async def test_pre_admission_close_has_a_definite_outcome(actual_hass, peer, reason):
+    from custom_components.ics_proxy.api import ProxyError
+
+    entry = await setup(actual_hass, peer)
+    peer["pre_admission_close"] = reason
+    with pytest.raises(ProxyError, match="too busy to accept this request"):
+        await entry.runtime_data.client.request("pause", revision=0)
+    assert peer["commands"][-1] == "pause"
+
+
 # Intent: recursive JSON and out-of-range integer ages start the real outage deadline and later recover normally.
 # Why: decoder/arithmetic exceptions must not bypass ProxyError/freshness handling or permanently suppress notices.
 @pytest.mark.parametrize("shape", ["recursive-json", "huge-native-age", "huge-status-age"])

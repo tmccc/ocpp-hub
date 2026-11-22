@@ -99,7 +99,7 @@ def disposition(result, purpose="automatic", **changes):
     return release_disposition(purpose, result, current, **inputs)
 
 
-# Intent: automatic recovery may wait, while an explicit Return ends after a cloud loss with exact verified zero.
+# Intent: automatic recovery may wait, while an explicit Return ends after an interruption with exact verified zero.
 # Why: typed results distinguish a safely unsent Return from unresolved effects without replaying the request.
 @pytest.mark.parametrize(
     "reason",
@@ -122,7 +122,7 @@ def disposition(result, purpose="automatic", **changes):
 )
 def test_owned_pending_policy_is_distinct_from_explicit_attempt_failure(reason, purpose, expected):
     result = owned(purpose, pending=Pending(reason, "same diagnostic wording"))
-    if purpose == "explicit" and reason is Prerequisite.CLOUD_ACK:
+    if purpose == "explicit" and reason in (Prerequisite.CLOUD_ACK, Prerequisite.SUPERSEDED):
         expected = ReleaseDisposition.NOT_SENT
     assert disposition(result, purpose) is expected
 

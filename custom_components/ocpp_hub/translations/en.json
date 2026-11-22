@@ -198,6 +198,9 @@
     "control_rejected": {
       "message": "The charger refused the request ({detail})."
     },
+    "control_session_changed": {
+      "message": "The charging session changed before its current limit could be confirmed."
+    },
     "control_no_charge": {
       "message": "No charge is running, so there is nothing to stop."
     },

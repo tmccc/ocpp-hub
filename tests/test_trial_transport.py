@@ -20,7 +20,13 @@ import pytest
 from ocpp_hub_core.frames import basic_auth_header
 from ocpp_hub_core.prototype.security import TRANSPORT_LOG, SecurityError
 from ocpp_hub_core.prototype.store import fingerprint
-from ocpp_hub_core.prototype.trial_config import PreparedTLS, prepare_tls, read_file, verify_listener_certificate
+from ocpp_hub_core.prototype.trial_config import (
+    PreparedTLS,
+    prepare_tls,
+    private_json,
+    read_file,
+    verify_listener_certificate,
+)
 from ocpp_hub_core.prototype.trial_evidence import NativeObserver
 from ocpp_hub_core.prototype.trial_resources import Baseline
 from ocpp_hub_core.prototype.trial_session import preflight, save_private
@@ -292,6 +298,9 @@ def test_private_file_boundary(tmp_path: Path, change: str) -> None:
     with pytest.raises(SecurityError) as error:
         read_file(path, secret=secret)
     assert "credential" not in str(error.value)
+    if change == "secret-mode":
+        with pytest.raises(SecurityError, match="secrets must be private"):
+            private_json(path)
 
 
 # Intent: a path typo cannot make baseline capture or status writing overwrite a credential/configuration input.
@@ -345,7 +354,7 @@ def test_listener_tls_preflight(
         with pytest.raises(SecurityError):
             TrialTransport(config, PreparedTLS(prepared.client, prepared.client, prepared.incoming, prepared.upstream))
         return
-    with pytest.raises(SecurityError):
+    with pytest.raises(SecurityError, match="certificate name or validity"):
         prepare_tls(config)
 
 

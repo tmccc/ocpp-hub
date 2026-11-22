@@ -45,7 +45,7 @@
 
 - Read [the test map and review procedure](docs/code-navigation.md#tests-and-their-support-code). A review does not authorize test execution; do not launch twenty-worker qualification during a review.
 - Engine tests drive the real engine with a fake charger over a real websocket. Do not mock the engine under test.
-- Recorded sessions are fixtures in `tests/fixtures/`, byte for byte with a provenance note (`.gitattributes` keeps them unconverted). Do not trim a capture to the frames that look relevant.
+- Recorded sessions and their provenance notes live in `tests/fixtures/`. The iCS fixtures are sanitized, reserialized derivatives. Preserve the stored fixture bytes and complete frame sequences (`.gitattributes` keeps the stored files unconverted).
 - A bug fix gets a test that fails without it. Check weak spots in small pure modules with `tools/mutation_check.py`.
 - Write a helper in `tools/` (with tests) when a manual step is repeated a third time.
 

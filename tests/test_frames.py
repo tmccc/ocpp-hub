@@ -24,6 +24,7 @@ def test_parse_frame_accepts_ocpp_frames_and_rejects_everything_else() -> None:
     assert parse_frame('{"a": 1}') is None
     assert parse_frame('[2,"id"]') is None
     assert parse_frame(b"\x00\x01") is None
+    assert parse_frame('[2,"id","MeterValues",{"reading":' + "9" * 5000 + "}]") is None
 
 
 # Intent: only CALL frames have an action name.

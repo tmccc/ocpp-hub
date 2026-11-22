@@ -29,7 +29,7 @@ def parse_frame(raw: str | bytes) -> Frame | None:
         return None
     try:
         frame = json.loads(raw)
-    except json.JSONDecodeError:
+    except ValueError, RecursionError:
         return None
     if not isinstance(frame, list) or len(frame) < 3 or not isinstance(frame[0], int):
         return None

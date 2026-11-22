@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -71,10 +72,11 @@ async def test_a_finished_charge_is_reported_with_its_numbers(start_hub) -> None
     ]
 
 
-# Intent: a delayed reading identified with a closed charge cannot change the next charge on the same connector.
-# Why: reported transaction IDs are more precise than the connector and prevent mixing measurements across charges.
+# Intent: a delayed reading from a closed charge cannot change the next charge on the same connector.
+# Why: the prior transaction ID or an earlier timestamp can identify a sample that belongs to the previous charge.
+@pytest.mark.parametrize("tagged", [False, True])
 @pytest.mark.parametrize("before_first_sample", [False, True])
-async def test_delayed_meter_values_stay_with_their_charge(start_hub, before_first_sample) -> None:
+async def test_delayed_meter_values_stay_with_their_charge(start_hub, before_first_sample, tagged) -> None:
     hub = await start_hub()
     charger = await hub.charger()
     first = await charger.call(
@@ -88,13 +90,18 @@ async def test_delayed_meter_values_stay_with_their_charge(start_hub, before_fir
         "StartTransaction", {"connectorId": 1, "idTag": "T", "meterStart": 1000, "timestamp": "2026-10-21T09:00:00Z"}
     )
     second_id = second[2]["transactionId"]
-    delayed = _meter("2026-10-21T08:25:00Z", 900, 7000) | {"transactionId": first_id}
+    delayed = _meter("2026-10-21T08:25:00Z", 9000, 7000)
+    if tagged:
+        delayed["transactionId"] = first_id
     if before_first_sample:
         await charger.call("MeterValues", delayed)
         assert hub.listener.latest.meter is None
     await charger.call("MeterValues", _meter("2026-10-21T09:10:00Z", 1300, 2000) | {"transactionId": second_id})
     if not before_first_sample:
         await charger.call("MeterValues", delayed)
+    buffered = _meter("2026-10-21T09:05:00Z", 1100, 1000)
+    buffered["meterValue"].append({"timestamp": "2026-10-21T09:15:00Z", "sampledValue": []})
+    await charger.call("MeterValues", buffered | {"transactionId": second_id})
     running = hub.listener.latest
     assert running.meter.power_w == 2000 and readings.session_energy_kwh(running) == 0.3
     assert readings.session_duration_s(running) == 600
@@ -104,7 +111,7 @@ async def test_delayed_meter_values_stay_with_their_charge(start_hub, before_fir
     )
     assert [charge.transaction_id for charge in hub.listener.finished] == [first_id, second_id]
     last = hub.listener.finished[-1]
-    assert last.max_power_w == last.average_power_w == 2000
+    assert last.max_power_w == 2000 and last.average_power_w == 1500
 
 
 # Intent: a stop for a transaction the hub never saw start produces no charge, and a stop without a stop reading falls
@@ -124,6 +131,50 @@ async def test_unknown_stops_are_ignored_and_a_missing_stop_reading_uses_the_las
 
     assert len(hub.listener.finished) == 1
     assert hub.listener.finished[0].energy_wh == 1200.0 and hub.listener.finished[0].meter_stop_wh is None
+
+
+# Intent: a missing stop reading uses only meter values matched to the closing connector and transaction.
+# Why: a second connector can have a later and entirely different energy register.
+async def test_missing_stop_reading_uses_its_own_connector(start_hub) -> None:
+    hub = await start_hub()
+    charger = await hub.charger()
+    timestamp = "2026-10-21T08:00:00Z"
+    first, second = [
+        (
+            await charger.call(
+                "StartTransaction",
+                {
+                    "connectorId": connector,
+                    "idTag": "TAG1",
+                    "meterStart": 500,
+                    "timestamp": timestamp,
+                },
+            )
+        )[2]["transactionId"]
+        for connector in (1, 2)
+    ]
+    await charger.call(
+        "MeterValues",
+        _meter("2026-10-21T08:10:00Z", 1700, 3000)
+        | {
+            "connectorId": 1,
+            "transactionId": first,
+        },
+    )
+    await charger.call(
+        "MeterValues",
+        _meter("2026-10-21T08:20:00Z", 9000, 4000)
+        | {
+            "connectorId": 2,
+            "transactionId": second,
+        },
+    )
+    assert readings.session_energy_kwh(hub.listener.latest) == 1.2
+    await charger.call("MeterValues", _meter("2026-10-21T08:05:00Z", 600, 3000) | {"transactionId": first})
+    assert readings.session_energy_kwh(hub.listener.latest) == 1.2
+    await charger.call("StopTransaction", {"transactionId": first, "timestamp": "2026-10-21T08:30:00Z"})
+    assert hub.listener.finished[0].energy_wh == 1200.0
+    assert hub.listener.latest.connectors[2].transaction_id == second
 
 
 # Intent: a charge survives a trip through to_dict and from_dict unchanged, and a damaged record raises.
@@ -186,6 +237,10 @@ async def test_a_second_start_closes_the_charge_that_was_still_running(start_hub
         "StartTransaction", {"connectorId": 1, "idTag": "TAG1", "meterStart": 1000, "timestamp": "2026-10-21T08:00:00Z"}
     )
     await charger.call("MeterValues", _meter("2026-10-21T08:10:00Z", 2500, 6000))
+    session = hub.central.session("TEST0001")
+    assert session is not None
+    session.record_limit(10, "TxProfile")
+    session.record_vendor_limit(6, 812, "TxProfile", connector_id=2)
     second = await charger.call(
         "StartTransaction", {"connectorId": 1, "idTag": "TAG2", "meterStart": 2500, "timestamp": "2026-10-21T09:00:00Z"}
     )
@@ -195,6 +250,7 @@ async def test_a_second_start_closes_the_charge_that_was_still_running(start_hub
     assert closed.transaction_id == first[2]["transactionId"] and closed.energy_wh == 1500.0
     assert closed.ended_at == datetime(2026, 10, 21, 9, 0, tzinfo=UTC) and closed.stop_reason == "Other"
     assert hub.listener.latest.connectors[1].transaction_id == second[2]["transactionId"]
+    assert hub.listener.latest.charge_limit_a is None and hub.listener.latest.vendor_limit_a == 6
 
 
 # Intent: hostile numbers and texts in the start and stop do not break the answer or reach the history unbounded: an
@@ -263,6 +319,38 @@ async def test_no_ghost_charge_after_a_reconnect_over_a_live_link(start_hub) -> 
 
     assert len(hub.listener.finished) == 1
     assert hub.listener.finished[0].transaction_id == started[2]["transactionId"]
+
+
+# Intent: an old reader still reserving a transaction retires before the new socket can report a session.
+# Why: closing a websocket alone does not join a handler awaiting the allocator.
+async def test_replacement_joins_the_previous_charge_reader(start_hub, monkeypatch) -> None:
+    hub = await start_hub()
+    first = await hub.charger()
+    old = hub.central.session("TEST0001")
+    assert old is not None
+    entered, retired = asyncio.Event(), asyncio.Event()
+
+    # Open a genuine await in the old reader at its normal transaction reservation boundary.
+    async def waiting_for_reservation():
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            retired.set()
+
+    monkeypatch.setattr(old, "_next_transaction_id", waiting_for_reservation)
+    start = {"connectorId": 1, "idTag": "TAG1", "meterStart": 0, "timestamp": "2026-10-21T08:00:00Z"}
+    caller = asyncio.create_task(first.call("StartTransaction", start))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        replacement = await hub.charger()
+        reply = await replacement.call("StartTransaction", start)
+        assert reply[0] == 3 and retired.is_set()
+        assert hub.listener.latest.connectors[1].transaction_id == reply[2]["transactionId"]
+        await asyncio.wait_for(hub.central.stop(), 2)
+    finally:
+        caller.cancel()
+        await asyncio.gather(caller, return_exceptions=True)
 
 
 # Intent: a reading with only the energy register, as the NEO sends on the clock, does not erase the power, currents and

@@ -33,6 +33,23 @@ async def _control(start_hub: Any) -> tuple[Any, Any, ChargerControl]:
     return hub, charger, control
 
 
+# Intent: accept a limit only when the charger sends an exact successful result.
+# Why: an error code or a malformed status must never publish a setting the charger refused.
+@pytest.mark.parametrize("error_reply", [False, True])
+async def test_accepted_must_be_an_exact_result(start_hub, error_reply):
+    hub, charger, control = await _control(start_hub)
+    task = asyncio.create_task(control.set_current_limit(10))
+    call = await charger.next_hub_call()
+    if error_reply:
+        await charger.answer_error(call, code="Accepted")
+    else:
+        await charger.answer(call, {"status": " Accepted "})
+    await _answer_with(charger, "Rejected")
+    with pytest.raises(ControlError, match="rejected"):
+        await task
+    assert hub.listener.latest.charge_limit_a is None
+
+
 # Intent: a limit inside the ceiling is sent as a station-wide ChargePointMaxProfile on connector 0 with the hub's own
 # profile id, and the snapshot shows what the charger accepted.
 # Why: this is the one write that matters; its exact shape decides whether a charger obeys it, and Home Assistant shows
@@ -181,9 +198,15 @@ async def test_a_default_profile_never_counts_for_a_running_charge(start_hub) ->
     await _answer_with(charger, "Rejected", "Accepted")
     await idle
     assert hub.listener.latest.limit_purpose == "TxDefaultProfile"
+    pending_idle = asyncio.create_task(control.set_current_limit(12))
+    pending_call = await charger.next_hub_call()
+    assert pending_call[3]["csChargingProfiles"]["chargingProfilePurpose"] == "TxDefaultProfile"
     await charger.call(
         "StartTransaction", {"connectorId": 1, "idTag": "T", "meterStart": 0, "timestamp": "2026-10-21T08:00:00Z"}
     )
+    await charger.answer(pending_call, {"status": "Accepted"})
+    with pytest.raises(ControlError, match="a charge started"):
+        await pending_idle
 
     running = asyncio.create_task(control.set_current_limit(8))
     seen = await _answer_with(charger, "Rejected", "Rejected")

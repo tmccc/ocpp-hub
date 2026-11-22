@@ -406,6 +406,15 @@ class Journal:
             grant = self.get("vendor_start_grant", {})
             if grant.get("mutation"):
                 protected.add(grant["mutation"])
+            # One genuine accepted Stop per open session survives routine receipt rotation.
+            protected.update(
+                row[0]
+                for row in self.db.execute(
+                    "SELECT min(m.token) FROM mutations m JOIN vendor_command_scope s ON s.mutation=m.token "
+                    "JOIN transactions t ON t.local=s.local WHERE t.stop IS NULL AND m.origin='vendor' "
+                    "AND m.action='RemoteStopTransaction' AND s.wire_result='Accepted' GROUP BY t.local"
+                )
+            )
             removable = [
                 row[0]
                 for row in self.db.execute("SELECT token FROM mutations WHERE state='confirmed' ORDER BY rowid")

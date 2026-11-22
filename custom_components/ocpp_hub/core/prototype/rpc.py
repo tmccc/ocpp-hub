@@ -318,6 +318,7 @@ class Peer:
         on_reply: ReplyHandler | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
         keep_late_reply: bool = False,
+        prepare_call: Callable[[], Awaitable[None]] | None = None,
     ) -> Frame:
         return require_reply(
             await self.call_result(
@@ -331,6 +332,7 @@ class Peer:
                 on_reply=on_reply,
                 on_receive=on_receive,
                 keep_late_reply=keep_late_reply,
+                prepare_call=prepare_call,
             )
         )
 
@@ -348,8 +350,11 @@ class Peer:
         on_reply: ReplyHandler | None = None,
         on_receive: Callable[[str, Frame], None] | None = None,
         keep_late_reply: bool = False,
+        prepare_call: Callable[[], Awaitable[None]] | None = None,
     ) -> CallResult:
         async with self.gate.enter(priority):
+            if prepare_call is not None:
+                await prepare_call()
             return await self._call_locked(
                 action,
                 payload,
@@ -376,6 +381,7 @@ class Peer:
         on_receive: Callable[[str, Frame], None] | None = None,
         late_reply_action: str | None = None,
         owner_scope: OwnerWireScope | None = None,
+        restricting: Callable[[], bool] | None = None,
     ) -> AsyncIterator[Callable[[str, dict[str, Any]], Awaitable[Frame]]]:
         async with self.sequence_results(
             priority,
@@ -386,6 +392,7 @@ class Peer:
             on_receive=on_receive,
             late_reply_action=late_reply_action,
             owner_scope=owner_scope,
+            restricting=restricting,
         ) as result_call:
             # Recheck generation and ownership before every step, not merely on sequence entry.
             async def call(action: str, payload: dict[str, Any]) -> Frame:
@@ -406,6 +413,7 @@ class Peer:
         on_receive: Callable[[str, Frame], None] | None = None,
         late_reply_action: str | None = None,
         owner_scope: OwnerWireScope | None = None,
+        restricting: Callable[[], bool] | None = None,
     ) -> AsyncIterator[ResultCall]:
         async with self.gate.enter(priority):
             # Each call revalidates after native waits and before recording any resource intent.
@@ -417,7 +425,7 @@ class Peer:
                     None,
                     None,
                     on_dispatch,
-                    priority > 0,
+                    priority > 0 and not (restricting is not None and restricting()),
                     on_reply,
                     on_sent,
                     on_receive=on_receive,

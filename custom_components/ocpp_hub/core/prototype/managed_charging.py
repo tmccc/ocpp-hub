@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .command_processor import CommandPriority
-from .connection_scope import CloudAttemptScope, control_scope_matches, current_scope
+from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
 from .gateway import NativeStartReport
-from .local_control import local_start_receipt, retire_unsent_local_start
+from .local_control import StopProof, local_start_receipt, retire_unsent_local_start
 from .managed_facts import ManagedFacts
 from .managed_intent import ControlIntent, request_pending, write_intent
 from .managed_settlement import claim_internal_pause, complete_record, current_candidate, require_record
@@ -21,18 +21,19 @@ from .managed_sources import confirmed_vendor_start, recorded_station_profile
 from .managed_start_binding import known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
 from .managed_start_debt import preserved_start_debt
+from .native_bounded import readiness_decision
+from .native_faults import _NativeMeasurementError
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite
+from .recovery_contracts import ALLOW, AuthorityStamp, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
 from .start_settlement import (
-    RetirementRule,
     StartFailureAction,
     StartFailureFacts,
     settle_start,
 )
-from .store import Journal, RecoveryRequiredError, fingerprint
+from .store import Journal, RecoveryRequiredError, StationZeroStorageError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
@@ -112,7 +113,7 @@ class ManagedCharging:
                         write_intent(self.journal, intent, "paused", coalesce=refused)
                     claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
-        self.retire_refused_unsent()
+        self.journal.starts.retire_refused()
         controller.native.observation_listener = self.record_source
         controller.native.positive_guard = self.positive_decision
 
@@ -143,68 +144,25 @@ class ManagedCharging:
             lease is not None and not lease.normal or state.get("kind") == "test" and state.get("state") == "stopping"
         )
 
-    # A durable failed receipt proves this request had no effects; it cannot own a later ordinary session.
-    def retire_refused_unsent(self) -> None:
-        candidate = self.journal.starts.retirement(RetirementRule.REFUSED)
-        if candidate is not None:
-            self.journal.starts.retire(candidate)
-
-    # Select once, then require the caller's live Pause proof before this exact unissued retirement.
-    def retire_unissued_at_zero(self, native: HandoverEvidence) -> bool:
-        candidate = self.journal.starts.retirement(RetirementRule.UNISSUED)
-        if candidate is None:
-            return False
-        try:
-            self.controller.require_paused(native)
-        except SecurityError, DeniedError, RecoveryRequiredError:
-            return False
-        self.journal.starts.retire(candidate)
-        return True
-
-    # Idle expiry can use an ended historical receipt, or a separately verified unissued command.
-    def ended_at_idle(self, native: HandoverEvidence, *, unissued: bool = False) -> bool:
-        j = self.journal
-        return bool(
-            not j.get("control", {}).get("start_pending")
-            and j.active() is None
-            and not native.physical.transaction_open
-            and (unissued or j.starts.receipt_ended())
+    # Start owns the settlement; only live observation and waking the timer belong here.
+    def settle_local_zero(self, native: HandoverEvidence, *, closed_only: bool = False) -> bool:
+        unissued, closed = self.journal.starts.retire_local_zero(
+            lambda: self.controller.require_paused(native), closed_only=closed_only
         )
+        if closed:
+            self.changed.set()
+        return unissued
 
     # Exact local closure can finish its request at verified Pause zero while separate cloud delivery stays retained.
     def retire_closed_at_zero(self, native: HandoverEvidence) -> None:
-        j = self.journal
-        candidate = j.starts.retirement(RetirementRule.CLOSED)
-        if candidate is None:
-            return
-        try:
-            self.controller.require_paused(native)
-        except SecurityError, DeniedError, RecoveryRequiredError:
-            return
-        try:
-            with j.atomic():
-                j.starts.retire(candidate)
-        except sqlite3.Error as error:
-            if j.db.in_transaction:
-                raise
-            raise RecoveryRequiredError("verified normal Start closure awaits retirement") from error
-        j.starts.set_lease(None)
-        self.changed.set()
+        self.settle_local_zero(native, closed_only=True)
 
     # Fault supervision still settles exact local closure; cloud delivery retains its independent recovery gate.
     async def retire_closed_after_fault(self) -> None:
-        state = self.state()
-        request = self.journal.db.execute(
-            "SELECT state FROM managed_requests WHERE id=?", (state.get("id"),)
-        ).fetchone()
         if (
             self.controller.stopping
             or self.controller.requests.intent().mode != "paused"
-            or state.get("kind") != "normal"
-            or state.get("source") != "local"
-            or state.get("state") == "completed"
-            and (request is None or request["state"] not in ("accepted", "running", "uncertain"))
-            or local_start_receipt(self.journal).get("local") is None
+            or not self.journal.starts.fault_closure_pending()
         ):
             return
         try:
@@ -568,7 +526,7 @@ class ManagedCharging:
         if decision.action is StartFailureAction.FAIL_PREFLIGHT:
             j.starts.fail_preflight(lease.identifier, cause)
             self.changed.set()
-            self.retire_refused_unsent()
+            j.starts.retire_refused()
         else:
             self.stop(lease, "start_not_confirmed", failure=cause)
         self.record_failure_diagnostic(cause)
@@ -717,7 +675,7 @@ class ManagedCharging:
     async def hold_expired(self) -> None:
         c, j = self.controller, self.journal
         g, expected = c.session.gateway, c.requests.intent()
-        epoch, identifier = g._charger_epoch, self.state().get("id")
+        connection, identifier = current_control_scope(g), self.state().get("id")
 
         # Restrictive writes remain bound to this request, current intent, commissioned device and actual Boot.
         def guard() -> None:
@@ -726,21 +684,37 @@ class ManagedCharging:
                 or self.state().get("id") != identifier
                 or not self.scoped_normal_stop()
                 or c.requests.intent() != expected
-                or g._charger_epoch != epoch
-                or not g.current_boot_seen(epoch)
+                or not control_scope_matches(g, connection)
                 or fingerprint(j.get("boot")) != c.native.spec.boot_digest
                 or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
             ):
                 raise RecoveryRequiredError("expired Start zero authority was superseded")
 
-        guard()
-        if not j.get("control", {}).get("inhibit"):
-            g.controls._claim(True, stopping=True)
-        ticket = j.get("control", {}).get("ticket")
-        await g.controls.ensure_ceiling(guard=guard)
-        guard()
+        # Take or reuse the current zero claim within the same turn that checks the expired Start's ownership.
+        def claim() -> str:
+            guard()
+            control = j.get("control", {})
+            ticket = control.get("ticket")
+            if control.get("inhibit") and isinstance(ticket, str):
+                return ticket
+            return g.controls._claim(True, stopping=True)[1]
+
+        ticket = c.commands.decide(claim, priority=CommandPriority.RESTRICT)
+
+        # A newer hold cannot inherit a verification completed for this particular Start.
+        def require_ticket() -> None:
+            guard()
+            if j.get("control", {}).get("ticket") != ticket:
+                raise RecoveryRequiredError("expired Start zero ticket was superseded")
+
+        await g.controls.ensure_ceiling(guard=require_ticket)
+
         # Confirm only the station zero. The separate Start receipt and real lifecycle remain outstanding.
-        g.controls._complete(ticket, uncertain=False)
+        def settle() -> None:
+            require_ticket()
+            g.controls._complete(ticket, uncertain=False)
+
+        c.commands.decide(settle, priority=CommandPriority.RESTRICT)
 
     # Each ordinary recovery owner validates its own delayed original-plan report under its existing zero.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:
@@ -830,21 +804,41 @@ class ManagedCharging:
         g, expected = c.session.gateway, c.requests.intent()
         try:
             active = j.active()
-            if expected.mode == "paused" or active is not None and not self.current_daily(active):
-                await self.hold_expired()
             owner = local_start_receipt(j)
             closing = (
                 active if owner.get("local") == active and owner.get("digest") == state.get("tag_digest") else None
             )
-            native = await c.native.read(closing_local=closing, stop_only=closing is not None)
+            connection = current_control_scope(g)
+            if expected.mode == "paused" or active is not None and not self.current_daily(active):
+                try:
+                    await self.hold_expired()
+                except UnavailableError, TimeoutError, StationZeroStorageError:
+                    if closing is None or j.db.in_transaction or not control_scope_matches(g, connection):
+                        raise
+                    # The known owner session can still receive a guarded Stop after fresh native proof.
+
+            # An exact restrictive Stop can use a full sample that failed only the measured current bound.
+            async def read_session(local: int | None) -> HandoverEvidence:
+                try:
+                    return await c.native.read(closing_local=local, stop_only=local is not None)
+                except _NativeMeasurementError as error:
+                    if (
+                        local is None
+                        or error.authority != c.native.authority()
+                        or error.sequence != c.native.last_resolved_read
+                    ):
+                        raise
+                    require_allowed(readiness_decision(error.native, False, c.native.allow_unplugged, local))
+                    return error.native
+
+            native = await read_session(closing)
+            sequence = c.native.last_resolved_read
 
             # Apply the native closure to the original outstanding owner Start.
             def settle_at_zero() -> bool:
                 if c.requests.intent() != expected:
                     raise RecoveryRequiredError("expired Start observation was superseded")
-                unissued = self.retire_unissued_at_zero(native)
-                self.retire_closed_at_zero(native)
-                return unissued
+                return self.settle_local_zero(native)
 
             unissued = c.commands.decide(settle_at_zero)
             local, owner = j.active(), local_start_receipt(j)
@@ -859,7 +853,7 @@ class ManagedCharging:
                 # Reuse the ordinary guarded release; this raises the ceiling and never sends RemoteStart.
                 progress = await c.recovery.restore(expected, continuing_local=local)
                 return not progress.shared
-            owner_closed = self.ended_at_idle(native, unissued=unissued)
+            owner_closed = j.starts.ended_at_idle(native, unissued=unissued)
             if owner_closed:
                 if expected.mode == "app" and (not g.controls.ready or g.controls.desired() == 0):
                     if not self.scoped_normal_stop():
@@ -869,13 +863,7 @@ class ManagedCharging:
                     if not progress.shared:
                         return True
 
-                # A later restore or Pause can leave a different request as the current row.
-                def complete_expired_start() -> None:
-                    current = self.state()
-                    if current.get("id") == state.get("id"):
-                        j.starts.complete_metadata(current)
-
-                c.commands.decide(complete_expired_start)
+                c.commands.decide(lambda: j.starts.finish_expired(state.get("id"), native, unissued=unissued))
                 return False
             if expected.mode == "app" and local is None and not native.physical.transaction_open:
                 if (
@@ -889,30 +877,78 @@ class ManagedCharging:
                     await self.hold_expired()
                     progress = await c.recovery.restore(expected)
                     return not progress.shared
-            await self.hold_expired()
+            if closing is None or local != closing:
+                await self.hold_expired()
+                return True
             c.native.require_known_session(native)
-            if local is not None and owner.get("local") == local and owner.get("digest") == state.get("tag_digest"):
-                epoch, boot = g._charger_epoch, g.boot_observation
 
-                # Recheck receipt, lifecycle and intent after every awaited native or profile verification.
-                def guard() -> None:
+            # Recheck the original Start, current intent and charger connection at the actual Stop boundary.
+            def guard() -> None:
+                receipt = local_start_receipt(j)
+                if (
+                    c.stopping
+                    or c.requests.intent() != expected
+                    or not self.scoped_normal_stop()
+                    or self.state().get("id") != state.get("id")
+                    or not control_scope_matches(g, connection)
+                    or receipt.get("local") != closing
+                    or receipt.get("digest") != state.get("tag_digest")
+                    or j.active() not in (None, closing)
+                    or not c.native.commissioned_binding_matches(native)
+                ):
+                    raise RecoveryRequiredError("expired owner Stop was superseded")
+
+            # An expired normal Start uses the same draw check as an explicit Pause.
+            def station_flowing() -> bool:
+                return c.native.still_drawing(native, sequence)
+
+            # If the zero call failed, refresh the exact active session before permitting a protective Stop.
+            async def prove_stop(local: int, ceiling_failed: bool, _awaiting_report: bool) -> StopProof:
+                if not ceiling_failed:
+                    return StopProof(guard, station_flowing)
+                fresh = await read_session(local)
+                fresh_sequence = c.native.last_resolved_read
+
+                # The wire guard may run after a later read, closure or Boot has retired this protection.
+                def require_fresh_target() -> None:
+                    guard()
+                    fresh.physical.require_fresh(j.identity, 5)
                     if (
-                        c.stopping
-                        or c.requests.intent() != expected
-                        or not self.scoped_normal_stop()
-                        or g._charger_epoch != epoch
-                        or g.boot_observation != boot
-                        or local_start_receipt(j).get("local") != local
-                        or j.active() not in (None, local)
+                        fresh_sequence != c.native.last_resolved_read
+                        or not fresh.physical.transaction_open
+                        or fresh.physical.native_transaction_id != local
+                        or j.active() != local
+                        or not c.native.commissioned_binding_matches(fresh)
                     ):
-                        raise RecoveryRequiredError("expired owner Stop was superseded")
+                        raise RecoveryRequiredError("expired Start Stop awaits the current active session")
 
-                if not g.controls.stop_acknowledged(local):
-                    await g.controls.stop(expected_local=local, guard=guard)
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+                c.commands.decide(require_fresh_target, priority=CommandPriority.RESTRICT)
+                return StopProof(require_fresh_target)
+
+            if g.controls.stop_work_needed(closing, station_flowing=station_flowing):
+                await g.controls.stop(expected_local=closing, guard=guard, prove_stop=prove_stop)
+        except (
+            DeniedError,
+            SecurityError,
+            RecoveryRequiredError,
+            UnavailableError,
+            TimeoutError,
+            StationZeroStorageError,
+        ):
+            if j.db.in_transaction:
+                raise
             try:
                 await self.hold_expired()
-            except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+            except (
+                DeniedError,
+                SecurityError,
+                RecoveryRequiredError,
+                UnavailableError,
+                TimeoutError,
+                StationZeroStorageError,
+            ):
+                if j.db.in_transaction:
+                    raise
                 pass  # Keep the debt and retry zero; no unknown transaction receives a guessed Stop.
         return True
 
@@ -937,9 +973,13 @@ class ManagedCharging:
             g = self.controller.session.gateway
             if g.controls._operations or g.charger._pending:
                 return False  # A shielded child still owns physical work even after its outer task disappeared.
-        if worker.cancelled() and self.lease is not None:
+        lease = self.lease
+        if worker.cancelled() and lease is not None:
             try:
-                if retire_cancelled_start(self, self.lease) is CancellationRetirement.PENDING:
+                retirement = self.controller.commands.decide(
+                    lambda: retire_cancelled_start(self, lease), priority=CommandPriority.RESTRICT
+                )
+                if retirement is CancellationRetirement.PENDING:
                     return False
             except sqlite3.Error, RecoveryRequiredError:
                 return False  # Required settlement is pending; no old deadline gains authority over another session.
@@ -949,18 +989,15 @@ class ManagedCharging:
 
     # Positive flow must belong to the known transaction and the actually accepted local or vendor Start path.
     def observed(self, native: HandoverEvidence) -> None:
-        self.retire_refused_unsent()
-        self.retire_unissued_at_zero(native)
-        self.retire_closed_at_zero(native)
+        self.journal.starts.retire_refused()
+        self.settle_local_zero(native)
         lease, c = self.lease, self.controller
         state = self.state()
         if self.journal.starts.observe_normal(native):
             self.changed.set()
             return
         if lease is None:
-            if state.get("state") != "completed" and state.get("expired_normal") and self.ended_at_idle(native):
-                # An explicit Pause can finish this expired debt too, without reviving it on the next Return.
-                self.journal.starts.complete_metadata(state)
+            self.journal.starts.finish_expired(state.get("id"), native)
             return
         if state.get("state") == "stopping":
             if (
@@ -969,9 +1006,8 @@ class ManagedCharging:
                 and not native.physical.transaction_open
             ):
                 c.require_paused(native)
-                self.journal.starts.complete_metadata(state, stopped_at=time.time())
-                self.journal.starts.set_lease(None)
-                self.changed.set()
+                if self.journal.starts.finish_timed_hold(lease, time.time()):
+                    self.changed.set()
             return
         if state.get("state") == "charging" and not native.physical.transaction_open and native.physical.power_w == 0:
             self.stop(lease, "charger_closed")
@@ -992,20 +1028,8 @@ class ManagedCharging:
             if active is None or native.physical.native_transaction_id != active:
                 self.stop(lease, "unknown_session")
                 return
-            grant = self.journal.get("vendor_start_grant", {})
-            cloud = (
-                grant.get("local") == active
-                and self.journal.db.execute(
-                    "SELECT 1 FROM mutations WHERE rowid>? AND token=? AND origin='vendor' "
-                    "AND action='RemoteStartTransaction' AND state='confirmed' LIMIT 1",
-                    (lease.first_mutation, grant.get("mutation")),
-                ).fetchone()
-            )
-            local = local_start_receipt(self.journal)
-            if (
-                lease.source == "local"
-                and (cloud or not state.get("start_rpc_accepted") or local.get("local") != active)
-            ) or (lease.source == "cloud" and not cloud):
+            source = self.journal.starts.timed_flow_source(lease, active)
+            if source is None:
                 return
             if lease.first_flow is None:
                 lease.first_flow = TestFlow(time.time(), time.monotonic() + DURATION)
@@ -1015,10 +1039,10 @@ class ManagedCharging:
                     self.journal.starts.confirm_test_flow(
                         lease,
                         state,
-                        active,
+                        source.local,
                         flow.observed_at,
                         DURATION,
-                        cloud_start=(grant["token"], grant["mutation"]) if cloud else None,
+                        cloud_start=source.cloud_start,
                     )
             except sqlite3.Error as error:
                 if self.journal.db.in_transaction:
@@ -1076,38 +1100,12 @@ class ManagedCharging:
             and internal.get("revision") == intent.revision
             and internal.get("id") == test.get("id")
             and test.get("kind") != "normal"
-            and self.timed_stop_target(test) != local
+            and self.journal.starts.timed_stop_target(test) != local
         )
 
     # A replacement introduction retains the same limits on which session the previous request can Stop.
     def recovery_zero_only(self) -> bool:
         return self.scoped_normal_stop() or self.timed_pause_leaves_session(self.journal.active())
-
-    # Resolve the exact timed test transaction, including a genuine report received before first power.
-    def timed_stop_target(self, state: dict[str, Any]) -> int | None:
-        for key in ("stop_local", "local_transaction"):
-            recorded = state.get(key)
-            if isinstance(recorded, int) and not isinstance(recorded, bool):
-                return recorded
-        j = self.journal
-        if state.get("source") == "local":
-            receipt = local_start_receipt(j)
-            local = receipt.get("local")
-            if receipt.get("request_id") == state.get("id") and type(local) is int:
-                return local
-        elif type(state.get("mutation_floor")) is int:
-            grant = j.get("vendor_start_grant", {})
-            local = grant.get("local")
-            if (
-                type(local) is int
-                and j.db.execute(
-                    "SELECT 1 FROM mutations WHERE rowid>? AND token=? AND origin='vendor' "
-                    "AND action='RemoteStartTransaction' AND state='confirmed'",
-                    (state["mutation_floor"], grant.get("mutation")),
-                ).fetchone()
-            ):
-                return local
-        return None
 
     # An independently identified daily remains with the app when an unrelated test expires.
     def retire_test_beside_daily(self, lease: ChargeLease, state: dict[str, Any], target: int | None) -> bool:
@@ -1150,7 +1148,7 @@ class ManagedCharging:
         c, j = self.controller, self.journal
         if c.stopping:
             return
-        target = None if lease.normal else self.timed_stop_target(state)
+        target = None if lease.normal else j.starts.timed_stop_target(state)
         if self.retire_test_beside_daily(lease, state, target):
             return
         with j.atomic():
@@ -1211,7 +1209,7 @@ class ManagedCharging:
                 or phase not in ACTIVE
                 or phase == "stopping"
                 or local is None
-                or local != self.timed_stop_target(state)
+                or local != j.starts.timed_stop_target(state)
             ):
                 return False
             if intent == ControlIntent("app", lease.revision):

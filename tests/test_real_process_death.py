@@ -20,6 +20,8 @@ from tests.native_peer_failures import InterruptedNativePeer
 from tests.process_helpers import process_rig
 from tests.prototype_rig import START
 from tests.recovery_barriers import require_zero_held
+from tests.runtime_rig import until
+from tests.test_cloud_ack_storage import HeldReply, SqlFault, StorageBench
 from tests_model.catalog import input_digest
 from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
 from tests_model.test_current_sequences import BoundaryPeer
@@ -242,6 +244,123 @@ async def test_process_saved_forwarded_stop_waits_for_closure(
         assert json.loads(transaction["start"]) == start
         assert json.loads(transaction["stop"]) == stop
         assert sum(frame[1] == wire for frame in bench.device_calls) == 1
+
+
+# Intent: a saved cloud acknowledgement and the original Pause survive real process death after SQLite refuses it.
+# Why: report, physical closure and cloud delivery must converge without replaying the accepted charger Stop.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("native_first", [False, True])
+async def test_process_resumes_exact_pause_after_stop_ack_write_fails(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, native_first
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        ports(),
+        ports(),
+        monkeypatch,
+        bench_type=StorageBench,
+        timing="fast-poll",
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        original = await child.delivered(local)
+        rig.peer.plan_session = (local, 9)
+        rig.peer.paused, rig.peer.permission_enabled = False, True
+        bench.cp, bench.connection = "C", "Charging"
+        bench.firmware.fire_plan(9)
+        charging = await child.status(lambda status: (status.get("power_w") or 0) > 0)
+
+        mark = len(bench.device_calls)
+        identifier = uuid.uuid4().hex
+        assert (await child.request("pause", id=identifier, revision=charging["control_revision"]))["ok"]
+        path = rig.prepared.config.journal
+
+        # Read only committed replies, independently of the service that attempted to publish them.
+        def receipt_row(sql, arg):
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(sql, (arg,)).fetchone()
+
+        await until(
+            lambda: (
+                receipt_row(
+                    "SELECT reply FROM owner_command_wires WHERE request=? AND action='RemoteStopTransaction'",
+                    identifier,
+                )
+                == ("Accepted",)
+            )
+        )
+        require_zero_held(rig, mark)
+        native, open_session = rig.peer.native, rig.peer.native("SESSION")
+        cloud = HeldReply("StopTransaction", asyncio.Event(), asyncio.Event())
+        bench.held_reply = cloud
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        with monkeypatch.context() as patch:
+            if not native_first:
+                patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
+            else:
+                seen_closed = asyncio.Event()
+
+                # Witness the child's genuine native read before the charger sends its lifecycle report.
+                def observe_closed(key):
+                    if key == "SESSION" and bench.firmware.active is None:
+                        seen_closed.set()
+                    return native(key)
+
+                patch.setattr(rig.peer, "native", observe_closed)
+                bench.firmware.active = None
+                bench.cp, bench.connection = "B", "Plug"
+            rig.peer.permission_enabled = False
+            try:
+                if native_first:
+                    await asyncio.wait_for(seen_closed.wait(), 5)
+                    assert receipt_row("SELECT stop FROM transactions WHERE local=?", local) == (None,)
+                assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+                await asyncio.wait_for(cloud.arrived.wait(), 5)
+                fault = SqlFault("delete", cloud.token)
+                with closing(sqlite3.connect(path)) as db, db:
+                    fault.install(db)
+                cloud.release.set()
+                await child.status(
+                    lambda status: status.get("diagnostics", {}).get("protocol", {}).get("delivery_cause") == "storage"
+                )
+                assert receipt_row("SELECT state FROM outbox WHERE token=?", cloud.token) == ("inflight",)
+                saved = receipt_row("SELECT answer FROM delivery_replies WHERE token=?", cloud.token)
+                assert saved is not None and json.loads(saved[0]) == cloud.answer
+                require_zero_held(rig, mark)
+                await child.kill()
+                with closing(sqlite3.connect(path)) as db, db:
+                    fault.remove(db)
+                await child.start()
+                closed = await child.delivered(local, closed=True)
+                assert closed["vendor"] == original["vendor"] and closed["start"] == original["start"]
+                assert json.loads(closed["stop"]) == stop
+                if not native_first:
+                    receipt = (await child.request("receipt", request_id=identifier))["result"]
+                    assert receipt["state"] != "completed"
+                    assert not (await child.status(lambda status: status.get("boot_verified")))["local_hold_verified"]
+                require_zero_held(rig, mark)
+            finally:
+                cloud.release.set()
+
+        paused = await child.status(lambda status: status.get("local_hold_verified") is True)
+        assert (await child.completed_control(identifier))["result"]["pause_verified"]
+        require_zero_held(rig, mark)
+        returned = await child.request("app_control", revision=paused["control_revision"])
+        assert returned["ok"]
+        await child.completed_control(returned["result"]["id"])
+        assert (await child.status())["station_ceiling_a"] == 6
+        assert [frame[3] for frame in bench.device_calls[mark:] if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+        assert sum(frame[1] == cloud.token for frame in bench.lifecycle_wires) == 1
+        assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
 
 
 # Intent: automatic recovery after real process death retires its exact abandoned choice before later selections.
@@ -724,7 +843,18 @@ async def test_process_return_commit_preserves_honest_receipt(
         await child.gate(phase, identifier)
         snapshot = child.durable()
         row = next(row for row in snapshot["requests"] if row["id"] == identifier)
+        binding = json.loads(row["result"]).get("_return")
         committed = phase == "after-return-success-commit"
+        assert (binding is None) == (phase == "after-return-request-commit")
+        if binding is not None:
+            journal = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(journal.as_uri() + "?mode=ro", uri=True)) as reader:
+                wires = reader.execute(
+                    "SELECT boot FROM owner_command_wires WHERE request=? "
+                    "AND action='SetChargingProfile' AND limit_a>0",
+                    (identifier,),
+                ).fetchall()
+            assert wires == [(binding["boot"],)] and binding["ticket"] and binding["local"] is None
         assert snapshot["metadata"]["managed_control_intent"]["mode"] == ("app" if committed else "paused")
         assert row["state"] == (
             "completed" if committed else "accepted" if phase == "after-return-request-commit" else "running"
@@ -736,9 +866,14 @@ async def test_process_return_commit_preserves_honest_receipt(
         await child.status(lambda value: value.get("charger_connected") is True)
         receipt = (await child.request("receipt", request_id=identifier))["result"]
         assert receipt["state"] == ("completed" if committed else "uncertain")
+        recovered = next(row for row in child.durable()["requests"] if row["id"] == identifier)
+        assert json.loads(recovered["result"]).get("_return") == binding
+        assert "_return" not in receipt["result"]
         await child.ordinary_recovery(selected, True)
         receipt = (await child.request("receipt", request_id=identifier))["result"]
         assert receipt["state"] == ("completed" if committed else "failed")
+        recovered = next(row for row in child.durable()["requests"] if row["id"] == identifier)
+        assert json.loads(recovered["result"]).get("_return") == binding
         assert not starts(child.rig) and len(child.kills) == 1
 
 

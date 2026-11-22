@@ -77,6 +77,9 @@ async def peer():
         command = value["command"]
         control["commands"].append(command)
         control["requests"].append(copy.deepcopy(value))
+        if command == "pause" and control.get("pre_admission_close") is not None:
+            await socket.close(code=1013, message=control["pre_admission_close"].encode())
+            return socket
         if command == "status":
             result = copy.deepcopy(state)
             if control.get("response_gate") is not None:

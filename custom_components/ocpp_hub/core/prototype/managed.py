@@ -24,6 +24,7 @@ from .managed_facts import ManagedFacts
 from .managed_faults import latch_managed_fault, stop_for_missing_station
 from .managed_intent import OFFLINE_PAUSE, RELEASE_PAUSE_ACK, ControlIntent, ManagedRequests, write_intent
 from .managed_native_repair import NativeRepairAudits
+from .managed_records import TerminalCurrent
 from .managed_release_recovery import (
     reconcile_owner_release,
     release_evidence,
@@ -123,6 +124,7 @@ class ManagedController:
         self.native.continuation_guard = self.continuation_decision
         self.native.recovery_zero_only = self.charging.recovery_zero_only
         self.native.stop_after_introduction = partial(session.gateway.stop, requests=self.requests)
+        self.native.stop_missing_station = partial(stop_for_missing_station, self)
         binding = ManagedStartBinding(session.gateway, self.native.spec.saved_schedule_digest, self.charging)
         session.gateway.start_reports = ManagedStartReports(self.charging, binding)
         self.native.command_source_observer = binding.observe
@@ -402,6 +404,11 @@ class ManagedController:
                 # Only measured excess may be ignored for Stop; identity, history and resources already passed.
                 native = candidate.native
             controls = g.controls
+            sequence = self.native.last_resolved_read
+
+            # Reuse the same short-lived draw evidence at the eventual wire dispatch.
+            def station_flowing() -> bool:
+                return self.native.still_drawing(native, sequence)
 
             # Interpret the live target or closed-zero report before issuing its exact Stop.
             def accept_stop_observation() -> tuple[bool, bool]:
@@ -420,8 +427,13 @@ class ManagedController:
                     self.require_paused(native)
                     self.charging.observed(native)
                     controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
+                    timed = charge_test_candidate(self, timed_only=True)
+                    if timed is not None:
+                        self._settle_pause_records(native, (timed,))
                     return False, station_absent
-                return not controls.stop_acknowledged(local), station_absent
+                return controls.stop_work_needed(
+                    local, station_absent=station_absent, station_flowing=station_flowing
+                ), station_absent
 
             stop_needed, station_absent = self.commands.decide(
                 accept_stop_observation, priority=CommandPriority.RESTRICT
@@ -431,6 +443,7 @@ class ManagedController:
                     expected_local=local,
                     guard=guard,
                     station_absent=station_absent,
+                    station_flowing=station_flowing,
                     on_claim=bind,
                     owner=("pause", intent, request, local, connection),
                     request_id=request.identifier if request is not None else None,
@@ -439,36 +452,25 @@ class ManagedController:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
     # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
-    def require_paused(self, native: HandoverEvidence) -> None:
-        self.native.require(native, closed=True)
-        self.native.require_known_session(native)
-        present = self.session.book.owned_present(native.physical, record_unchanged=False)
-        reason = self._paused_refusal(present)
+    def require_paused(self, native: HandoverEvidence, *, local: int | None = None) -> None:
+        reason = self.native.stop_zero_refusal(native, local=local) or self._paused_refusal()
         if reason is not None:
             error = RecoveryRequiredError("requested pause awaits independently verified closed zero")
             error.add_note(reason)
             raise error
 
-    # This follows the independent native/session/resource checks already performed by require_paused.
-    def _paused_refusal(self, present: list[Resource]) -> str | None:
+    # A local hold needs its own current authority as well as the common physical Stop proof.
+    def _paused_refusal(self) -> str | None:
         g, j = self.session.gateway, self.session.journal
         facts = ManagedFacts(self)
-        if not facts.boot_current():
-            return "boot_unconfirmed"
         if not facts.introduction_current():
             return "introduction_unconfirmed"
-        if not g.controls.ready:
-            return "station_ceiling_unconfirmed"
-        if g.controls.desired() != 0:
-            return "station_ceiling_nonzero"
         if not ControlState(j.get("control", {})).local_hold:
             return "local_hold_missing"
         if j.get("control", {}).get("start_pending"):
             return "start_pending"
         if g.vendor_write_evidence().unresolved:
             return "vendor_command_uncertain"
-        if not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present):
-            return "station_zero_receipt_missing"
         if g.charger._pending:
             return "charger_rpc_pending"
         if g.controls._operations:
@@ -545,7 +547,7 @@ class ManagedController:
     def _accept_pause_observation(
         self, native: HandoverEvidence, intent: ControlIntent, connection: ControlScope | None
     ) -> bool:
-        g, j = self.session.gateway, self.session.journal
+        g = self.session.gateway
         if self.stopping or self.requests.intent() != intent or not control_scope_matches(g, connection):
             raise RecoveryRequiredError("Pause observation no longer belongs to the current request and Boot")
         self.native.require_known_session(native)
@@ -560,8 +562,27 @@ class ManagedController:
         if (self.native.introduced_epoch, self.native.introduced_revision) != (g._charger_epoch, g.controls._revision):
             self.native.confirm_paused_introduction(native)
         self.require_paused(native)
-        records = [record for record in (current_candidate(self), charge_test_candidate(self)) if record is not None]
-        internal = internal_pause_matches(self)
+        records = tuple(
+            record for record in (current_candidate(self), charge_test_candidate(self)) if record is not None
+        )
+        self._settle_pause_records(native, records, internal=internal_pause_matches(self))
+        if self.current.failed_idle_hold():
+            # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
+            g.controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
+            raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
+        # Physical Pause is already proved. Cloud delivery debt can still block reactivation independently.
+        self.complete_pause_observation(native, intent, connection)
+        return True
+
+    # Foreground Stop and Pause supervision retire exact related records at the same settled zero boundary.
+    def _settle_pause_records(
+        self,
+        native: HandoverEvidence,
+        records: tuple[TerminalCurrent | RetirementCandidate, ...],
+        *,
+        internal: bool = False,
+    ) -> None:
+        g, j = self.session.gateway, self.session.journal
         if records or internal:
             try:
                 require_settled_debt(self)
@@ -578,13 +599,6 @@ class ManagedController:
                 if any(isinstance(record, RetirementCandidate) for record in records):
                     j.starts.set_lease(None)
                     self.charging.changed.set()
-        if self.current.failed_idle_hold():
-            # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
-            g.controls._complete(j.get("control")["ticket"], uncertain=False)
-            raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
-        # Physical Pause is already proved. Cloud delivery debt can still block reactivation independently.
-        self.complete_pause_observation(native, intent, connection)
-        return True
 
     # Pause alone settles its receipt, using current independent closure and the original paused generation.
     def complete_pause_observation(
@@ -598,7 +612,8 @@ class ManagedController:
         ):
             raise RecoveryRequiredError("Pause observation no longer belongs to the current request and Boot")
         native.physical.require_fresh(j.identity, 5)
-        self.require_paused(native)
+        request = self.requests.pause_request()
+        self.require_paused(native, local=request.local if request is not None else None)
         if awaiting_owner_start(j):
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         self.requests.complete_verified_pause()
@@ -624,10 +639,14 @@ class ManagedController:
 
     # A newer stop ticket invalidates an awaited release before it can send a positive ceiling.
     def request_stop(self) -> None:
-        if self.stopping:
-            return
-        self.stopping = True
-        self.session.gateway.controls._claim(True, stopping=True)
+        # Retire management authority in the same queue used by outgoing commands and lifecycle reports.
+        def claim() -> None:
+            if self.stopping:
+                return
+            self.stopping = True
+            self.session.gateway.controls._claim(True, stopping=True)
+
+        self.commands.decide(claim, priority=CommandPriority.SHUTDOWN)
 
     # A persistent failed restoration cannot be silently undone by another poll or a process restart.
     def fault(
@@ -647,25 +666,26 @@ class ManagedController:
         epoch, boot, revision = g._charger_epoch, g.boot_observation, g.controls._revision
         binding, handover = j.get("trial_binding", {}), j.get("native_bounded_handover", {})
         station = j.db.execute(
-            "SELECT * FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+            "SELECT key,desired,confirmed,state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
         ).fetchone()
         receipt = tuple(station) if station is not None else None
         zero = encoded(profile_projection(self.native.choice.payload(0)))
-        # Only this exact owned preimage and ResourceBook's own zero-intent/ACK transitions may cross the RPC waits.
+        # Re-reading a retained profile can refresh its observation digest during this same zero verification.
         allowed = {receipt}
         if station is not None and station["state"] != "absent_verified":
             allowed.update(
                 {
-                    (station["key"], zero, station["confirmed"], "pending", None),
-                    (station["key"], zero, station["confirmed"], "uncertain", None),
-                    (station["key"], zero, zero, "confirmed", None),
+                    (station["key"], zero, station["confirmed"], "pending"),
+                    (station["key"], zero, station["confirmed"], "uncertain"),
+                    (station["key"], zero, zero, "confirmed"),
                 }
             )
 
         # Both watchdog and foreground polling must retain the same fault, owner claim and commissioned installation.
         def guard() -> None:
             row = j.db.execute(
-                "SELECT * FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
+                "SELECT key,desired,confirmed,state FROM trial_resources WHERE key=?",
+                ("profile:" + str(HUB_PROFILE_ID),),
             ).fetchone()
             if (
                 self.stopping
@@ -720,6 +740,8 @@ class ManagedController:
     # Choose the domain's current source proof once, identically at preflight and the final native send gate.
     def continuation_decision(self, native: HandoverEvidence, local: int) -> GateDecision:
         j = self.session.journal
+        if j.outcomes.awaits_stop_report(local):
+            return Pending(Prerequisite.LIFECYCLE, "continuation awaits the Stop's lifecycle report")
         if j.current_change.read().recovering:
             return current_session_decision(self.session.gateway, native, local)
         elif self.ordinary.active():
@@ -771,9 +793,6 @@ class ManagedController:
         if isinstance(decision, Pending):
             return decision
         present = s.book.owned_present(native.physical)
-        row = j.db.execute(
-            "SELECT state FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-        ).fetchone()
         pending_stop = continuing_local is None and awaiting_known_stops(j)
         if not pending_stop:
             decision = lifecycle_decision(
@@ -784,7 +803,7 @@ class ManagedController:
             if isinstance(decision, Pending):
                 return decision
         pending_delivery = pending_stop or (not allow_offline and awaiting_observations(j))
-        refusal = self._zero_refusal(present, row, allow_offline=allow_offline, pending_delivery=pending_delivery)
+        refusal = self._zero_refusal(present, allow_offline=allow_offline, pending_delivery=pending_delivery)
         if refusal is not None:
             return Pending(Prerequisite.ZERO_PROOF, refusal)
         if pending_delivery or g.vendor._pending:
@@ -796,7 +815,6 @@ class ManagedController:
     def _zero_refusal(
         self,
         present: list[Resource],
-        row: sqlite3.Row | None,
         *,
         allow_offline: bool,
         pending_delivery: bool,
@@ -819,16 +837,10 @@ class ManagedController:
             g.vendor.sender is None or g.vendor_registration != "Accepted" or not s.runtime.status.vendor_connected
         ):
             return "cloud registration is unavailable"
-        if not g.controls.ready:
-            return "station ceiling is unconfirmed"
-        if g.controls.desired() != 0:
-            return "station ceiling is not zero"
         if not j.get("control", {}).get("inhibit"):
             return "local inhibit is missing"
-        if row is None or row["state"] != "confirmed":
-            return "owned station profile is unconfirmed"
-        if not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present):
-            return "owned station zero receipt is missing"
+        if (refusal := self.native.station_zero_refusal(present)) is not None:
+            return refusal
         if not allow_offline and not pending_delivery and not facts.cloud_queue_empty():
             return "cloud delivery is pending"
         if g.controls._operations:
@@ -841,7 +853,7 @@ class ManagedController:
 
     # One accepted return receives one guarded attempt; uncertainty never changes persisted paused intent to app.
     async def return_requested(self, identifier: str, revision: int) -> None:
-        expected = self.requests.check_return_revision(identifier, revision)
+        expected = self.commands.decide(lambda: self.requests.check_return_revision(identifier, revision))
         if expected is None:
             return
         if self.charging.return_blocked():
@@ -857,22 +869,7 @@ class ManagedController:
             control = j.get("control", {})
             if self.requests.intent() != expected or control.get("uncertain"):
                 return
-        receipt = local_start_receipt(j)
-        if (
-            control.get("start_pending")
-            or receipt.get("pause_revision") == expected.revision
-            and receipt.get("local") is not None
-            and (
-                j.active() == receipt.get("local")
-                or j.db.execute(
-                    "SELECT 1 FROM transactions WHERE local=? AND stop IS NULL", (receipt.get("local"),)
-                ).fetchone()
-            )
-            or receipt.get("pause_revision") == expected.revision
-            and receipt.get("verified_pause_revision") != expected.revision
-            or self.requests.pause_ownership().owns_ticket(control.get("ticket"))
-            and self.requests.pending_pause()
-        ):
+        if self.commands.decide(lambda: self.requests.return_waits_for_pause(expected)):
             return  # The same Return survives the real Start and both closure reports under its Pause.
         try:
             await self.recovery.restore(expected, return_request=identifier, claim_return=True)

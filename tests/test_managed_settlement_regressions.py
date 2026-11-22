@@ -477,7 +477,7 @@ async def test_replaced_unused_cloud_arm_leaves_two_independent_sessions_separat
         assert (await healthy(c))["power_w"] == 1440
         historical = c.requests.receipt(identifier)
         assert c.charging.state()["state"] == "armed"
-        assert c.charging.timed_stop_target(c.charging.state()) is None
+        assert b.session.journal.starts.timed_stop_target(c.charging.state()) is None
         assert not starts(rig)
         await c.charging.close()
         await crash(b.session)

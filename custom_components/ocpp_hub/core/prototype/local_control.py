@@ -10,8 +10,9 @@ from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .. import commands
 from ..control import HUB_PROFILE_ID
@@ -50,11 +51,16 @@ from .start_handoff import (
 from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, StationZeroStorageError, fingerprint
 
-if TYPE_CHECKING:
-    from .command_outcomes import OwnerWireScope
-
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
-type StopProof = Callable[[int, bool], Awaitable[Callable[[], None]]]
+type ProveStop = Callable[[int, bool, bool], Awaitable[StopProof]]
+
+
+@dataclass(frozen=True)
+class StopProof:
+    """Independent evidence required to Stop an exact target when zero is in doubt."""
+
+    check: Callable[[], None]
+    flowing: Callable[[], bool] | None = None
 
 
 class ControlSupersededError(DeniedError):
@@ -63,6 +69,19 @@ class ControlSupersededError(DeniedError):
 
 class StopReplyUnconfirmedError(UnavailableError):
     """The station confirmed zero but the transaction Stop reply did not establish acceptance."""
+
+
+class StopDecision(Enum):
+    """A Stop can use an exact acknowledgement, wait for its report, or need a physical send."""
+
+    SEND = auto()
+    ACCEPTED = auto()
+    WAIT_FOR_REPORT = auto()
+    CLOSED = auto()
+
+
+class _StopAlreadyHandledError(Exception):
+    """The exact session closed or an earlier Stop was accepted during outgoing validation."""
 
 
 # Translate genuine technical failures once at the executor boundary; ordinary prerequisites never enter here.
@@ -103,18 +122,6 @@ async def join_retirement[T](task: asyncio.Task[T]) -> T:
     return result
 
 
-@dataclass(frozen=True)
-class StopScope:
-    """Live ownership of a Stop. The journal owns its actual reply."""
-
-    epoch: int
-    revision: int
-    ticket: str
-    local: int
-    generation: int
-    evidence: OwnerWireScope
-
-
 # Read compatibility evidence through the journal's sole Start lifecycle owner.
 def local_start_receipt(j: Journal) -> dict[str, Any]:
     return j.starts.receipt()
@@ -148,11 +155,10 @@ class LocalControl:
         self._stopping: asyncio.Task[Frame] | None = None
         self._stop_ticket: str | None = None
         self._stop_owner: tuple[object, ...] | None = None
+        self._protective_stop: tuple[int, str | None, int, str] | None = None
         self._release_ticket: str | None = None
         self._unsent_release: tuple[str, dict[str, Any]] | None = None
         self.release_attempt: ReleaseAttempt | None = None
-        self._issued_stop: StopScope | None = None
-        self._stop_generation = 0
         self.authorize: Callable[[str], bool] | None = None
         self.prepare_station: Callable[[ResultCall, int], Awaitable[StationChoice | NotSent]] | None = None
         self.require_retained_station: Callable[[float], Awaitable[None]] | None = None
@@ -569,27 +575,65 @@ class LocalControl:
         self.peer.decide(settle, priority=priority)
         return answer
 
-    # Every actual Boot retires Stop acknowledgements even when its metadata is unchanged.
-    def forget_stop_ack(self) -> None:
-        self._stop_generation += 1
-        self._issued_stop = None
-
     # An accepted known-session Stop waits for its genuine closure instead of repeating after each native poll.
-    def stop_acknowledged(self, local: int | None) -> bool:
-        ack = self._issued_stop
-        return (
-            ack is not None
-            and local is not None
-            and ack.local == local
-            and ack.epoch == self.epoch()
-            and ack.revision == self._revision
-            and ack.generation == self._stop_generation
-            and ack.ticket == self.journal.get("control", {}).get("ticket")
-            and any(
-                wire.action == "RemoteStopTransaction" and wire.local == local and wire.reply == "Accepted"
-                for wire in ack.evidence.wires.values()
+    def stop_acknowledged(self, local: int | None, *, protective: bool = False) -> bool:
+        # A Stop sent under a previously sound zero cannot cover a newly observed loss of that protection.
+        def accepted() -> bool:
+            if not protective:
+                return self.journal.outcomes.accepted_stop(local)
+            scope = self._protective_stop
+            return (
+                scope is not None
+                and scope[:3] == (local, self.boot(), self._revision)
+                and self.journal.outcomes.accepted_stop(local, ticket=scope[3])
             )
-        )
+
+        return self.peer.decide(accepted, priority=CommandPriority.RESTRICT)
+
+    # Apply the same exact-session and prior-reply decision for both local and vendor Stop requests.
+    def stop_decision(
+        self,
+        local: int | None,
+        *,
+        protective: bool = False,
+        station_flowing: Callable[[], bool] | None = None,
+        reuse_allowed: bool = True,
+    ) -> StopDecision:
+        # Read the exact report and reply in the same queued decision as the latest draw evidence.
+        def decide() -> StopDecision:
+            session = self.journal.outcomes.session(local)
+            if session is None or session.closed or self.journal.active() != session.local:
+                return StopDecision.CLOSED
+            if not reuse_allowed:
+                return StopDecision.SEND
+            protecting = protective or (station_flowing is not None and station_flowing())
+            if self.stop_acknowledged(session.local, protective=protecting):
+                return StopDecision.ACCEPTED
+            if not protecting and self.journal.outcomes.unanswered_shutdown_stop(session.local):
+                return StopDecision.WAIT_FOR_REPORT
+            return StopDecision.SEND
+
+        return self.peer.decide(decide, priority=CommandPriority.RESTRICT)
+
+    # Local operations check whether they still need to send, including after a newer receipt or report arrives.
+    def stop_needed(
+        self, local: int | None, *, protective: bool = False, station_flowing: Callable[[], bool] | None = None
+    ) -> bool:
+        return self.stop_decision(local, protective=protective, station_flowing=station_flowing) is StopDecision.SEND
+
+    # An accepted Stop can suppress the wire call while the current Boot still needs a zero hold.
+    def stop_work_needed(
+        self, local: int | None, *, station_absent: bool = False, station_flowing: Callable[[], bool] | None = None
+    ) -> bool:
+        # Check the station and session against the same live command state.
+        def decide() -> bool:
+            return (
+                not station_absent
+                and (not self.ready or self.desired() != 0)
+                or self.stop_needed(local, protective=station_absent, station_flowing=station_flowing)
+            )
+
+        return self.peer.decide(decide, priority=CommandPriority.RESTRICT)
 
     # Pause first, then stop only the known session, without allowing queued cloud traffic between them.
     async def stop(
@@ -598,14 +642,23 @@ class LocalControl:
         expected_local: int | None = None,
         guard: Callable[[], None] | None = None,
         station_absent: bool = False,
-        prove_stop: StopProof | None = None,
+        station_flowing: Callable[[], bool] | None = None,
+        prove_stop: ProveStop | None = None,
         on_claim: Callable[[str], None] | None = None,
         owner: tuple[object, ...] | None = None,
         priority: CommandPriority = CommandPriority.RESTRICT,
         request_id: str | None = None,
     ) -> Frame:
         claim = partial(
-            self._claim_stop, expected_local, guard, station_absent, prove_stop, on_claim, owner, request_id
+            self._claim_stop,
+            expected_local,
+            guard,
+            station_absent,
+            station_flowing,
+            prove_stop,
+            on_claim,
+            owner,
+            request_id,
         )
         task = claim() if self.command_processor is None else await self.command_processor.run(claim, priority=priority)
         return await asyncio.shield(task)
@@ -616,7 +669,8 @@ class LocalControl:
         expected_local: int | None,
         guard: Callable[[], None] | None,
         station_absent: bool,
-        prove_stop: StopProof | None,
+        station_flowing: Callable[[], bool] | None,
+        prove_stop: ProveStop | None,
         on_claim: Callable[[str], None] | None,
         owner: tuple[object, ...] | None,
         request_id: str | None,
@@ -658,6 +712,7 @@ class LocalControl:
                     expected_local,
                     guard,
                     station_absent,
+                    station_flowing,
                     prove_stop,
                     request_id,
                 )
@@ -674,10 +729,10 @@ class LocalControl:
         expected_local: int | None = None,
         guard: Callable[[], None] | None = None,
         station_absent: bool = False,
-        prove_stop: StopProof | None = None,
+        station_flowing: Callable[[], bool] | None = None,
+        prove_stop: ProveStop | None = None,
         request_id: str | None = None,
     ) -> Frame:
-        revision, generation = self._revision, self._stop_generation
         stop_guard: Callable[[], None] | None = None
 
         # Recheck generation and optional scoped authority at each physical RPC.
@@ -691,17 +746,26 @@ class LocalControl:
         cap_error: UnavailableError | StationZeroStorageError | None = None
         answer: Frame | None = None
         local: int | None = None
+        observed_flowing = station_flowing
 
-        # Only a Stop dispatched on this live scope can suppress a later retry.
-        def issued_stop(action: str) -> None:
+        # A fresh nonzero measurement can contradict an otherwise confirmed station limit after Boot.
+        def protective() -> bool:
+            return cap_error is not None or observed_flowing is not None and observed_flowing()
+
+        # Recheck real closure and any matched prior reply in the final queued send decision.
+        def dispatch_stop(action: str) -> None:
             if action == "RemoteStopTransaction" and local is not None:
+                protecting = protective()
+                if not self.stop_needed(local, protective=protecting):
+                    raise _StopAlreadyHandledError
                 if self.boot() != boot or self.journal.active() != local:
                     raise UnavailableError("Stop lost its original charger Boot or open session")
-                self._issued_stop = StopScope(epoch, revision, ticket, local, generation, scope)
+                if protecting:
+                    self._protective_stop = local, boot, self._revision, ticket
 
-        scope = self.journal.outcomes.owner_scope(request_id, ticket, self.boot())
+        scope = self.journal.outcomes.owner_scope(request_id, ticket, boot)
         async with self.peer.sequence(
-            0, check, on_dispatch=issued_stop, owner_scope=scope, late_reply_action="RemoteStopTransaction"
+            0, check, on_dispatch=dispatch_stop, owner_scope=scope, late_reply_action="RemoteStopTransaction"
         ) as call:
             if station_absent:
                 cap_error = UnavailableError("the missing station ceiling cannot establish a zero hold")
@@ -721,30 +785,37 @@ class LocalControl:
                         if isinstance(error, UnavailableError)
                         else UnavailableError("station hold could not be confirmed")
                     )
-            local = self.journal.active()
+            active = self.journal.active()
             # Managed shutdown pins the first attempt's transaction, then handles any newly reported Start.
-            if local is not None and (local == expected_local or expected_local is None and prove_stop is None):
+            if active == expected_local or expected_local is None and prove_stop is None:
+                local = active
+            if local is not None:
                 if prove_stop is not None:
-                    stop_guard = await prove_stop(local, cap_error is not None)
+                    awaiting_report = self.peer.decide(
+                        lambda: self.journal.outcomes.awaits_stop_report(local), priority=CommandPriority.RESTRICT
+                    )
+                    proof = await prove_stop(local, cap_error is not None, awaiting_report)
+                    stop_guard = proof.check
+                    observed_flowing = proof.flowing
+            if local is not None and self.stop_needed(local, protective=protective()):
                 try:
-                    answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
+                    stop_answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
+                except _StopAlreadyHandledError:
+                    stop_guard = None
                 except UnavailableError as error:
                     if cap_error is not None:
                         raise cap_error from error
                     raise StopReplyUnconfirmedError("transaction stop reply was unavailable") from error
-
-                # Keep an actual acknowledgement for the exact transaction it addressed.
-                def accept_stop(answer: Frame) -> None:
-                    nonlocal stop_guard
-                    if answer[0] != 3 or answer[2] != {"status": "Accepted"}:
+                else:
+                    wire = scope.wires.get(stop_answer[1])
+                    if wire is None or wire.reply != "Accepted":
                         if cap_error is not None:
                             raise cap_error
                         raise StopReplyUnconfirmedError("transaction stop was not confirmed")
                     # The StopTransaction report may already have closed this session.
                     stop_guard = None
-                    check()
-
-                self.peer.decide(lambda: accept_stop(answer), priority=CommandPriority.RESTRICT)
+                    self.peer.decide(check, priority=CommandPriority.RESTRICT)
+                    answer = stop_answer
             if cap_error is not None:
                 raise cap_error
         assert answer is not None
@@ -908,10 +979,15 @@ class LocalControl:
                 reply = "other"
             self.observe_incident("start_reply", request_id, ticket, reply)
 
+        # A rollback held by this ticket cannot wait behind another queued restrictive call.
+        def restricting() -> bool:
+            return restoring_zero
+
         async with self.peer.sequence(
             1,
             check,
             on_dispatch=dispatch,
+            restricting=restricting,
             on_receive=received,
             on_sent=sent,
             late_reply_action="RemoteStartTransaction",
@@ -1118,10 +1194,16 @@ class LocalControl:
             )
             if attempt is not None:
                 attempt.wires = scope
+
+            # Finish the original guarded rollback to zero before handing the gate to its next owner.
+            def restricting() -> bool:
+                return restoring_zero
+
             async with self.peer.sequence_results(
                 1,
                 check,
                 on_dispatch=dispatched,
+                restricting=restricting,
                 owner_scope=scope,
                 late_reply_action="SetChargingProfile",
             ) as call:
@@ -1202,6 +1284,12 @@ class LocalControl:
                                 self.peer.decide(self.retry_unsent_release, priority=CommandPriority.RESTRICT)
                                 return Pending(Prerequisite.SUPERSEDED, "release Boot changed before dispatch", retired)
                     await rollback_zero()
+                    if (
+                        attempt is not None
+                        and isinstance(error, ValidationPreemptedError)
+                        and not attempt.positive_may_have_dispatched
+                    ):
+                        return Pending(Prerequisite.SUPERSEDED, "restrictive work preceded release dispatch", error)
                     if attempt is None and isinstance(error, ReleaseDeferredError):
                         # A deferred legacy release still settles only its own verified zero.
                         def settle_deferred() -> None:

@@ -11,7 +11,66 @@ import pytest
 
 from tests.qualification_test_helpers import synthetic_collection_row, synthetic_source_recollection
 from tools import audit_parallel_qualification as audit
+from tools import parallel_worker, qualification_collection
+from tools.qualification_collection import runtime_digest
 from tools.qualification_snapshot import freeze
+
+
+# Intent: changes to either mounted runtime asset change the exact worker and collector digest.
+# Why: a stable mount path can otherwise hide a replacement executable or library.
+def test_runtime_digest_covers_explicit_auxiliary_mounts(tmp_path, monkeypatch):
+    venv = tmp_path / "venv"
+    library = tmp_path / "runtime"
+    venv.mkdir()
+    library.mkdir()
+    executable = tmp_path / "openssl"
+    library_file = library / "library"
+    executable.write_bytes(b"original executable")
+    library_file.write_bytes(b"original library")
+    config = {
+        "image": "sha256:" + "1" * 64,
+        "runtime_mode": "image",
+        "container_python": "/venv/bin/python",
+        "venv_target": "/venv",
+        "venv": str(venv),
+        "readonly_mounts": [
+            {"source": str(executable), "target": "/usr/bin/openssl"},
+            {"source": str(library), "target": "/task/openssl-runtime"},
+        ],
+    }
+    original = runtime_digest(config)
+    for key, changed_value in (
+        ("image", "sha256:" + "2" * 64),
+        ("container_python", "/tools/python"),
+        ("venv_target", "/other-venv"),
+    ):
+        assert runtime_digest({**config, key: changed_value}) != original
+    executable.write_bytes(b"replacement executable")
+    changed = runtime_digest(config)
+    library_file.write_bytes(b"replacement library")
+    assert original != changed != runtime_digest(config)
+    host_config = tmp_path / "openssl.cnf"
+    host_config.write_bytes(b"original configuration")
+    monkeypatch.setattr(qualification_collection, "HOST_RUNTIME_MOUNTS", ((str(host_config), "/etc/ssl/openssl.cnf"),))
+    config["runtime_mode"] = "host"
+    before = runtime_digest(config)
+    host_config.write_bytes(b"replacement configuration")
+    assert before != runtime_digest(config)
+
+
+# Intent: a failed container inspection remains visible in the worker's cleanup receipt.
+# Why: an unavailable daemon cannot confirm that auto-removal completed.
+def test_worker_cleanup_distinguishes_inspection_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(parallel_worker, "ROOT", tmp_path)
+
+    # Return the actual command contract for an unavailable daemon without starting a container.
+    def unavailable(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr(parallel_worker.subprocess, "run", unavailable)
+    errors = parallel_worker.cleanup_containers([{"container_name": "owned-test"}])
+    assert errors == ["container ownership inspection failed"]
+    assert json.loads((tmp_path / "container-cleanup.json").read_text())["errors"] == errors
 
 
 # Write deterministic fixture artifacts without invoking Docker or generating fake production test results.

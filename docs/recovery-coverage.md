@@ -59,11 +59,31 @@ exercise Return, change the selected current through HA, and finish a subsequent
 The [timed cutoff tests](../tests/test_managed_test_charge.py) hold a native read failure and a failed timed Stop
 write together, including before first power has been recorded for a known local or cloud test session. They
 check the actual zero-current command while both failures persist, then restore the two paths in different orders
-and verify Stop targets the same session.
+and verify Stop targets the same session. Another replay withholds the cloud Stop reply after the charger reports
+closure and native power reaches zero. The original timed request settles only once delivery completes, including
+when an older journal already marked its charge record complete. Both cases keep the one original Stop.
+
+The [Pause closure replay](../tests/test_ordinary_recovery.py) varies the charger report, measured closure and
+cloud acknowledgement. It covers an open-session replacement and graceful shutdown with a saved cloud reply
+while SQLite refuses to finish delivery. The [process restart replay](../tests/test_real_process_death.py) kills
+the service at that storage boundary with native closure already observed or still pending. Both preserve the
+original request and mapped session, require exactly one charger Stop and one cloud delivery, and keep zero until
+fresh evidence permits Return. The [shutdown replay](../tests/test_trial_session.py) also supersedes a draw sample
+with a newer zero before dispatch and checks that the prior acceptance still covers the Stop.
+The [shutdown dispatch replay](../tests/test_ordinary_recovery.py) distinguishes a proven unsent Stop from a
+sent but unanswered Stop whose optional wire write SQLite refused. It restarts twice with the latter to check
+that the second shutdown leaves the first outcome intact. The [paused reconnect tests](../tests/test_pause_stop_recovery.py)
+also exercise a charger that refuses to apply zero while an older accepted Stop has already halted the draw.
 
 The [Pause ordering tests](../tests/test_managed_controls.py) hold the outgoing positive profile for Start,
 Return or a current increase at the native validation boundary. Pause can take control before or after successful
 validation. In both orders, the simulated charger receives no positive profile from the superseded command.
+
+The [shared Stop tests](../tests/test_managed_cloud_zero_controls.py) overlap local Pause and vendor-app Stop
+in both orders and hold the first charger reply until the second request queues. Each order sends one charger
+Stop and delivers one real closure report. A late acceptance can also cover a prepared vendor request at the final
+send check. An unanswered shutdown Stop waits at proven zero, and a prior refusal, renewed draw or unavailable zero
+evidence lets the vendor send a real Stop to the same open session.
 
 The [issued-command tests](../tests/test_issued_pause_reconnect.py) let the charger receive Start or apply a
 positive profile for Return or a current increase before Pause. The reply arrives late on its original connection
@@ -76,10 +96,15 @@ closure has been verified.
 The [ordinary recovery tests](../tests/test_ordinary_recovery.py) also replace the proxy after a real Stop has
 been saved and while the charger still reports the same session at zero. They exercise both plugged and
 unplugged reports, replay the Stop and verify fresh closure before the positive ceiling returns.
+The same tests vary whether the charger Stop report, its command reply, or native closure arrives first. They
+replace the proxy after the charger reply survives a temporary SQLite refusal while the session is still open.
+They also replace it after SQLite refuses to dequeue a cloud-acknowledged Stop. The original Pause completes
+with one charger Stop and the original mapped session. Return keeps the ceiling at zero while the cloud
+acknowledgement is pending.
 The [shutdown overlap test](../tests/test_managed_start_binding.py) closes a daily session and then closes
 the separate late report of an already accepted owner Start. Each Stop uses its own transaction.
 The [shutdown checks](../tests/test_trial_session.py) also cover a real session closure before the pending Stop
-sends and a single unavailable native read during ordinary recovery. The
+sends, a previously accepted Pause Stop, and a single unavailable native read during ordinary recovery. The
 [cloud storage tests](../tests/test_cloud_ack_storage.py) cover stored acknowledgements across replacement and
 acknowledgements received just before storage fails and the cloud disconnects. They verify local settlement after
 storage recovers, with the cloud still offline or waiting for registration. Later undelivered reports stay queued.
@@ -184,6 +209,7 @@ These controls model task/runtime/process death, not literal hardware power fail
 | Observation retry | Durable CALL identity includes the observed Boot generation. Pending receipts cannot be evicted. | A failed SQLite transaction rolls back the receipt, queue and local status. Retries and later sessions succeed after recovery. | A buffered report before Boot and a fresh report after it can reuse a CALL ID. The recent retry window is bounded. |
 | Cloud Start reply | Explicit error retry, denied authorization and unknown delivery have different receipts | Retry budget survives restart. A quarantined malformed reply keeps its digest. Denied Start keeps its mapping for real Stop. | Mapping commits before the separate physical zero confirmation. There are three transmissions with 60/120-second waits for explicit errors, and an unknown outcome needs independent proof before retry. |
 | Forwarded charger Start and Stop replies | Match the actual charger reply to the issued request. An accepted Stop still needs its own closure report. | Retry temporary journal writes without sending the command again. Settle a saved reply after restart and respect the latest owner request. | The simulator cuts the process on both sides of the reply commit. A reply lost before commit retains the zero hold and shows the unknown outcome. |
+| Local Stop and Pause | Keep the accepted Stop with the exact session. Require the charger report and fresh native zero for Pause. | Keep zero after replacement, including after an accepted shutdown Stop. Restore app control only after cloud acknowledgement. | Real-peer cases vary closure order and temporary writes. A missing or contradictory zero can require a fresh protective Stop on the current Boot. |
 | Start dispatch | Prepared/unsent/rejected differs from issued/accepted unknown; exact request/tag binding | Exact closed local lifecycle and atomic receipt/metadata settlement at verified zero; unmapped cloud debt remains separately blocked | Unknown/unbound debt still needs supported exact evidence. |
 | Current/native proof | Real503/EOF/bad JSON, profile/composite rejection, applied CALLERROR, excessive composite | Prior selection unless target fully confirmed before revocation; new Pause/Return | All integer pairs for successful selection/idempotency; failure-order grammar uses representative currents. |
 | Boot | Incomplete old proof cannot cross Boot | Fresh pair after incomplete proof; completed pair may survive identical metadata | Changed identity/configuration retains blocking focused tests. |
@@ -280,6 +306,13 @@ The ordinary suites also retain explicit recovery checks outside the finite mode
   corresponding owner-epoch persistence failures after accepted Start retain Pause, zero and unknown Start debt.
   Return before the first settling poll and temporary-cleanup/Stop-refusal combinations must complete the same
   requests after genuine closure, without a second owner command or a guessed Start/Stop.
+- `test_ordinary_recovery.py` replaces the proxy while the regular database write for an accepted owner or
+  forwarded Stop is failing. The replacement retains the original reply and session, holds zero without a
+  duplicate Stop, and waits for charger closure and cloud delivery before returning control. A Return queued
+  after Stop acceptance can remain pending throughout closure and settle with the same request ID.
+- `test_managed_normal_start.py` expires an accepted Start after its exact charger report binds the session.
+  It verifies a protective Stop when the charger refuses zero. `test_trial_session.py` holds the shutdown Stop
+  at the send boundary while a newer reading either confirms draw or shows zero.
 - `test_trial_auth.py` and `test_prototype_runtime.py` cover connected/Pending/Rejected registration, bounded local
   approval, cached denial/expiry, real TLS and current cloud refusals/lost replies. Stop, revocation and expiry
   during physical readback remain restrictive on both registered and locally authorized paths.

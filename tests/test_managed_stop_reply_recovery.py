@@ -21,7 +21,7 @@ from tests import managed_rig as mp
 from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
 from tests.managed_rig import ReplyBench
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
@@ -375,6 +375,23 @@ async def test_stop_wire_ack_and_dequeue_are_atomic(tmp_path, tls, unused_tcp_po
             assert proof["wire_ack"] is None and proof["resolved"]["retained"]
             assert (await c.tick())["state"] == "attention"
             s.journal.db.execute("DROP TRIGGER fail_actual_stop_ack")
+
+        # The exact approved reply must settle before a replacement can establish cloud registration.
+        wire_count = len(rig.bench.stop_wires)
+        s = mp.managed_session(rig)
+        monkeypatch.setattr(s.runtime, "vendor_enabled", lambda: False)
+        await s.start()
+        c = ManagedController(s)
+        try:
+            async with rig.charger(s) as charger:
+                assert (await rig.bench.call(charger, "offline-saved-ack", "BootNotification", BOOT))[0] == 3
+                await c.tick()
+                assert s.journal.next_delivery() is None and not s.runtime.status.vendor_connected
+                assert next(iter(s.journal.get(KEY).values()))["proof"]["wire_ack"] is not None
+                assert len(rig.bench.stop_wires) == wire_count
+        finally:
+            await c.charging.close()
+            await crash(s)
         async with running(rig, "atomic-replacement-retry") as (s, c, charger):
             await return_after_ack(rig, s, c)
 

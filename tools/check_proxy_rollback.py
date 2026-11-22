@@ -491,6 +491,8 @@ def check_rollback(config: TrialConfig, current: Path, previous: Path) -> Rollba
     except RollbackRefusedError as error:
         reason = str(error)
     except (
+        AttributeError,
+        KeyError,
         OSError,
         sqlite3.Error,
         ValueError,

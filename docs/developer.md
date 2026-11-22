@@ -186,7 +186,9 @@ are unsupported. No auxiliary target may equal, contain or sit inside the concre
 scratch, venv or interpreter, or protected system code roots; the exact image-mode OpenSSL file is the sole system-file
 exception. A configurable primary venv target must also remain separate from source/evidence. Paths with parent
 traversal and duplicate targets fail. The launcher checks final destinations before dispatch; the worker and fresh
-collector independently repeat the checks and verify source types on their actual executor. New runtime assets require
+collector independently repeat the checks and verify source types on their actual executor. The runtime digest binds
+the virtual environment and runtime mounts by target and contents, including the host system and OpenSSL configuration
+when host mode supplies them. New runtime assets require
 an explicit policy update, not an overlay of pinned code. Every attempt has its own directory; interrupted runs are
 retained and cannot be combined into one pass.
 Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
@@ -370,8 +372,9 @@ focused checks are development evidence; release still requires exact-clean-sour
 
 ## Owned restore sequencing
 
-`RecoveryCoordinator._run_restore` directly sequences each owned attempt. The initial read uses the original default closure mode, followed by closure reconciliation, session
-agreement, the open-session check and zero proof. Optional native recovery is selected from current durable state
+`RecoveryCoordinator._restore_owned` calls `_prepare_restore` before running the owned release. Preparation
+reads with the default closure mode, reconciles the Stop report, checks session agreement and any open session,
+and verifies zero. Optional native recovery is selected from current durable state
 after those checks. The ticket is captured only at entry to the following verified read and zero proof. The release
 guard then rechecks the current source domain and owner authority before the owned release. Later observations never
 repeat the initial closure/session pipeline, recapture the ticket or loop back to recovery.
@@ -391,7 +394,7 @@ coroutine executes the same zero sequence inside the original LocalControl task,
 process-death tests retain their sequencing and effect witnesses. Preflight observers inspect the registered
 `_restore_owned` frame with their original native/UUID/task conditions; no runtime observation callback is added.
 
-`ResourceBook.confirmed_station_zero` owns the seven identical profile/receipt comparisons. Native observation,
+`ResourceBook.confirmed_station_zero` owns the profile and receipt comparison used for shared zero proof. Native observation,
 resource publication and receipt SQL stay at each caller's original position. The pure comparison stays after
 any lifecycle Pending return and inside its original short-circuit condition; malformed JSON retains its error.
 Callers still select their original profile-kind scope. Weaker physical-presence checks remain weaker.

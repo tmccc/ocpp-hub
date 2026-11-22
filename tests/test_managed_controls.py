@@ -272,6 +272,79 @@ async def test_accepted_return_is_not_retried_after_process_replacement(
             assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
 
 
+# Intent: a same-intent restrictive waiter cannot interrupt an owned Return's zero rollback.
+# Why: an unsent release leaves a retryable hold, and a sent positive profile must be zeroed before yielding.
+@pytest.mark.parametrize("boundary", ["positive-set", "composite"])
+async def test_same_intent_zero_waiter_allows_return_rollback(tmp_path, tls, unused_tcp_port, monkeypatch, boundary):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, rig = b.controller, b.session.gateway, b.rig
+        await healthy(c)
+        c.command(identifier(), "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        intent = c.requests.intent()
+        request = identifier()
+        c.command(request, "app_control", intent.revision)
+        initial = len(rig.bench.received_limits)
+        validate = g.charger.validate_send
+        assert validate is not None
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        attempts = []
+
+        # Hold the real outgoing validation before its Set or its post-acceptance composite.
+        async def delay(action, payload):
+            attempt = g.controls.release_attempt
+            if (
+                attempt is not None
+                and not attempts
+                and (
+                    boundary == "positive-set"
+                    and action == "SetChargingProfile"
+                    and profile_projection(payload)["limit"] > 0
+                    or boundary == "composite"
+                    and action == "GetCompositeSchedule"
+                    and attempt.positive_may_have_dispatched
+                )
+            ):
+                attempts.append(attempt)
+                blocked.set()
+                await release.wait()
+            return await validate(action, payload)
+
+        monkeypatch.setattr(g.charger, "validate_send", delay)
+        poll = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(blocked.wait(), 4)
+            assert c.requests.intent() == intent
+            if boundary == "composite":
+                assert rig.bench.firmware.effective_limit() == c.current.selected()
+            else:
+                assert rig.bench.firmware.effective_limit() == 0
+            assert g.controls.desired() == 0
+            zero_waiter = asyncio.create_task(g.controls.ensure_ceiling())
+            try:
+                await asyncio.wait_for(asyncio.gather(poll, zero_waiter), 5)
+            finally:
+                zero_waiter.cancel()
+                await asyncio.gather(zero_waiter, return_exceptions=True)
+        finally:
+            release.set()
+            await asyncio.gather(poll, return_exceptions=True)
+
+        attempt = attempts[0]
+        assert attempt.finished and not attempt.cleanup_failed and attempt.zero_confirmed
+        expected = "failed" if boundary == "positive-set" else "uncertain"
+        assert c.requests.intent() == intent and c.requests.receipt(request)["state"] == expected
+        assert rig.bench.firmware.effective_limit() == 0
+        received = rig.bench.received_limits[initial:]
+        if boundary == "positive-set":
+            assert not attempt.positive_may_have_dispatched and set(received) == {0}
+            assert not b.session.journal.fault.latched()
+            assert (await healthy(c))["local_hold_verified"]
+        else:
+            assert attempt.positive_may_have_dispatched and received[:2] == [c.current.selected(), 0]
+
+
 # Intent: Pause arriving while Return awaits a real native read invalidates the positive release before send.
 # Why: a newer Stop must preempt prior work rather than wait for it to restore app authority first.
 @pytest.mark.parametrize("boundary", ["native", "owned_task"])

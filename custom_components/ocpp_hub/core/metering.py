@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any
 
 from .model import PHASE_TOTAL, MeterSample
@@ -14,8 +15,14 @@ MEASURAND_CURRENT = "Current.Import"
 MEASURAND_VOLTAGE = "Voltage"
 MEASURAND_OFFERED = "Current.Offered"
 
-# Factor to the base unit for the units chargers actually send; an unknown unit is skipped, never guessed.
-_TO_BASE = {"W": 1.0, "kW": 1000.0, "Wh": 1.0, "kWh": 1000.0, "A": 1.0, "V": 1.0}
+# Bare measurements use their base unit. Explicit units must match the measurement.
+_UNITS = {
+    MEASURAND_ENERGY: {"Wh": 1.0, "kWh": 1000.0},
+    MEASURAND_POWER: {"W": 1.0, "kW": 1000.0},
+    MEASURAND_CURRENT: {"A": 1.0},
+    MEASURAND_VOLTAGE: {"V": 1.0},
+    MEASURAND_OFFERED: {"A": 1.0},
+}
 _DEFAULT_UNIT = {
     MEASURAND_ENERGY: "Wh",
     MEASURAND_POWER: "W",
@@ -27,10 +34,10 @@ _DEFAULT_UNIT = {
 
 # Reduce an OCPP phase label to the key used in a sample: L1, L2, L3, or "total" when there is no phase.
 # Voltage is often reported as L1-N while current is L1; both must land under the same key.
-def phase_key(phase: str | None) -> str | None:
-    if not phase:
+def phase_key(phase: object) -> str | None:
+    if phase is None or phase == "":
         return PHASE_TOTAL
-    if phase == "N":
+    if not isinstance(phase, str) or phase == "N":
         return None
     if phase.endswith("-N"):
         return phase[:-2]
@@ -53,28 +60,45 @@ def parse_timestamp(raw: object, fallback: datetime) -> datetime:
 # Signed-data and unknown-unit values must be skipped instead of corrupting a reading.
 def _number(sampled: dict[str, Any], measurand: str) -> float | None:
     unit = sampled.get("unit") or _DEFAULT_UNIT.get(measurand)
-    factor = _TO_BASE.get(str(unit))
-    if factor is None or sampled.get("format", "Raw") != "Raw":
+    factor = _UNITS.get(measurand, {}).get(str(unit))
+    raw = sampled.get("value")
+    if (
+        factor is None
+        or isinstance(raw, bool)
+        or not isinstance(raw, (int, float, str))
+        or sampled.get("format", "Raw") != "Raw"
+    ):
         return None
     try:
-        return float(sampled["value"]) * factor
-    except KeyError, TypeError, ValueError:
+        value = float(raw) * factor
+    except OverflowError, TypeError, ValueError:
         return None
+    return value if isfinite(value) else None
 
 
-# Build a MeterSample from the latest entry of a MeterValues payload.
+# Build a MeterSample from the latest usable entry of a MeterValues payload.
 # The hub shows the most recent reading; per-phase currents matter most because the mains limit is per phase.
 def parse_meter_values(payload: dict[str, Any], now: datetime) -> MeterSample | None:
-    entries = [entry for entry in payload.get("meterValue", []) if isinstance(entry, dict)]
-    if not entries:
+    values = payload.get("meterValue")
+    if not isinstance(values, list):
         return None
-    latest = max(entries, key=lambda entry: parse_timestamp(entry.get("timestamp"), now))
+    entries = [entry for entry in values if isinstance(entry, dict) and isinstance(entry.get("sampledValue"), list)]
+    entries.sort(key=lambda entry: parse_timestamp(entry.get("timestamp"), now), reverse=True)
+    for entry in entries:
+        sample = _meter_sample(entry["sampledValue"], parse_timestamp(entry.get("timestamp"), now))
+        if sample is not None:
+            return sample
+    return None
+
+
+# Ignore an entry that cannot update any measurement, including its timestamp.
+def _meter_sample(values: list[Any], sampled_at: datetime) -> MeterSample | None:
     power: dict[str, float] = {}
     currents: dict[str, float] = {}
     voltages: dict[str, float] = {}
     energy: float | None = None
     offered: float | None = None
-    for sampled in latest.get("sampledValue", []):
+    for sampled in values:
         if not isinstance(sampled, dict):
             continue
         measurand = str(sampled.get("measurand", MEASURAND_ENERGY))
@@ -92,9 +116,11 @@ def parse_meter_values(payload: dict[str, Any], now: datetime) -> MeterSample | 
             voltages[key] = value
         elif measurand == MEASURAND_OFFERED:
             offered = value if offered is None else max(offered, value)
+    if not (power or currents or voltages) and energy is None and offered is None:
+        return None
     total_power = power.get(PHASE_TOTAL, sum(power.values()) if power else None)
     return MeterSample(
-        sampled_at=parse_timestamp(latest.get("timestamp"), now),
+        sampled_at=sampled_at,
         power_w=total_power,
         energy_wh=energy,
         current_a=currents,

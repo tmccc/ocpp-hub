@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from dataclasses import replace
 
@@ -67,10 +68,10 @@ def observe_probe_peers(monkeypatch, policy):
 
 
 # Intent: a failed first probe is retried on the same real socket and only genuine Boot completes introduction.
-# Why: rejection, a lost reply and Accepted-without-Boot must not strand otherwise healthy connections.
-@pytest.mark.parametrize("failure", ["rejected", "lost_ack", "accepted_without_boot"])
+# Why: wire failures and a temporarily unavailable journal must not strand an otherwise healthy socket.
+@pytest.mark.parametrize("failure", ["rejected", "lost_ack", "accepted_without_boot", "storage"])
 async def test_read_only_boot_probe_retries_same_connection(tmp_path, tls, unused_tcp_port, monkeypatch, failure):
-    peers = observe_probe_peers(monkeypatch, {"failure": failure})
+    peers = observe_probe_peers(monkeypatch, {"failure": "normal" if failure == "storage" else failure})
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         session, controller, rig = b.session, b.controller, b.rig
         await select(b, 32)
@@ -84,11 +85,38 @@ async def test_read_only_boot_probe_retries_same_connection(tmp_path, tls, unuse
         session.gateway.charger.timeout = 0.06
         rig.bench.boot_on_probe = True
         initial_limits = len(rig.bench.received_limits)
+        before_send = session.gateway.charger.before_send
+        assert before_send is not None
+        refused_reads = []
+        db = session.journal.db
+
+        # Deny one real SQLite read inside the outgoing probe's resource guard.
+        def authorize(operation, table, *unused):
+            if operation == sqlite3.SQLITE_READ and table == "meta":
+                refused_reads.append(table)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        # Scope the one-time refusal to the original first probe and restore storage before the retry.
+        def refuse_probe_read(action, payload):
+            if action != "TriggerMessage" or refused_reads:
+                return before_send(action, payload)
+            db.set_authorizer(authorize)
+            try:
+                return before_send(action, payload)
+            finally:
+                db.set_authorizer(None)
+
+        if failure == "storage":
+            monkeypatch.setattr(session.gateway.charger, "before_send", refuse_probe_read)
         async with rig.charger(session):
             epoch = session.gateway._charger_epoch
             await until(lambda: controller.native.introduced_epoch == epoch and session.gateway.controls.ready)
             peer = peers[-1]
-            assert len(peer.probes) >= 2
+            if failure == "storage":
+                assert refused_reads == ["meta"] and len(peer.probes) == 1
+            else:
+                assert len(peer.probes) >= 2
             assert session.gateway._charger_epoch == epoch
             assert (await healthy(controller))["local_hold_verified"]
             count = len(peer.probes)

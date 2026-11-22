@@ -24,9 +24,10 @@ from ocpp_hub_core.prototype.store import RecoveryRequiredError, fingerprint
 
 from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
 from tests.handover_helpers import crash
-from tests.managed_rig import OwnerBench, healthy, introduced, managed_bench, managed_session, starts
+from tests.managed_rig import OwnerBench, ReplyBench, healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN
 from tests.native_peer_failures import InterruptedNativePeer
+from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
@@ -399,7 +400,7 @@ async def test_timer_holds_zero_when_native_and_cutoff_storage_are_unavailable(
         local = await positive_flow(test, source)
         if state == "charging":
             assert (await healthy(c))["power_w"] > 0
-        assert c.charging.state()["state"] == state and c.charging.timed_stop_target(c.charging.state()) == local
+        assert c.charging.state()["state"] == state and journal.starts.timed_stop_target(c.charging.state()) == local
         assert journal.active() == local and bench.firmware.current == 6
         before = len(bench.received_limits)
         wire_start = len(bench.device_calls)
@@ -613,6 +614,60 @@ async def test_late_first_flow_respects_startup_and_immutable_hard_deadline(
             assert lease.deadline == 1060 and lease.hard_deadline == 1180
             assert not test.controller.requests.receipt(identifier)["result"].get("positive_power_verified")
         assert (await actual_stop(test, local))["local_hold_verified"]
+
+
+# Intent: native zero can precede the cloud Stop reply without stranding the original timed request.
+# Why: both live and previously saved timed requests must settle once the independent closure proofs agree.
+@pytest.mark.parametrize("legacy_completed", [False, True])
+async def test_timed_receipt_waits_for_cloud_stop(tmp_path, tls, unused_tcp_port, monkeypatch, legacy_completed):
+    clock = [1000.0]
+    monkeypatch.setattr(charge_tests, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, bench_type=ReplyBench, startup=60) as test:
+        c, j, bench = test.controller, test.session.journal, test.rig.bench
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start_test", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        bench.firmware.requested_current = 0
+        native = await c.native.read()
+        assert native.physical.transaction_open and native.physical.power_w == 0
+        clock[0] += 61
+        c.commands.decide(lambda: c.charging.observed(native))
+        await asyncio.wait_for(bench.remote_stop.wait(), 3)
+        assert c.requests.receipt(identifier)["state"] == "uncertain"
+
+        stop_ack = bench.stop_gate = asyncio.Event()
+        try:
+            reply = await bench.call(
+                test.charger,
+                "actual-test-stop",
+                "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+            )
+            assert reply[0] == 3
+            test.rig.peer.permission_enabled = False
+            await until(lambda: bool(getattr(bench, "held_stop_replies", [])))
+            for _ in range(2):
+                status = await c.tick()
+                assert status["power_w"] == 0 and status["local_hold_verified"]
+                assert c.requests.receipt(identifier)["state"] == "uncertain"
+            if legacy_completed:
+                j.starts.complete_metadata(c.charging.state())
+                j.starts.set_lease(None)
+            else:
+                assert c.charging.state()["state"] == "stopping"
+        finally:
+            stop_ack.set()
+
+        await until(lambda: j.next_delivery() is None)
+        assert (await healthy(c))["local_hold_verified"]
+        receipt = c.requests.receipt(identifier)
+        assert receipt["state"] == "failed"
+        assert receipt["result"]["classification"] == "test_interrupted_at_verified_zero"
+        assert c.charging.state()["state"] == "completed" and c.charging.lease is None
+        assert [call[3] for call in bench.device_calls if call[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
 
 
 # Intent: an interrupted accepted test recovers as a durable pause and never repeats its already acknowledged Start.

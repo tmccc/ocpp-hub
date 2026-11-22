@@ -128,7 +128,7 @@ class MirrorLink:
         self._policy = policy or ControlPolicy()
         # Commands being passed on to the charger; they run beside the reader, which must keep reading meanwhile.
         self._forwards: set[asyncio.Task[None]] = set()
-        self._planning_writes: set[asyncio.Task[None]] = set()
+        self._sent_effects: set[asyncio.Task[None]] = set()
         self._settings = settings
         self._transactions = transactions
         self._ssl_context = ssl_context
@@ -248,7 +248,7 @@ class MirrorLink:
                 await asyncio.sleep(self._backoff(attempt))
         finally:
             self._connected = False
-            await asyncio.gather(*self._planning_writes, return_exceptions=True)
+            await asyncio.gather(*self._sent_effects, return_exceptions=True)
             self._on_finished(self)
 
     # Connect once and serve until the connection ends, turning every failure into a status instead of an exception.
@@ -340,8 +340,8 @@ class MirrorLink:
         finally:
             reader.cancel()
             sender.cancel()
-            # A planning switch already sent to the charger still needs its result and any local profile sync.
-            forwards = self._forwards - self._planning_writes
+            # A sent profile or planning command still needs settlement on the independent charger connection.
+            forwards = self._forwards - self._sent_effects
             for forward in forwards:
                 forward.cancel()
             await asyncio.gather(reader, sender, *forwards, return_exceptions=True)
@@ -393,7 +393,7 @@ class MirrorLink:
         task = asyncio.get_running_loop().create_task(self._forward(connection, unique_id, action, payload))
         self._forwards.add(task)
         task.add_done_callback(self._forwards.discard)
-        task.add_done_callback(self._planning_writes.discard)
+        task.add_done_callback(self._sent_effects.discard)
 
     # Check the command against the ceiling and the transaction map, give it to the charger, and relay the answer.
     # Every outcome is logged with the action, because this is the one way the vendor changes what the charger does.
@@ -419,16 +419,28 @@ class MirrorLink:
             return
         handler = self._plan_handler
         on = planning_switch(plan.payload) if handler is not None and action == "DataTransfer" else None
+        profile_write = action in ("SetChargingProfile", "ClearChargingProfile")
+        session = self._session
+        task = asyncio.current_task()
+        assert task is not None
+        implicit_transaction = None
 
-        # Own the result before the wire write can suspend, including an ACK concurrent with vendor disconnect.
-        def keep_planning_result() -> None:
-            task = asyncio.current_task()
-            assert task is not None
-            self._planning_writes.add(task)
+        # If the vendor omitted its transaction ID, use the connector's exact session at send time.
+        def remember_dispatch() -> None:
+            nonlocal implicit_transaction
+            self._keep_sent_effect()
+            if action == "SetChargingProfile":
+                profile = plan.payload["csChargingProfiles"]
+                connector_id = plan.payload.get("connectorId")
+                connector = session.snapshot.connectors.get(connector_id) if type(connector_id) is int else None
+                if profile.get("chargingProfilePurpose") == commands.PURPOSE_TX and connector is not None:
+                    implicit_transaction = connector.transaction_id
 
         try:
-            answer = await self._session.call(
-                plan.action, plan.payload, before_send=keep_planning_result if on is not None else None
+            answer = await session.call(
+                plan.action,
+                plan.payload,
+                before_send=remember_dispatch if on is not None or profile_write else None,
             )
         except CallRejectedError as error:
             _LOGGER.info(
@@ -439,6 +451,8 @@ class MirrorLink:
             await self._send_to_vendor(connection, refusal)
             return
         except CallError as error:
+            if profile_write and task in self._sent_effects and self._session is session:
+                session.request_effective_limit()
             _LOGGER.warning("[forward] Vendor %s for %s did not reach the charger: %s", action, self.cp_id, error)
             await self._send_to_vendor(
                 connection, build_call_error(unique_id, ERROR_INTERNAL, "the charger did not answer")
@@ -454,12 +468,18 @@ class MirrorLink:
             _LOGGER.info("[forward] DataTransfer answer of %s: %s", self.cp_id, plain_text(str(answer), 1500))
         else:
             _LOGGER.debug("[forward] the charger's answer to %s: %s", action, plain_text(str(answer), 1500))
-        if answer.get("status") == "Accepted":
-            self._note_accepted(action, plan.payload)
+        if answer.get("status") == "Accepted" and self._session is session:
+            self._note_accepted(action, plan.payload, implicit_transaction=implicit_transaction)
         await self._send_to_vendor(connection, build_call_result(unique_id, answer))
         if handler is not None and on is not None and answer.get("status") == "Accepted":
             _LOGGER.info("[plan] The app switched its planning %s for %s", "on" if on else "off", self.cp_id)
             await handler.planning_switched(self.cp_id, on)
+
+    # Retain a forwarded write at the exact charger send boundary, even if its vendor socket leaves.
+    def _keep_sent_effect(self) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._sent_effects.add(task)
 
     # Answer the app's planning from the hub's own plan instead of passing it on. A write is taken over by the plan (and
     # acknowledged only when that worked), a query is answered from the plan, and a message about the planning that the
@@ -480,7 +500,7 @@ class MirrorLink:
             await self._send_to_vendor(connection, build_call_result(unique_id, {"status": "Rejected"}))
             return True
         if isinstance(kind, PlanWrite):
-            stored = await handler.app_wrote(self.cp_id, kind.windows)
+            stored = await handler.app_wrote(self.cp_id, kind.windows, before_send=self._keep_sent_effect)
             _LOGGER.info(
                 "[plan] The app wrote %s window(s) for %s; taken over: %s", len(kind.windows), self.cp_id, stored
             )
@@ -512,15 +532,25 @@ class MirrorLink:
                 self._plan_handler.imported(self.cp_id, windows)
 
     # Update only the profiles an accepted vendor command affected, then ask the charger for its effective limit.
-    def _note_accepted(self, action: str, payload: dict[str, Any]) -> None:
+    def _note_accepted(self, action: str, payload: dict[str, Any], *, implicit_transaction: int | None = None) -> None:
         snapshot = self._session.snapshot
+        hub_purpose = snapshot.limit_purpose
+        hub_connector = STATION_CONNECTOR if hub_purpose == commands.PURPOSE_CHARGE_POINT_MAX else SOCKET_CONNECTOR
         if action == "SetChargingProfile":
             profile = payload.get("csChargingProfiles", {})
             connector, stack = payload.get("connectorId"), profile.get("stackLevel")
+            purpose = profile.get("chargingProfilePurpose")
+            transaction = profile.get("transactionId")
+            if purpose == commands.PURPOSE_TX and not self._session.owns_transaction(
+                connector, implicit_transaction if transaction is None else transaction
+            ):
+                return
+            if hub_purpose is not None and purpose == hub_purpose and connector == hub_connector and stack == 0:
+                self._session.record_limit(None, None)
             self._session.record_vendor_limit(
                 profile_limit_a(profile),
                 profile.get("chargingProfileId"),
-                profile.get("chargingProfilePurpose"),
+                purpose,
                 connector_id=connector if is_integer(connector) else None,
                 stack_level=stack if is_integer(stack) else None,
             )
@@ -533,11 +563,7 @@ class MirrorLink:
                 snapshot.vendor_profile_stack_level,
             ):
                 self._session.record_vendor_limit(None, None, None)
-            hub_connector = None
-            if snapshot.limit_purpose is not None:
-                station_profile = snapshot.limit_purpose == commands.PURPOSE_CHARGE_POINT_MAX
-                hub_connector = STATION_CONNECTOR if station_profile else SOCKET_CONNECTOR
-            if clears_profile(payload, HUB_PROFILE_ID, snapshot.limit_purpose, hub_connector, 0):
+            if hub_purpose is not None and clears_profile(payload, HUB_PROFILE_ID, hub_purpose, hub_connector, 0):
                 self._session.record_limit(None, None)
         else:
             return

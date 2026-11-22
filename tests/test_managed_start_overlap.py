@@ -17,7 +17,7 @@ from ocpp_hub_core.prototype.recovery_contracts import GateDecision
 from tests.handover_helpers import crash
 from tests.managed_rig import ReplyBench, healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, TimerBench, timer_bench
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
@@ -170,6 +170,26 @@ async def test_daily_survives_owner_start_timeout_and_following_nights(
         for _ in range(3):
             await b.c.tick()
         assert set(b.stops()) == {owner} and b.device.effective_limit() == 0
+        if selected == 6 and demand and not before_ack:
+            native = b.rig.peer.native
+
+            # Report bounded draw on the same delayed owner session after the new Boot.
+            def flowing(key):
+                result = native(key)
+                if key == "METER":
+                    result[0]["meterData"].update(cur=[15, 0, 0], power=[360, 0, 0, 360])
+                return result
+
+            with monkeypatch.context() as patch:
+                patch.setattr(b.rig.peer, "native", flowing)
+                assert (await b.rig.bench.call(b.sock, "boot-after-expiry-stop", "BootNotification", BOOT))[0] == 3
+                async with asyncio.timeout(5):
+                    while len(b.stops()) < 2:
+                        await b.c.tick()
+                        await asyncio.sleep(0.01)
+                await b.c.tick()
+                assert b.stops() == [owner, owner]
+                assert b.session.journal.active() == owner and b.device.effective_limit() == 0
         await until(lambda: b.session.journal.next_delivery() is None)
         stop_ack = b.rig.bench.stop_gate = asyncio.Event()
         try:

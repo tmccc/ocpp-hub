@@ -336,6 +336,15 @@ def test_historical_receipt_end_is_only_an_expiry_fact():
             "owned_session_closed_at_verified_zero",
         ),
         (
+            Rule.GENERIC,
+            "normal",
+            "local",
+            1,
+            "completed",
+            {"local_session_verified": True, "charging": False, "timed": False},
+            "owned_session_closed_at_verified_zero",
+        ),
+        (
             Rule.CANCELLED,
             "normal",
             "local",

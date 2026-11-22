@@ -68,6 +68,19 @@ async def test_setup_retries_share_notice_and_recovery(actual_hass, peer, monkey
         assert notice.problem_since == since
     await wait_for_notice(actual_hass, notice.notification_id)
     assert len(_async_get_or_create_notifications(actual_hass)) == 1
+    assert notice.shown_detail is not None
+    module = sys.modules["custom_components.ics_proxy.notification"]
+    create = module.persistent_notification.async_create
+    updates = []
+
+    # Observe actual notification writes while the next retry continues the same visible outage.
+    def count_notice(*args, **kwargs):
+        updates.append(args[1])
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(module.persistent_notification, "async_create", count_notice)
+    await retry(actual_hass, entry)
+    assert entry.state is ConfigEntryState.SETUP_RETRY and updates == []
     peer["status_failure"] = False
     await retry(actual_hass, entry)
     assert entry.state is ConfigEntryState.LOADED

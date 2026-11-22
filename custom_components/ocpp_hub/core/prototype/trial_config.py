@@ -48,8 +48,9 @@ def read_file(path: Path, *, secret: bool = True, maximum: int = 131072) -> byte
 
 # Parse exact JSON objects without retaining parser errors that may quote sensitive source text.
 def private_json(path: Path) -> dict[str, Any]:
+    data = read_file(path)
     try:
-        value = json.loads(read_file(path), object_pairs_hook=unique_object)
+        value = json.loads(data, object_pairs_hook=unique_object)
         if not isinstance(value, dict):
             raise ValueError
         return value
@@ -274,6 +275,8 @@ class TrialConfig:
             result = cls(**value)
             result.check_paths(path)
             return result
+        except SecurityError:
+            raise
         except TypeError, ValueError:
             raise SecurityError("trial configuration contains invalid field types") from None
 
@@ -350,6 +353,8 @@ def prepare_tls(config: TrialConfig) -> PreparedTLS:
         client = ssl.create_default_context(cadata=ca_data)
         client.minimum_version = ssl.TLSVersion.TLSv1_2
         return PreparedTLS(server, client, incoming, upstream, expires)
+    except SecurityError:
+        raise
     except OSError, ValueError, UnicodeError:
         raise SecurityError("trial TLS material could not be validated") from None
     finally:

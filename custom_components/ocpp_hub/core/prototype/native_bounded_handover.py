@@ -13,7 +13,13 @@ from .. import commands
 from ..control import HUB_PROFILE_ID
 from ..frames import Frame
 from .command_processor import CommandPriority
-from .connection_scope import ConnectionLineage, control_scope_matches, current_scope
+from .connection_scope import (
+    ConnectionLineage,
+    ControlScope,
+    control_scope_matches,
+    current_control_scope,
+    current_scope,
+)
 from .control_state import ControlState
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
@@ -76,10 +82,12 @@ class NativeBoundedHandover:
         self.last_verified_at = 0.0
         self.read_sequence = 0
         self.last_resolved_read = 0
+        self._stop_sample: tuple[int, ControlScope, HandoverEvidence] | None = None
         self.observation_listener: Callable[[HandoverEvidence], None] | None = None
         self.continuation_guard: Callable[[HandoverEvidence, int], GateDecision] | None = None
         self.recovery_zero_only: Callable[[], bool] | None = None
-        self.stop_after_introduction: Callable[[], Awaitable[Frame]] = gateway.stop
+        self.stop_after_introduction: Callable[[Callable[[], bool]], Awaitable[Frame]] = gateway.stop
+        self.stop_missing_station: Callable[[], Awaitable[None]] | None = None
         self.positive_guard: Callable[[HandoverEvidence], GateDecision] | None = None
         self.audited_epoch: int | None = None
         self._introductions: set[object] = set()
@@ -298,8 +306,17 @@ class NativeBoundedHandover:
                 if repair is not None:
                     repair.finish(attempt, "strict", error)
                 raise
-            except _NativeMeasurementError:
+            except _NativeMeasurementError as error:
                 invalidate()
+                if (
+                    route == "trial"
+                    and error.sequence == sequence
+                    and error.authority == self.authority()
+                    and not isinstance(
+                        readiness_decision(error.native, False, self.allow_unplugged, closing_local), Pending
+                    )
+                ):
+                    self._remember_stop_sample(error.native, sequence)
                 if repair is not None:
                     repair.finish(attempt, "measurement")
                 raise
@@ -352,6 +369,8 @@ class NativeBoundedHandover:
             if repair is not None:
                 repair.finish(attempt, "validated")
             self.last_verified_at = native.physical.observed_at
+            if route == "trial":
+                self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
             # A valid open source remains fresh while this particular operation awaits a closed station.
@@ -669,8 +688,19 @@ class NativeBoundedHandover:
                     except UnavailableError, TimeoutError, StationZeroStorageError:
                         # Runtime can retry the exact-Boot zero proof without rerunning this audit or Stop.
                         pass
-                elif (local := journal.active()) is not None and not gateway.controls.stop_acknowledged(local):
-                    await self.stop_after_introduction()
+                elif self.stop_missing_station is not None and self.book.station_ceiling_lost():
+                    await self.stop_missing_station()
+                else:
+                    # Introduction has its own authority checks, but a saved Stop has the same meaning here.
+                    def station_flowing() -> bool:
+                        return self.still_drawing(native, read_sequence)
+
+                    if gateway.controls.stop_work_needed(journal.active(), station_flowing=station_flowing):
+                        try:
+                            await self.stop_after_introduction(station_flowing)
+                        except UnavailableError, TimeoutError, StationZeroStorageError:
+                            # Exact Stop evidence stays with its owner while runtime retries the separate zero proof.
+                            pass
 
             # Keep the audited metadata and revision. The runtime checks zero against the latest actual Boot.
             def publish() -> None:
@@ -686,9 +716,7 @@ class NativeBoundedHandover:
     def confirm_paused_introduction(self, native: HandoverEvidence) -> None:
         g, j = self.gateway, self.gateway.journal
         epoch, revision = g._charger_epoch, g.controls._revision
-        self.require(native, closed=True)
-        self.require_known_session(native)
-        present = self.book.owned_present(native.physical)
+        zero_refusal = self.stop_zero_refusal(native)
         binding = {
             "configuration_digest": self.binding_digest(native),
             "station": self.choice.value(),
@@ -703,15 +731,11 @@ class NativeBoundedHandover:
             or j.get("trial_binding") != binding
             or j.get("managed_control_intent", {}).get("mode") != "paused"
             or j.fault.latched()
-            or not g.current_boot_seen(epoch)
             or fingerprint(j.get("boot")) != self.spec.boot_digest
-            or g.charger.sender is None
-            or not g.controls.ready
-            or g.controls.desired() != 0
+            or zero_refusal is not None
             or not ControlState(j.get("control", {})).local_hold
             or j.get("control", {}).get("start_pending")
             or j.get("uncertain_vendor_command")
-            or not any(r.identifier == HUB_PROFILE_ID and r.canonical.get("limit") == 0 for r in present)
             or g.charger._pending
             or g.controls._operations
         ):
@@ -724,6 +748,100 @@ class NativeBoundedHandover:
         decision = self.session_decision(native)
         if isinstance(decision, Pending):
             raise NativeSessionPendingError(decision.detail)
+
+    # Independently verify native zero against real journal closure and the current owned station profile.
+    def stop_zero_refusal(self, native: HandoverEvidence, *, local: int | None = None) -> str | None:
+        g, j = self.gateway, self.gateway.journal
+        self.require(native, closed=True)
+        self.require_known_session(native)
+        if not j.outcomes.stop_report_closed(local):
+            raise NativeSessionPendingError("the exact Stop still awaits its charger report")
+        present = self.book.owned_present(native.physical, record_unchanged=False)
+        if not g.current_boot_seen(g._charger_epoch):
+            return "boot_unconfirmed"
+        return self.station_zero_refusal(present)
+
+    # Pause, shutdown and positive release all use the same independently verified zero profile.
+    def station_zero_refusal(self, present: list[Resource]) -> str | None:
+        g, j = self.gateway, self.gateway.journal
+        if not g.controls.ready:
+            return "station ceiling is unconfirmed"
+        if g.controls.desired() != 0:
+            return "station ceiling is not zero"
+        station = [resource for resource in present if resource.identifier == HUB_PROFILE_ID]
+        row = j.db.execute(
+            "SELECT state,confirmed FROM trial_resources WHERE key=?", (f"profile:{HUB_PROFILE_ID}",)
+        ).fetchone()
+        if not self.book.confirmed_station_zero(station, row):
+            return "owned station zero receipt is missing"
+        return None
+
+    # Keep the latest structurally valid reading available only for restrictive decisions on this connection.
+    def _remember_stop_sample(self, native: HandoverEvidence, sequence: int) -> None:
+        scope = current_control_scope(self.gateway)
+        if scope is not None:
+            self._stop_sample = sequence, scope, native
+
+    # Reuse only the latest resolved sample of this session on the current commissioned charger connection.
+    def _current_stop_sample(self, local: int | None) -> HandoverEvidence | None:
+        latest = self._stop_sample
+        if (
+            latest is None
+            or latest[0] != self.last_resolved_read
+            or not control_scope_matches(self.gateway, latest[1])
+            or latest[2].physical.native_transaction_id != local
+            or not self.commissioned_binding_matches(latest[2])
+        ):
+            return None
+        return latest[2]
+
+    # Refresh independent evidence before reusing an earlier Stop. A missing proof permits a guarded physical Stop.
+    async def refresh_stop_zero(self, local: int) -> None:
+        try:
+            async with asyncio.timeout(2):
+                await self.read(closing_local=local, stop_only=True)
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+            return
+        except sqlite3.Error:
+            if self.gateway.journal.db.in_transaction:
+                raise
+
+    # Check the latest evidence again at the actual decision, including draw that resumed during validation.
+    def stop_zero_verified(self, local: int) -> bool:
+        sample = self._current_stop_sample(local)
+        j = self.gateway.journal
+        if (
+            sample is None
+            or sample.physical.observed_at != self.last_verified_at
+            or not sample.physical.transaction_open
+            or j.active() != local
+        ):
+            return False
+        try:
+            sample.physical.require_fresh(j.identity, 5)
+        except StaleEvidenceError:
+            return False
+        return (
+            sample.output_limit_a == 0
+            and not any((*sample.currents_a, *sample.powers_w, sample.physical.power_w))
+            and self.station_zero_refusal(list(sample.physical.resources)) is None
+        )
+
+    # A newer valid reading for the exact session can confirm or contradict an earlier draw observation.
+    def still_drawing(self, native: HandoverEvidence, sequence: int) -> bool:
+        j = self.gateway.journal
+        if sequence != self.last_resolved_read:
+            latest = self._current_stop_sample(native.physical.native_transaction_id)
+            if latest is None:
+                return False
+            native = latest
+        if not native.physical.transaction_open or native.physical.native_transaction_id != j.active():
+            return False
+        try:
+            native.physical.require_fresh(j.identity, 5)
+        except StaleEvidenceError:
+            return False
+        return any(value != 0 for value in (*native.currents_a, *native.powers_w, native.physical.power_w))
 
     # A managed reconnect can explain an unplugged native marker using the exact latest recorded Stop.
     def recovery_closing_local(self) -> int | None:

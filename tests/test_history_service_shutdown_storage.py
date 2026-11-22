@@ -233,6 +233,8 @@ async def test_service_history_commit_failure_allows_zero_stop_and_uncertainty(
                     assert child.durable()["metadata"]["trial_shutdown_uncertain"] is True
                 finally:
                     await child.close()
+                assert child.process.returncode == 0
+                assert "trial_shutdown_uncertain" not in child.durable()["metadata"]
         finally:
             (tmp_path / "history-sql-observations.json").write_text(
                 json.dumps({"failures": failures, "statements": statements}, indent=2)

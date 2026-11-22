@@ -69,7 +69,7 @@ async def stop_for_missing_station(controller: ManagedController) -> None:
         or gateway.charger._pending
         or controller.pause_task is not None
         and not controller.pause_task.done()
-        or gateway.controls.stop_acknowledged(local)
+        or not gateway.controls.stop_needed(local, protective=True)
     ):
         return
     intent = controller.requests.intent()

@@ -93,12 +93,17 @@ OCPP_QUALIFICATION_REPORT="$QUALIFICATION_BUNDLE" python tools/deploy_ha.py \
 ```
 
 The helper runs the validation gate, creates an external backup, installs and verifies files. Without the explicit
-domain it selects the older `ocpp_hub` integration. It does not deploy the standalone service. When separately
+domain it selects the older `ocpp_hub` integration. It does not deploy the standalone service. Backup retention keeps the archive created by the current Docker
+install and uses modification times for earlier archives, including ones created by SSH. When separately
 authorized, `--restart --yes --ha-api-config "$HA_API_CONFIG"` performs the configuration check and HA restart.
 Docker verifies the selected Core process through its local API and waits for a new process to report running.
 The Docker installer holds the component lock from the Core preflight through restart verification.
 A failed configuration check restores the previous files before the installer releases the lock. If a restart may
 have reached Core, the installer retains the candidate and reports that activation could not be verified.
+The legacy SSH installer verifies each staging directory before publishing. Both transports use the same
+component lock through verification and any requested restart. A failed SSH directory move or refused configuration
+check restores the previous component. A hard interruption during a directory move can leave the previous component
+staged and the lock in place.
 For the legacy SSH restart, the API hostname must match the SSH target. Use `ssh_host` in the private API
 configuration for an explicit SSH alias. Verification uses the configured Uptime timestamp entity, which
 defaults to `sensor.uptime` and can be set via `uptime_entity`.
@@ -123,8 +128,9 @@ The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and fr
 The migrated rehearsals preserved the saved 32 A selection, the archive and original receipts. The older
 build kept the newer Pause and completed the next simulated scheduled charge after Return.
 
-For a stopped installation, the read-only check reports whether the two supplied builds and the retained journal
-match the rehearsed conditions. Use the actual stopped service build as the current root.
+For one of the listed historical pairs, the read-only check reports whether the actual stopped service build and
+the retained journal match the rehearsed conditions. The installation-week rehearsal exercises the software change
+with simulated peers. The checker requires a separately rehearsed build pair and journal format.
 
 ```bash
 python -B tools/check_proxy_rollback.py --config "$PROXY_CONFIG" \

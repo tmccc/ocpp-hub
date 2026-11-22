@@ -208,32 +208,12 @@ class ManagedCurrentLimits:
     # Retry only the closed zero hold of this exact failed idle update; its current receipt stays uncertain.
     def failed_idle_hold(self) -> bool:
         c, j = self.controller, self.journal
-        g, change, control = c.session.gateway, j.current_change.read().value, j.get("control", {})
-        row = j.db.execute(
-            "SELECT r.action,r.state,r.revision,r.result,c.current_a FROM managed_requests r "
-            "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
-            (change.get("id"),),
-        ).fetchone()
+        g, control = c.session.gateway, j.get("control", {})
         receipt = local_start_receipt(j)
         return bool(
             not c.stopping
             and (self.worker is None or self.worker.done())
-            and change.get("state") == "uncertain"
-            and change.get("mode") == "app"
-            and change.get("native_open") is False
-            and change.get("observed_open") is False
-            and "failure" in change
-            and j.current_change.failure(change) is not None
-            and row is not None
-            and row["action"] == "set_current"
-            and row["state"] == "uncertain"
-            and row["current_a"] == change.get("current_a")
-            and json.loads(row["result"]) == j.current_change.unconfirmed(change["current_a"], change.get("previous_a"))
-            and j.get("managed_control_intent") == {"mode": "paused", "revision": row["revision"] + 2}
-            and type(change.get("previous_a")) is int
-            and change["previous_a"] == self.selected() == control.get("resume_limit")
-            and g.boot_observation is not None
-            and change.get("source_boot") == g.boot_observation
+            and j.current_change.failed_idle_at_zero(self.selected, g.boot_observation)
             and g.current_boot_seen(g._charger_epoch)
             and j.active() is None
             and ControlState(control).explicit_local_hold
@@ -445,7 +425,7 @@ class ManagedCurrentLimits:
                     raise RecoveryRequiredError("selected current has not been independently verified")
                 with j.atomic():
                     guard()
-                    j.current_change.complete(identifier, value)
+                    j.current_change.complete(identifier, value, expected.revision - 1)
 
             c.commands.decide(complete)
         except (
@@ -589,7 +569,8 @@ class ManagedCurrentLimits:
         c, j = self.controller, self.journal
         g = c.session.gateway
         change = j.current_change.read().value
-        epoch = g._charger_epoch
+        connection = current_control_scope(g)
+        ticket = j.get("control", {}).get("ticket")
 
         # A newer owner Pause or another Boot revokes this operation's restrictive ticket too.
         def guard() -> None:
@@ -600,41 +581,46 @@ class ManagedCurrentLimits:
                 or current.identifier != change["id"]
                 or c.requests.intent().mode != "app"
                 or c.requests.intent().revision != change["recovery_revision"]
-                or g._charger_epoch != epoch
-                or not g.current_boot_seen(epoch)
+                or not control_scope_matches(g, connection)
+                or j.get("control", {}).get("ticket") != ticket
                 or fingerprint(j.get("boot")) != c.native.spec.boot_digest
                 or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
                 or g.controls.desired() != 0
             ):
                 raise RecoveryRequiredError("current recovery zero was superseded")
 
-        guard()
-        ticket = j.get("control", {}).get("ticket")
         await g.controls.ensure_ceiling(guard=guard, request_id=change["id"])
 
         # This zero verifies only the hold that requested it.
         def settle() -> None:
             guard()
-            if j.get("control", {}).get("ticket") != ticket or not g.controls.ready:
+            if not g.controls.ready:
                 raise RecoveryRequiredError("current recovery zero no longer belongs to its hold")
             if j.phase.read().active and isinstance(ticket, str):
                 g.controls._complete(ticket, uncertain=False)
 
-        c.commands.decide(settle)
+        c.commands.decide(settle, priority=CommandPriority.RESTRICT)
 
     # Reconcile the failed selection under zero, then restore only the previous verified current without any Start.
     async def recover_overlap(self) -> Pending | None:
         c, j = self.controller, self.journal
         g = c.session.gateway
-        change = j.current_change.read().value
-        if change.get("state") != "recovering":
+
+        # Read and retire an obsolete selection in one decision before awaiting any evidence.
+        def prepare() -> tuple[dict[str, Any], ControlIntent] | None:
+            change = j.current_change.read()
+            if change.recovering:
+                expected = ControlIntent("app", change.value["recovery_revision"])
+                if c.requests.intent() == expected:
+                    return change.value, expected
+                j.current_change.cancel(change.value)
             self._settling_overlap = None
             return None
-        expected = ControlIntent("app", change["recovery_revision"])
-        if c.requests.intent() != expected:
-            self._settling_overlap = None
-            j.current_change.cancel(change)
+
+        prepared = c.commands.decide(prepare, priority=CommandPriority.RESTRICT)
+        if prepared is None:
             return None
+        change, expected = prepared
         if self._settling_overlap is not None and not c.stopping:
             identifier, authority, local = self._settling_overlap
             if identifier == change["id"] and c.authority() == authority and j.active() == local and g.controls.ready:
@@ -656,11 +642,25 @@ class ManagedCurrentLimits:
                 ):
                     return self._settle_overlap(change, authority, local)
             self._settling_overlap = None
-        if not c.stopping and g.controls.desired() != 0:
-            # Restoration may have succeeded before settlement storage failed; retry from a new restrictive ticket.
-            with j.atomic():
-                g.controls._claim(True, stopping=True)
-                c.released_epoch = None
+
+        # Restoration may have succeeded before settlement storage failed; reclaim only the current operation.
+        def reclaim() -> bool:
+            current = j.current_change.read()
+            if (
+                c.stopping
+                or c.requests.intent() != expected
+                or not current.recovering
+                or current.identifier != change["id"]
+            ):
+                return False
+            if g.controls.desired() != 0:
+                with j.atomic():
+                    g.controls._claim(True, stopping=True)
+                    c.released_epoch = None
+            return True
+
+        if not c.commands.decide(reclaim, priority=CommandPriority.RESTRICT):
+            return Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
         await self.protect_overlap()
         native = await c.native.read_result()
         if isinstance(native, Pending):

@@ -42,6 +42,24 @@ def test_install_and_backup_are_domain_scoped(tmp_path: Path) -> None:
     assert len(list((tmp_path / ".ics_proxy-backup").glob("*.tar.gz"))) == 1
 
 
+# Intent: a Docker replacement retains its own rollback archive alongside older SSH archives.
+# Why: filenames from the two supported transports do not sort in creation order.
+def test_mixed_backup_names_keep_new_rollback(tmp_path: Path, monkeypatch) -> None:
+    old = {"manifest.json": b'{"domain":"ocpp_hub"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    install(tmp_path, "ocpp_hub", *archive(old))
+    backups = tmp_path / ".ocpp_hub-backup"
+    for suffix in ("a", "b", "c"):
+        (backups / f"ocpp_hub-20261122-100000-{suffix}.tar.gz").write_bytes(b"older SSH archive")
+    monkeypatch.setattr("tools.ha_container_deploy.time.time_ns", lambda: 1795338000000000000)
+    assert install(tmp_path, "ocpp_hub", *archive(new))["backup_created"]
+    saved = backups / "ocpp_hub-1795338000000000000.tar.gz"
+    assert len(list(backups.glob("*.tar.gz"))) == 3
+    with tarfile.open(saved, "r:gz") as package:
+        previous = package.extractfile("ocpp_hub/__init__.py")
+        assert previous is not None and previous.read() == old["__init__.py"]
+
+
 # Intent: the installed build stays exclusively owned through Core preflight and restart verification.
 # Why: two installs could otherwise make the first command verify a Core process that loaded the second build.
 def test_install_lock_covers_core_activation(tmp_path: Path) -> None:
@@ -56,6 +74,8 @@ def test_install_lock_covers_core_activation(tmp_path: Path) -> None:
     def observe() -> None:
         with lock_path.open("a") as competitor, pytest.raises(BlockingIOError):
             fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(FileExistsError):
+            (lock_path.parent / ".install-lock").mkdir()
         observations.append(installed.read_bytes())
 
     # Capture the old process baseline before publication and its replacement afterward.

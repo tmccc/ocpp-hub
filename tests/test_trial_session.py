@@ -222,9 +222,12 @@ async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(
             assert saved["local"] == local and saved["state"] == "verified" and saved["boot"]
 
 
-# Intent: a genuinely closed session cancels its unsent shutdown Stop without losing the measured zero proof.
-# Why: a charger can finish on its own between station zero and final command dispatch.
-async def test_shutdown_verifies_closure_before_remote_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+# Intent: shutdown shares prior Stop evidence and takes fresh protection if the same session still draws.
+# Why: an accepted Stop can cover a verified zero but does not prove closure or loss of power by itself.
+@pytest.mark.parametrize(
+    "evidence", ["report-before-send", "accepted-pause", "draw-after-pause", "superseded-draw", "confirmed-draw"]
+)
+async def test_shutdown_verifies_closure_before_remote_stop(tmp_path, tls, unused_tcp_port, monkeypatch, evidence):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         await healthy(b.controller)
@@ -232,6 +235,8 @@ async def test_shutdown_verifies_closure_before_remote_stop(tmp_path, tls, unuse
         validate = peer.validate_send
         assert validate is not None
         reached, resume = asyncio.Event(), asyncio.Event()
+        pause_first = evidence != "report-before-send"
+        native = b.rig.peer.native
 
         # Let the actual send validation finish, then wait while the independent receiver processes closure.
         async def hold_stop(action, payload):
@@ -241,12 +246,43 @@ async def test_shutdown_verifies_closure_before_remote_stop(tmp_path, tls, unuse
                 await resume.wait()
             return result
 
-        monkeypatch.setattr(peer, "validate_send", hold_stop)
+        if pause_first:
+            c = b.controller
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+            await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+            assert b.session.journal.outcomes.accepted_stop(local)
+        if not pause_first or evidence in ("superseded-draw", "confirmed-draw"):
+            monkeypatch.setattr(peer, "validate_send", hold_stop)
+
+        # Give the same native session a meter reading that contradicts the accepted station limit.
+        def still_drawing(key):
+            result = native(key)
+            if key == "METER":
+                result[0]["meterData"].update(cur=[15, 0, 0], power=[360, 0, 0, 360])
+            return result
+
+        if evidence in ("draw-after-pause", "superseded-draw", "confirmed-draw"):
+            monkeypatch.setattr(b.rig.peer, "native", still_drawing)
+        mark = len(b.rig.bench.device_calls)
         b.controller.request_stop()
         shutdown = asyncio.create_task(b.session.close())
         try:
-            await asyncio.wait_for(reached.wait(), 3)
+            if pause_first:
+                await until(lambda: b.session.journal.get("trial_shutdown_attempt", {}).get("local") == local)
+                if evidence in ("superseded-draw", "confirmed-draw"):
+                    await asyncio.wait_for(reached.wait(), 3)
+                    if evidence == "superseded-draw":
+                        monkeypatch.setattr(b.rig.peer, "native", native)
+                    sample = await b.controller.native.read(closing_local=local, stop_only=True)
+                    assert sample.physical.transaction_open
+                    assert sample.physical.power_w == (360 if evidence == "confirmed-draw" else 0)
+                    resume.set()
+                await until(lambda: b.session.gateway.controls._stopping.done())
+                assert not shutdown.done() and b.session.journal.active() == local
+            else:
+                await asyncio.wait_for(reached.wait(), 3)
             assert b.session.gateway.controls.ready and b.session.gateway.controls.desired() == 0
+            monkeypatch.setattr(b.rig.peer, "native", native)
             stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
             assert (await b.rig.bench.call(b.charger, "closed-before-shutdown-stop", "StopTransaction", stop))[0] == 3
             b.rig.peer.permission_enabled = False
@@ -255,7 +291,8 @@ async def test_shutdown_verifies_closure_before_remote_stop(tmp_path, tls, unuse
             resume.set()
             await shutdown
         assert b.session.final_status["shutdown_attempt_uncertain"] is False
-        assert not any(frame[2] == "RemoteStopTransaction" for frame in b.rig.bench.device_calls)
+        stops = [frame[3] for frame in b.rig.bench.device_calls[mark:] if frame[2] == "RemoteStopTransaction"]
+        assert stops == ([{"transactionId": local}] if evidence in ("draw-after-pause", "confirmed-draw") else [])
 
 
 # Intent: a saved Stop is not enough to verify a final hold while the actual native session still reports open.

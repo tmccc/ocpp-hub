@@ -88,7 +88,7 @@ def select(ids, config):
 
 # Build a network-isolated container with only its own scratch writable and explicit read-only runtime inputs.
 def container_command(config, directory, cpu, name, env, start_recovery_ram=False):
-    from tools.qualification_collection import validate_readonly_mounts
+    from tools.qualification_collection import runtime_mounts, validate_readonly_mounts
 
     validate_readonly_mounts(config, ROOT, directory)
     command = [
@@ -114,15 +114,8 @@ def container_command(config, directory, cpu, name, env, start_recovery_ram=Fals
         "--mount",
         f"type=bind,src={config['venv']},dst={config['venv_target']},readonly",
     ]
-    if config["runtime_mode"] == "host":
-        command += [
-            "--mount",
-            "type=bind,src=/usr,dst=/usr,readonly",
-            "--mount",
-            "type=bind,src=/etc/ssl/openssl.cnf,dst=/etc/ssl/openssl.cnf,readonly",
-        ]
-    for mount in config["readonly_mounts"]:
-        command += ["--mount", f"type=bind,src={mount['source']},dst={mount['target']},readonly"]
+    for source, target in runtime_mounts(config):
+        command += ["--mount", f"type=bind,src={source},dst={target},readonly"]
     if start_recovery_ram:
         from tools.qualification_scratch import RAM_DIRECTORY
 
@@ -159,19 +152,6 @@ def container_command(config, directory, cpu, name, env, start_recovery_ram=Fals
         config["container_python"],
         config["image"],
     ]
-
-
-# Hash the mounted virtual environment before and after execution without including volatile bytecode caches.
-def runtime_digest(config):
-    digest = hashlib.sha256()
-    base = Path(config["venv"])
-    for path in sorted(base.rglob("*")):
-        if (not path.is_file() and not path.is_symlink()) or "__pycache__" in path.parts or path.suffix == ".pyc":
-            continue
-        name = str(path.relative_to(base))
-        data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes()
-        digest.update(name.encode() + b"\0" + hashlib.sha256(data).digest())
-    return digest.hexdigest()
 
 
 # Read process ancestry and identity without collecting command lines or environment secrets.
@@ -289,6 +269,11 @@ def cleanup_containers(workers):
                 timeout=3,
             )
             # Nonexistent --rm containers make inspect nonzero; existing names still appear on stdout.
+            notices = [line.lower() for line in checked.stderr.splitlines() if line.strip()]
+            if checked.returncode and (
+                not notices or any("no such object" not in line and "no such container" not in line for line in notices)
+            ):
+                errors.append("container ownership inspection failed")
             for line in checked.stdout.splitlines():
                 if not line.strip():
                     continue  # Docker prints empty rows for already removed --rm containers.
@@ -424,6 +409,8 @@ def main():
         if os.environ.get("PYTEST_ADDOPTS") or os.environ.get("PYTEST_PLUGINS"):
             raise RuntimeError("full qualification forbids inherited pytest filters/plugins")
         sys.path.insert(0, str(SOURCE))
+        from tools.qualification_collection import runtime_digest
+
         summary["runtime_digest_before"] = runtime_digest(config)
         cpus = sorted(os.sched_getaffinity(0))
         if len(cpus) < config["workers"] + 4:

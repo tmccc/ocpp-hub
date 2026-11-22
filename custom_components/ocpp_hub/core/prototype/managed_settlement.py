@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from .local_control import local_start_receipt
 from .managed_records import TerminalCurrent
-from .start_settlement import RetirementCandidate, RetirementRule
+from .start_settlement import RetirementCandidate
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -22,10 +22,10 @@ def current_candidate(c: ManagedController) -> TerminalCurrent | None:
 
 
 # Closed lifecycle or exact known-unsent provenance distinguishes obsolete test metadata from unbound Start debt.
-def charge_test_candidate(c: ManagedController) -> RetirementCandidate | None:
+def charge_test_candidate(c: ManagedController, *, timed_only: bool = False) -> RetirementCandidate | None:
     worker = c.charging.worker
-    return c.session.journal.starts.retirement(
-        RetirementRule.GENERIC, worker_pending=worker is not None and not worker.done()
+    return c.session.journal.starts.delivered_at_zero(
+        worker_pending=worker is not None and not worker.done(), timed_only=timed_only
     )
 
 

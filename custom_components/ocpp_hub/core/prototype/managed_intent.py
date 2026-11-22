@@ -8,16 +8,25 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError
+
+if TYPE_CHECKING:
+    from .recovery_contracts import RestoreProgress
 
 OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
 OFFLINE_PAUSE = "managed_offline_pause"
 RELEASE_PAUSE_ACK = "managed_release_pause_acknowledgement"
 PAUSE_RELEASE_PROOF = "_release_ack"
+RETURN_OUTCOME = (
+    "CASE WHEN action='app_control' AND json_valid(result) THEN CASE "
+    "WHEN json_type(result,'$._return')='object' "
+    "THEN json_set(:outcome,'$._return',json_extract(result,'$._return')) ELSE :outcome END "
+    "ELSE :outcome END"
+)
 
 type ReturnFailure = Literal["return_not_sent", "return_not_confirmed"]
 
@@ -138,8 +147,9 @@ def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesc
 # Finish only the original live request and keep an already settled receipt intact.
 def finish_request(journal: Journal, identifier: str, state: str, result: dict[str, Any]) -> None:
     journal.db.execute(
-        "UPDATE managed_requests SET state=?,result=? WHERE id=? AND state IN ('accepted','running')",
-        (state, json.dumps(result, sort_keys=True), identifier),
+        f"UPDATE managed_requests SET state=:state,result={RETURN_OUTCOME} "
+        "WHERE id=:identifier AND state IN ('accepted','running')",
+        {"state": state, "outcome": json.dumps(result, sort_keys=True), "identifier": identifier},
     )
 
 
@@ -293,6 +303,43 @@ class PauseRequest:
     hold: str
 
 
+@dataclass(frozen=True)
+class ReturnSettlement:
+    """The exact Return's receipt decision can be retried without repeating its physical work."""
+
+    identifier: str
+    intent: ControlIntent
+    failure: ReturnFailure | None = None
+    await_cloud: bool = False
+
+    # An exception can be final failure only when the positive command definitely did not go out.
+    @classmethod
+    def failed(cls, identifier: str, intent: ControlIntent, *, possibly_sent: bool) -> ReturnSettlement:
+        return cls(identifier, intent, failure="return_not_confirmed" if possibly_sent else "return_not_sent")
+
+    # Interpret all release progress for the original Return; shared publication already completed the request.
+    @classmethod
+    def observed(
+        cls, identifier: str, intent: ControlIntent, progress: RestoreProgress
+    ) -> tuple[ReturnSettlement | None, RestoreProgress]:
+        from .recovery_contracts import Prerequisite, RestoreProgress, RestoreState
+        from .recovery_policy import PreflightDisposition, preflight_disposition
+
+        if progress.shared:
+            return None, progress
+        operation, pending = progress.operation, progress.pending
+        if progress.state is RestoreState.REQUEST_NOT_SENT:
+            return cls.failed(identifier, intent, possibly_sent=False), progress
+        await_cloud = False
+        if (operation is None or not operation.claimed) and pending is not None:
+            if preflight_disposition("explicit", pending) is PreflightDisposition.NOT_SENT:
+                return cls.failed(identifier, intent, possibly_sent=False), RestoreProgress(
+                    RestoreState.REQUEST_NOT_SENT, pending, operation
+                )
+            await_cloud = pending.reason is Prerequisite.CLOUD_ACK
+        return cls(identifier, intent, await_cloud=await_cloud), progress
+
+
 class ManagedRequests:
     """A paused intent is recorded before its effect; a return remains paused until physically confirmed."""
 
@@ -308,11 +355,12 @@ class ManagedRequests:
         if journal.get("managed_control_intent") is None:
             journal.put("managed_control_intent", {"mode": "app", "revision": 0})
         self.intent()
+        # Keep the original Return-to-wire link while withdrawing its unfinished authority on replacement.
         journal.db.execute(
-            "UPDATE managed_requests SET state='uncertain',result=? "
+            f"UPDATE managed_requests SET state='uncertain',result={RETURN_OUTCOME} "
             "WHERE action IN ('app_control','start','start_test','arm_cloud_test','set_current') "
             "AND state IN ('accepted','running')",
-            (json.dumps({"classification": "process_replaced"}),),
+            {"outcome": json.dumps({"classification": "process_replaced"})},
         )
 
     # Corrupted intent never becomes an implicit permission to release the zero hold.
@@ -387,10 +435,10 @@ class ManagedRequests:
                         }
                 # A new restrictive intent revokes an old Return, including one whose reply was lost at replacement.
                 self.journal.db.execute(
-                    "UPDATE managed_requests SET state='failed',result=? "
+                    f"UPDATE managed_requests SET state='failed',result={RETURN_OUTCOME} "
                     "WHERE action='app_control' AND (state IN ('accepted','running') "
-                    "OR state='uncertain' AND revision<=?)",
-                    (json.dumps({"classification": "superseded_by_pause"}), current.revision),
+                    "OR state='uncertain' AND revision<=:revision)",
+                    {"outcome": json.dumps({"classification": "superseded_by_pause"}), "revision": current.revision},
                 )
                 if "_pause" in result and capture_release_proof is not None:
                     proof = capture_release_proof()
@@ -518,7 +566,7 @@ class ManagedRequests:
         intent = self.intent()
         if intent.revision == revision:
             return intent
-        self.finish(identifier, "failed", {"classification": "stale_revision"})
+        self._finish_return(identifier, "failed", {"classification": "stale_revision"}, revision=revision)
         return None
 
     # A paused release belongs to its exact current Return; automatic app release has no Return request.
@@ -561,6 +609,21 @@ class ManagedRequests:
             is not None
         )
 
+    # The accepted Return stays queued while its Pause still owns unresolved Start or Stop evidence.
+    def return_waits_for_pause(self, expected: ControlIntent) -> bool:
+        j = self.journal
+        control, receipt = j.get("control", {}), j.starts.receipt()
+        if control.get("start_pending"):
+            return True
+        if receipt.get("pause_revision") == expected.revision:
+            session = j.outcomes.session(receipt.get("local"))
+            if (session is not None and not session.closed) or receipt.get(
+                "verified_pause_revision"
+            ) != expected.revision:
+                return True
+        ticket = control.get("ticket")
+        return (self.pause_ownership().owns_ticket(ticket) or self.stop_owns_ticket(ticket)) and self.pending_pause()
+
     # Settle or park only the original Return. Neither outcome replays a device command.
     def settle_return(
         self,
@@ -571,8 +634,11 @@ class ManagedRequests:
         await_cloud: bool = False,
     ) -> None:
         if failure is not None:
-            self.finish(
-                identifier, "failed" if failure == "return_not_sent" else "uncertain", {"classification": failure}
+            self._finish_return(
+                identifier,
+                "failed" if failure == "return_not_sent" else "uncertain",
+                {"classification": failure},
+                revision=expected.revision,
             )
         elif self.intent() == expected:
             self.journal.db.execute(
@@ -604,22 +670,23 @@ class ManagedRequests:
         if before_finish is not None:
             before_finish()
         result: dict[str, Any] = {"app_control_enabled": True, "charging_started": False}
-        if expected is None:
-            self.finish(identifier, "completed", result)
-            return
-        row = self.journal.db.execute("SELECT result FROM managed_requests WHERE id=?", (identifier,)).fetchone()
-        binding = json.loads(row["result"]).get("_return")
-        if binding is not None:
-            result["_return"] = binding
-        if (
-            self.journal.db.execute(
-                "UPDATE managed_requests SET state='completed',result=? WHERE id=? AND action='app_control' "
-                "AND revision=? AND state IN ('accepted','running')",
-                (json.dumps(result, sort_keys=True), identifier, expected.revision),
-            ).rowcount
-            != 1
-        ):
+        changed = self._finish_return(identifier, "completed", result, revision=expected.revision if expected else None)
+        if expected is not None and changed != 1:
             raise RecoveryRequiredError("Return receipt changed before atomic publication")
+
+    # All successful and unsuccessful Return completions preserve the original wire binding.
+    def _finish_return(self, identifier: str, state: str, result: dict[str, Any], *, revision: int | None) -> int:
+        return self.journal.db.execute(
+            f"UPDATE managed_requests SET state=:state,result={RETURN_OUTCOME} "
+            "WHERE id=:identifier AND action='app_control' AND (:revision IS NULL OR revision=:revision) "
+            "AND state IN ('accepted','running')",
+            {
+                "identifier": identifier,
+                "state": state,
+                "outcome": json.dumps(result, sort_keys=True),
+                "revision": revision,
+            },
+        ).rowcount
 
     # Positive intent publication joins the exact current owner's transaction and grants nothing across an await.
     def _publish_app(self, expected: ControlIntent) -> None:

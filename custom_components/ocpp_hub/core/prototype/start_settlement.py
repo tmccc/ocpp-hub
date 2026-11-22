@@ -182,6 +182,17 @@ class ChargeStart:
             == self.revision
         )
 
+    # A local timed Start can still own a receipt after native power has reached zero.
+    @property
+    def pending_local_test(self) -> bool:
+        return (
+            self.kind == "test"
+            and self.source == "local"
+            and self.request is not None
+            and self.request.state in ("accepted", "running", "uncertain")
+            and self.request_matches()
+        )
+
     # Generic settlement permits legacy unpublished binding; strict normal identity also needs a current issued request.
     def bound(self, local: int, *, strict_issued: bool = False) -> bool:
         receipt = self.receipt
@@ -282,10 +293,11 @@ class RetirementDecision:
         ):
             reason = "start_not_accepted_at_verified_zero"
             return RetirementUpdate("failed", reason, {"classification": reason})
+        closed_normal = self.rule is RetirementRule.CLOSED or (
+            record.kind == "normal" and self.local == record.local and record.correlated(closed=True)
+        )
         reason = (
-            "owned_session_closed_at_verified_zero"
-            if self.rule is RetirementRule.CLOSED
-            else "owned_operation_settled_at_verified_zero"
+            "owned_session_closed_at_verified_zero" if closed_normal else "owned_operation_settled_at_verified_zero"
         )
         if record.kind == "normal":
             return RetirementUpdate(
@@ -476,11 +488,16 @@ def retire_start(
     if rule is not RetirementRule.GENERIC:
         return None
     normal, cloud = record.kind == "normal", record.source == "cloud"
+    # Earlier versions could complete timed metadata before the bound Stop was delivered.
+    legacy_timed = record.phase == "completed" and record.pending_local_test
     if (
         worker_pending
         or record.kind not in ("normal", "test")
         or record.source not in ("local", "cloud")
-        or record.phase not in ("interrupted", "expired", "stopping", "running", "charging", "awaiting_power")
+        or (
+            not legacy_timed
+            and record.phase not in ("interrupted", "expired", "stopping", "running", "charging", "awaiting_power")
+        )
         or lease is not None
         and (lease.identifier != record.identifier or lease.source != record.source)
         or active is not None
@@ -498,7 +515,7 @@ def retire_start(
         if local is not None and record.source_verified is not True:
             return None
     elif local is None:
-        if record.published is not False or not record.unissued(unbound=False):
+        if legacy_timed or record.published is not False or not record.unissued(unbound=False):
             return None
     elif not record.bound(local):
         return None

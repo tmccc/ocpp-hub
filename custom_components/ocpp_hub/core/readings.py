@@ -65,7 +65,7 @@ def phase_current_a(snapshot: ChargerSnapshot, phase: str) -> float | None:
         return None
     if phase in snapshot.meter.current_a:
         return snapshot.meter.current_a[phase]
-    return 0.0 if snapshot.meter.current_a else None
+    return 0.0 if snapshot.meter.current_a.keys() - {"total"} else None
 
 
 # The latest voltage of one phase (L1, L2 or L3), in volts.
@@ -88,11 +88,9 @@ def _running_charge(snapshot: ChargerSnapshot) -> ConnectorState | None:
 # is missing. Never negative, because a meter that was reset must not show a negative charge.
 def session_energy_kwh(snapshot: ChargerSnapshot) -> float | None:
     charge = _running_charge(snapshot)
-    if charge is None or charge.meter_start_wh is None:
+    if charge is None or charge.meter_start_wh is None or charge.last_energy is None:
         return None
-    if snapshot.meter is None or snapshot.meter.energy_wh is None:
-        return None
-    return round(max(snapshot.meter.energy_wh - charge.meter_start_wh, 0.0) / 1000, 3)
+    return round(max(charge.last_energy[1] - charge.meter_start_wh, 0.0) / 1000, 3)
 
 
 # When the charge that is running started, or None.

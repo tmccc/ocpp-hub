@@ -88,6 +88,45 @@ async def test_accepted_planning_switch_survives_vendor_disconnect(hass, setup_h
         await vendor.stop()
 
 
+# Intent: an app timetable write that reached the charger completes after the vendor disconnects.
+# Why: a real late acceptance must leave the charger and the saved HA plan describing the same windows.
+async def test_app_timetable_reply_survives_vendor_disconnect(hass, setup_hub, connect_charger):
+    vendor = FakeVendor()
+    await vendor.start()
+    try:
+        entry = await setup_hub({CONF_VENDOR_URL: vendor.url, CONF_VENDOR_COMMANDS: "forward"})
+        charger = await connect_charger(entry)
+        await charger.boot()
+        await wait_for(hass, lambda: vendor.calls_of("BootNotification"), "the boot did not reach the vendor")
+        await _call(hass, charger, {"windows": [MONDAY_NOON]})
+        replacement = [PlanWindow(2, 46800, 61200)]
+        data = raedian.build_frame(
+            raedian.HEAD_CLOUD,
+            raedian.COMMAND_PLAN,
+            bytes.fromhex("0123456789abcdbe"),
+            raedian.encode_plan(replacement),
+        )
+        payload = {
+            "vendorId": "READIAN",
+            "messageId": "RemoteConfiguration",
+            "data": json.dumps({"instructType": f"{raedian.COMMAND_PLAN:02x}", "originalData": data}),
+        }
+        sent = asyncio.create_task(vendor.command("DataTransfer", payload))
+        profile = await charger.next_hub_call()
+        assert profile[2] == "SetChargingProfile"
+        prior_connections = vendor.connection_count
+        await vendor.stop()
+        sent.cancel()
+        await asyncio.gather(sent, return_exceptions=True)
+        await vendor.start()
+        await wait_for(hass, lambda: vendor.connection_count > prior_connections, "vendor did not reconnect")
+        assert entry.runtime_data.plans.plan("TEST0001") == [PlanWindow(1, 43200, 50400)]
+        await charger.answer(profile, {"status": "Accepted"})
+        await wait_for(hass, lambda: entry.runtime_data.plans.plan("TEST0001") == replacement, "plan was lost")
+    finally:
+        await vendor.stop()
+
+
 # Intent: setting a plan writes one weekly profile to the charger with the limit inside the windows from the ceiling and
 # a pause outside them, shows the windows, and keeps them as the plan.
 # Why: the plan is what the app and Home Assistant both show; the charger must be given what the plan says.

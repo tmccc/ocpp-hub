@@ -72,13 +72,122 @@ def test_compare_separates_missing_extra_and_different() -> None:
     assert deploy.compare(local, remote) == (["c.py"], ["d.py"], ["b.py"])
 
 
-# Intent: the install script unpacks the new copy completely before it replaces the old one, and backs up first.
-# Why: a broken transfer must leave the running integration untouched.
-def test_remote_script_backs_up_unpacks_then_swaps() -> None:
-    script = deploy.remote_install_script(deploy.Target("h", "u"))
+# Intent: a failed candidate rename or competing install preserves the old component and its exact bytes.
+# Why: the SSH installer must recover its active directory independently of the backup archive.
+def test_remote_script_preserves_installed_component(tmp_path, monkeypatch) -> None:
+    target = deploy.Target("h", "u", config_dir=str(tmp_path / "configuration with spaces"))
+    installed = Path(target.remote_dir)
+    installed.mkdir(parents=True)
+    (installed / "data").write_bytes(b"previous")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "data").write_bytes(b"new")
+    archive, expected = deploy.make_archive(candidate, ["data"], {})
+    script = deploy.remote_install_script(target, expected)
+    lock = Path(target.backup_dir) / ".install-lock"
+    lock.mkdir(parents=True)
+    blocked = subprocess.run(["sh", "-c", script], input=archive, capture_output=True)
+    assert blocked.returncode != 0 and lock.is_dir()
+    assert (installed / "data").read_bytes() == b"previous"
+    lock.rmdir()
 
-    assert script.index("tar -C '/config/custom_components' -czf") < script.index("-xf -") < script.index("mv '/config")
-    assert "ocpp_hub" in script and "tail -n +4" in script
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    move = bin_dir / "mv"
+    move.write_text('#!/bin/sh\nif [ "${1##*/}" = candidate ]; then exit 1; fi\nexec /usr/bin/mv "$@"\n')
+    move.chmod(0o755)
+    with monkeypatch.context() as patch:
+        patch.setenv("PATH", str(bin_dir) + ":" + os.environ["PATH"])
+        failed = subprocess.run(["sh", "-c", script], input=archive, capture_output=True)
+    assert failed.returncode != 0 and not lock.exists()
+    assert (installed / "data").read_bytes() == b"previous"
+    tar = bin_dir / "tar"
+    tar.write_text('#!/bin/sh\n/usr/bin/tar "$@" || exit $?\nif [ "$3" = -xf ]; then printf changed > "$2/data"; fi\n')
+    tar.chmod(0o755)
+    with monkeypatch.context() as patch:
+        patch.setenv("PATH", str(bin_dir) + ":" + os.environ["PATH"])
+        corrupt = subprocess.run(["sh", "-c", script], input=archive, capture_output=True)
+    assert corrupt.returncode != 0 and b"differs from the expected files" in corrupt.stderr
+    assert (installed / "data").read_bytes() == b"previous" and not lock.exists()
+    success = subprocess.run(["sh", "-c", script], input=archive, capture_output=True, check=True)
+    assert deploy.parse_sha256sum(success.stdout.decode()) == expected
+    assert (installed / "data").read_bytes() == b"new"
+    assert len(list(Path(target.backup_dir).glob("ocpp_hub-*.tar.gz"))) == 1
+    retained = deploy.remote_install_script(target, expected, activation_owner="review-test")
+    subprocess.run(["sh", "-c", retained], input=archive, capture_output=True, check=True)
+    assert (lock / "review-test").is_file()
+    wrong = deploy.remote_unlock_script(target, "other-install")
+    subprocess.run(["sh", "-c", wrong], capture_output=True, check=True)
+    assert lock.is_dir()
+    subprocess.run(["sh", "-c", deploy.remote_unlock_script(target, "review-test")], capture_output=True, check=True)
+    assert not lock.exists()
+
+
+# Intent: a refusal or failed install handoff rolls back the SSH candidate before releasing its lock.
+# Why: the next normal Core start must not use a candidate that did not pass the complete install and preflight.
+@pytest.mark.parametrize("had_previous", [False, True])
+@pytest.mark.parametrize(
+    ("failure", "restart"), [("check", True), ("report", True), ("transport", False), ("transport", True)]
+)
+def test_failed_ssh_install_restores_previous_files(tmp_path, monkeypatch, had_previous, failure, restart) -> None:
+    target = deploy.Target("h", "u", config_dir=str(tmp_path / "config"), sudo=False)
+    installed = Path(target.remote_dir)
+    if had_previous:
+        installed.mkdir(parents=True)
+        (installed / "data").write_bytes(b"previous")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "data").write_bytes(b"new")
+    archive, expected = deploy.make_archive(candidate, ["data"], {})
+    original = subprocess.run
+    lock = Path(target.backup_dir) / ".install-lock"
+    lock.parent.mkdir(parents=True)
+    backups = {f"ocpp_hub-previous-{index}.tar.gz": bytes([index]) for index in range(3)}
+    for name, contents in backups.items():
+        (lock.parent / name).write_bytes(contents)
+    if failure == "report":
+        report = tmp_path / "cat"
+        report.write_text("#!/bin/sh\nexit 1\n")
+        report.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ["PATH"])
+
+    # Run every real remote shell script locally, using a disposable configuration directory.
+    def transport(arguments, **options):
+        if arguments[1] == "-O":
+            return subprocess.CompletedProcess(arguments, 0)
+        result = original(["sh", "-c", arguments[-1]], **options)
+        if failure == "transport" and options.get("input") == archive:
+            raise subprocess.CalledProcessError(255, arguments)
+        return result
+
+    # Inspect what the actual remote install published before refusing the preflight.
+    def check() -> None:
+        assert failure == "check"
+        assert (installed / "data").read_bytes() == b"new" and lock.exists()
+        raise ha_restart.RestartError("configuration refused")
+
+    # Configuration must pass before any activation request.
+    def activate() -> None:
+        pytest.fail("activation ran after a refused preflight")
+
+    monkeypatch.setattr(deploy.subprocess, "run", transport)
+    expected_error = ha_restart.RestartError if failure == "check" else subprocess.CalledProcessError
+    with pytest.raises(expected_error):
+        deploy.deploy(
+            target,
+            archive,
+            expected,
+            str(tmp_path / "socket"),
+            activate=activate if restart else None,
+            check_activation=check if restart else None,
+        )
+    assert not lock.exists()
+    assert not list(installed.parent.glob(".ocpp_hub-install.*"))
+    assert {path.name: path.read_bytes() for path in lock.parent.glob("ocpp_hub-*.tar.gz")} == backups
+    if had_previous:
+        assert (installed / "data").read_bytes() == b"previous"
+    else:
+        assert not installed.exists()
 
 
 # Intent: privileged commands use `sudo -n`, which fails rather than prompting for a password.
@@ -217,7 +326,7 @@ def test_checked_deployment_packages_only_the_pinned_snapshot(tmp_path, monkeypa
         args = ["--domain", domain, "--container", "unit-home-assistant"]
     else:
         # Capture the SSH package at the same boundary as the container package.
-        def transport(target, archive, expected, control_path, batch):
+        def transport(target, archive, expected, control_path, batch, *, activate=None, check_activation=None):
             receive(archive, expected)
 
         monkeypatch.setattr(deploy, "deploy", transport)

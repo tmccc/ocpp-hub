@@ -2,13 +2,17 @@
 
 import asyncio
 import socket
+import sqlite3
 import uuid
+from contextlib import AsyncExitStack, closing
 from dataclasses import replace
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.rpc import UnavailableError
+from ocpp_hub_core.prototype.store import encoded
 
 from tests.charge_rig import owner_start, positive_flow
 from tests.current_rig import selected_ready
@@ -16,6 +20,7 @@ from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import START
+from tests.recovery_barriers import require_zero_held, returned_to_app
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
@@ -155,17 +160,67 @@ async def test_ocpp_first_mapped_closure_recovers_only_after_native_closure(
         )
 
 
-# Intent: replacement during an exact, mapped Stop waits for the late native closure and accepts a Stop replay.
-# Why: the proxy must keep handling charger reports while the native copy still shows a session already closed in SQL.
+# Intent: replacement during an exact, mapped Stop waits for the report and native closure.
+# Why: the receiver must stay open at zero while either source still shows the session waiting to close.
 @pytest.mark.parametrize("connection", [("B", "Plug"), ("A", "Unplug")])
-async def test_replacement_during_ocpp_first_closure(tmp_path, tls, unused_tcp_port, monkeypatch, connection):
+@pytest.mark.parametrize(
+    "order", ["stop-report", "accepted-shutdown-stop", "missing-shutdown-reply", "forwarded-stop", "forwarded-unsaved"]
+)
+async def test_replacement_during_ocpp_first_closure(tmp_path, tls, unused_tcp_port, monkeypatch, connection, order):
+    from tests.test_managed_boot_supersession import delay_reply
+
     async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
         rig = b.rig
         intent = b.controller.requests.intent()
         local = await positive_flow(b, "daily")
         open_session = rig.peer.native("SESSION")
-        await close_session(rig, b.session, b.charger, local)
+        if order == "stop-report":
+            await close_session(rig, b.session, b.charger, local)
+        elif order in ("forwarded-stop", "forwarded-unsaved"):
+            journal = b.session.journal
+            vendor = journal.vendor_id(local)
+            assert vendor is not None
+            request = uuid.uuid4().hex
+            if order == "forwarded-unsaved":
+                journal.db.execute(
+                    "CREATE TEMP TRIGGER refuse_forwarded_stop_reply "
+                    "BEFORE UPDATE OF wire_result ON vendor_command_scope "
+                    "WHEN NEW.local IS NOT NULL AND OLD.wire_result='dispatched' AND NEW.wire_result='Accepted' "
+                    "BEGIN SELECT RAISE(ABORT,'forwarded Stop reply storage temporarily refused'); END"
+                )
+            reply = await rig.bench.cloud_call(request, "RemoteStopTransaction", {"transactionId": vendor})
+            assert reply[0] == 3 and reply[2] == {"status": "Accepted"}
+            assert journal.active() == local
+            capacity, journal.capacity = journal.capacity, 3
+            try:
+                for index in range(5):
+                    with journal.atomic():
+                        token = journal.mutation_intent("local", "UnrelatedWrite", {"index": index})
+                        journal.mutation_finished(token, True)
+                assert journal.outcomes.accepted_stop(local)
+            finally:
+                journal.capacity = capacity
+            if order == "forwarded-unsaved":
+                assert (
+                    journal.db.execute(
+                        "SELECT wire_result FROM vendor_command_scope WHERE request=?", (request,)
+                    ).fetchone()[0]
+                    == "dispatched"
+                )
+        else:
+            if order == "missing-shutdown-reply":
+                _, held, _ = delay_reply(monkeypatch, rig, b.charger, "RemoteStopTransaction")
+                b.session.gateway.charger.timeout = 0.2
+            b.controller.request_stop()
+            await b.session._request_shutdown_stop(uuid.uuid4().hex, local)
+            assert b.session.journal.active() == local
+            if order == "missing-shutdown-reply":
+                assert held and not b.session.journal.outcomes.accepted_stop(local)
+            else:
+                assert b.session.journal.outcomes.accepted_stop(local)
         rig.bench.cp, rig.bench.connection = connection
+        if rig.bench.cp == "A":
+            rig.peer.permission_enabled = False
         device_calls = len(rig.bench.device_calls)
         write_count = len(rig.bench.received_limits)
         native = rig.peer.native
@@ -175,9 +230,30 @@ async def test_replacement_during_ocpp_first_closure(tmp_path, tls, unused_tcp_p
         with monkeypatch.context() as patch:
             patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
             await session.start()
+            if order == "forwarded-unsaved":
+                assert session.journal.outcomes.accepted_stop(local)
+                assert tuple(
+                    session.journal.db.execute(
+                        "SELECT state,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
+                        "WHERE request=?",
+                        (request,),
+                    ).fetchone()
+                ) == ("confirmed", "Accepted")
             controller = ManagedController(session)
             async with rig.charger(session) as charger:
                 await introduced(rig, session, charger, "mapped-closure-replacement")
+                if order != "stop-report":
+                    for _ in range(4):
+                        status = await controller.tick()
+                        assert not status["owner_control_enabled"] and not session.journal.fault.latched()
+                        assert rig.bench.firmware.effective_limit() == 0 and session.journal.active() == local
+                if order == "missing-shutdown-reply":
+                    await until(lambda: session.gateway.vendor_registration == "Accepted")
+                    request = uuid.uuid4().hex
+                    vendor = session.journal.vendor_id(local)
+                    reply = await rig.bench.cloud_call(request, "RemoteStopTransaction", {"transactionId": vendor})
+                    assert reply[:3] == [4, request, "InternalError"]
+                    assert not session.journal.outcomes.accepted_stop(local)
                 await close_session(rig, session, charger, local)
                 for _ in range(4):
                     status = await controller.tick()
@@ -194,34 +270,262 @@ async def test_replacement_during_ocpp_first_closure(tmp_path, tls, unused_tcp_p
         )
 
 
-# Intent: a real Pause remains at zero while an unplugged charger reports the last closed session.
-# Why: the Stop report and the native confirmation can arrive several polls apart without a charger fault.
-async def test_pause_waits_for_unplugged_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
-        c, j, rig = b.controller, b.session.journal, b.rig
+# Intent: the exact shutdown Stop can be unsent or still pending even when its optional wire record is absent.
+# Why: replacement must resume a proven untouched session and hold an unanswered session through another shutdown.
+@pytest.mark.parametrize("first_stop", ["proven-unsent", "unanswered-without-wire-record"])
+async def test_shutdown_replacement_preserves_possible_dispatch(
+    tmp_path, tls, unused_tcp_port, monkeypatch, first_stop
+):
+    from tests.test_managed_boot_supersession import delay_reply
+
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+        rig, j = b.rig, b.session.journal
+        local = await positive_flow(b, "daily")
+        await healthy(b.controller)
+        g = b.session.gateway
+        count = len(rig.bench.device_calls)
+        saved_validate = g.charger.validate_send
+        assert saved_validate is not None
+        attempt = uuid.uuid4().hex
+
+        # Refuse the outgoing Stop before the independent device can receive it.
+        async def refuse_stop(action, payload):
+            if action == "RemoteStopTransaction":
+                raise UnavailableError("the outgoing Stop was never sent")
+            return await saved_validate(action, payload)
+
+        with monkeypatch.context() as patch:
+            if first_stop == "proven-unsent":
+                patch.setattr(g.charger, "validate_send", refuse_stop)
+            else:
+                delay_reply(patch, rig, b.charger, "RemoteStopTransaction")
+                g.charger.timeout = 0.2
+                j.db.execute(
+                    "CREATE TEMP TRIGGER refuse_stop_wire BEFORE INSERT ON owner_command_wires "
+                    "WHEN NEW.action='RemoteStopTransaction' "
+                    "BEGIN SELECT RAISE(ABORT,'Stop wire storage unavailable'); END"
+                )
+            b.controller.request_stop()
+            await b.session._request_shutdown_stop(attempt, local)
+            b.session._record_shutdown_outcome(attempt, "uncertain")
+
+        sent = first_stop != "proven-unsent"
+        assert j.active() == local and j.outcomes.awaits_stop_report(local) is sent
+        commands = [f[3] for f in rig.bench.device_calls[count:] if f[2] == "RemoteStopTransaction"]
+        assert commands == ([{"transactionId": local}] if sent else [])
+        assert rig.bench.firmware.effective_limit() == 0
+        assert not j.db.execute("SELECT 1 FROM owner_command_wires WHERE action='RemoteStopTransaction'").fetchone()
+        await crash(b.session)
+
+        async with AsyncExitStack() as stack:
+            session = managed_session(rig)
+            stack.push_async_callback(crash, session)
+            await session.start()
+            controller = ManagedController(session)
+            charger = await stack.enter_async_context(rig.charger(session))
+            await introduced(rig, session, charger, "shutdown-dispatch-replacement")
+            assert session.journal.active() == local
+            if not sent:
+                status = await healthy(controller)
+                assert status["owner_control_enabled"] and status["station_ceiling_a"] == 32
+                return
+            assert not (await controller.tick())["owner_control_enabled"]
+            controller.request_stop()
+            second_attempt = uuid.uuid4().hex
+            await session._request_shutdown_stop(second_attempt, local)
+            session._record_shutdown_outcome(second_attempt, "uncertain")
+            assert session.journal.outcomes.awaits_stop_report(local)
+            assert [f[3] for f in rig.bench.device_calls[count:] if f[2] == "RemoteStopTransaction"] == commands
+
+        third = managed_session(rig)
+        async with AsyncExitStack() as stack:
+            stack.push_async_callback(crash, third)
+            await third.start()
+            controller = ManagedController(third)
+            charger = await stack.enter_async_context(rig.charger(third))
+            await introduced(rig, third, charger, "shutdown-dispatch-second-replacement")
+            assert third.journal.active() == local and third.journal.outcomes.awaits_stop_report(local)
+            assert not (await controller.tick())["owner_control_enabled"]
+            assert rig.bench.firmware.effective_limit() == 0
+            await close_session(rig, third, charger, local)
+            status = await healthy(controller)
+            assert status["owner_control_enabled"] and status["station_ceiling_a"] == 32
+
+
+# Intent: one Pause retains its exact session as the charger, native source, cloud and journal settle independently.
+# Why: any order can leave a verified zero or accepted Stop without enough evidence to release or to send another Stop.
+@pytest.mark.parametrize(
+    "order",
+    [
+        "native-first",
+        "report-first",
+        "cloud-before-native",
+        "return-before-report",
+        "restart-open",
+        "restart-reply-unsaved",
+        "saved-cloud-reply",
+        "shutdown",
+    ],
+)
+async def test_pause_waits_for_unplugged_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch, order):
+    from tests.test_cloud_ack_storage import HeldReply, SqlFault, StorageBench, assert_retained
+    from tests.test_managed_boot_supersession import delay_reply
+
+    async with (
+        selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6, bench_type=StorageBench) as b,
+        AsyncExitStack() as replacements,
+    ):
+        session, charger, c, rig = b.session, b.charger, b.controller, b.rig
+        j, bench = session.journal, rig.bench
         local = await positive_flow(b, "daily")
         assert (await healthy(c))["charging_session_open"]
+        vendor = j.vendor_id(local)
+        assert vendor is not None
+        original_start = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()[0]
         open_session = rig.peer.native("SESSION")
+        mark = len(bench.device_calls)
         identifier = uuid.uuid4().hex
+        if order == "report-first":
+            send, replies, stop_sent = delay_reply(monkeypatch, rig, charger, "RemoteStopTransaction")
+        if order in ("restart-open", "restart-reply-unsaved"):
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_stop_reply BEFORE UPDATE OF reply ON owner_command_wires "
+                "WHEN OLD.action='RemoteStopTransaction' AND NEW.reply='Accepted' "
+                "BEGIN SELECT RAISE(ABORT,'charger Stop reply storage temporarily refused'); END"
+            )
         c.command(identifier, "pause", c.requests.intent().revision)
-        await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
-        await close_session(rig, b.session, b.charger, local)
-        assert j.vendor_id(local) is not None
-        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        if order == "report-first":
+            await asyncio.wait_for(stop_sent.wait(), 3)
+        else:
+            await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+            assert j.outcomes.accepted_stop(local)
+        require_zero_held(rig, mark)
+
+        # Keep peers alive, and reopen the same journal under a replacement proxy and charger socket.
+        async def restart():
+            new_session = managed_session(rig)
+            await new_session.start()
+            new_controller = ManagedController(new_session)
+            if order == "restart-reply-unsaved":
+                original = new_session.journal.outcomes.owner(identifier, include_wires=True)
+                assert original is not None
+                stop_wires = [wire for wire in original.wires if wire.action == "RemoteStopTransaction"]
+                assert [(wire.local, wire.reply) for wire in stop_wires] == [(local, "Accepted")]
+            new_charger = await replacements.enter_async_context(rig.charger(new_session))
+            await introduced(rig, new_session, new_charger, "pause-replacement")
+            return new_session, new_charger, new_controller, new_session.journal
+
+        if order in ("restart-open", "restart-reply-unsaved"):
+            query = (
+                "SELECT reply FROM owner_command_wires WHERE request=? AND local=? AND action='RemoteStopTransaction'"
+            )
+            assert [tuple(r) for r in j.db.execute(query, (identifier, local))] == [(None,)]
+            await c.tick()
+            assert [tuple(r) for r in j.db.execute(query, (identifier, local))] == [(None,)]
+            if order == "restart-open":
+                j.db.execute("DROP TRIGGER refuse_stop_reply")
+                await c.tick()
+                assert [tuple(r) for r in j.db.execute(query, (identifier, local))] == [("Accepted",)]
+            await crash(session)
+            session, charger, c, j = await restart()
+            assert j.active() == local and j.outcomes.accepted_stop(local)
+            assert c.requests.receipt(identifier)["state"] != "completed"
+            await c.tick()
+            require_zero_held(rig, mark)
+
+        cloud = HeldReply("StopTransaction", asyncio.Event(), asyncio.Event())
+        bench.held_reply = cloud
         native = rig.peer.native
-        mark = len(rig.bench.device_calls)
-        with monkeypatch.context() as patch:
-            patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
-            for _ in range(4):
-                status = await c.tick()
-                assert status["state"] == "reconciling" and not j.fault.latched()
-                assert rig.bench.firmware.effective_limit() == 0
-                assert not status.get("local_hold_verified")
+        shutdown = None
+        returned = None
+        defer_native = order in ("report-first", "cloud-before-native", "saved-cloud-reply", "shutdown")
+        try:
+            if order == "return-before-report":
+                returned = uuid.uuid4().hex
+                assert j.active() == local and j.outcomes.accepted_stop(local)
+                assert c.requests.stop_owns_ticket(j.control.read().values.get("ticket"))
+                assert not j.control.read().values.get("uncertain")
+                c.command(returned, "app_control", c.requests.intent().revision)
+                await c.tick()
+                assert c.requests.receipt(returned)["state"] == "accepted"
+                require_zero_held(rig, mark)
+
+            if order == "native-first":
+                bench.firmware.active = None
+                bench.cp, bench.connection = "A", "Unplug"
+                assert not (await c.tick()).get("local_hold_verified")
+                assert j.active() == local and j.vendor_id(local) == vendor
                 assert c.requests.receipt(identifier)["state"] != "completed"
-        assert (await healthy(c))["local_hold_verified"]
-        assert c.requests.receipt(identifier)["state"] == "completed"
-        later_calls = rig.bench.device_calls[mark:]
-        assert not any(frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for frame in later_calls)
+
+            if order == "shutdown":
+                c.request_stop()
+                shutdown = asyncio.create_task(session.close())
+                await until(lambda: j.get("trial_shutdown_attempt", {}).get("local") == local)
+                await until(lambda: session.gateway.controls._stopping.done())
+                require_zero_held(rig, mark)
+
+            with monkeypatch.context() as patch:
+                if defer_native:
+                    patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
+                await close_session(rig, session, charger, local, delivered=False)
+                if order == "report-first":
+                    await send(replies[0])
+                    await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+                bench.cp, bench.connection = "A", "Unplug"
+                await asyncio.wait_for(cloud.arrived.wait(), 3)
+                if order == "cloud-before-native":
+                    cloud.release.set()
+                    await until(lambda: j.next_delivery() is None)
+                if defer_native and shutdown is None:
+                    status = await c.tick()
+                    assert status["state"] == "reconciling" and not j.fault.latched()
+                    assert not status.get("local_hold_verified")
+                    assert c.requests.receipt(identifier)["state"] != "completed"
+                if order in ("saved-cloud-reply", "shutdown"):
+                    failure = SqlFault("delete", cloud.token)
+                    failure.install(j.db)
+                    cloud.release.set()
+                    await until(lambda: session.runtime.status.delivery_blocked)
+                    assert_retained(j, cloud, saved=True)
+                    require_zero_held(rig, mark)
+                    if shutdown is None:
+                        # With native closure still pending, only the restricted replacement receiver may start.
+                        await crash(session)
+                        with closing(sqlite3.connect(j.path)) as database, database:
+                            failure.remove(database)
+                        session, charger, c, j = await restart()
+            if shutdown is not None:
+                await shutdown
+                assert session.final_status["shutdown_attempt_uncertain"] is False
+                with closing(sqlite3.connect(j.path)) as database, database:
+                    failure.remove(database)
+                session, charger, c, j = await restart()
+            if returned is None:
+                returned = uuid.uuid4().hex
+                c.command(returned, "app_control", c.requests.intent().revision)
+            if not cloud.release.is_set():
+                for _ in range(3):
+                    await c.tick()
+                assert c.requests.receipt(identifier)["state"] == "completed"
+                assert c.requests.receipt(returned)["state"] == "accepted"
+                assert j.next_delivery().token == cloud.token
+            require_zero_held(rig, mark)
+        finally:
+            cloud.release.set()
+            if shutdown is not None:
+                await shutdown
+
+        await returned_to_app(replace(b, session=session, controller=c, charger=charger), 6)
+        assert c.requests.receipt(identifier)["state"] == c.requests.receipt(returned)["state"] == "completed"
+        row = j.db.execute("SELECT local,vendor,start,stop,live FROM transactions").fetchall()
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert [tuple(r) for r in row] == [(local, vendor, original_start, encoded(stop), 0)]
+        assert [f[3] for f in bench.device_calls[mark:] if f[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+        assert [f for f in bench.lifecycle_wires if f[2] == "StopTransaction"] == [
+            [2, cloud.token, "StopTransaction", stop | {"transactionId": vendor}]
+        ]
 
 
 # Intent: unrelated, unmapped and nonzero native reports remain strict refusals after OCPP closure.

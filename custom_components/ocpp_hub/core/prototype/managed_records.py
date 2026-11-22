@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, cast, overload
 
-from .managed_intent import ControlIntent, decode_intent, finish_request, insert_request
+from .managed_intent import ControlIntent, decode_intent, finish_request, insert_request, request_pending
 from .store import RecoveryRequiredError, encoded
 
 if TYPE_CHECKING:
@@ -141,8 +141,17 @@ class CurrentChangeJournal:
         self.replace({**change.value, "ticket": ticket, "boot": boot})
 
     # Publish the verified selection and its receipt together after the caller checks the live profile.
-    def complete(self, identifier: str, target: int) -> None:
-        saved = self.read().value
+    def complete(self, identifier: str, target: int, revision: int) -> None:
+        change = self.read()
+        if (
+            not change.selecting
+            or change.identifier != identifier
+            or change.value.get("current_a") != target
+            or self._request_target(identifier) != target
+            or not request_pending(self.journal, identifier, "set_current", revision)
+        ):
+            raise RecoveryRequiredError("current verification no longer owns the requested selection")
+        saved = change.value
         binding: dict[str, Any] = {key: saved[key] for key in ("ticket", "boot") if key in saved}
         self.replace({"id": identifier, "current_a": target, "state": "completed", **binding})
         finish_request(self.journal, identifier, "completed", {"current_a": target, "charging_started": False})
@@ -244,36 +253,70 @@ class CurrentChangeJournal:
         ).fetchone()
         return target[0] if target is not None else None
 
+    # Zero, restoration and fault recovery all need the same exact failed selection and immutable argument.
+    def _failed_selection(self, change: CurrentChange) -> TerminalCurrent | None:
+        request = self._receipt_snapshot(change.identifier)
+        target = self._request_target(change.identifier)
+        if (
+            request is None
+            or request[1] != "set_current"
+            or request[3] not in ("uncertain", "failed")
+            or type(target) is not int
+            or type(change.value.get("current_a")) is not int
+            or target != change.value["current_a"]
+        ):
+            return None
+        return TerminalCurrent(encoded(change.value), request, target)
+
+    # A local zero keeps the previous selection both as the effective future limit and as the saved rollback value.
+    def _previous_at_hold(self, change: dict[str, Any], selected: Callable[[], int]) -> bool:
+        previous = change.get("previous_a")
+        return type(previous) is int and previous == selected() == self.journal.get("control", {}).get("resume_limit")
+
+    # A failed idle selection can still require its original local hold before its receipt may settle.
+    def failed_idle_at_zero(self, selected: Callable[[], int], boot: str | None) -> bool:
+        current = self.read()
+        change = current.value
+        record = self._failed_selection(current)
+        return bool(
+            current.state == "uncertain"
+            and change.get("mode") == "app"
+            and change.get("native_open") is False
+            and change.get("observed_open") is False
+            and "failure" in change
+            and self.failure(change) is not None
+            and record is not None
+            and record.request[3] == "uncertain"
+            and json.loads(record.request[4]) == self.unconfirmed(record.target, change.get("previous_a"))
+            and decode_intent(self.journal.get("managed_control_intent"))
+            == ControlIntent("paused", record.request[2] + 2)
+            and self._previous_at_hold(change, selected)
+            and boot is not None
+            and change.get("source_boot") == boot
+        )
+
     # A fresh zero proof can retire only a finished worker's exact failed selection with its prior limit retained.
     def terminal(self, *, worker_pending: bool, selected: Callable[[], int]) -> TerminalCurrent | None:
         current = self.read()
         change = current.value
-        request = self._receipt_snapshot(current.identifier)
-        target = self._request_target(current.identifier)
+        record = self._failed_selection(current)
         if (
             worker_pending
             or change.get("state") not in ("uncertain", "interrupted", "cancelled")
             or change.get("mode") not in ("app", "paused")
-            or type(change.get("previous_a")) is not int
-            or change["previous_a"] != selected()
-            or change["previous_a"] != self.journal.get("control", {}).get("resume_limit")
-            or request is None
-            or request[1] != "set_current"
-            or request[3] not in ("uncertain", "failed")
-            or (change.get("state") == "cancelled" and request[3] != "uncertain")
-            or request[2] >= decode_intent(self.journal.get("managed_control_intent")).revision
-            or target is None
-            or type(change.get("current_a")) is not int
-            or target != change["current_a"]
+            or not self._previous_at_hold(change, selected)
+            or record is None
+            or (change.get("state") == "cancelled" and record.request[3] != "uncertain")
+            or record.request[2] >= decode_intent(self.journal.get("managed_control_intent")).revision
         ):
             return None
-        result = json.loads(request[4])
+        result = json.loads(record.request[4])
         if "failure" in change:
             if self.failure(change) is None or result != self.unconfirmed(change["current_a"], change["previous_a"]):
                 return None
         elif result != {"classification": "process_replaced"}:
             return None
-        return TerminalCurrent(encoded(change), request, target)
+        return record
 
     # A candidate is usable only while its metadata, raw receipt and current argument still match.
     def require_terminal(self, record: TerminalCurrent) -> None:
@@ -284,16 +327,10 @@ class CurrentChangeJournal:
 
     # Ordinary verified zero ends uncertainty without rewriting the original outcome bytes.
     def settle_terminal(self, record: TerminalCurrent, selected: Callable[[], int]) -> None:
-        self.require_terminal(record)
         state = json.loads(record.body)
-        if state["previous_a"] != selected() or state["previous_a"] != self.journal.get("control", {}).get(
-            "resume_limit"
-        ):
+        if not self._previous_at_hold(state, selected):
             raise RecoveryRequiredError("previous current selection changed before settlement")
-        self.cancel(state, recovery_reason="previous_selection_at_verified_zero")
-        self.journal.db.execute(
-            "UPDATE managed_requests SET state='failed' WHERE id=? AND state='uncertain'", (record.identifier,)
-        )
+        self._retire_failed(record, "previous_selection_at_verified_zero")
 
     # After verified restoration, retire the abandoned selection and preserve already terminal receipts.
     def restore_previous(
@@ -303,12 +340,12 @@ class CurrentChangeJournal:
         recovery: dict[str, Any] | None,
     ) -> None:
         j = self.journal
-        change = self.read().value
-        row = j.db.execute(
-            "SELECT r.action,r.state,r.revision,r.result,c.current_a FROM managed_requests r "
-            "JOIN managed_current_requests c ON c.id=r.id WHERE r.id=?",
-            (change.get("id"),),
-        ).fetchone()
+        current = self.read()
+        change = current.value
+        record = self._failed_selection(current)
+        if record is None:
+            return
+        _, _, revision, state, result = record.request
         automatic = recovery is not None
         eligible = change.get("state") in ("uncertain", "interrupted", "cancelled")
         if recovery is not None:
@@ -321,65 +358,50 @@ class CurrentChangeJournal:
                 and not stopping
                 and (intent := decode_intent(j.get("managed_control_intent"))).mode == "app"
                 and intent.revision == change.get("recovery_revision")
-                and row is not None
-                and row["revision"] + 1 == change.get("recovery_revision")
-                and (row["state"] != "uncertain" or json.loads(row["result"]) == {"classification": "process_replaced"})
+                and revision + 1 == change.get("recovery_revision")
+                and (state != "uncertain" or json.loads(result) == {"classification": "process_replaced"})
             )
-        if (
-            eligible
-            and change.get("previous_a") == selected()
-            and row is not None
-            and row["action"] == "set_current"
-            and row["state"] in ("failed", "uncertain")
-            and row["current_a"] == change.get("current_a")
-        ):
-            self.replace(
+        if eligible and change.get("previous_a") == selected():
+            self._retire_failed(
+                record,
+                "verified_overlap_recovery" if automatic else "explicit_return_previous_selection",
                 {
-                    **change,
-                    "state": "cancelled",
-                    "recovery_reason": "verified_overlap_recovery"
-                    if automatic
-                    else "explicit_return_previous_selection",
-                },
-            )
-            # Preserve terminal failed results byte for byte; only this exact uncertain request can be retired.
-            j.db.execute(
-                "UPDATE managed_requests SET state='failed',result=? "
-                "WHERE id=? AND action='set_current' AND revision=? AND state='uncertain'",
-                (
-                    json.dumps(
-                        {
-                            "classification": (
-                                "superseded_by_verified_overlap_recovery"
-                                if automatic
-                                else "superseded_by_verified_return"
-                            ),
-                            "current_a": selected(),
-                        }
+                    "classification": (
+                        "superseded_by_verified_overlap_recovery" if automatic else "superseded_by_verified_return"
                     ),
-                    change["id"],
-                    row["revision"],
-                ),
+                    "current_a": selected(),
+                },
             )
 
     # A recognized historical fault can settle its own receipt after an explicit verified Pause.
     def reconcile_at_zero(self, change: dict[str, Any], previous: int) -> None:
-        self.cancel(change, previous_a=previous, recovery_reason="explicit_pause_verified_zero")
-        self.journal.db.execute(
-            "UPDATE managed_requests SET state='failed',result=? WHERE id=? AND state='uncertain'",
-            (
-                json.dumps(
-                    {
-                        "classification": "current_unconfirmed",
-                        "reconciled_at_zero": True,
-                        "requested_current_a": change["current_a"],
-                        "previous_current_a": previous,
-                    }
-                ),
-                change["id"],
-            ),
+        record = self._failed_selection(CurrentChange(change))
+        if record is None:
+            raise RecoveryRequiredError("the reconciled current no longer owns its original request")
+        self._retire_failed(
+            record,
+            "explicit_pause_verified_zero",
+            {**self.unconfirmed(record.target, previous), "reconciled_at_zero": True},
+            previous_a=previous,
         )
         self.journal.db.execute("DELETE FROM meta WHERE key=?", (INTERRUPTED_CURRENT,))
+
+    # Retire the exact request once; already-terminal results and unchanged failure bytes remain historical evidence.
+    def _retire_failed(
+        self, record: TerminalCurrent, reason: str, result: dict[str, Any] | None = None, **details: Any
+    ) -> None:
+        self.require_terminal(record)
+        self.cancel(json.loads(record.body), **details, recovery_reason=reason)
+        update = "state='failed'" if result is None else "state='failed',result=:result"
+        self.journal.db.execute(
+            f"UPDATE managed_requests SET {update} "
+            "WHERE id=:identifier AND action='set_current' AND revision=:revision AND state='uncertain'",
+            {
+                "result": json.dumps(result) if result is not None else None,
+                "identifier": record.identifier,
+                "revision": record.request[2],
+            },
+        )
 
     # Only the caller can establish which exact preimage is still valid.
     def replace(self, value: dict[str, Any]) -> None:

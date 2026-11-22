@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -9,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
+from weakref import WeakValueDictionary
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 
@@ -46,6 +48,9 @@ class CentralSystem:
         self._clock = clock
         self._server: Server | None = None
         self._sessions: dict[str, ChargerSession] = {}
+        self._session_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._attachment_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._stopping = False
         # The in-memory fallback keeps standalone core sessions unique within this central lifetime.
         self._transaction_counter = int(time.time()) % 2**31
         self._allocate_transaction_id = allocate_transaction_id or self._next_transaction_id
@@ -63,6 +68,7 @@ class CentralSystem:
 
     # Start listening on the given interface and port.
     async def start(self, host: str, port: int) -> None:
+        self._stopping = False
         self._server = await serve(self._handle, host, port, subprotocols=list(SUPPORTED_SUBPROTOCOLS))
         _LOGGER.info("OCPP server listening on %s:%s", host, port)
 
@@ -72,9 +78,12 @@ class CentralSystem:
     async def stop(self) -> None:
         if self._server is None:
             return
+        self._stopping = True
         self._server.close(close_connections=False)
         for session in list(self._sessions.values()):
             session.abort()
+        for task in self._session_tasks.values():
+            task.cancel()
         await self._server.wait_closed()
         self._server = None
 
@@ -154,34 +163,42 @@ class CentralSystem:
             _LOGGER.warning("Refusing a connection without charger identity or OCPP subprotocol")
             await connection.close(CLOSE_BAD_REQUEST, "missing charge point id or OCPP subprotocol")
             return
-        previous = self._sessions.get(cp_id)
-        if previous is not None:
-            # The charger came back before the hub noticed the old link dying.
-            _LOGGER.info("Charger %s reconnected; closing its previous connection", cp_id)
-            await previous.close()
-        # A charge that was running when the charger's last connection ended goes on with the new one.
-        # The entry is always taken out: the old connection may have stored one while it closed, and a copy left behind
-        # would bring a finished charge back as a ghost.
-        remembered = self._open_charges.pop(cp_id, {})
-        resume = (_running_connectors(previous.snapshot) if previous is not None else None) or remembered
-        session = ChargerSession(
-            cp_id,
-            protocol,
-            connection,
-            _Fanout(self._listeners),
-            self._allocate_transaction_id,
-            self._settings,
-            self._clock,
-            resume,
-            self._limits.get(cp_id),
-        )
-        self._sessions[cp_id] = session
+        lock = self._attachment_locks.setdefault(cp_id, asyncio.Lock())
+        async with lock:
+            previous = self._sessions.get(cp_id)
+            if previous is not None and not self._stopping:
+                _LOGGER.info("Charger %s reconnected; closing its previous connection", cp_id)
+                previous_handler = self._session_tasks[cp_id]
+                await previous.close()
+                previous_handler.cancel()
+                # Join the reader as well as its socket. An old pending allocation cannot publish after takeover.
+                await asyncio.gather(previous_handler, return_exceptions=True)
+            if self._stopping:
+                connection.transport.abort()
+                return
+            # Retirement saved the current transaction and limits before this connection takes ownership.
+            session = ChargerSession(
+                cp_id,
+                protocol,
+                connection,
+                _Fanout(self._listeners),
+                self._allocate_transaction_id,
+                self._settings,
+                self._clock,
+                self._open_charges.pop(cp_id, {}),
+                self._limits.get(cp_id),
+            )
+            handler = asyncio.current_task()
+            assert handler is not None
+            self._sessions[cp_id] = session
+            self._session_tasks[cp_id] = handler
         _LOGGER.info("Charger %s connected (%s)", cp_id, protocol)
         try:
             await session.run()
         finally:
             if self._sessions.get(cp_id) is session:
                 del self._sessions[cp_id]
+                del self._session_tasks[cp_id]
                 self._remember_limit(cp_id, session.snapshot)
                 running = _running_connectors(session.snapshot)
                 if running:

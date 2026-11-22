@@ -6,7 +6,6 @@ import math
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..control import HUB_PROFILE_ID
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_current_recovery import legacy_current_evidence
@@ -230,29 +229,13 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
     # Original timetable, closed native zero and the exact current Pause must agree at every completion boundary.
     def require_original_zero(native: HandoverEvidence) -> None:
         common_guard()
-        c.native.require(native, closed=True)
-        c.native.require_known_session(native)
-        if (
-            native.physical.transaction_open
-            or any(value != 0 for value in native.currents_a + native.powers_w)
-            or native.saved_schedule_digest != c.native.spec.saved_schedule_digest
-            or j.get("trial_binding")
-            != {
-                "configuration_digest": c.native.binding_digest(native),
-                "station": c.native.choice.value(),
-                "boot_digest": c.native.spec.boot_digest,
-            }
-        ):
+        if native.saved_schedule_digest != c.native.spec.saved_schedule_digest or j.get("trial_binding") != {
+            "configuration_digest": c.native.binding_digest(native),
+            "station": c.native.choice.value(),
+            "boot_digest": c.native.spec.boot_digest,
+        }:
             raise RecoveryRequiredError("release reconciliation awaits closed native zero and exact configuration")
-        station = [
-            resource
-            for resource in c.session.book.owned_present(native.physical)
-            if resource.kind == "profile" and resource.identifier == HUB_PROFILE_ID
-        ]
-        row = j.db.execute(
-            "SELECT state,confirmed FROM trial_resources WHERE key=?", ("profile:" + str(HUB_PROFILE_ID),)
-        ).fetchone()
-        if not c.session.book.confirmed_station_zero(station, row):
+        if c.native.stop_zero_refusal(native) is not None:
             raise RecoveryRequiredError("release reconciliation awaits independently confirmed owned station zero")
 
     common_guard()

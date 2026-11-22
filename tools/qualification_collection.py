@@ -38,6 +38,7 @@ OMISSION_HOOKS = {
 RAW = []
 DESELECTED = []
 COLLECTION_ERRORS = []
+HOST_RUNTIME_MOUNTS = (("/usr", "/usr"), ("/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf"))
 
 
 # Every allowed suite starts from complete source roots rather than a run's supplied node IDs or file list.
@@ -240,17 +241,49 @@ def source_digest(batch):
     return metadata["commit"], digest.hexdigest()
 
 
-# Match the existing worker's exact mounted virtual-environment digest, excluding volatile bytecode caches.
+# Use the same read-only mounts for workers, fresh collection and runtime verification.
+def runtime_mounts(config):
+    explicit = tuple((mount["source"], mount["target"]) for mount in config.get("readonly_mounts", ()))
+    implicit = HOST_RUNTIME_MOUNTS if config.get("runtime_mode") == "host" else ()
+    return implicit + explicit
+
+
+# Bind the image, interpreter and mounted runtime bytes to execution and the independent collection check.
 def runtime_digest(config):
-    digest = hashlib.sha256()
     base = Path(config["venv"])
     if not base.is_dir():
         raise ValueError("pinned collection runtime unavailable on selected executor")
+    identity = [config.get(key) for key in ("image", "runtime_mode", "container_python", "venv_target")]
+    if not all(isinstance(value, str) and value for value in identity):
+        raise ValueError("qualification runtime identity is incomplete")
+    digest = hashlib.sha256(json.dumps(identity).encode() + b"\0")
     for path in sorted(base.rglob("*")):
         if (not path.is_file() and not path.is_symlink()) or "__pycache__" in path.parts or path.suffix == ".pyc":
             continue
         data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes()
         digest.update(str(path.relative_to(base)).encode() + b"\0" + hashlib.sha256(data).digest())
+
+    # Stream large system files and include mount destinations in the identity.
+    def file_digest(path):
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").digest()
+
+    for source_path, target in sorted(runtime_mounts(config), key=lambda mount: mount[1]):
+        source = Path(source_path)
+        digest.update(b"\0mount\0" + os.fsencode(target) + b"\0")
+        if source.is_file():
+            digest.update(file_digest(source))
+            continue
+        if not source.is_dir():
+            raise ValueError("mounted runtime asset is unavailable")
+        for path in sorted(source.rglob("*")):
+            if path.is_symlink():
+                kind, checksum = b"link", hashlib.sha256(os.fsencode(os.readlink(path))).digest()
+            elif path.is_file():
+                kind, checksum = b"file", file_digest(path)
+            else:
+                continue
+            digest.update(os.fsencode(path.relative_to(source)) + b"\0" + kind + checksum)
     return digest.hexdigest()
 
 
@@ -373,15 +406,8 @@ def replay(batch, commit, checksum):
             "--mount",
             f"type=bind,src={config['venv']},dst={config['venv_target']},readonly",
         ]
-        if config["runtime_mode"] == "host":
-            command += [
-                "--mount",
-                "type=bind,src=/usr,dst=/usr,readonly",
-                "--mount",
-                "type=bind,src=/etc/ssl/openssl.cnf,dst=/etc/ssl/openssl.cnf,readonly",
-            ]
-        for row in config["readonly_mounts"]:
-            command += ["--mount", f"type=bind,src={row['source']},dst={row['target']},readonly"]
+        for source, target in runtime_mounts(config):
+            command += ["--mount", f"type=bind,src={source},dst={target},readonly"]
         env = {
             "TMPDIR": str(scratch),
             "PYTHONPATH": str(batch / "source/tools") + ":" + str(batch / "source"),

@@ -91,12 +91,14 @@ def test_zero_when_nothing_flows_and_unknown_only_when_nothing_is_known() -> Non
     charging = _snapshot("Charging", power_w=4000.0, current_a={"L1": 5.9})
     no_status = _snapshot(None, power_w=4000.0)
     no_current = _snapshot("Charging", power_w=4000.0)
+    aggregate_current = _snapshot("Charging", current_a={"total": 5.9})
 
     assert readings.power_w(idle) == 0.0 and readings.phase_current_a(idle, "L1") == 0.0
     assert readings.power_w(charging) == 4000.0 and readings.phase_current_a(charging, "L1") == 5.9
     assert readings.phase_current_a(charging, "L2") == 0.0
     assert readings.power_w(no_status) == 4000.0
     assert readings.phase_current_a(no_current, "L1") is None
+    assert all(readings.phase_current_a(aggregate_current, phase) is None for phase in ("L1", "L2", "L3"))
 
 
 # Intent: plugged in, car charging and problem come from the socket's status and error code, and stay unknown when the

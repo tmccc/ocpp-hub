@@ -39,7 +39,6 @@ class ProxyNotice:
         self.cancel_deadline()
         self.generation += 1
         self.active, self.clock = True, clock
-        self.detail = None
         self.cleanup_pending = True
         if self.problem_since is not None:
             self.arm()

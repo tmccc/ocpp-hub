@@ -71,6 +71,9 @@ def test_unusable_values_are_skipped_not_fatal() -> None:
                     {"measurand": "Current.Import", "value": "abc"},
                     {"measurand": "Energy.Active.Import.Register", "value": "00AA", "format": "SignedData"},
                     {"measurand": "Current.Import", "phase": "L1", "value": "7", "unit": "A"},
+                    {"measurand": "Current.Import", "phase": "L1", "value": "inf", "unit": "A"},
+                    {"measurand": "Current.Import", "phase": "L1", "value": "100", "unit": "kWh"},
+                    {"measurand": "Current.Import", "phase": ["L1"], "value": "100", "unit": "A"},
                 ]
             }
         ]
@@ -103,6 +106,17 @@ def test_latest_entry_wins_and_missing_timestamp_falls_back_to_now() -> None:
 
     assert latest is not None and latest.power_w == 2000.0
     assert fallback is not None and fallback.sampled_at == NOW and parse_meter_values({}, NOW) is None
+
+
+# Intent: an unusable meter entry cannot replace the reading or advance its timestamp.
+# Why: an empty or invalid report contains no new current or energy evidence.
+def test_latest_usable_entry_wins() -> None:
+    valid = _payload()["meterValue"][0]
+    empty = {"timestamp": "2026-10-20T18:00:00Z", "sampledValue": []}
+    invalid = {"timestamp": "2026-10-20T18:00:01Z", "sampledValue": [{"value": "unavailable"}]}
+
+    assert parse_meter_values({"meterValue": [empty, invalid]}, NOW) is None
+    assert parse_meter_values({"meterValue": [empty, valid, invalid]}, NOW) == parse_meter_values(_payload(), NOW)
 
 
 # Intent: phase labels reduce to L1 to L3, a missing phase means total, and the neutral is dropped.

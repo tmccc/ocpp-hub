@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -129,12 +129,26 @@ class ChargerControl:
         snapshot = self._session.snapshot
         connector = snapshot.connectors.get(SOCKET_CONNECTOR)
         transaction_id = connector.transaction_id if connector is not None else None
+
+        # The send lock and the reply can each wait through a Start that changes the applicable profile purpose.
+        def require_transaction() -> None:
+            if transaction_id is None:
+                current = self._session.snapshot.connectors.get(SOCKET_CONNECTOR)
+                if current is not None and current.transaction_id is not None:
+                    raise ControlError("session_changed", "a charge started while its idle limit was pending")
+                return
+            if not self._session.owns_transaction(SOCKET_CONNECTOR, transaction_id):
+                raise ControlError("session_changed", "the requested charge ended while its limit was pending")
+
         outcomes: list[str] = []
         for purpose, connector_id in _purposes(transaction_id, snapshot.limit_purpose):
             payload = commands.set_charging_profile(
                 connector_id, purpose, amps, HUB_PROFILE_ID, transaction_id=transaction_id
             )
-            status = await self._ask("SetChargingProfile", payload)
+            guard = require_transaction if purpose != commands.PURPOSE_CHARGE_POINT_MAX else None
+            status = await self._ask("SetChargingProfile", payload, before_send=guard)
+            if guard is not None:
+                guard()
             outcomes.append(f"{purpose}={status}")
             if status == "Accepted":
                 self._session.record_limit(amps, purpose)
@@ -162,7 +176,13 @@ class ChargerControl:
     # to what the charger says it supports (ChargingScheduleMaxPeriods) when the hub knows it. A weekly schedule starts
     # on the weekday of `anchor`.
     async def set_schedule(
-        self, anchor: datetime, periods: Sequence[tuple[int, object]], recurrency: str, *, from_plan: bool = False
+        self,
+        anchor: datetime,
+        periods: Sequence[tuple[int, object]],
+        recurrency: str,
+        *,
+        from_plan: bool = False,
+        before_send: Callable[[], None] | None = None,
     ) -> list[tuple[int, float]]:
         weekly = recurrency == "Weekly"
         known = self._session.snapshot.configuration.get("ChargingScheduleMaxPeriods", "")
@@ -187,7 +207,7 @@ class ChargerControl:
             payload = commands.set_charging_schedule(
                 connector_id, purpose, schedule, HUB_PROFILE_ID, anchor_iso, recurrency=recurrency
             )
-            status = await self._ask("SetChargingProfile", payload)
+            status = await self._ask("SetChargingProfile", payload, before_send=before_send)
             outcomes.append(f"{purpose}={status}")
             if status == "Accepted":
                 self._session.record_limit(None, purpose, from_plan=from_plan)
@@ -201,8 +221,12 @@ class ChargerControl:
 
     # Remove the hub's own limit again, so the charger goes back to what it had.
     # Only the hub's profile id is cleared.
-    async def clear_current_limit(self, *, from_plan: bool = False) -> None:
-        status = await self._ask("ClearChargingProfile", commands.clear_charging_profile(HUB_PROFILE_ID))
+    async def clear_current_limit(
+        self, *, from_plan: bool = False, before_send: Callable[[], None] | None = None
+    ) -> None:
+        status = await self._ask(
+            "ClearChargingProfile", commands.clear_charging_profile(HUB_PROFILE_ID), before_send=before_send
+        )
         if status not in ("Accepted", "Unknown"):
             raise ControlError("rejected", f"ClearChargingProfile={status}")
         self._session.record_limit(None, None, from_plan=from_plan)
@@ -230,13 +254,19 @@ class ChargerControl:
 
     # Send one request and return the `status` of the answer. A CALLERROR counts as a refusal, so the next purpose can
     # be tried; a charger that does not answer or is gone is a failure of its own.
-    async def _ask(self, action: str, payload: dict[str, object]) -> str:
+    async def _ask(
+        self, action: str, payload: dict[str, object], *, before_send: Callable[[], None] | None = None
+    ) -> str:
         try:
-            answer = await self._session.call(action, payload)
+            answer = await self._session.call(action, payload, before_send=before_send)
         except CallRejectedError as error:
-            return plain_text(error.code, 40)
+            return f"Call error: {plain_text(error.code, 40)}"
         except CallError as error:
             # A timeout does not say the charger ignored the request: it may have applied the limit and answered late.
             raise ControlError("unreachable", str(error)) from error
         status = answer.get("status")
-        return plain_text(status, 40) if isinstance(status, str) else "NoStatus"
+        if not isinstance(status, str):
+            return "NoStatus"
+        if status in ("Accepted", "Rejected", "Unknown", "NotSupported"):
+            return status
+        return f"Invalid status: {plain_text(status, 40)}"
