@@ -58,6 +58,74 @@ def test_runtime_digest_covers_explicit_auxiliary_mounts(tmp_path, monkeypatch):
     assert before != runtime_digest(config)
 
 
+# Intent: qualify with expected permission denials in the host system tree while binding accessible runtime bytes.
+# Why: an unprivileged worker cannot read every system file, but its own runtime and auxiliary assets must be readable.
+def test_runtime_digest_handles_unreadable_host_system_files(tmp_path, monkeypatch):
+    venv = tmp_path / "venv"
+    system = tmp_path / "usr"
+    auxiliary = tmp_path / "auxiliary"
+    for directory in (venv, system, auxiliary):
+        directory.mkdir()
+    readable = system / "readable"
+    unreadable = system / "unreadable"
+    auxiliary_file = auxiliary / "library"
+    venv_file = venv / "package"
+    for path in (readable, unreadable, auxiliary_file, venv_file):
+        path.write_bytes(b"original")
+    unreadable.chmod(0o600)
+    config = {
+        "image": "sha256:" + "1" * 64,
+        "runtime_mode": "host",
+        "container_python": "/venv/bin/python",
+        "venv_target": "/venv",
+        "venv": str(venv),
+        "readonly_mounts": [{"source": str(auxiliary), "target": "/task/openssl-runtime"}],
+    }
+    monkeypatch.setattr(qualification_collection, "HOST_RUNTIME_MOUNTS", ((str(system), "/usr"),))
+    blocked = {unreadable}
+    original_open = Path.open
+
+    # Model denied reads independently of the permissions of the user running this test.
+    def controlled_open(path, mode="r", *args, **kwargs):
+        if path in blocked and mode == "rb":
+            raise PermissionError(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", controlled_open)
+    before = runtime_digest(config)
+    unreadable.write_bytes(b"inaccessible contents")
+    assert runtime_digest(config) == before
+    unreadable.chmod(0o640)
+    changed_access = runtime_digest(config)
+    assert changed_access != before
+    readable.write_bytes(b"changed runtime contents")
+    changed_contents = runtime_digest(config)
+    assert changed_contents != changed_access
+    unreadable.chmod(0o111)
+    with pytest.raises(PermissionError):
+        runtime_digest(config)
+    unreadable.chmod(0o640)
+    blocked.clear()
+    assert runtime_digest(config) != changed_contents
+    for path in (auxiliary_file, venv_file):
+        blocked.add(path)
+        with pytest.raises(PermissionError):
+            runtime_digest(config)
+        blocked.clear()
+
+    original_scandir = os.scandir
+
+    # Simulate an incomplete directory listing even when files can be opened by name.
+    def controlled_scandir(path):
+        if os.fspath(path) == str(system):
+            raise PermissionError(path)
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", controlled_scandir)
+    with pytest.raises(PermissionError):
+        runtime_digest(config)
+
+
 # Intent: a failed container inspection remains visible in the worker's cleanup receipt.
 # Why: an unavailable daemon cannot confirm that auto-removal completed.
 def test_worker_cleanup_distinguishes_inspection_failure(tmp_path, monkeypatch):

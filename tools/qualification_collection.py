@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -263,24 +264,50 @@ def runtime_digest(config):
         data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes()
         digest.update(str(path.relative_to(base)).encode() + b"\0" + hashlib.sha256(data).digest())
 
-    # Stream large system files and include mount destinations in the identity.
-    def file_digest(path):
-        with path.open("rb") as stream:
-            return hashlib.file_digest(stream, "sha256").digest()
+    # Bind each system entry's access mode and ownership without elevating the worker to read it.
+    def access_digest(info):
+        return hashlib.sha256(f"{info.st_mode}:{info.st_uid}:{info.st_gid}".encode()).digest()
+
+    # Hash readable bytes and record access metadata only when the worker can neither open nor execute a system file.
+    def file_digest(path, *, unreadable_info=None):
+        try:
+            stream = path.open("rb")
+        except PermissionError:
+            if unreadable_info is None or os.access(path, os.X_OK):
+                raise
+            return b"unreadable", access_digest(unreadable_info)
+        with stream:
+            return b"file", hashlib.file_digest(stream, "sha256").digest()
+
+    # A failed directory listing leaves the runtime file inventory unknown.
+    def raise_traversal_error(error):
+        raise error
 
     for source_path, target in sorted(runtime_mounts(config), key=lambda mount: mount[1]):
         source = Path(source_path)
+        host_system_tree = (
+            config["runtime_mode"] == "host" and target == "/usr" and (source_path, target) in HOST_RUNTIME_MOUNTS
+        )
         digest.update(b"\0mount\0" + os.fsencode(target) + b"\0")
         if source.is_file():
-            digest.update(file_digest(source))
+            _, checksum = file_digest(source)
+            digest.update(checksum)
             continue
         if not source.is_dir():
             raise ValueError("mounted runtime asset is unavailable")
-        for path in sorted(source.rglob("*")):
-            if path.is_symlink():
+        entries = sorted(
+            directory / name
+            for directory, subdirs, files in source.walk(on_error=raise_traversal_error)
+            for name in (*subdirs, *files)
+        )
+        for path in entries:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
                 kind, checksum = b"link", hashlib.sha256(os.fsencode(os.readlink(path))).digest()
-            elif path.is_file():
-                kind, checksum = b"file", file_digest(path)
+            elif stat.S_ISREG(info.st_mode):
+                kind, checksum = file_digest(path, unreadable_info=info if host_system_tree else None)
+            elif host_system_tree and stat.S_ISDIR(info.st_mode):
+                kind, checksum = b"directory", access_digest(info)
             else:
                 continue
             digest.update(os.fsencode(path.relative_to(source)) + b"\0" + kind + checksum)

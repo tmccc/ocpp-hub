@@ -188,9 +188,10 @@ exception. A configurable primary venv target must also remain separate from sou
 traversal and duplicate targets fail. The launcher checks final destinations before dispatch; the worker and fresh
 collector independently repeat the checks and verify source types on their actual executor. The runtime digest binds
 the virtual environment and runtime mounts by target and contents, including the host system and OpenSSL configuration
-when host mode supplies them. New runtime assets require
-an explicit policy update, not an overlay of pinned code. Every attempt has its own directory; interrupted runs are
-retained and cannot be combined into one pass.
+when host mode supplies them. Within the implicit host `/usr` mount, the digest records mode and ownership for
+files the executor can neither read nor execute. The check fails if it cannot list a mounted directory. New runtime
+assets require an explicit policy update, not an overlay of pinned code. Every attempt has its own directory.
+Interrupted runs are retained and cannot be combined into one pass.
 Raw setup/call/teardown, once-only assignments, process exits, namespaces, source digests and model event/suffix evidence
 must all pass the auditor. The source-pinned registry declares33,194 raw/9,202 runnable engine inputs and
 584 raw/360 runnable HA inputs per HA runtime. The auditor regenerates all inputs and exclusions from frozen

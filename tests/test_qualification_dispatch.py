@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools import parallel_worker
+from tools import parallel_worker, qualification_collection
 from tools.audit_parallel_qualification import dispatch_grants
 from tools.parallel_worker import WorkQueue
 
@@ -80,7 +80,7 @@ def test_preparation_consumes_the_worker_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(parallel_worker, "SOURCE", source)
     monkeypatch.setattr(parallel_worker, "ABORT", None)
     monkeypatch.setattr(parallel_worker, "snapshot_digest", lambda _: config["source_digest"])
-    monkeypatch.setattr(parallel_worker, "runtime_digest", lambda _: "runtime")
+    monkeypatch.setattr(qualification_collection, "runtime_digest", lambda _: "runtime")
     monkeypatch.setattr(parallel_worker, "container_command", lambda *_: ["docker"])
     monkeypatch.setattr(parallel_worker, "telemetry", lambda _: None)
     monkeypatch.setattr(parallel_worker.os, "sched_getaffinity", lambda _: set(range(6)))
