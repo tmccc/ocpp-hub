@@ -14,7 +14,7 @@ from tests.charge_rig import positive_flow, ready
 from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.current_rig import commissioned
 from tests.native_peer_failures import InterruptedNativePeer
-from tests.recovery_barriers import witnessed_native_loss
+from tests.recovery_barriers import returned_to_app, witnessed_native_loss
 from tests.runtime_rig import until
 from tests.test_ordinary_recovery import close_session
 from tests.tls_support import tls as tls
@@ -101,8 +101,7 @@ async def finish_recovery(b, identifier, current):
     assert c.requests.receipt(pause)["state"] == "completed"
     assert c.requests.receipt(identifier)["state"] == "failed" and c.charging.state()["state"] == "completed"
     assert j.get("local_start_receipt") is None and not mp.starts(rig)
-    c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-    assert (await mp.healthy(c))["station_ceiling_a"] == current
+    await returned_to_app(b, current)
     await two_later_sessions(b, selected=current, original_starts=0)
     assert j.next_delivery() is None and not rig.bench.backend_errors
 

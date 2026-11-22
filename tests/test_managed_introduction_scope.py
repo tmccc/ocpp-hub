@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from ocpp_hub_core.prototype.connection_scope import current_scope
+from ocpp_hub_core.prototype.managed_intent import OFFLINE_PAUSE
 from ocpp_hub_core.prototype.native_bounded_handover import AuditSupersededError
 
 from tests.current_rig import selected_ready
@@ -196,8 +197,8 @@ async def test_resume_acknowledges_lineage_only_after_real_commit(tmp_path, tls,
         no_start_or_stop(b)
 
 
-# Intent: matching Boot supersedes a held proof and old cloud failure, without erasing pending connection origin.
-# Why: shared lineage must not borrow exact-Boot proof/failure, and a later genuine current failure must still Pause.
+# Intent: matching Boot supersedes stale proof and failure, then the current Boot can recover after its cloud returns.
+# Why: only the current Boot can impose its offline hold or prove that the saved app setting can resume.
 async def test_matching_boot_fences_proof_and_failed_attempt_without_erasing_origin(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -247,6 +248,7 @@ async def test_matching_boot_fences_proof_and_failed_attempt_without_erasing_ori
                 status = await c.tick()
                 paused = c.requests.intent()
                 assert paused.mode == "paused" and paused.revision == intent.revision + 1
+                assert j.get(OFFLINE_PAUSE) == paused.revision
                 assert current_scope(g) == current and b.rig.bench.firmware.effective_limit() == 0
                 assert not j.get("managed_control_fault"), status
                 no_start_or_stop(b)
@@ -256,9 +258,19 @@ async def test_matching_boot_fences_proof_and_failed_attempt_without_erasing_ori
                 proof.cancel()
             await asyncio.gather(proof, return_exceptions=True)
         await until(
-            lambda: b.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted", timeout=12
+            lambda: (
+                b.session.runtime.status.vendor_connected
+                and g.vendor_registration == "Accepted"
+                and j.next_delivery() is None
+                and not g.vendor._pending
+            ),
+            timeout=12,
         )
-        status = await healthy(c)
-        assert c.requests.intent() == paused and status["station_ceiling_a"] == 0
-        assert b.rig.bench.firmware.effective_limit() == 0
+        async with asyncio.timeout(5):
+            while (status := await healthy(c))["desired_control"] != "app":
+                await asyncio.sleep(0.02)
+        assert c.requests.intent() == paused.next("app") and status["station_ceiling_a"] == 32
+        assert j.get(OFFLINE_PAUSE) is None and current_scope(g) == current
+        assert native.acknowledged_lineage == current.lineage
+        assert b.rig.bench.firmware.effective_limit() == 32
         no_start_or_stop(b)
