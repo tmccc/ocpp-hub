@@ -10,13 +10,16 @@ Read [the navigation guide](code-navigation.md) before interpreting the historic
 
 ## Automatic recovery after a charger outage — 22 November 2026
 
-- [~] A clean idle recovery can restore the saved app/schedule ceiling after the charger and cloud verify
-  closed zero and settle the reports. An owner Pause or unfinished charging work at interruption retains
-  the explicit Return path. The change is covered offline.
+- [x] The standalone iCS proxy is running `d476559`. A clean idle recovery restores the saved app/schedule
+  ceiling after the charger and cloud confirm the session is closed, power is zero and queued reports are
+  settled. An owner Pause or unfinished charging work at interruption retains the explicit Return path.
+- [x] All 14,968 release tests passed, along with the recovery search and simulated installation week
+  against `98c47e1`. After deployment, the charger was idle in app/schedule mode with the 32 A ceiling
+  restored, the cloud was connected, and all 13 charging records were preserved.
 
 ## Shared Stop deployment — 22 November 2026
 
-- [x] The standalone iCS proxy is running `98c47e1`. Tests sent local Pause and vendor-app Stop in both orders.
+- [x] The standalone iCS proxy was deployed at `98c47e1`. Tests sent local Pause and vendor-app Stop in both orders.
   Each order sent one Stop to the charger and waited for the closing reports.
 - [x] All 14,962 release tests and the recovery search passed. The simulated installation week passed against
   `11b1515`. After restart, the charger was idle in app/schedule mode at its 32 A ceiling, the cloud was connected,
