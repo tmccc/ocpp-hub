@@ -44,7 +44,8 @@ class Reporting:
         self.software = software(root)
         self.timeline: deque[dict[str, Any]] = deque(maxlen=20)
         self.previous: str | None = None
-        self.persisted: str | None = None
+        self.pending_events: deque[dict[str, Any]] = deque(maxlen=20)
+        self.last_queued_event: dict[str, Any] | None = None
         self.output_errors = 0
 
     # Ages and ordinary protocol counters do not create a repeated transition every five-second poll.
@@ -116,28 +117,29 @@ class Reporting:
         diagnostics = status.get("diagnostics")
         if diagnostics is not None:
             diagnostics["reporting_errors"] = self.output_errors
+            timeline = diagnostics.get("timeline", [])
+            if timeline:
+                first_new = 0
+                for index, transition in enumerate(timeline):
+                    if transition == self.last_queued_event:
+                        first_new = index + 1
+                self.pending_events.extend(timeline[first_new:])
+                self.last_queued_event = timeline[-1]
         try:
             save(status_path, status)
         except OSError, SecurityError:
             self.output_errors += 1
-        if diagnostics is None:
-            return False
-        timeline = diagnostics.get("timeline", [])
-        transition = timeline[-1] if timeline else None
-        signature = (
-            json.dumps({key: value for key, value in transition.items() if key != "at_epoch"}, sort_keys=True)
-            if transition is not None
-            else None
-        )
-        changed = transition is not None and signature != self.persisted
-        if changed:
+        changed = bool(self.pending_events)
+        while self.pending_events:
             try:
-                event(events_path, transition)
+                event(events_path, self.pending_events[0])
             except OSError, SecurityError:
                 self.output_errors += 1
+                break  # Retry this transition before later ones, including during final shutdown.
             else:
-                self.persisted = signature
-        diagnostics["reporting_errors"] = self.output_errors
+                self.pending_events.popleft()
+        if diagnostics is not None:
+            diagnostics["reporting_errors"] = self.output_errors
         return changed
 
 

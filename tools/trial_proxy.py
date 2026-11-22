@@ -122,6 +122,7 @@ async def interactive(session: Any, stopped: asyncio.Event) -> None:
             except asyncio.IncompleteReadError as error:
                 raw = error.partial
             if not raw:
+                stopped.set()
                 return
             if discarding:
                 discarding = False

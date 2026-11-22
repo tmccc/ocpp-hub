@@ -356,7 +356,10 @@ def deploy_container(
             raise SystemExit("The Home Assistant container API port is invalid.")
         command.extend((str(port), (source / "tools/ha_restart.py").read_text()))
         archive = access.token.encode() + b"\n" + archive
-    subprocess.run(command, input=archive, check=True)
+    try:
+        subprocess.run(command, input=archive, check=True)
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(error.returncode) from None
 
 
 # Resolve the optional restart confirmation before modifying the selected installation.

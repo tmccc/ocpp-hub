@@ -17,6 +17,40 @@ from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 
 
+# Intent: shutdown closes a daily charge and then a separate delayed report of an already accepted owner Start.
+# Why: the second lifecycle needs its own exact Stop even when shutdown began with a different active session.
+async def test_shutdown_stops_daily_then_delayed_owner_start(tmp_path, tls, unused_tcp_port):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        gateway, journal = b.session.gateway, b.session.journal
+        gateway.policy = replace(gateway.policy, allowed_tags=frozenset({"APP_OWNER", *gateway.policy.allowed_tags}))
+        gateway.controls.policy = gateway.policy
+        b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+        await b.c.charging.settle()
+        owner_tag = starts(b.rig)[0][3]["idTag"]
+        b.clock.now = int(datetime(2026, 11, 11, tzinfo=ZONE).timestamp())
+        daily = await b.start_plan(9, demand=True)
+        await healthy(b.c)
+        assert journal.get("control")["start_pending"] and journal.active() == daily
+
+        b.c.request_stop()
+        shutdown = asyncio.create_task(b.session.close())
+        try:
+            await until(lambda: daily in b.stops())
+            await b.close_transaction(daily)
+            b.clock.now += 60
+            body = START | {"idTag": owner_tag, "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat()}
+            reply = await b.rig.bench.call(b.sock, "shutdown-owner-report", "StartTransaction", body)
+            assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+            owner = reply[2]["transactionId"]
+            await until(lambda: owner in b.stops(), timeout=2)
+            assert b.stops() == [daily, owner]
+            await b.close_transaction(owner)
+        finally:
+            await shutdown
+        assert len(starts(b.rig)) == 1 and b.device.effective_limit() == 0
+        assert b.session.final_status["shutdown_attempt_uncertain"] is False
+
+
 # Intent: exercise a scheduled source on either side of the local ACK, then the still-distinct owner lifecycle.
 # Why: debt consumption must depend on command provenance even when the configured tags are equal.
 @pytest.mark.parametrize("before_ack", [True, False])

@@ -20,7 +20,7 @@ from tests.tls_support import admission as admission
 from tests.tls_support import tls as tls
 
 
-# Deny only the real vendor receipt retirement statement and retain the exact attempts for independent assertions.
+# Deny only the real receipt retirement statement and retain the exact attempts for independent assertions.
 def refuse_retirement(journal, failures):
     # Record actual receipt retirement attempts and refuse only their DELETE statement.
     def authorizer(action, table, column, database, trigger):
@@ -60,6 +60,41 @@ async def lifecycle(bench, charger, cycle):
     with closing(sqlite3.connect(bench.store.path)) as reader:
         saved = reader.execute("SELECT vendor,stop FROM transactions WHERE local=?", (local,)).fetchone()
         assert saved[0] == 9001 and json.loads(saved[1]) == stop
+
+
+# Intent: a failed overlapping charger replacement closes both abandoned sockets and permits a clean reconnect.
+# Why: a still-responsive old socket cannot carry reports after the gateway has retired its sender and Boot.
+async def test_charger_attachment_storage_failure_retires_replaced_socket(tmp_path, tls, admission):
+    bench = Bench(tmp_path / "journal.db", tls, admission)
+    failures = []
+    try:
+        async with serve(
+            bench.vendor, "127.0.0.1", 0, ssl=bench.server_tls, subprotocols=["ocpp1.6"], logger=TRANSPORT_LOG
+        ) as cloud:
+            runtime = await bench.start(cloud.sockets[0].getsockname()[1])
+            async with bench.charger() as original:
+                await bench.boot(original)
+                await until(lambda: bench.gateway.vendor_registration == "Accepted")
+                refuse_retirement(bench.store, failures)
+                try:
+                    async with bench.charger() as replacement:
+                        async with asyncio.timeout(2):
+                            await replacement.wait_closed()
+                        assert failures
+                        assert not runtime.status.charger_connected
+                        assert not runtime.status.boot_observed
+                        assert runtime.status.charger_fault.stage == "charger_attachment"
+                        assert bench.gateway.charger.sender is None
+                        async with asyncio.timeout(2):
+                            await original.wait_closed()
+                finally:
+                    bench.store.db.set_authorizer(None)
+            async with bench.charger() as recovered:
+                await bench.boot(recovered)
+                await until(lambda: bench.gateway.vendor_registration == "Accepted")
+                await lifecycle(bench, recovered, 0)
+    finally:
+        await bench.close()
 
 
 # Intent: two repeated real receipt DELETE failures automatically reconnect and register, then deliver later lifecycles.

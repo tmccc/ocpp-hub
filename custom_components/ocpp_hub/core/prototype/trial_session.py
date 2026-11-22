@@ -426,7 +426,9 @@ class TrialSession:
             await self.native_bounded.admit()
         elif phase.supervised:
             selected = self._commissioned_selection()
-            known_local = self.journal.active() if self.journal.get("trial_binding") is not None else None
+            known_local = (
+                self.native_bounded.recovery_closing_local() if self.journal.get("trial_binding") is not None else None
+            )
             try:
                 try:
                     native = await self.native_bounded.read(selected_current=selected, closing_local=known_local)
@@ -563,7 +565,7 @@ class TrialSession:
                     try:
                         await self._request_shutdown_stop(attempt, local)
                     finally:
-                        await self._wait_for_shutdown_closure(attempt, stop_late_start=local is None)
+                        await self._wait_for_shutdown_closure(attempt, local)
                     self._record_shutdown_outcome(attempt, "verified")
                     verified = True
                 except Exception:
@@ -672,14 +674,14 @@ class TrialSession:
             pass
 
     # Keep the receiver alive to journal the real Stop, even if confirming zero failed.
-    async def _wait_for_shutdown_closure(self, attempt: str, *, stop_late_start: bool) -> None:
+    async def _wait_for_shutdown_closure(self, attempt: str, stopping_local: int | None) -> None:
         managed = bool(self.journal.get("managed_mode"))
-        late = await self._wait_for_shutdown_reports(accept_late_start=managed and stop_late_start)
+        late = await self._wait_for_shutdown_reports(stopping_local, accept_late_start=managed)
         if late is not None:
             try:
                 await self._request_shutdown_stop(attempt, late)
             finally:
-                await self._wait_for_shutdown_reports(accept_late_start=False)
+                await self._wait_for_shutdown_reports(late, accept_late_start=False)
 
     # The final result records independent closure, never a guessed acknowledgement of the Stop RPC.
     def _record_shutdown_outcome(self, attempt: str, state: str) -> None:
@@ -688,11 +690,11 @@ class TrialSession:
             self.journal.put("trial_shutdown_attempt", {**current, "state": state})
 
     # Wait for closure and verified zero, or return a late Start so shutdown can Stop it explicitly.
-    async def _wait_for_shutdown_reports(self, *, accept_late_start: bool) -> int | None:
+    async def _wait_for_shutdown_reports(self, stopping_local: int | None, *, accept_late_start: bool) -> int | None:
         async with asyncio.timeout(5):
             while True:
                 local = self.journal.active()
-                if accept_late_start and local is not None:
+                if accept_late_start and local is not None and local != stopping_local:
                     return local
                 if (
                     local is None

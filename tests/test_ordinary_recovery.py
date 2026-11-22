@@ -155,6 +155,45 @@ async def test_ocpp_first_mapped_closure_recovers_only_after_native_closure(
         )
 
 
+# Intent: replacement during an exact, mapped Stop waits for the late native closure and accepts a Stop replay.
+# Why: the proxy must keep handling charger reports while the native copy still shows a session already closed in SQL.
+@pytest.mark.parametrize("connection", [("B", "Plug"), ("A", "Unplug")])
+async def test_replacement_during_ocpp_first_closure(tmp_path, tls, unused_tcp_port, monkeypatch, connection):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 32) as b:
+        rig = b.rig
+        intent = b.controller.requests.intent()
+        local = await positive_flow(b, "daily")
+        open_session = rig.peer.native("SESSION")
+        await close_session(rig, b.session, b.charger, local)
+        rig.bench.cp, rig.bench.connection = connection
+        device_calls = len(rig.bench.device_calls)
+        write_count = len(rig.bench.received_limits)
+        native = rig.peer.native
+        await crash(b.session)
+        session = managed_session(rig)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
+            await session.start()
+            controller = ManagedController(session)
+            async with rig.charger(session) as charger:
+                await introduced(rig, session, charger, "mapped-closure-replacement")
+                await close_session(rig, session, charger, local)
+                for _ in range(4):
+                    status = await controller.tick()
+                    assert not status["owner_control_enabled"] and not session.journal.fault.latched()
+                    assert rig.bench.firmware.effective_limit() == 0
+                assert set(rig.bench.received_limits[write_count:]) == {0}
+                assert session.journal.active() is None and session.journal.latest_mapped_stop(local)
+                patch.undo()
+                status = await healthy(controller)
+                assert status["owner_control_enabled"] and status["station_ceiling_a"] == 32
+                assert controller.requests.intent() == intent
+        assert not any(
+            f[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for f in rig.bench.device_calls[device_calls:]
+        )
+
+
 # Intent: a real Pause remains at zero while an unplugged charger reports the last closed session.
 # Why: the Stop report and the native confirmation can arrive several polls apart without a charger fault.
 async def test_pause_waits_for_unplugged_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):

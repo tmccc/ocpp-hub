@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tools import ha_restart
 from tools.ha_container_deploy import install
 
 
@@ -60,10 +61,51 @@ def test_install_lock_covers_core_activation(tmp_path: Path) -> None:
     # Capture the old process baseline before publication and its replacement afterward.
     def prepare_restart():
         observe()
-        return observe
+        return observe, observe
 
     install(tmp_path, "ics_proxy", *archive(new), prepare_restart=prepare_restart)
-    assert observations == [old["__init__.py"], new["__init__.py"]]
+    assert observations == [old["__init__.py"], new["__init__.py"], new["__init__.py"]]
+
+
+# Intent: a rejected configuration restores staged files, while an uncertain restart keeps the candidate.
+# Why: the install can undo its own preflight publication only until Core may have read the new build.
+@pytest.mark.parametrize("replacing", [False, True])
+@pytest.mark.parametrize("failure", ["configuration", "restart"])
+def test_failed_activation_respects_restart_boundary(tmp_path, monkeypatch, replacing, failure):
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    installed = tmp_path / "custom_components/ics_proxy/__init__.py"
+    if replacing:
+        install(tmp_path, "ics_proxy", *archive(old))
+    requests = []
+
+    # Observe the actual candidate bytes during the dry check and fail at only the selected Core boundary.
+    def request(self, path, *, post=False):
+        assert post
+        requests.append(path)
+        assert installed.read_bytes() == new["__init__.py"]
+        if path == "/config/core/check_config":
+            return {"result": "invalid" if failure == "configuration" else "valid"}
+        raise ha_restart.ResponseError("The restart request was rejected.")
+
+    monkeypatch.setattr(ha_restart.HomeAssistantAPI, "request", request)
+    monkeypatch.setattr(ha_restart, "container_lifetime", lambda *args: (10, "same"))
+
+    # Bind the real activation callback to the fake Core.
+    def prepare():
+        return ha_restart.prepare_container_restart(8123, "fixture")
+
+    with pytest.raises(SystemExit):
+        install(tmp_path, "ics_proxy", *archive(new), prepare_restart=prepare)
+    if failure == "configuration":
+        assert requests == ["/config/core/check_config"]
+        if replacing:
+            assert installed.read_bytes() == old["__init__.py"]
+        else:
+            assert not installed.exists()
+    else:
+        assert requests == ["/config/core/check_config", "/services/homeassistant/restart"]
+        assert installed.read_bytes() == new["__init__.py"]
 
 
 # Intent: unsafe names, incorrect hashes and syntax errors fail before an installed component is touched.

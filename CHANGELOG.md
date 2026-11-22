@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Retire both charger sockets when a failed replacement leaves the earlier connection unusable.
+- Keep the receiver and its zero hold available while a restarted proxy waits for native closure after
+  an exact saved Stop.
+- Stop an already accepted owner session that reports after the first session closes during shutdown.
+- Commit exact saved cloud Start and Stop acknowledgements while the cloud is offline.
+- Retain briefly unwritten transition reports and retry them in order, including at shutdown.
+- Check exact native configuration types during operation and close interactive commissioning on input EOF.
+- Require audited engine qualification on the standalone runtime pins. Restore the previous Home Assistant
+  files if the configuration check fails before a restart request.
+
 - Keep a reconnect Stop and its real reply with the pending Pause that owns the open session.
 - Keep a fresh charger report after Boot distinct from a buffered report that reused its message ID.
 - Recheck historical iCS transaction mappings immediately before sending the query and when translating its reply.

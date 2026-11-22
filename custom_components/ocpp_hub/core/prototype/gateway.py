@@ -1763,6 +1763,22 @@ class Gateway:
         outcome = self.journal.outcomes.delivery()
         return outcome is not None and outcome.uncertain
 
+    # An exact saved positive lifecycle reply can finish locally while the cloud pump is disconnected.
+    def settle_saved_lifecycle(self) -> bool:
+        if self.vendor.sender is not None or self._flush_lock.locked():
+            return False
+        head = self.journal.next_delivery()
+        if head is None or head.action not in ("StartTransaction", "StopTransaction"):
+            return False
+        saved = DeliveryReply.restore(self.journal, head)
+        if saved is None or saved.answer[0] != 3 or not saved.storage_only(self.journal):
+            return False
+        current = self.journal.outcomes.delivery_reply
+        if current is not None and current != saved:
+            raise RecoveryRequiredError("cloud reply requires exact delivery reconciliation")
+        self.journal.outcomes.retain_delivery(saved)
+        return self._settle_delivery(head) == "acknowledged"
+
     # Recover the exact head before deciding whether its original request can be sent.
     def _prepare_delivery(self) -> Delivery | None:
         outcome = self.journal.outcomes.delivery()

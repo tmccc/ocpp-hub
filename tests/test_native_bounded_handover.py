@@ -13,8 +13,9 @@ from typing import Any
 
 import pytest
 from ocpp_hub_core import commands
+from ocpp_hub_core.prototype.native_bounded import NativeBoundedSpec
 from ocpp_hub_core.prototype.rpc import UnavailableError
-from ocpp_hub_core.prototype.security import SecurityError
+from ocpp_hub_core.prototype.security import SecurityError, StaleEvidenceError
 from ocpp_hub_core.prototype.station import StationChoice
 from ocpp_hub_core.prototype.store import RecoveryRequiredError
 
@@ -85,6 +86,39 @@ async def verify_original_backend(rig: ConnectedBench, session: Any) -> None:
     assert not (await session.native_bounded.observe_backend())["original_backend_connected"]
     rig.bench.online = True
     assert (await session.native_bounded.observe_backend())["original_backend_connected"]
+
+
+# Intent: a change in the JSON type of a saved native setting fails both live and replacement configuration checks.
+# Why: accepting a different typed setting during a poll would disagree with the exact binding after reconnect.
+async def test_native_configuration_preserves_json_types(tmp_path, tls, unused_tcp_port):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        source = rig.spec.value()
+        source["original_configuration"]["fixture_setting"] = 1
+        spec = NativeBoundedSpec.parse(source)
+        rig.peer.configuration["fixture_setting"] = 1
+        before = await rig.prepared.observer.observe_handover()
+        spec.require(before, rig.prepared.config.identity, "original")
+        rig.peer.configuration["fixture_setting"] = True
+        changed = await rig.prepared.observer.observe_handover()
+        with pytest.raises(SecurityError, match="configuration"):
+            spec.require(changed, rig.prepared.config.identity, "original")
+
+
+# Intent: detect a type-only configuration change that arrives between two genuine HTTP reads.
+# Why: the sample must carry the exact same configuration at its beginning and end.
+async def test_native_audit_rejects_changed_configuration_json_type(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        original = rig.peer.native
+        values = iter((1, True))
+
+        # Vary only a benign setting in the independent native peer.
+        def config_changes(key):
+            result = original(key)
+            return result | {"fixture_setting": next(values)} if key == "config" else result
+
+        monkeypatch.setattr(rig.peer, "native", config_changes)
+        with pytest.raises(StaleEvidenceError, match="configuration changed"):
+            await rig.prepared.observer.observe_handover()
 
 
 # Intent: an admitted trial that never receives Boot can clean up using fresh closed native6 without inventing a hold.

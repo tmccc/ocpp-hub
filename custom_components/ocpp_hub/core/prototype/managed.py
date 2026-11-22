@@ -977,6 +977,7 @@ class ManagedController:
     # A poll first joins owned work, then supervises, assesses current authority and publishes one view.
     async def _tick(self) -> dict[str, Any]:
         self.commands.decide(self.session.gateway.retry_reply_writes)
+        self.commands.decide(self.session.runtime.settle_saved_lifecycle)
         pending = await self._pending_work()
         if pending is not None:
             self.latest_native = None

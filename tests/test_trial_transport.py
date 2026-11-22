@@ -66,6 +66,20 @@ async def test_interactive_trial_recovers_after_an_oversized_line(monkeypatch, c
                 await asyncio.gather(terminal, return_exceptions=True)
 
 
+# Intent: closing the terminal's input requests normal commissioning shutdown.
+# Why: the listener cannot safely continue an interactive run after its operator channel has gone away.
+async def test_interactive_trial_stops_at_eof(monkeypatch):
+    from tools.trial_proxy import interactive
+
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd) as source:
+        monkeypatch.setattr(sys, "stdin", source)
+        os.close(write_fd)
+        stopped = asyncio.Event()
+        await asyncio.wait_for(interactive(SimpleNamespace(), stopped), 2)
+        assert stopped.is_set()
+
+
 # Intent: refuse a certificate name mismatch even if an older checker exits successfully.
 # Why: a zero command exit alone does not prove the name that the charger will verify.
 def test_listener_certificate_requires_positive_name_result(monkeypatch):

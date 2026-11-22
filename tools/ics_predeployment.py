@@ -64,6 +64,17 @@ def changed_proxy(repo: Path, candidate: str, installed: str | None) -> bool:
     return bool(git(repo, "diff", "--name-only", installed, candidate, "--", *PROXY_INPUTS).strip())
 
 
+# Require qualification to have exercised the packages that the standalone installer will use.
+def require_standalone_pins(source: Path, audited_packages: dict[str, str]) -> None:
+    expected = dict(
+        line.strip().split("==", 1)
+        for line in (source / "requirements-trial.txt").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    if not expected or any(audited_packages.get(name) != version for name, version in expected.items()):
+        raise ValueError("standalone runtime pins differ from the audited engine runtime")
+
+
 # Export the exact installed commit without opening its running installation or checking out another branch.
 def export_installed(repo: Path, commit: str, destination: Path) -> None:
     archive = git(repo, "archive", "--format=tar", commit)

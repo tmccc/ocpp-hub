@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from functools import partial
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -76,7 +77,7 @@ def install(
     archive: bytes,
     expected: dict[str, str],
     *,
-    prepare_restart: Callable[[], Callable[[], None]] | None = None,
+    prepare_restart: Callable[[], tuple[Callable[[], None], Callable[[], None]]] | None = None,
 ) -> dict[str, Any]:
     files = validated_files(domain, archive, expected)
     parent = config / "custom_components"
@@ -104,6 +105,7 @@ def install(
             if target.is_symlink() or (target.exists() and not target.is_dir()):
                 raise ValueError("component path must be a directory")
             replacing = target.exists()
+            backup = None
             if replacing:
                 if any(path.is_symlink() for path in target.rglob("*")):
                     raise ValueError("installed component contains a symlink")
@@ -115,14 +117,34 @@ def install(
                     pending.rename(backup)
                 finally:
                     pending.unlink(missing_ok=True)
-            for old in sorted(backups.glob(domain + "-*.tar.gz"), reverse=True)[3:]:
-                old.unlink()
             if replacing:
                 exchange_directories(staged, target)
             else:
                 staged.rename(target)
             if restart is not None:
-                restart()
+                check, activate = restart
+                try:
+                    check()
+                except (Exception, SystemExit) as error:
+                    # Core has not been asked to restart. Restore the old files under the same lock.
+                    try:
+                        if replacing:
+                            exchange_directories(staged, target)
+                        else:
+                            target.rename(staged)
+                    except OSError:
+                        raise SystemExit(f"{error} Restoring the previous installation files failed.") from None
+                    if backup is not None:
+                        with suppress(OSError):
+                            backup.unlink(missing_ok=True)
+                    raise SystemExit(f"{error} Restored the previous installation files.") from None
+                try:
+                    activate()
+                except (Exception, SystemExit) as error:
+                    # Core may have restarted using the candidate. Keep those files and the previous backup.
+                    raise SystemExit(f"{error} The new component remains installed.") from None
+            for old in sorted(backups.glob(domain + "-*.tar.gz"), reverse=True)[3:]:
+                old.unlink()
     return {"domain": domain, "verified_files": len(files), "backup_created": replacing}
 
 

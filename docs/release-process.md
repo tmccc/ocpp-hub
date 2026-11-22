@@ -51,7 +51,8 @@ The corresponding environment settings are `OCPP_QUALIFICATION_REPORT`, `OCPP_IN
 the standalone proxy source or its dependency pins differ from the installed build. This includes the service
 pins in `requirements-trial.txt`. The week commissions a synthetic journal with the installed build, uses the
 candidate, then reopens the same journal on the installed build. Both builds use the supplied rehearsal interpreter,
-so the rehearsal checks state compatibility across the source versions in one environment.
+so the rehearsal checks state compatibility across the source versions in one environment. The standalone release
+gate also checks the candidate's service pins against the actual engine qualification runtime.
 Passing results beside the qualification bundle are reused for matching source, builds and test environments.
 A failed check stops validation before it produces a deployment snapshot.
 
@@ -78,6 +79,7 @@ python tools/managed_proxy.py check --config "$PROXY_CONFIG" \
 Service replacement must preserve its journal, allocation, history, original baseline, native specification,
 credentials and requested control mode under the existing supervisor. A restart can perform protective charger
 work; it is not a read-only status check. Do not improvise an installer or substitute a fresh journal.
+The current supervisor retries service failures after five seconds and disables the startup burst limit.
 `health` reads saved status rather than contacting the charger; global health can be false during a cloud outage
 while local control remains healthy.
 
@@ -95,6 +97,8 @@ domain it selects the older `ocpp_hub` integration. It does not deploy the stand
 authorized, `--restart --yes --ha-api-config "$HA_API_CONFIG"` performs the configuration check and HA restart.
 Docker verifies the selected Core process through its local API and waits for a new process to report running.
 The Docker installer holds the component lock from the Core preflight through restart verification.
+A failed configuration check restores the previous files before the installer releases the lock. If a restart may
+have reached Core, the installer retains the candidate and reports that activation could not be verified.
 For the legacy SSH restart, the API hostname must match the SSH target. Use `ssh_host` in the private API
 configuration for an explicit SSH alias. Verification uses the configured Uptime timestamp entity, which
 defaults to `sensor.uptime` and can be set via `uptime_entity`.
@@ -108,6 +112,10 @@ When comparing a journal migration with the running service, rehearse journal an
 a copy. Gateway initialization also creates the table for saved authorization refusals.
 
 ### Rehearsed standalone software rollback
+
+The read-only rollback checker accepts only the build pairs and journal formats listed here. The installed
+`11b1515` build and its predecessor `f40f7ed` passed the separate installation-week rehearsal. The historical
+checker reports `build_pair_unrehearsed` for this pair.
 
 The rollback to `7a08f2a` was rehearsed from `fc2dc0a` on a fresh journal and from `051500f`, `3fdace8` and
 `73b1856`, and `10597b0` on saved copies of the migrated journal. Each rehearsal used one advancing SQLite journal.

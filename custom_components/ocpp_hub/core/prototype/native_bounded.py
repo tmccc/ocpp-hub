@@ -328,7 +328,10 @@ class NativeBoundedSpec:
             False,
             allow_unplugged=allow_unplugged and route == "trial" and user_a == 6,
         )
-        if native.configuration != expected or native.saved_schedule_digest != self.saved_schedule_digest:
+        if (
+            encoded(native.configuration) != encoded(expected)
+            or native.saved_schedule_digest != self.saved_schedule_digest
+        ):
             raise NativeContentError("configuration", "native bounded configuration or saved schedule changed")
         return measured
 
@@ -373,7 +376,10 @@ class NativeBoundedSpec:
             allow_full_current=True,
             closing_local=closing_local,
         )
-        if native.configuration != expected or native.saved_schedule_digest != (self.saved_schedule_digest):
+        if (
+            encoded(native.configuration) != encoded(expected)
+            or native.saved_schedule_digest != self.saved_schedule_digest
+        ):
             raise NativeContentError("configuration", "managed full configuration or saved schedule changed")
         return measured
 
@@ -390,7 +396,7 @@ class NativeBoundedSpec:
             raise SecurityError("normal native restoration belongs to another charger")
         require_native(native, identity, self.hardware_identity, 32, False)
         if (
-            native.configuration != expected
+            encoded(native.configuration) != encoded(expected)
             or native.saved_schedule_digest != self.saved_schedule_digest
             or native.physical.upstream_connected is not True
         ):

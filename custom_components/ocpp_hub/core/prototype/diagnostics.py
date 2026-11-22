@@ -32,6 +32,7 @@ STAGES = frozenset(
         "heartbeat",
         "authorization",
         "session",
+        "charger_attachment",
         "charger_receive",
         "charger_retirement",
         "boot_or_ceiling",

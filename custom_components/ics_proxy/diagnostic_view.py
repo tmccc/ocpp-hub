@@ -193,6 +193,7 @@ def protocol(value: Any) -> dict[str, Any]:
                         "authorization",
                         "session",
                         "charger_receive",
+                        "charger_attachment",
                         "charger_retirement",
                         "boot_or_ceiling",
                         "boot_probe",

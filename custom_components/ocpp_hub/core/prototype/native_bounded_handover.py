@@ -539,7 +539,7 @@ class NativeBoundedHandover:
                     owned=True,
                     initial=binding is None,
                     selected_current=selected_current,
-                    closing_local=None if first_zero else journal.active(),
+                    closing_local=None if first_zero else self.recovery_closing_local(),
                 )
             except (
                 NativeReadinessError,
@@ -724,6 +724,14 @@ class NativeBoundedHandover:
         if isinstance(decision, Pending):
             raise NativeSessionPendingError(decision.detail)
 
+    # A managed reconnect can explain an unplugged native marker using the exact latest recorded Stop.
+    def recovery_closing_local(self) -> int | None:
+        journal = self.gateway.journal
+        active = journal.active()
+        if active is None and journal.get("managed_mode"):
+            return journal.latest_mapped_stop_id()
+        return active
+
     # A physical/ledger closure gap is ordinary pending evidence and never authority to adopt or stop a session.
     def session_decision(self, native: HandoverEvidence) -> GateDecision:
         known = self.gateway.journal.active()
@@ -741,6 +749,15 @@ class NativeBoundedHandover:
         if native.physical.transaction_open:
             j = self.gateway.journal
             control = j.get("control", {})
+            active = j.active()
+            if (
+                active is None
+                and j.get("managed_mode")
+                and j.latest_mapped_stop(native.physical.native_transaction_id)
+                and native.physical.power_w == 0
+                and all(value == 0 for value in native.currents_a + native.powers_w)
+            ):
+                return  # Keep reception and restrictive recovery available while native closure catches up.
             if (
                 j.current_change.read().recovering
                 and recorded_station_profile(j, self.spec.digest, self.spec.boot_digest)
@@ -748,7 +765,7 @@ class NativeBoundedHandover:
             ):
                 return  # Introduce only the restricted listener; no native ID is adopted or given Stop authority.
             if (
-                j.active() is None
+                active is None
                 and j.get("managed_control_intent", {}).get("mode") == "paused"
                 and control.get("start_pending")
                 and control.get("inhibit")

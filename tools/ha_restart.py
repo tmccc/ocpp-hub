@@ -12,6 +12,7 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -49,13 +50,19 @@ def require_running(api: HomeAssistantAPI) -> dict[str, Any]:
     return config
 
 
-# Check that Core accepted a valid configuration, then prove a new lifetime is serving requests.
-def restart(api: HomeAssistantAPI, before: object, lifetime: Callable[[], object], *, timeout: float = 300) -> None:
+# Finish all configuration and identity checks before any restart is requested.
+def check_restart(api: HomeAssistantAPI, before: object, lifetime: Callable[[], object]) -> None:
     check = api.request("/config/core/check_config", post=True)
     if not isinstance(check, dict) or check.get("result") != "valid":
         raise RestartError("The Home Assistant configuration check failed.")
     if lifetime() != before:
         raise RestartError("Home Assistant changed before the requested restart.")
+
+
+# Once the request can reach Core, only evidence of a new lifetime confirms activation.
+def request_restart(
+    api: HomeAssistantAPI, before: object, lifetime: Callable[[], object], *, timeout: float = 300
+) -> None:
     try:
         api.request("/services/homeassistant/restart", post=True)
     except OSError, http.client.HTTPException:
@@ -70,6 +77,12 @@ def restart(api: HomeAssistantAPI, before: object, lifetime: Callable[[], object
             pass
         time.sleep(min(2, remaining))
     raise RestartError("The Home Assistant restart did not produce a verified new Core lifetime.")
+
+
+# Check that Core accepted a valid configuration, then prove a new lifetime is serving requests.
+def restart(api: HomeAssistantAPI, before: object, lifetime: Callable[[], object], *, timeout: float = 300) -> None:
+    check_restart(api, before, lifetime)
+    request_restart(api, before, lifetime, timeout=timeout)
 
 
 # The optional SSH restart uses the installation's Home Assistant start-time sensor as its lifetime evidence.
@@ -167,7 +180,7 @@ def container_lifetime(port: int, token: str) -> tuple[int, str]:
 
 
 # Bind the install and restart to one original Core lifetime.
-def prepare_container_restart(port: int, token: str) -> Callable[[], None]:
+def prepare_container_restart(port: int, token: str) -> tuple[Callable[[], None], Callable[[], None]]:
     try:
         before = container_lifetime(port, token)
     except RestartError as error:
@@ -175,17 +188,22 @@ def prepare_container_restart(port: int, token: str) -> Callable[[], None]:
     except OSError, http.client.HTTPException, ValueError:
         raise SystemExit("The Home Assistant container's local API could not be verified.") from None
 
-    # The installer keeps its lock until the same checked build has had time to load.
-    def activate() -> None:
-        api = HomeAssistantAPI(lambda: connect_to_core(port, before), token)
+    api = HomeAssistantAPI(lambda: connect_to_core(port, before), token)
+
+    # Both phases verify Core in the selected container.
+    def lifetime() -> tuple[int, str]:
+        return container_lifetime(port, token)
+
+    # Turn fixed API failures into an installer message without exposing connection details.
+    def run_phase(phase: Callable[[HomeAssistantAPI, object, Callable[[], object]], None]) -> None:
         try:
-            restart(api, before, lambda: container_lifetime(port, token))
+            phase(api, before, lifetime)
         except RestartError as error:
             raise SystemExit(str(error)) from None
         except OSError, http.client.HTTPException, ValueError:
             raise SystemExit("The Home Assistant container's local API could not be verified.") from None
 
-    return activate
+    return partial(run_phase, check_restart), partial(run_phase, request_restart)
 
 
 # Keep the standalone process-lifetime probe and restart interface for existing callers.

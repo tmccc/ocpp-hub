@@ -9,11 +9,13 @@ once, while an accepted Start needs the real closed-session mapping tool.
 
 import asyncio
 import json
+import socket
 import sqlite3
 import time
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from ocpp_hub_core.frames import build_call_result
@@ -382,6 +384,51 @@ async def replace_and_recover(stack, b, fault, held, action, tmp_path, capsys, c
     await mp.healthy(recovered.controller)
     assert wire_count(b.rig, held.token) == 1
     return recovered
+
+
+# Intent: a genuine saved Start or Stop reply settles after replacement even while the cloud is unavailable.
+# Why: committing a stored reply is local work and reopening a cloud connection cannot make that reply more exact.
+@pytest.mark.parametrize("action", ["StartTransaction", "StopTransaction"])
+async def test_replacement_settles_saved_cloud_ack_offline(tmp_path, tls, unused_tcp_port, monkeypatch, action):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 32, cli_route=True, bench_type=StorageBench
+    ) as b:
+        held, local = await enqueue(b, action, 0)
+        fault = SqlFault("delete", held.token)
+        fault.install(b.session.journal.db)
+        held.release.set()
+        await until(lambda: b.session.runtime.status.delivery_blocked)
+        assert_retained(b.session.journal, held, saved=True)
+        await crash(b.session)
+
+        with socket.socket() as unavailable:
+            unavailable.bind(("127.0.0.1", 0))
+            session = mp.managed_session(b.rig)
+            transport = session.runtime.transport
+            url = urlsplit(transport.config.vendor_url)
+            endpoint = urlunsplit(url._replace(netloc=f"127.0.0.1:{unavailable.getsockname()[1]}"))
+            transport.config = replace(transport.config, vendor_url=endpoint)
+            await session.start()
+            controller = ManagedController(session)
+            async with b.rig.charger(session) as charger:
+                assert (await b.rig.bench.call(charger, "offline-ack-boot", "BootNotification", mp.BOOT))[0] == 3
+                await until(lambda: session.runtime.status.vendor_fault.count > 0)
+                await controller.tick()
+                assert_retained(session.journal, held, saved=True)
+                fault.remove(session.journal.db)
+                await controller.tick()
+                assert not session.runtime.status.vendor_connected
+                assert (
+                    session.journal.db.execute("SELECT 1 FROM delivery_replies WHERE token=?", (held.token,)).fetchone()
+                    is None
+                )
+                head = session.journal.next_delivery()
+                if action == "StartTransaction":
+                    assert session.journal.vendor_id(local) == held.answer[2]["transactionId"]
+                    assert head is not None and head.action == "StopTransaction" and head.transaction == local
+                else:
+                    assert head is None and session.journal.active() is None
+                assert wire_count(b.rig, held.token) == 1
 
 
 # Intent: two real storage faults per case recover authority, exact mapping and later outage protection.

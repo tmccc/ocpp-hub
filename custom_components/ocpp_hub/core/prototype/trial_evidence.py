@@ -13,7 +13,7 @@ from .native_http import read_native
 from .policy import DeniedError, integer, number
 from .security import SecurityError, StaleEvidenceError
 from .station import anchor_epoch
-from .store import fingerprint
+from .store import encoded, fingerprint
 from .trial_allocation import HistoryObservation, observe_history
 from .trial_config import TrialConfig, basic_secret
 
@@ -231,7 +231,7 @@ class NativeObserver:
             ):
                 raise NativeContentError("identity", "native profile identities do not match the configured charger")
             profiles = native_profiles(await self._read("statistics", "SMART"))
-            if await self._read("getConfig") != config:
+            if encoded(await self._read("getConfig")) != encoded(config):
                 raise NativeContentError("configuration", "native configuration changed during the profile read")
             return profiles
 
@@ -252,7 +252,7 @@ class NativeObserver:
             for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP", "STATE"):
                 values[name] = await self._read("statistics", name)
             values["TRANSACTIONS"] = await self._read("getTransaction", {})
-            if await self._read("getConfig") != config:
+            if encoded(await self._read("getConfig")) != encoded(config):
                 raise StaleEvidenceError("native configuration changed during the connected audit")
             return handover_evidence(config, values, started)
 
@@ -275,7 +275,7 @@ class NativeObserver:
                 values[name] = await self._read("statistics", name)
             if include_history:
                 values["TRANSACTIONS"] = await self._read("getTransaction", {})
-            if await self._read("getConfig") != config:
+            if encoded(await self._read("getConfig")) != encoded(config):
                 raise NativeContentError("configuration", "native configuration changed during the history audit")
             return native_evidence(config, values, started)
 

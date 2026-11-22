@@ -249,3 +249,28 @@ def test_reporting_io_failure_is_counted_without_escaping_and_can_recover(tmp_pa
     reporter.write(value, status_path, event_path, managed_proxy.save_private, managed_proxy.event)
     assert json.loads(status_path.read_text())["diagnostics"]["reporting_errors"] == 1
     assert json.loads(event_path.read_text())["state"] == "healthy"
+
+
+# Intent: persist a missed transition before its successor, or on shutdown if that was the last transition.
+# Why: a one-poll fault should survive a temporary event-file failure and process replacement.
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_reporting_retries_failed_transition_in_order(tmp_path, shutdown):
+    reporter = Reporting(tmp_path)
+    status_path, event_path = tmp_path / "status.json", tmp_path / "events.jsonl"
+    event_path.mkdir()
+    fault = {"state": "attention", "checked_at": 10000, "diagnostics": {"available": True}}
+    report = with_reporting(fault, reporter.observe(fault))
+    reporter.write(report, status_path, event_path, managed_proxy.save_private, managed_proxy.event)
+    assert report["diagnostics"]["reporting_errors"] == 1
+    event_path.rmdir()
+    status = (
+        {"state": "stopped"}
+        if shutdown
+        else {"state": "healthy", "checked_at": 10005, "diagnostics": {"available": True}}
+    )
+    later = status if shutdown else with_reporting(status, reporter.observe(status))
+    for _ in range(2):
+        reporter.write(later, status_path, event_path, managed_proxy.save_private, managed_proxy.event)
+    assert [json.loads(line)["state"] for line in event_path.read_text().splitlines()] == (
+        ["attention"] if shutdown else ["attention", "healthy"]
+    )

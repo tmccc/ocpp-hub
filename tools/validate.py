@@ -127,6 +127,7 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
         or set(bundle.get("phases", {})) != required
     ):
         raise ValueError("qualification bundle does not cover this exact source and every required suite")
+    engine_packages = {}
     for suite in sorted(required):
         batch = Path(bundle["phases"][suite])
         config = json.loads((batch / "config.json").read_text())
@@ -159,6 +160,9 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
         ):
             results[f"qualification ({suite})"] = False
             raise ValueError("fresh raw audit did not establish full qualification for this exact suite/source")
+        if suite == "engine-model":
+            engine_packages = config["expected_packages"]
+    return engine_packages
 
 
 # Finish the normal gate and the focused iCS checks before publishing a deployable snapshot.
@@ -189,7 +193,9 @@ def run_full_qualification(
                 raise ValueError(
                     "provide --ics-ha-python from a pinned Home Assistant runtime for the installation week"
                 )
-            audit_qualification(path, source or ROOT, metadata, python, results, collection_executors)
+            engine_packages = audit_qualification(path, source or ROOT, metadata, python, results, collection_executors)
+            if target == "ics-proxy":
+                ics_predeployment.require_standalone_pins(source, engine_packages)
             if ics_release and all(results.values()):
                 output = path.resolve().parent / "ics-predeployment"
                 ics_predeployment.ensure_check(ics_predeployment.DISCOVERY, source, output, metadata, python)

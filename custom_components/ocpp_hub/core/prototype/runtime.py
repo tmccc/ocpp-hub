@@ -154,12 +154,27 @@ class ConnectionRuntime:
     async def _charger_handler(self, connection: ServerConnection) -> None:
         async with self._charger_lock:
             previous = self._charger
-            epoch = self.gateway.attach_charger(self._sender(connection))
-            introduction = object()
-            self._introductions.add(introduction)
-            self._charger = connection
-            self.status.charger_connected = True
-            self.status.boot_observed = False
+            previous_epoch = self.gateway._charger_epoch
+            try:
+                epoch = self.gateway.attach_charger(self._sender(connection))
+            except sqlite3.Error as error:
+                if previous is not None:
+                    self._retire_charger(previous, previous_epoch)
+                self.status.last_failure = type(error).__name__
+                self.status.charger_fault.record(error, "charger_attachment", "None")
+                epoch = None
+            else:
+                self._charger = connection
+                self.status.charger_connected = True
+                self.status.boot_observed = False
+        if epoch is None:
+            # Failed admission can already have retired the prior sender. Reconnect both sockets cleanly.
+            if previous is not None:
+                await previous.close(code=1012)
+            await connection.close(code=1011)
+            return
+        introduction = object()
+        self._introductions.add(introduction)
         probe: asyncio.Task[None] | None = None
         boot_retry: asyncio.Task[None] | None = None
         try:
@@ -171,24 +186,29 @@ class ConnectionRuntime:
             async for raw in connection:
                 await self.gateway.receive("charger", raw, epoch)
         except (ConnectionClosed, UnavailableError, DeniedError) as error:
-            self.status.last_failure = type(error).__name__
-            self.status.charger_fault.record(error, "charger_receive", self.gateway.charger.diagnostics.action)
+            if self._charger is connection:
+                self.status.last_failure = type(error).__name__
+                self.status.charger_fault.record(error, "charger_receive", self.gateway.charger.diagnostics.action)
         finally:
             probes = [task for task in (probe, boot_retry) if task is not None]
             for task in probes:
                 task.cancel()
             await asyncio.gather(*probes, return_exceptions=True)
             self._introductions.discard(introduction)
-            try:
-                self.gateway.detach_charger(epoch)
-            except sqlite3.Error as error:
-                self.status.last_failure = type(error).__name__
-                self.status.charger_fault.record(error, "charger_retirement", "None")
-            finally:
-                if self._charger is connection:
-                    self._charger = None
-                    self.status.charger_connected = False
-                    self.status.boot_observed = False
+            self._retire_charger(connection, epoch)
+
+    # A retired connection can clear its own liveness even if SQLite cannot finish the cleanup.
+    def _retire_charger(self, connection: ServerConnection, epoch: int) -> None:
+        try:
+            self.gateway.detach_charger(epoch)
+        except sqlite3.Error as error:
+            self.status.last_failure = type(error).__name__
+            self.status.charger_fault.record(error, "charger_retirement", "None")
+        finally:
+            if self._charger is connection:
+                self._charger = None
+                self.status.charger_connected = False
+                self.status.boot_observed = False
 
     # Retry only the read-only request on this socket; every delay still accepts a spontaneous genuine Boot.
     async def _wait_for_real_boot(self, epoch: int) -> None:
@@ -525,6 +545,16 @@ class ConnectionRuntime:
         else:
             self.status.delivery_blocked_cause = "storage" if isinstance(failure, sqlite3.Error) else "reconciliation"
             self.status.last_failure = type(failure).__name__
+
+    # Retry a known local acknowledgement while leaving network delivery and physical authority separate.
+    def settle_saved_lifecycle(self) -> None:
+        try:
+            settled = self.gateway.settle_saved_lifecycle()
+        except (RecoveryRequiredError, ConflictError, sqlite3.Error) as error:
+            self._settle_delivery_status(error)
+        else:
+            if settled and self.status.delivery_blocked_cause == "storage":
+                self._settle_delivery_status(None)
 
     # OCPP data-frame heartbeats are distinct from websocket Ping/Pong and continue through journal quarantine.
     async def _heartbeat(self) -> None:

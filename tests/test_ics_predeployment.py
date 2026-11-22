@@ -29,6 +29,7 @@ def releases(tmp_path):
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     for key, value in (("user.name", "Example"), ("user.email", "example@example.invalid")):
         subprocess.run(["git", "config", key, value], cwd=repo, check=True)
+    commit(repo, "requirements-trial.txt", "websockets==15.0.1\n")
     installed = commit(repo, "tools/managed_proxy.py", "# installed\n")
     client = commit(repo, "custom_components/ics_proxy/sensor.py", "# client change\n")
     candidate = commit(repo, "tools/managed_proxy.py", "# candidate\n")
@@ -51,8 +52,7 @@ def test_proxy_change_detection_and_export(tmp_path, releases):
 # Intent: changing only the standalone installation's dependency pin triggers the installation week.
 # Why: the service installs from a different requirements file than the offline test environment.
 def test_proxy_change_detection_includes_standalone_dependency_pins(releases):
-    repo, *_ = releases
-    old_pin = commit(repo, "requirements-trial.txt", "websockets==15.0.1\n")
+    repo, _, _, old_pin = releases
     new_pin = commit(repo, "requirements-trial.txt", "websockets==16.0\n")
     assert checks.changed_proxy(repo, new_pin, old_pin) is True
 
@@ -60,17 +60,18 @@ def test_proxy_change_detection_includes_standalone_dependency_pins(releases):
 # Intent: exact scoped release checks precede publication of an approved source snapshot.
 # Why: a failed week must stop the actual packaging path, even when the normal four suites have already passed.
 @pytest.mark.parametrize(
-    ("target", "same_proxy", "week_fails", "expected"),
+    ("target", "same_proxy", "week_fails", "pin_matches", "expected"),
     [
-        ("legacy-ha", False, False, ()),
-        ("ics-client", False, False, (checks.DISCOVERY,)),
-        ("ics-proxy", True, False, (checks.DISCOVERY,)),
-        ("ics-proxy", False, False, (checks.DISCOVERY, checks.WEEK)),
-        ("ics-proxy", False, True, (checks.DISCOVERY, checks.WEEK)),
+        ("legacy-ha", False, False, True, ()),
+        ("ics-client", False, False, True, (checks.DISCOVERY,)),
+        ("ics-proxy", True, False, True, (checks.DISCOVERY,)),
+        ("ics-proxy", False, False, True, (checks.DISCOVERY, checks.WEEK)),
+        ("ics-proxy", False, True, True, (checks.DISCOVERY, checks.WEEK)),
+        ("ics-proxy", False, False, False, ()),
     ],
 )
 def test_release_snapshot_waits_for_required_checks(
-    tmp_path, monkeypatch, releases, target, same_proxy, week_fails, expected
+    tmp_path, monkeypatch, releases, target, same_proxy, week_fails, pin_matches, expected
 ):
     repo, installed, _, candidate = releases
     monkeypatch.setattr(validate, "ROOT", repo)
@@ -82,6 +83,7 @@ def test_release_snapshot_waits_for_required_checks(
     def audit(path, source, metadata, python, results, executors):
         assert metadata["commit"] == candidate
         results["four suites"] = True
+        return {"websockets": "15.0.1" if pin_matches else "16.0"}
 
     # Capture the command boundary before the release process can mark a snapshot as approved.
     def invoke(check, source, output, metadata, python, *, installed=None):
@@ -106,8 +108,9 @@ def test_release_snapshot_waits_for_required_checks(
         deployment=validate.Deployment(target, candidate if same_proxy else installed, Path(sys.executable)),
     )
     assert tuple(calls) == expected
-    assert (snapshot / "snapshot.json").exists() is not week_fails
-    assert all(results.values()) is not week_fails
+    passed = not week_fails and pin_matches
+    assert (snapshot / "snapshot.json").exists() is passed
+    assert all(results.values()) is passed
 
 
 # Intent: a later validation reuses real test evidence while a changed result must be refreshed.

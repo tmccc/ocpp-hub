@@ -73,6 +73,14 @@ open session. The replacement Stop reply stays with the current Pause whether th
 arrives before or after it. Introduction shares a Stop already sent by the same Pause. Pause completes after
 closure has been verified.
 
+The [ordinary recovery tests](../tests/test_ordinary_recovery.py) also replace the proxy after a real Stop has
+been saved and while the charger still reports the same session at zero. They exercise both plugged and
+unplugged reports, replay the Stop and verify fresh closure before the positive ceiling returns.
+The [shutdown overlap test](../tests/test_managed_start_binding.py) closes a daily session and then closes
+the separate late report of an already accepted owner Start. Each Stop uses its own transaction.
+The [cloud storage tests](../tests/test_cloud_ack_storage.py) also take the cloud offline during replacement.
+The proxy commits the stored Start or Stop acknowledgement locally and retains any later undelivered report.
+
 The focused interaction checks run in the ordinary engine suite. The finite families below have their
 own per-case manifest and recovery evidence.
 
