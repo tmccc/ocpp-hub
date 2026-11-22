@@ -126,6 +126,10 @@ class ManagementServer:
         fields = {"id", "command", "revision"}
         if command == "set_current":
             fields.add("current_a")
+        elif command == "stop_session":
+            fields.add("target")
+            if not isinstance(value.get("target"), str) or not re.fullmatch(r"[a-f0-9]{64}", value["target"]):
+                raise SecurityError("management Stop target is invalid")
         elif command not in ("pause", "app_control", "start", "start_test", "arm_cloud_test"):
             raise SecurityError("management command is not supported")
         if set(value) != fields:
@@ -133,9 +137,13 @@ class ManagementServer:
         try:
             result = await self.controller.commands.run(
                 lambda: self.controller.command(
-                    value["id"], command, value["revision"], current_a=value.get("current_a")
+                    value["id"],
+                    command,
+                    value["revision"],
+                    current_a=value.get("current_a"),
+                    target=value.get("target"),
                 ),
-                priority=CommandPriority.RESTRICT if command == "pause" else CommandPriority.NORMAL,
+                priority=CommandPriority.RESTRICT if command in ("pause", "stop_session") else CommandPriority.NORMAL,
             )
         except sqlite3.Error:
             # An absent receipt outside a transaction proves this request was not admitted.
@@ -150,6 +158,8 @@ class ManagementServer:
         binding = {"revision": value["revision"]}
         if command == "set_current":
             binding["current_a"] = value["current_a"]
+        if command == "stop_session":
+            binding["target"] = value["target"]
         return {"id": value["id"], "ok": True, "result": {**result, **binding}}
 
     # Reserve Pause capacity independently of dashboard requests and other controls.

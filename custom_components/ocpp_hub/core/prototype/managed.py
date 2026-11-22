@@ -23,6 +23,7 @@ from .managed_release_recovery import (
     release_evidence,
     release_pause_ack,
 )
+from .managed_session_stop import STOP_SESSION, ManagedSessionStop
 from .managed_settlement import (
     charge_test_candidate,
 )
@@ -96,6 +97,7 @@ class ManagedController:
 
         self.current = ManagedCurrentLimits(self)
         self.charging = ManagedCharging(self)
+        self.session_stop = ManagedSessionStop(self)
         self.ordinary = OrdinaryRecovery(self)
         self.recovery = RecoveryCoordinator(self)
         session.gateway.retiring = lambda: self.stopping
@@ -134,7 +136,9 @@ class ManagedController:
         return self.session.journal.db.in_transaction and self.authority() == expected
 
     # Accept commands without performing hidden Start, while a newer Pause immediately revokes positive authority.
-    def command(self, identifier: str, action: str, revision: int, *, current_a: int | None = None) -> dict[str, Any]:
+    def command(
+        self, identifier: str, action: str, revision: int, *, current_a: int | None = None, target: str | None = None
+    ) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
         if action != "pause" and self.session._introduction_refusal is not None:
@@ -145,6 +149,12 @@ class ManagedController:
             return self.current.accept(identifier, revision, current_a)
         if current_a is not None:
             raise SecurityError("current is only supported by the current-selection command")
+        if action == STOP_SESSION:
+            if target is None:
+                raise SecurityError("Stop requires an exact session target")
+            return self.session_stop.accept(identifier, revision, target)
+        if target is not None:
+            raise SecurityError("a session target is only supported by Stop")
         if action in ("start", "start_test", "arm_cloud_test"):
             return self.charging.accept(identifier, action, revision)
         if action == "app_control":
@@ -425,6 +435,8 @@ class ManagedController:
                     raise AuditSupersededError("settled native evidence crossed a newer authority or observation")
                 if self.ordinary.closure_gap(native):
                     return False
+                if self.session_stop.closure_pending(native):
+                    raise RecoveryRequiredError("session Stop awaits both local closure observations")
                 if (
                     native.physical.transaction_open
                     and native.physical.native_transaction_id != self.session.journal.active()
@@ -486,12 +498,14 @@ class ManagedController:
     async def _tick(self) -> dict[str, Any]:
         self.commands.decide(self.session.gateway.retry_reply_writes)
         self.commands.decide(self.session.runtime.settle_saved_lifecycle)
+        self.commands.decide(self.session_stop.expire)
         pending = await self._pending_work()
         if pending is not None:
             self.latest_native = None
             return render_poll(self, PollStatus("stopping" if self.stopping else "reconciling", pending), pending=True)
         gate = await self._poll_gate()
         if gate is not None:
+            await self.session_stop.confirm_while_blocked()
             return render_poll(self, gate)
         observed = await self._supervise()
         if isinstance(observed, PollStatus):
@@ -501,6 +515,7 @@ class ManagedController:
 
     # Decide health and Return completion before rendering the dashboard view.
     def _settle_poll(self, observed: Observation) -> PollStatus | tuple[HandoverEvidence, HealthVerdict]:
+        self.session_stop.observed(observed.native)
         verdict = self._assess_observation(observed)
         if isinstance(verdict, PollStatus):
             return verdict

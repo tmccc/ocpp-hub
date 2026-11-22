@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Let Solar Display 2 start and stop sessions through the local iCS proxy. Confirm its requests from the
+  charger's session reports and leave app and scheduled charging available after a session-only Stop.
 - Use the shared controller to hold the charger at zero during outage recovery and decide when the saved
   limit can be restored. Recheck the active charger connection, cloud acknowledgement, and charging records
   before releasing the hold.

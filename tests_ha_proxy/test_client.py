@@ -27,6 +27,7 @@ async def peer():
         "status_age_seconds": 0,
         "native_age_seconds": 0,
         "power_w": 0,
+        "charging_session_open": False,
         "current_a": 0,
         "native_limit_a": 6,
         "station_ceiling_a": 6,
@@ -138,12 +139,23 @@ async def peer():
                 station_ceiling_a=6,
                 owner_control_enabled=True,
                 local_charge={"state": "running", "charging": False},
+                charging_session_open=True,
+                stop_target="b" * 64,
             )
             receipts[value["id"]] = {"id": value["id"], "action": command, "state": "completed"}
             result = {"id": value["id"], "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
             if control["lose_reply"]:
                 await socket.close()
                 return socket
+        elif command == "stop_session":
+            if value["revision"] != state["control_revision"] or value["target"] != state.get("stop_target"):
+                await socket.send_json({"ok": False, "error": "not_ready"})
+                await socket.close()
+                return socket
+            state.update(charging_session_open=False, stop_target=None, can_start=True, local_charge=None)
+            binding = {"id": value["id"], "action": command, "revision": value["revision"], "target": value["target"]}
+            receipts[value["id"]] = {**binding, "state": "completed"}
+            result = {**binding, "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
         elif command == "receipt":
             if control.get("close_first_receipt") and control["commands"].count("receipt") == 1:
                 await socket.close(code=1013, message=b"Busy")
@@ -191,6 +203,42 @@ async def setup(hass, peer):
     entry = result["result"]
     assert entry.state is ConfigEntryState.LOADED
     return entry
+
+
+# Intent: one HA action waits for the correct receipt, updates the session view and enables an immediate Stop.
+# Why: an open session can draw 0 W, and a result for another target must never clear this request as confirmed.
+@pytest.mark.parametrize("wrong_receipt", [False, True])
+async def test_session_action_can_start_then_stop_at_zero_watts(actual_hass, peer, wrong_receipt):
+    hass = actual_hass
+    await setup(hass, peer)
+    peer["pending_receipt"] = True
+    session = "binary_sensor.ics_proxy_session_open"
+    assert hass.states.get(session).state == "off"
+
+    # Call the same response-bearing HA action as a touchscreen automation.
+    async def request(action, **fields):
+        return await hass.services.async_call(
+            "ics_proxy", "session_command", {"action": action, **fields}, blocking=True, return_response=True
+        )
+
+    assert await request("start") == {"confirmed": True}
+    active = hass.states.get(session)
+    assert active.state == "on" and hass.states.get("binary_sensor.ics_proxy_charging").state == "off"
+    target = active.attributes["stop_target"]
+    assert await request("stop_session", target="c" * 64) == {"confirmed": False}
+    assert "stop_session" not in peer["commands"]
+
+    # An independent status update to closed is still insufficient if the saved receipt has the wrong target.
+    def alter_receipt(command, _request, receipt):
+        if wrong_receipt and command == "receipt" and receipt.get("action") == "stop_session":
+            return {**receipt, "target": "c" * 64}
+        return receipt
+
+    peer["result_filter"] = alter_receipt
+    assert await request("stop_session", target=target) == {"confirmed": not wrong_receipt}
+    assert peer["commands"].count("start") == peer["commands"].count("stop_session") == 1
+    assert hass.states.get(session).state == "off"
+    assert hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
 
 
 # Intent: a recorded Pause reports unknown confirmation on a slow receipt while a fast receipt completes normally.

@@ -189,6 +189,8 @@ class ProxyClient:
                 return False
             if action == "set_current" and "current_a" in receipt:
                 return type(receipt["current_a"]) is int and receipt["current_a"] == fields.get("current_a")
+            if action == "stop_session":
+                return isinstance(receipt.get("target"), str) and receipt["target"] == fields.get("target")
             return True
 
         try:

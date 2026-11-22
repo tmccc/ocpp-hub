@@ -647,6 +647,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     if result["state"] in ("healthy", "local_only") and not result["healthy"]:
         result["state"] = "local_only" if result["local_healthy"] else "degraded"
     result["can_pause"] = not c.stopping
+    result["stop_target"] = c.session_stop.target() if fresh and scope_current else None
     try:
         result.update(
             can_start_test=result["healthy"] and c.charging.available(native),

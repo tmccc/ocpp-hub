@@ -383,6 +383,7 @@ class ManagedRequests:
             "start_test",
             "arm_cloud_test",
             "set_current",
+            "stop_session",
         ):
             raise SecurityError("management request shape is invalid")
         if type(revision) is not int or not 0 <= revision < 2**53:
@@ -461,9 +462,15 @@ class ManagedRequests:
         if command.action == "app_control":
             result.pop("_return", None)
             result.pop("_await_cloud", None)
+        target = None
+        if command.action == "stop_session":
+            target = result.pop("target", None)
+            result.pop("_session_stop", None)
         receipt: dict[str, Any] = {"id": identifier, "action": command.action, "state": command.state, "result": result}
         if include_binding:
             receipt["revision"] = command.revision
+            if command.action == "stop_session":
+                receipt["target"] = target
             if command.action == "set_current":
                 bound = self.journal.db.execute(
                     "SELECT current_a FROM managed_current_requests WHERE id=?", (identifier,)

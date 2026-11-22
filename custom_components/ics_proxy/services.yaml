@@ -1,0 +1,17 @@
+session_command:
+  name: Control charging session
+  description: Start charging or stop an exact open session and wait for the local proxy to confirm the result.
+  fields:
+    action:
+      name: Action
+      required: true
+      selector:
+        select:
+          options:
+            - start
+            - stop_session
+    target:
+      name: Stop target
+      description: The stop_target attribute from the Session open sensor at the time of the request.
+      selector:
+        text:

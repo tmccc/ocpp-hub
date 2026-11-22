@@ -2126,12 +2126,21 @@ class ControlDecisions:
         protective: bool = False,
         station_flowing: Callable[[], bool] | None = None,
         reuse_allowed: bool = True,
+        session_only: bool = False,
     ) -> StopDecision:
         # Read the exact report and reply in the same queued decision as the latest draw evidence.
         def decide() -> StopDecision:
             session = self.journal.outcomes.session(local)
             if session is None or session.closed or self.journal.active() != session.local:
                 return StopDecision.CLOSED
+            # Without a new protective hold, keep any possibly sent ordinary Stop with its original session.
+            if session_only and (
+                self.journal.outcomes.session_stop_dispatched(session.local)
+                or self.journal.outcomes.unanswered_vendor_stop(session.local)
+            ):
+                if self.stop_acknowledged(session.local):
+                    return StopDecision.ACCEPTED
+                return StopDecision.WAIT_FOR_REPORT
             if not reuse_allowed:
                 return StopDecision.SEND
             protecting = protective or (station_flowing is not None and station_flowing())
@@ -2543,7 +2552,9 @@ class ControlDecisions:
 
     # The gateway renders this decision with its own request ID and keeps any unsent mutation separate.
     def require_vendor_stop(self, local: int, boot: str, evidence: StopZeroEvidence) -> None:
-        decision = self._stop_send_decision(local, boot, reuse_allowed=evidence.stop_zero_verified(local))
+        decision = self._stop_send_decision(
+            local, boot, reuse_allowed=evidence.stop_zero_verified(local), session_only=True
+        )
         if decision is StopDecision.ACCEPTED:
             raise VendorStopAlreadyAcceptedError
         if decision is StopDecision.WAIT_FOR_REPORT:
@@ -2553,16 +2564,29 @@ class ControlDecisions:
 
     # Both wire callers authorize a Stop against the exact open target, prior reply and original Boot.
     def _stop_send_decision(
-        self, local: int, boot: str | None, *, protective: bool = False, reuse_allowed: bool = True
+        self,
+        local: int,
+        boot: str | None,
+        *,
+        protective: bool = False,
+        reuse_allowed: bool = True,
+        session_only: bool = False,
     ) -> StopDecision:
-        decision = self.stop_decision(local, protective=protective, reuse_allowed=reuse_allowed)
+        decision = self.stop_decision(
+            local, protective=protective, reuse_allowed=reuse_allowed, session_only=session_only
+        )
         if decision is StopDecision.SEND and self.control.boot() != boot:
             raise UnavailableError("Stop lost its original charger Boot or open session")
         return decision
 
     # Authorize the local executor's send and remember exactly which attempt protects a lost zero.
-    def authorize_local_send(self, local: int, boot: str | None, ticket: str, *, protective: bool) -> bool:
-        if self._stop_send_decision(local, boot, protective=protective) is not StopDecision.SEND:
+    def authorize_local_send(
+        self, local: int, boot: str | None, ticket: str, *, protective: bool, session_only: bool = False
+    ) -> bool:
+        if (
+            self._stop_send_decision(local, boot, protective=protective, session_only=session_only)
+            is not StopDecision.SEND
+        ):
             return False
         if protective:
             self._protective_stop = local, boot, self.control._revision, ticket

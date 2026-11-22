@@ -895,6 +895,12 @@ receipt even when the car initially draws0W. The dashboard reports **Local sessi
 charging**. The60second startup permission retires after session confirmation; regular charging has no two-minute
 cutoff and continues until the car, app, native schedule or an explicit Pause ends it.
 
+Home Assistant's **Control charging session** action sends Start and **Stop this session** through the local
+proxy. A Stop targets the currently verified session shown by **Session open**. It leaves the selected ceiling
+and the app/schedule setting in place. The action confirms Stop only after the charger reports the session
+closed and a fresh local reading agrees. A session can still be open at 0 W. An unanswered Stop remains tied
+to that session so an older request cannot stop the next one.
+
 The first actual local transaction binding is immutable. Its real Stop completes normal metadata without pausing a
 later app or same-tag native session, including Start/Stop pairs between polls or before startup-deadline processing.
 Interrupted active normal sessions recover paused at zero and never replay Start. Start and Return reserve a receipt

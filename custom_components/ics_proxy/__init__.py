@@ -8,9 +8,16 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import ProxyCoordinator
 from .notification import NOTICES
+from .session_service import register_session_service
 
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON, Platform.NUMBER]
 type ProxyEntry = ConfigEntry[ProxyCoordinator]
+
+
+# Register the response action once for the domain. Setup never sends a charger command.
+async def async_setup(hass: HomeAssistant, config: dict[str, object]) -> bool:
+    register_session_service(hass)
+    return True
 
 
 # Connect only to the authenticated management channel; the OCPP service remains independently supervised.

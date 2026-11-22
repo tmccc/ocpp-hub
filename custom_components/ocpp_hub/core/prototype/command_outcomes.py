@@ -166,6 +166,8 @@ class OwnerCommand:
         elif self.action == "pause":
             stops = [wire for wire in self.wires if wire.action == "RemoteStopTransaction"]
             relevant = stops or [wire for wire in self.wires if wire.action == "SetChargingProfile"]
+        elif self.action == "stop_session":
+            relevant = [wire for wire in self.wires if wire.action == "RemoteStopTransaction"]
         else:
             relevant = [wire for wire in self.wires if wire.action == "SetChargingProfile" and wire.limit_a]
         return bool(relevant) and relevant[-1].reply in ("Accepted", "Rejected", "NotSupported", "Unknown")
@@ -532,7 +534,37 @@ class CommandOutcomes:
     def awaits_stop_report(self, local: int | None) -> bool:
         if local is None or self.journal.active() != local:
             return False
-        return self.accepted_stop(local) or self.unanswered_shutdown_stop(local)
+        return self.accepted_stop(local) or self.unanswered_shutdown_stop(local) or self.session_stop_dispatched(local)
+
+    # Session-only Stop owns a possible dispatch even if its separate wire record could not be saved.
+    def session_stop_dispatched(self, local: int) -> bool:
+        if self.journal.get("managed_mode") is None:
+            return False
+        return (
+            self.journal.db.execute(
+                "SELECT 1 FROM managed_requests r WHERE r.action='stop_session' "
+                "AND r.state IN ('running','uncertain') AND json_extract(r.result,'$._session_stop.local')=? "
+                "AND json_extract(r.result,'$._session_stop.dispatched')=1 AND NOT EXISTS ("
+                "SELECT 1 FROM owner_command_wires w WHERE w.request=r.id AND w.action='RemoteStopTransaction' "
+                "AND w.reply='Rejected') LIMIT 1",
+                (local,),
+            ).fetchone()
+            is not None
+        )
+
+    # A possibly sent vendor Stop is distinct from one merely prepared in the charger gate.
+    def unanswered_vendor_stop(self, local: int) -> bool:
+        rows = self.journal.db.execute(
+            "SELECT token,wire_request FROM vendor_command_scope JOIN mutations ON mutation=token "
+            "WHERE local=? AND origin='vendor' AND action='RemoteStopTransaction' "
+            "AND wire_result='dispatched' AND state IN ('pending','uncertain')",
+            (local,),
+        )
+        for row in rows:
+            reply = self._received(row["token"])
+            if not isinstance(reply, ForwardedReply) or reply.wire != row["wire_request"] or reply.status != "Rejected":
+                return True
+        return False
 
     # This is evidence to wait, without an Accepted reply that can be sent to another caller.
     def unanswered_shutdown_stop(self, local: int) -> bool:
