@@ -13,7 +13,7 @@ from .command_processor import CommandPriority
 from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope
 from .control_decisions import ACTIVE, ExpiredStartStop
 from .local_control import local_start_receipt
-from .managed_intent import ControlIntent, write_intent
+from .managed_intent import write_intent
 from .managed_settlement import claim_internal_pause, current_candidate
 from .managed_sources import confirmed_vendor_start, known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
@@ -237,7 +237,9 @@ class ManagedCharging:
 
     # All preparation, dispatch and lifecycle users recheck the same live lease.
     def guard(self, lease: ChargeLease, *, stopping: bool = False) -> None:
-        self.controller.session.gateway.controls.decisions.require_start_lease(self, lease, stopping=stopping)
+        self.controller.session.gateway.controls.decisions.require_start_lease(
+            self, lease, time.monotonic, stopping=stopping
+        )
 
     # The service owns the worker after client disappearance; failures revoke only this Start's authority.
     async def _start(self, lease: ChargeLease) -> None:
@@ -698,61 +700,20 @@ class ManagedCharging:
     def failed_start_zero_needed(self, lease: ChargeLease, reason: str, failure: dict[str, Any] | None) -> bool:
         return self.controller.session.gateway.controls.decisions.failed_start_zero_needed(self, lease, reason, failure)
 
-    # An internal timed-test Pause can hold zero without stopping a different charging session.
+    # Let the owner check whether this timed Pause may Stop the current session.
     def timed_pause_leaves_session(self, local: int | None) -> bool:
-        requests = self.controller.requests
-        if local is None or requests.pause_request() is not None:
-            return False
-        intent = requests.intent()
-        test = self.state()
-        internal = self.journal.get("managed_internal_pause", {})
-        return (
-            intent.mode == "paused"
-            and internal.get("source") == "test"
-            and internal.get("revision") == intent.revision
-            and internal.get("id") == test.get("id")
-            and test.get("kind") != "normal"
-            and self.journal.starts.timed_stop_target(test) != local
-        )
+        return self.controller.session.gateway.controls.decisions.timed_pause_leaves_session(self, local)
 
     # A replacement introduction retains the same limits on which session the previous request can Stop.
     def recovery_zero_only(self) -> bool:
         return self.scoped_normal_stop() or self.timed_pause_leaves_session(self.journal.active())
 
-    # Record the protective Pause independently of any subsequent timed-test result.
-    def _claim_test_pause(self, intent: ControlIntent, identifier: str) -> None:
-        write_intent(self.journal, intent, "paused")
-        claim_internal_pause(self.controller, "test", identifier)
-        self.controller.requests.charge_stopped()
-
-    # Retire only the timed test's target, or the matching normal Start's own pending evidence.
+    # Schedule restrictive execution after the shared owner commits the exact expiry.
     def stop(self, lease: ChargeLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
-        state = self.state()
-        if self.lease is not lease or state.get("state") == "stopping":
-            return
-        c, j = self.controller, self.journal
-        if c.stopping:
-            return
-        target = None if lease.normal else j.starts.timed_stop_target(state)
-        if c.session.gateway.controls.decisions.schedule.retire_test_beside_daily(self, lease, state, target):
-            return
-        with j.atomic():
-            intent = c.requests.intent()
-            preserve = (
-                lease.normal
-                and intent.mode == "app"
-                and intent.revision == lease.revision
-                and self.state().get("independent_seen") is True
-            )
-            if intent.mode != "paused" and not preserve:
-                self._claim_test_pause(intent, lease.identifier)
-            elif self.failed_start_zero_needed(lease, reason, failure):
-                c.session.gateway.controls._claim(True)
-            j.starts.expire(lease, reason, preserve, failure, target=target)
-        if lease.normal:
-            self.journal.starts.set_lease(None)
-        c.schedule_pause()
-        self.changed.set()
+        c = self.controller
+        if c.session.gateway.controls.decisions.expire_start(self, lease, reason, failure):
+            c.schedule_pause()
+            self.changed.set()
 
     # A monotonic deadline owns Stop independently of HA, the initiating socket, native reads and service polling.
     async def _deadline(self, lease: ChargeLease) -> None:
@@ -781,30 +742,13 @@ class ManagedCharging:
 
     # Try the guarded zero at the deadline while the exact timed Stop record is still waiting to be saved.
     async def _hold_timed_cutoff(self, lease: ChargeLease) -> None:
-        c, j = self.controller, self.journal
-
-        # A matching Start report identifies the session even before the first native power reading.
-        def claim() -> bool:
-            if self.lease is not lease or lease.normal or c.stopping or time.monotonic() < lease.deadline:
-                return False
-            state, intent, local = self.state(), c.requests.intent(), j.active()
-            phase = state.get("state")
-            if (
-                state.get("id") != lease.identifier
-                or phase not in ACTIVE
-                or phase == "stopping"
-                or local is None
-                or local != j.starts.timed_stop_target(state)
-            ):
-                return False
-            if intent == ControlIntent("app", lease.revision):
-                with j.atomic():
-                    self._claim_test_pause(intent, lease.identifier)
-                return True
-            return intent.mode == "paused"
+        c = self.controller
 
         try:
-            if await c.commands.run(claim, priority=CommandPriority.RESTRICT):
+            if await c.commands.run(
+                lambda: c.session.gateway.controls.decisions.claim_timed_cutoff(self, lease, time.monotonic),
+                priority=CommandPriority.RESTRICT,
+            ):
                 await c.ensure_pause_zero()
         except sqlite3.Error, RecoveryRequiredError, DeniedError:
             pass  # The deadline retries the exact hold and bookkeeping on its next turn.

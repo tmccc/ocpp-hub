@@ -11,16 +11,13 @@ from typing import Any
 from ..control import HUB_PROFILE_ID
 from .command_processor import CommandPriority
 from .composite import STATION_COMPOSITE_FAULT, ExcessiveCompositeError
-from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
-from .control_state import ControlState
-from .local_control import ControlSupersededError, local_start_receipt
+from .connection_scope import ControlScope, current_control_scope, current_scope
+from .local_control import ControlSupersededError
 from .managed_charging import ManagedCharging
 from .managed_current import ManagedCurrentLimits
 from .managed_current_recovery import capture_interrupted_collision
-from .managed_facts import ManagedFacts
 from .managed_intent import RELEASE_PAUSE_ACK, ControlIntent, ManagedRequests
 from .managed_native_repair import NativeRepairAudits
-from .managed_records import TerminalCurrent
 from .managed_release_recovery import (
     reconcile_owner_release,
     release_evidence,
@@ -28,12 +25,7 @@ from .managed_release_recovery import (
 )
 from .managed_settlement import (
     charge_test_candidate,
-    complete_record,
-    current_candidate,
-    internal_pause_matches,
-    require_settled_debt,
 )
-from .managed_sources import recorded_station_profile
 from .managed_start_binding import ManagedStartReports
 from .managed_view import render_poll
 from .native_bounded import NativeReadinessError
@@ -54,8 +46,7 @@ from .recovery_contracts import AuthorityStamp, GateDecision, Pending, Prerequis
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
-from .start_settlement import RetirementCandidate
-from .store import JournalStartBusy, RecoveryRequiredError, fingerprint
+from .store import JournalStartBusy, RecoveryRequiredError
 from .supervision import ControlProof, HealthVerdict, Observation, PollStatus, assess
 from .trial_handover_evidence import HandoverEvidence
 from .trial_session import TrialSession, managed_service_mode
@@ -208,99 +199,17 @@ class ManagedController:
                 return
             await self.commands.turn(CommandPriority.RESTRICT)
 
-    # The current persistent Pause may reclaim only the shared ticket of its exact retired normal Start.
-    def reclaim_failed_start_pause(self) -> None:
-        g, j = self.session.gateway, self.session.journal
-        intent, state = self.requests.intent(), self.charging.state()
-        failure = state.get("failure")
-        if (
-            intent.mode != "paused"
-            or state.get("kind") != "normal"
-            or state.get("source") != "local"
-            or state.get("state") != "stopping"
-            or state.get("stop_reason") != "start_not_confirmed"
-            or state.get("start_attempted") is not True
-            or state.get("revision") != intent.revision
-            or not isinstance(failure, dict)
-            or failure.get("id") != state.get("id")
-            or failure.get("action") != "start"
-            or failure.get("revision") != intent.revision
-            or failure.get("effects_started") is not True
-        ):
-            return
-        receipt, control = local_start_receipt(j), j.get("control", {})
-        ownership = self.requests.pause_ownership()
-        connection = current_control_scope(g)
-        row = j.db.execute(
-            "SELECT action,revision,state FROM managed_requests WHERE id=?", (state.get("id"),)
-        ).fetchone()
-        if (
-            connection is None
-            or row is None
-            or tuple(row) != ("start", intent.revision, "uncertain")
-            or receipt.get("request_id") != state.get("id")
-            or receipt.get("digest") != state.get("tag_digest")
-            or receipt.get("stage") not in ("issued", "accepted")
-            or not receipt.get("ticket")
-            or control.get("ticket") != receipt["ticket"]
-            or not ControlState(control).confirmed_shared
-            or not ownership.requested
-        ):
-            return
-
-        # This is current Pause authority under its own Boot, never adoption of the failed Start's older scope.
-        def current() -> bool:
-            return (
-                not self.stopping
-                and not j.fault.latched()
-                and self.charging.lease is None
-                and not g.controls._operations
-                and not g.charger._pending
-                and self.requests.intent() == intent
-                and control_scope_matches(g, connection)
-                and j.phase.read().active
-                and self.charging.state() == state
-                and local_start_receipt(j) == receipt
-                and j.get("control") == control
-                and self.requests.pause_ownership().pause == ownership.pause
-                and fingerprint(j.get("boot")) == self.native.spec.boot_digest
-                and recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
-                and j.db.execute(
-                    "SELECT action,revision,state FROM managed_requests WHERE id=?", (state["id"],)
-                ).fetchone()
-                == row
-            )
-
-        if current():
-            with j.atomic():
-                if current():
-                    g.controls._claim(True)
-
     # Explicit owner Pause can restrict the commissioned station even while a native HTTP read is unavailable.
     async def ensure_pause_zero(self, *, request_id: str | None = None) -> None:
-        g, j = self.session.gateway, self.session.journal
+        g = self.session.gateway
         intent = self.requests.intent()
         if intent.mode != "paused" or g.controls.ready and g.controls.desired() == 0:
             return
         try:
-            self.commands.decide(self.reclaim_failed_start_pause, priority=CommandPriority.RESTRICT)
-            ticket = j.get("control", {}).get("ticket")
-            connection = current_control_scope(g)
-
-            # Recheck the owner's claim and authenticated device immediately before each wire operation.
-            def guard() -> None:
-                control = j.get("control", {})
-                if (
-                    self.stopping
-                    or self.requests.intent() != intent
-                    or not ticket
-                    or control.get("ticket") != ticket
-                    or not ControlState(control).explicit_local_hold
-                    or not control_scope_matches(g, connection)
-                    or fingerprint(j.get("boot")) != self.native.spec.boot_digest
-                    or not recorded_station_profile(j, self.native.spec.digest, self.native.spec.boot_digest)
-                ):
-                    raise RecoveryRequiredError("owner Pause awaits the current commissioned station")
+            self.commands.decide(
+                lambda: g.controls.decisions.reclaim_failed_start_pause(self), priority=CommandPriority.RESTRICT
+            )
+            guard = g.controls.decisions.owner_pause_zero_guard(self, intent)
 
             if request_id is None:
                 try:
@@ -368,7 +277,7 @@ class ManagedController:
                 if controls.decisions.complete_closed_stop(native, self.require_paused, self.charging.observed):
                     timed = charge_test_candidate(self, timed_only=True)
                     if timed is not None:
-                        self._settle_pause_records(native, (timed,))
+                        controls.decisions.settle_pause_records(self, native, (timed,))
                     return False, station_absent
                 return controls.stop_work_needed(
                     local, station_absent=station_absent, station_flowing=station_flowing
@@ -391,71 +300,9 @@ class ManagedController:
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.
 
-    # A deliberate hold is confirmed only by actual closed/all-phase zero and the current owned station0 receipt.
+    # A deliberate hold must pass the shared owner's current closed-zero proof.
     def require_paused(self, native: HandoverEvidence, *, local: int | None = None) -> None:
-        reason = self.native.stop_zero_refusal(native, local=local) or self._paused_refusal()
-        if reason is not None:
-            error = RecoveryRequiredError("requested pause awaits independently verified closed zero")
-            error.add_note(reason)
-            raise error
-
-    # A local hold needs its own current authority as well as the common physical Stop proof.
-    def _paused_refusal(self) -> str | None:
-        g, j = self.session.gateway, self.session.journal
-        facts = ManagedFacts(self)
-        if not facts.introduction_current():
-            return "introduction_unconfirmed"
-        if not ControlState(j.get("control", {})).local_hold:
-            return "local_hold_missing"
-        if j.get("control", {}).get("start_pending"):
-            return "start_pending"
-        if g.vendor_write_evidence().unresolved:
-            return "vendor_command_uncertain"
-        if g.charger._pending:
-            return "charger_rpc_pending"
-        if g.controls._operations:
-            return "control_operation_pending"
-        return None
-
-    # Independently verify the newer owner's closed zero before clearing a superseded Start's pending flag.
-    def settle_rejected_start_at_pause(
-        self, native: HandoverEvidence, intent: ControlIntent, connection: ControlScope | None
-    ) -> None:
-        g, j = self.session.gateway, self.session.journal
-
-        # Check only the exact newer Pause and its current hold in the Start settlement transaction.
-        def require_hold(control: dict[str, Any]) -> None:
-            pause, ownership = self.requests.pause_request(), self.requests.pause_ownership()
-            if (
-                self.stopping
-                or ownership.intent != intent
-                or pause is None
-                or pause.revision != intent.revision
-                or not ownership.owns_ticket(pause.hold)
-                or not control_scope_matches(g, connection)
-                or self.native.introduction_pending
-                or self.native.audited_epoch != g._charger_epoch
-                or j.get("control", {}) != control
-                or not ControlState(control).explicit_local_hold
-                or j.active() is not None
-                or not g.controls.ready
-                or g.controls.desired() != 0
-                or g.charger._pending
-                or g.controls._operations
-                or not self.native.commissioned_binding_matches(native)
-            ):
-                raise RecoveryRequiredError("rejected Start settlement awaits its current owner Pause")
-            self.native.require(native, closed=True)
-            key = f"profile:{HUB_PROFILE_ID}"
-            station = [resource for resource in native.physical.resources if resource.key == key]
-            row = j.db.execute("SELECT state,confirmed FROM trial_resources WHERE key=?", (key,)).fetchone()
-            if not self.session.book.confirmed_station_zero(station, row):
-                raise RecoveryRequiredError("rejected Start settlement awaits the confirmed station zero")
-
-        try:
-            j.starts.settle_rejected_pause(intent.revision, require_hold)
-        except sqlite3.Error as error:
-            raise RecoveryRequiredError("rejected Start settlement awaits journal storage") from error
+        self.session.gateway.controls.decisions.require_paused(self, native, local=local)
 
     # Reapply only a requested Stop after replacement; this branch never returns authority to the app implicitly.
     async def maintain_pause(self) -> HandoverEvidence:
@@ -470,7 +317,8 @@ class ManagedController:
                 raise native.cause
             raise RecoveryRequiredError(native.detail) from native.cause
         if not self.commands.decide(
-            lambda: self._accept_pause_observation(native, intent, connection), priority=CommandPriority.RESTRICT
+            lambda: self.session.gateway.controls.decisions.accept_pause_observation(self, native, intent, connection),
+            priority=CommandPriority.RESTRICT,
         ):
             await asyncio.shield(self.schedule_pause())
             raise RecoveryRequiredError("requested pause awaits actual physical closure")
@@ -478,63 +326,6 @@ class ManagedController:
         if local_only is not None:
             await self.native.resume(local_only=local_only)
         return native
-
-    # Settle closure, related receipts and the exact owner Pause together.
-    def _accept_pause_observation(
-        self, native: HandoverEvidence, intent: ControlIntent, connection: ControlScope | None
-    ) -> bool:
-        g = self.session.gateway
-        if self.stopping or self.requests.intent() != intent or not control_scope_matches(g, connection):
-            raise RecoveryRequiredError("Pause observation no longer belongs to the current request and Boot")
-        self.native.require_known_session(native)
-        if (
-            native.physical.transaction_open
-            or not self.session.gateway.controls.ready
-            or self.session.gateway.controls.desired() != 0
-            or not ControlState(self.session.journal.get("control", {})).local_hold
-        ):
-            return False
-        self.settle_rejected_start_at_pause(native, intent, connection)
-        if (self.native.introduced_epoch, self.native.introduced_revision) != (g._charger_epoch, g.controls._revision):
-            self.native.confirm_paused_introduction(native)
-        self.require_paused(native)
-        records = tuple(
-            record for record in (current_candidate(self), charge_test_candidate(self)) if record is not None
-        )
-        self._settle_pause_records(native, records, internal=internal_pause_matches(self))
-        if self.current.failed_idle_hold():
-            # This fresh closed-zero proof settles only the physical hold, without issuing another Stop.
-            g.controls._complete(self.session.journal.get("control")["ticket"], uncertain=False)
-            raise RecoveryRequiredError("failed current hold awaits a fresh settled Pause observation")
-        # Physical Pause is already proved. Cloud delivery debt can still block reactivation independently.
-        self.complete_pause_observation(native, intent, connection)
-        return True
-
-    # Foreground Stop and Pause supervision retire exact related records at the same settled zero boundary.
-    def _settle_pause_records(
-        self,
-        native: HandoverEvidence,
-        records: tuple[TerminalCurrent | RetirementCandidate, ...],
-        *,
-        internal: bool = False,
-    ) -> None:
-        g, j = self.session.gateway, self.session.journal
-        if records or internal:
-            try:
-                require_settled_debt(self)
-            except RecoveryRequiredError:
-                pass  # Unknown Start and lifecycle facts remain authoritative even at fresh native zero.
-            else:
-                with j.atomic():
-                    self.require_paused(native)
-                    require_settled_debt(self)
-                    for record in records:
-                        complete_record(self, record)
-                    if internal:
-                        g.controls._complete(j.get("control")["ticket"], uncertain=False)
-                if any(isinstance(record, RetirementCandidate) for record in records):
-                    j.starts.set_lease(None)
-                    self.charging.changed.set()
 
     # Pause alone settles its receipt, using current independent closure and the original paused generation.
     def complete_pause_observation(
