@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Restore the saved iCS app/schedule setting after a clean offline recovery once the charger and cloud reports
+  agree. A manual Pause or unresolved charging work still requires the owner's Return.
 - Use one Stop decision for local Pause and vendor-app Stop. Reuse the real acceptance of the same session
   when fresh readings confirm zero, and allow a protective Stop when zero is lost or cannot be verified.
 - Preserve an unanswered shutdown Stop through later shutdowns. Resume a known session after a proven unsent

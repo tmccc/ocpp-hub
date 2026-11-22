@@ -577,6 +577,16 @@ class ManagedRequests:
             return identifier is None
         return identifier is not None and request_pending(self.journal, identifier, "app_control", expected.revision)
 
+    # Only a revision-bound offline Pause can return automatically; older Boolean markers confer no authority.
+    def offline_pause_current(self, expected: ControlIntent) -> bool:
+        marker = self.journal.get(OFFLINE_PAUSE)
+        return (
+            type(marker) is int
+            and marker == expected.revision
+            and expected.mode == "paused"
+            and self.intent() == expected
+        )
+
     # The owner claims Return immediately before launch; busy or stopping polls leave it accepted.
     def return_started(self, identifier: str, expected: ControlIntent) -> bool:
         return (

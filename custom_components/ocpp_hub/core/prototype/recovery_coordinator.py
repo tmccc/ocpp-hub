@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 
 from .connection_scope import control_scope_matches, current_control_scope
 from .managed_current import current_source_decision
-from .managed_intent import ControlIntent, ReturnSettlement
+from .managed_intent import ControlIntent, ReturnSettlement, write_intent
+from .managed_settlement import offline_return_decision
 from .policy import DeniedError
 from .recovery_contracts import (
     ALLOW,
@@ -123,6 +124,13 @@ class RecoveryCoordinator:
                         return Pending(Prerequisite.RECONCILIATION, "Return retained its protective fault")
             elif work is RecoveryWork.PAUSE:
                 await c.maintain_pause()
+                intent = c.requests.intent()
+                if (
+                    c.requests.offline_pause_current(intent)
+                    and c.session.runtime.status.vendor_connected
+                    and g.vendor_registration == "Accepted"
+                ):
+                    await self.restore(intent, offline_pause=True)
             elif work is RecoveryWork.ORDINARY:
                 if not c.session.runtime.status.vendor_connected or g.vendor_registration != "Accepted":
                     await c.ordinary.hold("restricted_introduction")
@@ -155,9 +163,10 @@ class RecoveryCoordinator:
         continuing_local: int | None = None,
         return_request: str | None = None,
         claim_return: bool = False,
+        offline_pause: bool = False,
     ) -> RestoreProgress:
         launched = await self.c.commands.run(
-            lambda: self._begin_restore(expected_intent, continuing_local, return_request, claim_return)
+            lambda: self._begin_restore(expected_intent, continuing_local, return_request, claim_return, offline_pause)
         )
         if isinstance(launched, RestoreProgress):
             return launched
@@ -185,6 +194,7 @@ class RecoveryCoordinator:
         continuing_local: int | None,
         return_request: str | None,
         claim_return: bool,
+        offline_pause: bool,
     ) -> asyncio.Task[RestoreProgress] | RestoreProgress:
         if self.c.stopping:
             return RestoreProgress(
@@ -196,6 +206,10 @@ class RecoveryCoordinator:
                 Pending(Prerequisite.OWNED_OPERATION, "the current owned recovery completion remains pending"),
             )
         expected = expected_intent or self.c.requests.intent()
+        if offline_pause and self.c.requests.return_in_progress():
+            return RestoreProgress(
+                RestoreState.WAITING, Pending(Prerequisite.OWNED_OPERATION, "an explicit Return already owns recovery")
+            )
         # The request driver claims running; the existing direct restore API retains accepted until publication.
         if claim_return and return_request is not None:
             try:
@@ -210,7 +224,12 @@ class RecoveryCoordinator:
                 )
         try:
             self._task = self.c.session.gateway.controls.launch_completion(
-                self._restore_owned(expected, continuing_local=continuing_local, return_request=return_request)
+                self._restore_owned(
+                    expected,
+                    continuing_local=continuing_local,
+                    return_request=return_request,
+                    offline_pause=offline_pause,
+                )
             )
         except DeniedError:
             if claim_return and return_request is not None:
@@ -220,12 +239,17 @@ class RecoveryCoordinator:
 
     # This completion boundary owns request disposition even if the original poll or HTTP client disappears.
     async def _restore_owned(
-        self, expected_intent: ControlIntent, *, continuing_local: int | None, return_request: str | None
+        self,
+        expected_intent: ControlIntent,
+        *,
+        continuing_local: int | None,
+        return_request: str | None,
+        offline_pause: bool,
     ) -> RestoreProgress:
         attempt: ReleaseAttempt | None = None
         try:
             try:
-                prepared = await self._prepare_restore(expected_intent, continuing_local, return_request)
+                prepared = await self._prepare_restore(expected_intent, continuing_local, return_request, offline_pause)
             except sqlite3.Error as error:
                 c = self.c
                 g, j = c.session.gateway, c.session.journal
@@ -246,7 +270,7 @@ class RecoveryCoordinator:
                 )
             if isinstance(prepared, ReleaseAttempt):
                 attempt = prepared
-                progress = await self._run_release(attempt, return_request)
+                progress = await self._run_release(attempt, return_request, offline_pause)
             else:
                 progress = prepared
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
@@ -271,10 +295,12 @@ class RecoveryCoordinator:
         expected_intent: ControlIntent,
         continuing_local: int | None,
         return_request: str | None,
+        offline_pause: bool,
     ) -> RestoreProgress | ReleaseAttempt:
         c = self.c
         g, j = c.session.gateway, c.session.journal
         vendor_epoch = g._vendor_epoch
+        lifecycle = j.lifecycle_position() if offline_pause else None
 
         # A replacement vendor connection cannot authorize a release prepared under the previous one.
         def cloud_current() -> bool:
@@ -291,8 +317,19 @@ class RecoveryCoordinator:
 
         # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
         def guard() -> GateDecision:
-            if c.stopping or not c.requests.return_current(return_request, expected_intent):
+            current = (
+                c.requests.offline_pause_current(expected_intent)
+                if offline_pause
+                else c.requests.return_current(return_request, expected_intent)
+            )
+            if c.stopping or not current:
                 return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
+            if offline_pause:
+                if j.lifecycle_position() != lifecycle:
+                    return Pending(Prerequisite.LIFECYCLE, "charging records changed during offline Pause verification")
+                decision = offline_return_decision(c)
+                if isinstance(decision, Pending):
+                    return decision
             if continuing_local is not None and j.outcomes.awaits_stop_report(continuing_local):
                 return Pending(Prerequisite.LIFECYCLE, "continuation awaits the Stop's lifecycle report")
             if not cloud_current():
@@ -384,7 +421,7 @@ class RecoveryCoordinator:
                         raise RecoveryRequiredError("Return requires its current zero hold ticket")
                     c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
             return ReleaseAttempt(
-                "automatic" if expected_intent.mode == "app" else "explicit",
+                "automatic" if expected_intent.mode == "app" or offline_pause else "explicit",
                 expected_intent,
                 connection[0],
                 revision,
@@ -397,7 +434,9 @@ class RecoveryCoordinator:
         return c.commands.decide(lambda: prepare_release(native))
 
     # The wire child records possible dispatch and publishes the result under the original scope.
-    async def _run_release(self, attempt: ReleaseAttempt, return_request: str | None) -> RestoreProgress:
+    async def _run_release(
+        self, attempt: ReleaseAttempt, return_request: str | None, offline_pause: bool
+    ) -> RestoreProgress:
         c = self.c
         g, j = c.session.gateway, c.session.journal
         expected_intent, scope, revision = attempt.intent, attempt.scope, attempt.control_revision
@@ -418,6 +457,8 @@ class RecoveryCoordinator:
             j.put("managed_owner_epoch", epoch)
             if return_request is not None:
                 c.requests.returned(return_request, expected_intent, c.current.returned_to_previous)
+            elif offline_pause:
+                write_intent(j, expected_intent, "app")
             published = c.authority()
             if published is None:
                 raise RecoveryRequiredError("release publication lost its exact Boot")

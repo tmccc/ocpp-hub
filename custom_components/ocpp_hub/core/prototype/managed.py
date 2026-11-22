@@ -36,6 +36,7 @@ from .managed_settlement import (
     complete_record,
     current_candidate,
     internal_pause_matches,
+    offline_return_decision,
     require_settled_debt,
 )
 from .managed_sources import awaiting_owner_start, recorded_station_profile
@@ -618,7 +619,7 @@ class ManagedController:
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         self.requests.complete_verified_pause()
 
-    # Offline replacement retires prior app authority before any recovery wait and never auto-Returns on reconnection.
+    # Offline replacement holds zero; only a clean app interruption keeps permission to restore the schedule.
     def prepare_offline_pause(self) -> None:
         g, j = self.session.gateway, self.session.journal
         intent = self.requests.intent()
@@ -633,8 +634,9 @@ class ManagedController:
             and intent.mode == "app"
         ):
             with j.atomic(retry_busy=True):
-                write_intent(j, intent, "paused")
-                j.put(OFFLINE_PAUSE, True)
+                can_restore = not isinstance(offline_return_decision(self), Pending)
+                paused = write_intent(j, intent, "paused")
+                j.put(OFFLINE_PAUSE, paused.revision if can_restore else True)
                 g.controls._claim(True, stopping=True)
 
     # A newer stop ticket invalidates an awaited release before it can send a positive ceiling.

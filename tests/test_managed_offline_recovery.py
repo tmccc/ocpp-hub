@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import pytest
 from ocpp_hub_core.prototype import managed_charging as charge_tests
 from ocpp_hub_core.prototype.managed import ManagedController
+from ocpp_hub_core.prototype.managed_intent import OFFLINE_PAUSE
 from ocpp_hub_core.prototype.managed_view import refresh_for_read
 from ocpp_hub_core.prototype.rpc import UnavailableError
 from ocpp_hub_core.prototype.security import SecurityError
@@ -27,6 +28,7 @@ from tests.charge_rig import ChargeRig
 from tests.current_rig import adjustable, locally_ready, select
 from tests.handover_helpers import crash
 from tests.managed_rig import OwnerBench, healthy, managed_session, starts
+from tests.peer_mutation_helpers import matches_operation
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
@@ -303,15 +305,15 @@ async def test_delayed_online_boot_acknowledgement_does_not_force_offline_pause(
             release.set()
 
 
-# Intent: queued Status/Meter survives local recovery and later real ACK delivery while preserving the pause.
-# Why: readiness cannot erase history, invent acknowledgement, or let cloud reconnection release the pause.
-@pytest.mark.parametrize("confirm_pause", [False, True])
-async def test_observations_remain_queued_then_flush_on_reconnect_while_pause_remains(
+# Intent: queued Status/Meter survives local recovery and cloud reconnection releases only its own clean Pause.
+# Why: App/schedule can resume after real delivery, and a newer owner Pause or an old unbound marker stays at zero.
+@pytest.mark.parametrize("pause", ["automatic", "owner", "legacy"])
+async def test_cloud_reconnect_flushes_observations_and_restores_only_its_own_pause(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
-    confirm_pause: bool,
+    pause: str,
 ) -> None:
     async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
         test = recovery.test
@@ -325,7 +327,17 @@ async def test_observations_remain_queued_then_flush_on_reconnect_while_pause_re
         status = await locally_ready(test.controller)
         assert status["normal_start_ready"] and status["local_hold_verified"]
         assert queue == [tuple(row) for row in test.session.journal.db.execute("SELECT * FROM outbox ORDER BY seq")]
-        intent = test.controller.requests.intent()
+        c, j = test.controller, test.session.journal
+        intent = c.requests.intent()
+        assert j.get(OFFLINE_PAUSE) == intent.revision
+        assert not starts(test.rig) and test.rig.bench.firmware.effective_limit() == 0
+        if pause == "owner":
+            c.command(uuid.uuid4().hex, "pause", intent.revision)
+            status = await locally_ready(c)
+            assert status["local_hold_verified"] and j.get(OFFLINE_PAUSE) is None
+            intent = c.requests.intent()
+        elif pause == "legacy":
+            j.put(OFFLINE_PAUSE, True)
         transport = test.session.runtime.transport
         transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
         await until(
@@ -333,26 +345,100 @@ async def test_observations_remain_queued_then_flush_on_reconnect_while_pause_re
                 test.session.gateway.vendor_registration == "Accepted" and test.session.journal.next_delivery() is None
             )
         )
-        status = await healthy(test.controller)
-        assert status["local_hold_verified"] and test.controller.requests.intent() == intent
-        assert refresh_for_read(test.controller, status)["pause_reason"] == "cloud_connection_failed"
-        assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
-        await select(test, 20)
-        status = await healthy(test.controller)
-        assert refresh_for_read(test.controller, status)["pause_reason"] == "cloud_connection_failed"
-        intent = test.controller.requests.intent()
-        if confirm_pause:
-            test.controller.command(uuid.uuid4().hex, "pause", intent.revision)
-            status = await healthy(test.controller)
-            assert status["local_hold_verified"]
-            assert "pause_reason" not in refresh_for_read(test.controller, status)
-            intent = test.controller.requests.intent()
-        request = uuid.uuid4().hex
-        test.controller.command(request, "app_control", intent.revision)
-        status = await healthy(test.controller)
-        assert status["desired_control"] == "app" and status["station_ceiling_a"] == 20
-        assert "pause_reason" not in refresh_for_read(test.controller, status)
-        assert test.controller.requests.receipt(request)["state"] == "completed" and not starts(test.rig)
+        status = await healthy(c)
+        if pause == "automatic":
+            assert c.requests.intent() == intent.next("app")
+            assert status["desired_control"] == "app" and status["station_ceiling_a"] == 16
+            assert j.get(OFFLINE_PAUSE) is None and "pause_reason" not in refresh_for_read(c, status)
+        else:
+            assert status["local_hold_verified"] and c.requests.intent() == intent
+            reason = refresh_for_read(c, status).get("pause_reason")
+            assert reason == ("cloud_connection_failed" if pause == "legacy" else None)
+            assert test.rig.bench.firmware.effective_limit() == 0
+        assert not starts(test.rig)
+        assert j.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == recovery.prior_transaction_count
+        assert j.db.execute("SELECT 1 FROM managed_requests WHERE action='app_control' LIMIT 1").fetchone() is None
+
+
+# Intent: a newer owner Pause revokes the automatic return while its real native read is outstanding.
+# Why: reconnecting the cloud cannot move the station above zero on stale owner authority.
+async def test_owner_pause_overtakes_automatic_return_during_native_read(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        await locally_ready(c)
+        intent = c.requests.intent()
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+        entered, proceed = asyncio.Event(), asyncio.Event()
+        actual = c.native.read_result
+
+        # Delay an authentic native result only inside the automatic release worker.
+        async def delayed(*args: Any, **kwargs: Any) -> Any:
+            native = await actual(*args, **kwargs)
+            if c.recovery.pending() and not entered.is_set():
+                entered.set()
+                await proceed.wait()
+            return native
+
+        monkeypatch.setattr(c.native, "read_result", delayed)
+        mark = len(test.rig.bench.received_limits)
+        task = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            request = uuid.uuid4().hex
+            c.command(request, "pause", intent.revision)
+            proceed.set()
+            await task
+            status = await healthy(c)
+            assert status["local_hold_verified"] and c.requests.intent() == intent.next("paused")
+            assert c.requests.receipt(request)["state"] == "completed" and j.get(OFFLINE_PAUSE) is None
+            assert all(limit == 0 for limit in test.rig.bench.received_limits[mark:])
+            assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        finally:
+            proceed.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+# Intent: an explicit Return arriving during the automatic positive reply can share the verified result.
+# Why: the same owner choice must not revoke an issued release and turn a successful return into a fault.
+async def test_explicit_return_can_share_automatic_release_after_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        c, j, bench = test.controller, test.session.journal, test.rig.bench
+        await local_boot(recovery)
+        await locally_ready(c)
+        intent = c.requests.intent()
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+        entered, proceed = asyncio.Event(), asyncio.Event()
+
+        # Withhold only the real reply after the fake charger applies the restored station limit.
+        async def delay_positive(action: str, payload: dict[str, Any]) -> None:
+            if not entered.is_set() and matches_operation("restore", action, payload):
+                entered.set()
+                await proceed.wait()
+
+        monkeypatch.setattr(bench, "before_reply", delay_positive)
+        mark = len(bench.received_limits)
+        task = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            assert bench.firmware.effective_limit() == 16 and c.requests.intent() == intent
+            request = uuid.uuid4().hex
+            c.command(request, "app_control", intent.revision)
+            proceed.set()
+            await task
+            status = await healthy(c)
+            assert status["desired_control"] == "app" and c.requests.intent() == intent.next("app")
+            assert c.requests.receipt(request)["state"] == "completed" and not j.fault.latched()
+            assert bench.received_limits[mark:] == [16] and not starts(test.rig)
+        finally:
+            proceed.set()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 # Intent: the strict legacy acknowledgement still refuses queued data while the explicit managed local path retains it.
@@ -380,7 +466,7 @@ async def test_default_resume_stays_strict_and_local_only_retains_real_observati
 
 # Intent: genuine lifecycle debt or an unresolved mutation prevents offline acknowledgement at actual zero.
 # Why: the new path permits observations only, never unresolved charging or mutating work from an earlier process.
-@pytest.mark.parametrize("debt", ["lifecycle", "mutation"])
+@pytest.mark.parametrize("debt", ["lifecycle", "mapped-stop", "mutation"])
 async def test_prior_lifecycle_or_mutation_debt_blocks_offline_readiness(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
@@ -394,10 +480,35 @@ async def test_prior_lifecycle_or_mutation_debt_blocks_offline_readiness(
         status = await test.controller.tick()
         assert not status.get("local_healthy", False)
         assert test.session.journal.get("trial_phase") == "recovering"
+        assert test.session.journal.get(OFFLINE_PAUSE) is True
         assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
         assert test.session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == (
             recovery.prior_transaction_count
         )
+
+
+# Intent: incomplete Start or Stop delivery at interruption retains the explicit Return path after backfill.
+# Why: a recovery that began with unsettled charging work must not inherit the clean idle release permission.
+@pytest.mark.parametrize("debt", ["lifecycle", "mapped-stop"])
+async def test_offline_lifecycle_debt_requires_return_after_backfill(tmp_path, tls, unused_tcp_port, monkeypatch, debt):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch, debt=debt) as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        assert not (await c.tick()).get("local_healthy", False)
+        intent = c.requests.intent()
+        assert intent.mode == "paused" and j.get(OFFLINE_PAUSE) is True
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted" and j.next_delivery() is None)
+        status = await healthy(c)
+        assert status["local_hold_verified"] and c.requests.intent() == intent
+        assert status["station_ceiling_a"] == test.rig.bench.firmware.effective_limit() == 0
+        request = uuid.uuid4().hex
+        c.command(request, "app_control", intent.revision)
+        status = await healthy(c)
+        assert status["desired_control"] == "app" and status["station_ceiling_a"] == 16
+        assert c.requests.receipt(request)["state"] == "completed" and not starts(test.rig)
 
 
 # Intent: verified zero can complete a Pause receipt even while a previous genuine Stop awaits the cloud.

@@ -8,6 +8,12 @@ The repository has two deployment domains: the standalone iCS proxy with its thi
 older Raedian NEO OCPP backend inside the `ocpp_hub` HA integration. They share core modules, not a live listener.
 Read [the navigation guide](code-navigation.md) before interpreting the historical milestones below.
 
+## Automatic recovery after a charger outage — 22 November 2026
+
+- [~] A clean idle recovery can restore the saved app/schedule ceiling after the charger and cloud verify
+  closed zero and settle the reports. An owner Pause or unfinished charging work at interruption retains
+  the explicit Return path. The change is covered offline.
+
 ## Shared Stop deployment — 22 November 2026
 
 - [x] The standalone iCS proxy is running `98c47e1`. Tests sent local Pause and vendor-app Stop in both orders.

@@ -975,9 +975,11 @@ queue. Local readiness is published only after the phase is active and control u
 
 For a saved app intent, a real failed cloud attempt belonging to this exact charger introduction first commits a
 higher-revision Pause before recovery I/O. Slow initial cloud registration alone does not trigger that conversion,
-and a failure from an older introduction cannot authorize it. A saved Pause remains paused. Cloud reconnection never
-implicitly returns this locally recovered pause to app/schedule authority; explicit Return is still required. This
-path sends no Start or positive ceiling. Validation passes 1288 full-suite and 67 actual-HA cases.
+and a failure from an older introduction cannot authorize it. After a clean idle interruption, the proxy restores
+the saved app/schedule control once the current cloud registration, actual closed zero and settled reports agree.
+It restores the saved ceiling and leaves charging to the app or schedule. A newer owner Pause, an older Pause
+without a recorded recovery revision or unsettled charging work at the interruption keeps the hold for explicit
+Return.
 
 The connected idle check on 2026-11-10 stopped the old proxy at independently verified zero while preserving its
 saved app intent, blocked the cloud endpoint, and started a different proxy process. Fresh actual Boot/introduction
@@ -991,8 +993,8 @@ explanation also remains accurate when queued observations temporarily disable c
 
 Commissioning of this iCS installation is closed for routine use at the owner's request on 2026-11-10. The proxy and
 independent health timer are enabled, app/saved-schedule authority is the daily default, and the selected/native/owned
-ceiling is 32 A. HA Start and Pause remain available; current selection is idle-only. An offline process recovery
-retains Pause until an explicit Start or, once the cloud is reconciled, Return. The five deliberately disabled
+ceiling is 32 A. HA Start and Pause remain available; current selection is idle-only. A clean offline recovery
+holds zero until it verifies app/schedule control again. The five deliberately disabled
 EV/reserve automations stay off. No additional dedicated charge, cable removal or phone test is an acceptance
 prerequisite. Follow-up should use ordinary charging logs and address a concrete fault or an explicitly requested
 feature. Active-session current modulation, selective cleanup beside original profiles and wider app-feature work
@@ -1013,8 +1015,8 @@ audit alone does not confirm zero or restore app authority. If a newer Pause sup
 after that work retires and its own fresh closed-zero proof succeeds.
 
 An ordinary temporary zero hold on the existing connection preserves the saved app
-choice during a cloud outage. Offline replacement retains the documented Pause
-behavior. Recovery checks current permission, pending prerequisites and actual
+choice during a cloud outage. Offline replacement holds the charger in Pause
+until the recovery checks pass. Recovery checks current permission, pending prerequisites and actual
 command effects separately. Fresh native or source evidence does not itself grant
 permission: the current owner choice, Boot and control claim must still agree when
 a command is sent and its result is committed.
